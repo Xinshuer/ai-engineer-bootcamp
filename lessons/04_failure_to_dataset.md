@@ -49,6 +49,24 @@ python evals/run_evals.py --mode deepseek --runs 3 --prompt v3                  
 
 `evals/harness.py` 的 `check()` 里加一种断言 `must_not_call_prefix`，用例里写 `"must_not_call_prefix": ["mark_for_review"]`。这样即使判定碰巧对了，多调的那次 `mark_for_review` 也会被抓住。这就是"评轨迹，不只评答案"。
 
+## 实战记录：2026-09-21 我们实际走的路
+
+这一课后来真的按上面的顺序做了一遍，过程比计划曲折，更值得看。用例是 `mutual-warranty-disclaimer`（双向 AS IS 免责，必须放过），模型是 DeepSeek。
+
+| 步 | 做了什么 | 结果 | 学到 |
+|---|---|---|---|
+| 基线 | v2 跑 5 次 | 2/5 | 抽风，不是稳定错 |
+| 诊断 1 | trace 加 `model_verdict` 字段 | 模型 5 次都说 accept，是代码把"调过 mark_for_review 的 accept"降成了 flag | 看不见的字段就补上；问题分模型层和代码层 |
+| 加断言 | 用例加 `must_not_call_prefix: ["mark_for_review"]` | 3 次失败都被抓住 | 评轨迹，不只评答案 |
+| 试 1 | 写 v3 prompt，把第 5 条收窄 | **0/5，变差** | "显然有效"的改动也要测；说得更狠不等于更清楚 |
+| 诊断 2 | 打印工具描述 | `mark_for_review` 的描述写着 "use it when out of the playbook's scope"，和 prompt 矛盾 | 根因排序第三条：提示词互相矛盾。工具描述也是 prompt |
+| 试 2 | 退回 v2，只改工具描述 | 1/5 | 有帮助但不够 |
+| 诊断 3 | trace 加 `marks` 字段，看模型给 mark_for_review 填的理由 | 一次写 "Not needed"；两次写"没有规则管免责声明，是否要求明示保证是业务决定" | 模型在**合理地**谨慎，它缺的是客户立场 |
+| 试 3 | playbook 加 PB-00："双向样板条款可接受" | **4/5** | 数据问题用数据修，不用 prompt 修 |
+| 回归 | 9 条 × 3 次 | 27/27，召回 1.00，这条 3/3 | 没搬坏别的才算修好 |
+
+三次尝试里只有一次是"改 prompt"，而且那次失败了。真正起作用的是**工具描述**和**playbook 数据**。每次尝试之间都有一次新的诊断，每次诊断都是"给 trace 加一个字段，让系统自己说"。
+
 ## 面试一句话
 
 "Every production miss becomes a test case first. I don't touch the prompt until I have a case that fails, and I don't ship until the whole set is green again."
