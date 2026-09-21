@@ -21,9 +21,12 @@ backend = OpenAICompatBackend(settings, contract)
 print(f"model={settings.model}  full_contract={settings.full_contract}  system prompt ~{len(backend.system) // 4} tokens\n")
 
 
-def run(label: str) -> None:
+def run(label: str, volatile_prefix: bool = False) -> None:
     print(label)
     for i in range(1, 4):
+        if volatile_prefix:
+            # regenerated on EVERY call, like datetime.now() in a real system prompt
+            backend.system = f"Request time: {time.time()}\n\n" + original
         step = backend.step([{"role": "user", "content": _user_message(clause, contract)}])
         u = step.usage
         total = u["input"] + u["cache_read"]
@@ -34,8 +37,8 @@ def run(label: str) -> None:
 run("A) stable prefix (instructions -> contract -> clause)")
 
 original = backend.system
-backend.system = f"Request time: {time.time()}\n\n" + original  # one volatile line at the very front
-run("\nB) same prompt with a timestamp at the START of the system prompt")
+run("\nB) same prompt with a fresh timestamp at the START of the system prompt on every call", volatile_prefix=True)
 backend.system = original
 
-print("\nB never hits: the first byte differs, so the whole prefix is new every time. Put anything that changes per request at the END.")
+print("\nB never hits: the first byte differs on every call, so the whole prefix is new every time. Put anything that changes per request at the END.")
+print("(An earlier version of this script generated the timestamp once, so B's 2nd and 3rd calls hit again. The data caught the bug.)")
