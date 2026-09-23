@@ -306,6 +306,9 @@ console.log(RISKS.length, RISKS[2]);
 type: code
 title: 复习：async 调用 + 计数
 level: 2
+cards: d6:async / await：等网络的时候不卡住; d5:Record 和计数; d6:fetch：TypeScript 里的 requests.post
+--- context
+先给一批条款归个类，看这份合同里哪类主题最多（责任上限、自动续约、数据处理……），律师心里就先有个数。每一段都要问一次模型，得等网络回来。
 --- prompt
 复习第 5、6 天。写 `countTopics(texts)`：对每段文字**按顺序** await 一次 `askJson(text)`（已写好），取回答里的 `topic` 字段计数，返回 `{ 主题: 次数 }`。空数组返回 `{}`。
 
@@ -377,6 +380,9 @@ expectAsync("每段调用一次", async () => { MOCK.reset(); await countTopics(
 type: choice
 title: 只能用 type 写的
 level: 1
+cards: interface 和 type
+--- context
+用 TypeScript 描述 Clause Check 的数据（条款、判定、审查结果）时，有 `interface` 和 `type` 两种写法可选，团队要先定一个统一的习惯。
 --- prompt
 下面哪一个**只能**用 `type` 写，不能用 `interface` 写？
 --- options
@@ -392,6 +398,9 @@ answer: 2
 type: fix
 title: 可能是 undefined
 level: 2
+cards: 可选、只读、可选链
+--- context
+报告页要按编号显示条款标题。练习里的条款数据有的缺了标题（比如从别的系统导进来的）；用户也可能输入一个根本不存在的编号。
 --- prompt
 运行一下，类型检查报了三处 `possibly 'undefined'`。修好它们，规则：
 
@@ -435,6 +444,9 @@ expect("找不到", () => headingOf(CLAUSES, "99"), "(missing)");
 type: predict
 title: 收窄的结果
 level: 2
+cards: 联合类型和收窄
+--- context
+模型交回来的字段不一定是你想的类型：同一个字段，这次是数字，下次是列表，还可能是空的。用之前，先得弄清它这次到底是什么。
 --- prompt
 写出输出。最后一行是 JavaScript 的两个老坑，想想为什么要用 `Array.isArray` 和 `=== null`。
 --- code
@@ -462,6 +474,9 @@ console.log(typeof null, typeof [], Array.isArray([]));
 type: code
 title: 统一 rule_ids
 level: 2
+cards: 联合类型和收窄; d5:数组方法：map、filter、find
+--- context
+判定里的 `rule_ids` 记着这条条款对照了 playbook 的哪几条规则，报告要把它们列出来。可模型交回来的格式不统一，后面的代码只想处理一种格式。
 --- prompt
 模型有时把 `rule_ids` 写成数组，有时写成逗号分隔的字符串，有时干脆给 `null`。写 `normalizeIds(input)`，统一返回字符串数组：每项去掉首尾空格，去掉空项。
 
@@ -493,6 +508,9 @@ expect("空字符串和多余逗号", () => [normalizeIds(""), normalizeIds("PB-
 type: code
 title: 描述一个决定
 level: 2
+cards: 可辨识联合和穷尽检查
+--- context
+三种判定要带的信息不一样：flag 要写原因，redline 要附上建议的新写法。报告里每条判定要用一行字说清楚，而且每种情况只能读到它自己有的字段。
 --- prompt
 写 `describe(d)`：
 
@@ -546,6 +564,9 @@ expect("redline", () => describe({ kind: "redline", replacement: "Cap at 12 mont
 type: fix
 title: 漏掉的 case
 level: 2
+cards: 可辨识联合和穷尽检查
+--- context
+需求会变：团队想让某些条款直接转给法务部的某个人处理，于是给判定加了第四种。改类型的人和写 `describe` 的人常常不是同一个，漏改一处很正常。
 --- prompt
 团队给 `Decision` 加了第四种情况 `{ kind: "escalate"; to: string }`（交给某个人处理），却忘了改 `describe`。运行一下：类型检查立刻在 `default` 那一行报错。读懂报错，补上这个 case，返回 `"escalate to legal"` 这样的文字。**不要**删掉穷尽检查那一行，它刚刚帮你抓住了一个 bug。
 --- starter
@@ -603,6 +624,9 @@ expect("flag 还是对的", () => describe({ kind: "flag", reason: "late fee" })
 type: code
 title: 泛型 first 和 last
 level: 1
+cards: 泛型：类型的参数
+--- context
+取第一条、最后一条，这个操作条款编号列表要用，审查结果列表也要用。每种类型各写一遍太啰嗦，写成 `any` 又会把类型丢掉。
 --- prompt
 写两个泛型函数：`first(xs)` 返回第一个元素，`last(xs)` 返回最后一个；空数组都返回 `undefined`。返回类型是 `T | undefined`。例：`last(["3.1", "8.1"])` → `"8.1"`。
 --- starter
@@ -634,6 +658,9 @@ expect("类型跟着走", () => { const c: { id: string } | undefined = last([{ 
 type: code
 title: 泛型 groupBy
 level: 2
+cards: 泛型：类型的参数; d5:Record 和计数
+--- context
+报告页上，律师有时想按判定看，有时想按风险或章节看。与其每种分法各写一个函数，不如写一个通用的，什么数据都能用。
 --- prompt
 写 `groupBy(xs, key)`：`key` 是一个函数，算出每个元素属于哪一组。返回 `Record<string, T[]>`，组内保持原顺序。例：`groupBy(reviews, (r) => r.verdict)` → `{ flag: [...], accept: [...] }`。
 
@@ -675,6 +702,9 @@ expect("空", () => groupBy([], (x: string) => x), {});
 type: order
 title: 排代码：泛型 indexBy
 level: 2
+cards: 泛型：类型的参数
+--- context
+审查时经常要按编号找一条条款，或者按 id 找一条 playbook 规则。每次都从头翻一遍数组太慢，先建一张查找表更方便。
 --- prompt
 排出 `indexBy`：把数组变成「名字 → 元素」的查找表，名字由 `key(x)` 算出；同名时后面的覆盖前面的。有两行干扰项。
 --- lines
@@ -704,6 +734,9 @@ expect("空", () => indexBy([], (x: string) => x), {});
 type: code
 title: Partial 补丁
 level: 2
+cards: 工具类型：从一个类型派生另一个
+--- context
+律师在界面上看报告时，觉得某条判定不对，可以当场改，比如把 flag 改成 redline。原来那份结果还要留着，好对照模型当初是怎么判的。
 --- prompt
 律师在界面上只改了一两个字段。写泛型 `applyPatch(obj, patch)`：返回一个**新对象**，`patch` 里有的字段覆盖原值，其它不变，**不要修改** `obj`。`patch` 的类型要写成 `Partial<T>`（starter 里写错了）。例：`applyPatch(review, { verdict: "redline" })`。
 --- starter
@@ -743,6 +776,9 @@ expect("别的类型也能用", () => applyPatch({ a: 1, b: 2 }, { b: 3 }), { a:
 type: predict
 title: Omit 在运行时
 level: 2
+cards: 工具类型：从一个类型派生另一个
+--- context
+审查结果里有些字段只该给内部看，比如这条审查花了多少钱。团队用 TypeScript 的工具类型，定义了一个给外部看的「对外版」类型。
 --- prompt
 写出输出。想一想：`Omit` 在运行时还存在吗？
 --- code
@@ -766,6 +802,9 @@ console.log(Object.keys(rest).join(", "), cost_usd);
 type: code
 title: 对外的审查结果
 level: 2
+cards: 工具类型：从一个类型派生另一个
+--- context
+客户在前端看到的审查结果，不能带着内部成本和模型的原始回复：前者是商业信息，后者又长又乱。列表页只显示最简单的几项。
 --- prompt
 API 返回给前端的审查结果不能带内部字段。写两个函数，都返回**新对象**，不修改原对象：
 
@@ -824,6 +863,9 @@ expect("原对象没被改", () => FULL.cost_usd, 0.0021);
 type: choice
 title: any 和 unknown
 level: 2
+cards: unknown 和类型守卫
+--- context
+前端收到的每个审查结果都是一段 JSON 文字，要先解析成对象才能用。写代码时字段名打错一个字母，是很常见的事。
 --- prompt
 `const data = JSON.parse(raw);` 之后写了 `data.verdcit.toUpperCase()`（verdict 拼错了）。下面哪句话是对的？
 --- options
@@ -839,6 +881,9 @@ answer: 2
 type: code
 title: 守卫 + 过滤坏数据
 level: 3
+cards: unknown 和类型守卫; 联合类型和收窄
+--- context
+为了少发几次请求，有时让模型一次审好几条条款，它交回一个 JSON 数组。数组里难免混着缺字段、判定写错的元素，这些外来数据用之前都得逐个检查。
 --- prompt
 模型一次返回了一个 JSON 数组，但其中有的元素不合格。不用 Zod，手写：
 
@@ -906,6 +951,9 @@ expect("坏 JSON 和不是数组", () => [parseVerdicts("Sure! ["), parseVerdict
 type: code
 title: as const：最高风险
 level: 2
+cards: as const：一份列表，两种用途; unknown 和类型守卫
+--- context
+报告封面要写整份合同的最高风险等级。风险等级的列表既要在运行时检查模型给的值，又要在类型里用；分开写两份，迟早会对不上。
 --- prompt
 `RISKS` 已经给好。先把 `type Risk` 改成**从 RISKS 推导**出来的联合类型，然后写：
 
@@ -956,6 +1004,9 @@ expect("Risk 是三个字面量的联合", () => { const r: "low" | "medium" | "
 type: fill
 title: 填空：一份列表两种用途
 level: 1
+cards: as const：一份列表，两种用途; unknown 和类型守卫
+--- context
+三个判定词在程序里要用两次：运行时检查模型的回答，编译时限定变量只能取这三个值。模型的回答还可能带空格或大写。
 --- prompt
 补全代码：`VERDICTS` 既是运行时的数组，又推导出 `Verdict` 类型；`isVerdict` 是一个类型守卫。
 --- template
@@ -982,6 +1033,9 @@ expect("类型是联合", () => { const v: "accept" | "flag" | "redline" = toVer
 type: translate
 title: 翻译：dataclass→TS
 level: 2
+cards: 可选、只读、可选链; interface 和 type; d5:从 Python 到 TypeScript
+--- context
+Clause Check 的后端是 Python。假设给它做一个 TypeScript 前端，两边描述的必须是同一份数据，所以要把 Python 里的数据类翻成 TypeScript 的类型。
 --- prompt
 把 Python 的 dataclass 和函数翻译成 TypeScript 的 `interface Review` 和 `headline(r)`。
 
@@ -1031,6 +1085,9 @@ expect("全部字段", () => headline({ clause_id: "10.1", verdict: "redline", r
 type: local
 title: 本机：tsc 类型检查
 level: 2
+cards: 可辨识联合和穷尽检查; d5:从 Python 到 TypeScript
+--- context
+在自己电脑上写 TypeScript，「能运行」和「类型检查通过」是两回事。亲眼看一次这个区别，以后在真项目里才不会误以为代码没问题。
 --- prompt
 本页每次运行都会帮你做类型检查。在自己电脑上，这一步要自己跑 `tsc`（TypeScript 编译器）。
 
@@ -1061,6 +1118,9 @@ type: scratch
 title: 闭卷：事件汇总
 exam: yes
 level: 3
+cards: 可辨识联合和穷尽检查
+--- context
+Agent 审一份合同时，会一步步留下记录：调了哪个工具、给了什么判定、哪里出了错。最后要把这些记录汇总成一个小结，显示在报告页上。
 --- prompt
 Agent 运行时会产生一串事件。定义可辨识联合 `ReviewEvent`（用字段 `type` 区分）：
 
@@ -1120,6 +1180,9 @@ type: scratch
 title: 闭卷：泛型 topBy
 exam: yes
 level: 3
+cards: 泛型：类型的参数
+--- context
+报告页要列出「最该先看的几条」。打分的办法可能是风险，也可能是检索得分，还会用在别的数据上，所以要写成一个通用的函数。
 --- prompt
 写泛型函数 `topBy<T>(xs: T[], score: (x: T) => number, k: number): T[]`：按 `score` 从高到低返回前 `k` 个元素。
 
@@ -1151,6 +1214,9 @@ type: scratch
 title: 闭卷：守卫加载规则
 exam: yes
 level: 3
+cards: unknown 和类型守卫; 联合类型和收窄
+--- context
+playbook 是客户的审查规则，存在一个 JSON 文件里，由人手写手改，难免有写错的规则。加载时要把坏规则挑出来，不能让它悄悄混进审查。
 --- prompt
 从 JSON 文字里加载 playbook 规则，不用 Zod，手写检查：
 

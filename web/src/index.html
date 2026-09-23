@@ -66,7 +66,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 code, pre, .mono { font-family: var(--font-code); font-size: 13px; }
-p code, li code, .md code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+p code, li code, .md code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; white-space: break-spaces; }
 
 /* ---------- shell ---------- */
 .topbar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; padding: 10px 20px; background: var(--surface); border-bottom: 1px solid var(--line); }
@@ -227,6 +227,19 @@ textarea.answer { width: 100%; min-height: 120px; border: 1px solid var(--line);
 .hintBox { border-left: 3px solid var(--warn); background: var(--warn-soft); padding: 8px 12px; border-radius: 0 6px 6px 0; font-size: 14px; }
 .solution { border: 1px solid var(--warn); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
 .explain { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; border-radius: 0 6px 6px 0; }
+.context { border-left: 3px solid var(--line); background: var(--surface-2); padding: 8px 12px; border-radius: 0 6px 6px 0; font-size: 14px; }
+.context p:last-child { margin-bottom: 0; }
+.context .panelLabel { margin-bottom: 4px; }
+.cardLinks { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.cardLinks button { font: 500 13px var(--font-ui); color: var(--accent); background: var(--accent-soft); border: 1px solid transparent; border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.cardLinks button[aria-expanded="true"] { border-color: var(--accent); }
+.cardPeek { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.cardPeek h4 { margin: 0; font: 600 14px var(--font-head); }
+.checks ul { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 3px; font-size: 13.5px; }
+.checks li { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.checks li::before { content: "·"; color: var(--faint); }
+.checks code { font: 12.5px var(--font-code); color: var(--ink); background: var(--code-bg); border-radius: 4px; padding: 1px 6px; word-break: break-word; white-space: break-spaces; }
+.cardBody.textOnly { grid-template-columns: minmax(0, 1fr); }
 
 .examBar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; background: var(--fail-soft); border: 1px solid var(--fail); color: var(--ink); border-radius: 10px; padding: 12px 16px; }
 .examBar .clock { font: 700 22px var(--font-code); color: var(--fail); font-variant-numeric: tabular-nums; }
@@ -1147,7 +1160,7 @@ function renderLearn(main, day) {
     const seenKey = c.id;
     const card = h("details", { class: "card", open: i === 0 && !STATE.seen[seenKey] ? true : undefined },
       h("summary", {}, h("span", { class: "n" }, i + 1), h("span", {}, c.title), STATE.seen[seenKey] ? h("span", { class: "seen" }, "运行过") : ""));
-    const body = h("div", { class: "cardBody" });
+    const body = h("div", { class: "cardBody" + (c.code ? "" : " textOnly") });
     const text = h("div", { class: "md", html: md(c.body) });
     highlightIn(text, c.lang);
     body.append(text);
@@ -1218,12 +1231,51 @@ function renderItem(work, item, ctx) {
     r.a ? h("span", { class: "note" }, `已提交 ${r.a} 次`) : "",
     h("h2", {}, item.title)));
   if (st === "review") work.append(h("div", { class: "hintBox" }, "这道题之前看过答案或用了较多提示，现在进了复习区。点「从空白重做」，不看答案独立写对一次，它就会离开复习区。"));
+  if (item.context) {
+    const bg = h("div", { class: "context" }, h("p", { class: "panelLabel" }, "背景"), h("div", { class: "md", html: md(item.context) }));
+    highlightIn(bg, item.lang);
+    work.append(bg);
+  }
   const prompt = h("div", { class: "md", html: md(item.prompt) });
   highlightIn(prompt, item.lang);
   work.append(prompt);
+  if (!exam) work.append(cardLinks(item));
+  work.append(checksView(item));
   const renderer = { choice: viewChoice, predict: viewPredict, fill: viewFill, order: viewOrder, local: viewLocal, testwrite: viewTestwrite, sql: viewSql }[item.type] || viewCode;
   if (item.lang === "sql" && item.tables && item.type !== "sql" && item.type !== "choice") work.append(schemaPanel(item.tables, false));
   renderer(work, item, { ...ctx, exam });
+}
+
+// ---- the knowledge cards an item uses (opened in place) and what the grader checks
+function conceptById(id) {
+  for (const d of COURSE.days) { const c = d.concepts.find((x) => x.id === id); if (c) return { c, day: d }; }
+  return null;
+}
+function cardLinks(item) {
+  const found = (item.cardIds || []).map(conceptById).filter(Boolean);
+  if (!found.length) return "";
+  const peek = h("div");
+  const btns = found.map(({ c, day }) => {
+    const b = h("button", { type: "button", "aria-expanded": "false", onclick: () => {
+      const open = b.getAttribute("aria-expanded") === "true";
+      btns.forEach((x) => x.setAttribute("aria-expanded", "false"));
+      if (open) { peek.replaceChildren(); return; }
+      b.setAttribute("aria-expanded", "true");
+      const text = h("div", { class: "md", html: md(c.body) });
+      highlightIn(text, c.lang);
+      peek.replaceChildren(h("div", { class: "cardPeek" },
+        h("h4", {}, (Number(day.id) === item.day ? "" : `第 ${day.id} 天 · `) + c.title), text,
+        c.code ? h("p", { class: "panelLabel" }, "卡片里的例子（去「学」页可以运行）") : "", c.code ? codeBlock(c.code, c.lang) : ""));
+    } }, (Number(day.id) === item.day ? "" : `D${day.id} `) + c.title);
+    return b;
+  });
+  return h("div", {}, h("div", { class: "cardLinks" }, h("span", {}, "要用到的知识卡片："), ...btns), peek);
+}
+function checksView(item) {
+  const cs = item.checks || [];
+  if (!cs.length) return "";
+  return h("div", { class: "checks" }, h("p", { class: "panelLabel" }, "判题会检查"),
+    h("ul", {}, cs.map((c) => h("li", {}, h("span", {}, c.label), c.call ? h("code", {}, `${c.call}  →  ${c.value}`) : ""))));
 }
 
 // ---- shared: hints + solution + results

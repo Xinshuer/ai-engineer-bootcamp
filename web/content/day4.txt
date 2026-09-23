@@ -77,7 +77,7 @@ for raw in ['{"clause_id": "8.1", "verdict": "flag"}', '{"clause_id": "8.1", "ve
 @@ concept
 title: Chat API 的请求和回答长什么样
 --- body
-几乎所有大模型接口（DeepSeek、OpenAI、LM Studio）都用同一种格式。DeepSeek 现在的模型名是 `deepseek-flash`（快、便宜，本课一直用它）和 `deepseek-v4-pro`（更大、更慢、更贵）。旧的模型名 `deepseek-chat` / `deepseek-reasoner` 已在 2026-07-24 停用，网上很多教程还在用它们。
+几乎所有大模型接口（DeepSeek、OpenAI、LM Studio）都用同一种格式。DeepSeek 现在的模型名是 `deepseek-flash`（快、便宜，本课一直用它）和 `deepseek-v4-pro`（更大、更慢、更贵）。旧的模型名 `deepseek-chat` / `deepseek-reasoner` 官方已经宣布从 2026-07-24 起停用：2026-09 实测还能调用（由 `deepseek-flash` 回答），但模型列表里已经没有它们，随时可能失效。网上很多教程还在用它们，照抄时换成 `deepseek-flash`。
 
 **请求**：POST 到 `.../chat/completions`，请求头带 `Authorization: Bearer <密钥>`，请求体：
 
@@ -146,7 +146,7 @@ title: 状态码和重试
 mock: yes
 --- body
 - `200` 成功
-- `400` 请求写错了（字段缺了、模型名不对，包括抄了已停用的旧模型名）：**不要重试**，改代码
+- `400` 请求写错了（字段缺了、模型名不对）：**不要重试**，改代码
 - `401` 密钥不对或没带 `Bearer`：**不要重试**
 - `429` 请求太频繁、`500` / `503` 服务器问题：**可以重试**，等一下再来
 
@@ -187,7 +187,7 @@ message["tool_calls"] = [{"id": "call_1", "function": {"name": "lookup_playbook"
 2. `json.loads(arguments)` 得到参数，调用它
 3. 把模型那条消息和一条 `{"role": "tool", "tool_call_id": ..., "content": 结果}` 加进 messages，**再请求一次**
 
-模型看到工具结果后给出最终回答。这个「请求 → 调工具 → 再请求」的循环就是 Agent。例子里照样关掉了思考模式：Agent 要来回请求好几次，快和便宜更重要；而且开着思考模式时，第 3 步加回去的模型消息必须带着它的 `reasoning_content`，漏掉了真接口会返回 400。
+模型看到工具结果后给出最终回答。这个「请求 → 调工具 → 再请求」的循环就是 Agent。例子里照样关掉了思考模式：Agent 要来回请求好几次，快和便宜更重要；而且开着思考模式时，DeepSeek 的文档规定第 3 步加回去的模型消息必须带着它的 `reasoning_content`，漏掉了返回 400（练习页的模拟服务器照这条规定执行；2026-09 实测真接口暂时没有拒绝，但文档写了就要照做）。
 --- code
 import json
 import os
@@ -233,6 +233,9 @@ print("accept rate:", results.count("accept") / len(results))
 type: choice
 title: Literal 是什么意思
 level: 1
+cards: Pydantic：给数据定规矩
+--- context
+真实项目的 `models.py` 里，判定、风险等级、主题这几个字段都是这样写的。先弄懂这一种写法，读项目的数据定义就顺多了。
 --- prompt
 在 Pydantic 模型里写 `verdict: Literal["accept", "flag", "redline"]`，表示什么？
 --- options
@@ -248,6 +251,9 @@ answer: 2
 type: code
 title: 定义 Verdict 模型
 level: 2
+cards: Pydantic：给数据定规矩
+--- context
+昨天手写的校验器又长又容易漏。这次换个办法：把「一个判定应该长什么样」写成一份定义，检查交给 Pydantic。真实项目里的 `ClauseVerdict` 就是这样一份定义，只是字段更多。
 --- prompt
 用 Pydantic 定义 `Verdict`，字段：
 
@@ -288,6 +294,9 @@ expect_raises("缺 rationale", lambda: Verdict(clause_id="1", verdict="accept", 
 type: code
 title: 解析并校验模型输出
 level: 2
+cards: 校验失败：ValidationError; Pydantic：给数据定规矩
+--- context
+模型的回答拿回来，要一步完成「解析 + 检查」。检查不过时，真实项目会把出错原因发回给模型，请它重答一次，所以这句原因要让模型也看得懂。
 --- prompt
 写 `parse_verdict(raw)`：
 
@@ -331,6 +340,9 @@ expect_true("错误信息里提到了允许的值", lambda: "accept" in parse_ve
 type: predict
 title: Pydantic 的转换和默认值
 level: 2
+cards: Pydantic：给数据定规矩
+--- context
+模型给的数字有时是带引号的文字；有的字段模型干脆没写。这段代码演示 Pydantic 遇到这两种情况时怎么处理。
 --- prompt
 写出输出。注意字符串 `"0.9"` 被转成了什么，以及 `model_dump()` 的样子。
 --- code
@@ -352,6 +364,9 @@ print(w.confidence + 0.1)
 type: code
 title: 组装 messages
 level: 1
+cards: Chat API 的请求和回答长什么样
+--- context
+和模型说话，发的不是一句话，而是一组带角色的消息：系统消息定下「你是谁、按什么规矩办事」，用户消息放这次要问的具体内容。每审一条条款都要组一次。
 --- prompt
 写 `build_messages(system, clause_text)`，返回两条消息的列表：
 
@@ -378,6 +393,9 @@ expect("第二条是 user", lambda: m()[1], {"role": "user", "content": "Review 
 type: code
 title: 组装请求体
 level: 1
+cards: Chat API 的请求和回答长什么样; d2:函数：默认参数和提前 return
+--- context
+消息准备好以后，还要和模型名、`temperature`（控制回答的随机程度）等设置一起，装进一个「请求体」（发给接口的全部内容）里发出去。
 --- prompt
 写 `build_body(messages, model="deepseek-flash", temperature=0.3)`，返回请求体字典，有四个键：`model`、`messages`、`thinking`、`temperature`。
 
@@ -402,6 +420,9 @@ type: code
 title: 第一次调接口
 level: 2
 mock: yes
+cards: 用 requests 发请求; Chat API 的请求和回答长什么样
+--- context
+这是整个项目里最核心的一步：把问题发给模型，拿回它的回答。本页连的是模拟服务器，写法和连真服务器完全一样。
 --- prompt
 写 `ask(prompt)`：
 
@@ -445,6 +466,9 @@ type: fix
 title: 修 bug：401
 level: 2
 mock: yes
+cards: 状态码和重试; 用 requests 发请求
+--- context
+第一次调接口，最常见的结果就是被服务器挡在门外，一句回答都拿不到。这类错误重试多少次都没用，只能读服务器给的错误信息，找到原因改代码。
 --- prompt
 这个函数报错了。先运行，看输出里打印的状态码和服务器的错误信息，找到原因再修。
 --- starter
@@ -483,6 +507,9 @@ type: code
 title: 顺便记下 token 用量
 level: 2
 mock: yes
+cards: 用 requests 发请求; Chat API 的请求和回答长什么样
+--- context
+模型按 token 计费（token：模型读写文字的计量单位）。真实项目会记下每条条款用了多少 token，汇总时算出审这份合同一共花了多少钱。
 --- prompt
 写 `ask_with_usage(prompt)`：返回 `{"text": 回答文字, "tokens": 这次用掉的 total_tokens}`。
 
@@ -526,6 +553,9 @@ type: code
 title: 状态码不对就报错
 level: 2
 mock: yes
+cards: 状态码和重试; d3:raise：主动报错
+--- context
+接口出错时，服务器会回一个状态码和一句错误说明。把它们原样报出来，出问题时一看日志就知道是密钥错了、请求写错了，还是服务器忙。
 --- prompt
 写 `call_api(body)`：发请求；状态码是 200 就返回解析后的字典；否则 `raise RuntimeError(f"API error {状态码}: {服务器给的错误信息}")`。
 
@@ -571,6 +601,9 @@ type: code
 title: 失败了就重试
 level: 3
 mock: yes
+cards: 状态码和重试; d2:for 循环
+--- context
+审一份合同要连着调几十次接口，中途碰上「请求太频繁」或服务器临时故障很正常，等一下再试往往就好了。可有的错误重试多少次都没用，只会白白浪费时间。
 --- prompt
 写 `ask_with_retry(prompt, max_attempts=3)`：
 
@@ -638,6 +671,9 @@ type: code
 title: 让模型返回结构化判定
 level: 3
 mock: yes
+cards: Pydantic：给数据定规矩; 用 requests 发请求; 校验失败：ValidationError
+--- context
+这一题把前面几题连起来：把一条条款发给模型，拿回一个检查过的判定对象，后面的汇总、排序都靠它。真实项目的 `review.py` 做的也是这件事，只是多了工具调用。
 --- prompt
 写 `classify(clause_text)`：
 
@@ -704,6 +740,9 @@ expect("关掉了思考模式", lambda: MOCK.calls[-1]["body"].get("thinking"), 
 type: code
 title: 从啰嗦的回答里抠出 JSON
 level: 2
+cards: d3:JSON：文字和字典之间的桥; d1:字符串
+--- context
+有些模型（特别是在自己电脑上跑的小模型）不太守规矩，JSON 前后会带几句客套话，直接解析就会失败。真实项目 `review.py` 里的 `_extract_json` 专门处理这种情况。
 --- prompt
 有些模型会在 JSON 前后加废话：`'Sure! Here is the JSON:\n{"verdict": "flag"}'`。
 
@@ -735,6 +774,9 @@ expect("没有大括号", lambda: extract_json("no json here"), None)
 type: code
 title: 执行一次工具调用
 level: 2
+cards: 工具调用：模型说「帮我查一下」
+--- context
+模型审条款时，可以要求程序替它办事，比如查公司的审查规则（`lookup_playbook`）。模型只说出工具名和参数，真正去执行的是你的代码。
 --- prompt
 模型返回的工具调用长这样：
 
@@ -777,6 +819,9 @@ type: code
 title: 通过率
 level: 2
 mock: yes
+cards: 随机性：跑一次不算数
+--- context
+同一条条款问模型五次，可能得到两种判定。要知道模型在某条上靠不靠得住，就得多问几次看比例。真实项目的 `evals/run_evals.py` 就是把每个测试用例跑 N 次，算通过率。
 --- prompt
 写 `pass_rate(clause_text, expected, n)`：调用 `classify(clause_text)` 共 `n` 次，返回判定等于 `expected` 的比例（0 到 1 之间的小数）。
 
@@ -845,6 +890,9 @@ type: code
 title: 迷你 Agent：请求 → 调工具 → 再请求
 level: 3
 mock: yes
+cards: 工具调用：模型说「帮我查一下」; Chat API 的请求和回答长什么样
+--- context
+真实项目里，模型审一条条款往往要先查规则、翻看被引用的条款，再下结论，中间来回好几轮。轮数必须有上限，否则模型一直要工具，程序就停不下来，钱也一直在花。
 --- prompt
 把前面的都串起来。写 `mini_agent(question)`：
 
@@ -917,6 +965,9 @@ type: order
 title: 排代码：一次完整的调用
 level: 2
 mock: yes
+cards: 用 requests 发请求; d3:JSON：文字和字典之间的桥
+--- context
+要模型只用 JSON 回答，再把回答变成字典，这是调用模型时最常用的一套写法。这几行值得熟到不用想。
 --- prompt
 排出 `ask_json(prompt)`：请求时要求 JSON 格式、关掉思考模式，返回解析后的字典。有一行干扰项。
 --- lines
@@ -940,6 +991,9 @@ expect("topic", lambda: ask_json("Review clause 4.2: renews for twenty-four (24)
 type: choice
 title: temperature 设成 0 就确定了吗
 level: 2
+cards: 随机性：跑一次不算数
+--- context
+有人觉得把回答的随机程度调到最低，测试就只用跑一次，省时又省钱。这个想法对不对，直接决定评估结果可不可信。
 --- prompt
 关掉思考模式（`"thinking": {"type": "disabled"}`），再把请求里的 `temperature` 设成 0 以后：
 --- options
@@ -955,6 +1009,9 @@ temperature 越低输出越集中，但服务器端的批处理、浮点运算�
 type: local
 title: 本机任务：真的调一次 DeepSeek
 level: 2
+cards: 用 requests 发请求; Chat API 的请求和回答长什么样
+--- context
+前面的题都连着模拟服务器。这次在自己电脑上，用真的密钥调一次真的模型，亲眼看到回答和 token 用量。从空白开始自己写一遍，最能检验这几天学会了没有。
 --- prompt
 在自己电脑上，**不看这个页面**，手写一次真实的调用。
 
@@ -978,13 +1035,16 @@ verify: tokens?\D{0,30}\d+
 --- hints
 - 需要的包：`pip install requests python-dotenv`（已经装过就跳过）。
 - 如果看到 401：检查 `.env` 里的 key，以及请求头是不是 `Bearer ` 开头。
-- 如果看到 400 和 `Model Not Exist`：模型名写错了，或者抄了网上用旧模型名的教程，用 `deepseek-flash`。
+- 如果看到 400，错误里写着 `The supported API model names are ...`：模型名写错了，用 `deepseek-flash`。
 
 @@ item d4-e1
 type: scratch
 title: 闭卷：Rule 模型
 exam: yes
 level: 2
+cards: Pydantic：给数据定规矩; 校验失败：ValidationError
+--- context
+playbook 文件是人手写的，也可能写错，比如把严重程度写成 `critical`。读规则时先检查一遍，坏规则不能混进审查里。
 --- prompt
 用 Pydantic 写 `Rule` 模型：`id`（字符串）、`topic`（字符串）、`severity`（只能是 `low` / `medium` / `high`）。
 
@@ -1014,6 +1074,9 @@ title: 闭卷：要 JSON 的调用
 exam: yes
 level: 2
 mock: yes
+cards: 用 requests 发请求; Chat API 的请求和回答长什么样
+--- context
+要模型给结构化结果时，这就是最基本的一次调用：发出问题，拿回一个可以直接取字段的字典。
 --- prompt
 写 `ask_json(prompt)`：调用 `https://api.deepseek.com/v1/chat/completions`（模型 `deepseek-flash`，密钥从环境变量 `DEEPSEEK_API_KEY` 读），要求 `json_object` 格式并关掉思考模式，返回解析后的字典。
 --- solution
@@ -1037,6 +1100,9 @@ title: 闭卷：一共花了多少 token
 exam: yes
 level: 2
 mock: yes
+cards: 用 requests 发请求; d2:累加：在循环外准备，在循环里更新
+--- context
+审一份合同要调很多次模型，每次都按 token 计费（token：模型读写文字的计量单位）。把每次用掉的加起来，就知道这一批请求一共用了多少。
 --- prompt
 写 `total_tokens(prompts)`：对列表里的每个 prompt 各调用一次接口（模型 `deepseek-flash`），返回所有调用的 `total_tokens` 之和。空列表返回 0。
 --- solution

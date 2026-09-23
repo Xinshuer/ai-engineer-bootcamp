@@ -104,7 +104,7 @@ dataset: clausecheck
 --- body
 面试官常问「这个东西一个月多少钱」。回答的方法：**用自己测到的数据，按用量拆开算，每项说清楚单价的来源**。
 
-- **模型**：每条条款的输入 token（其中多少命中缓存）+ 输出 token，乘以单价。样例库的 `cost_usd` 按 DeepSeek 的**高峰价**算，以官方价格页为准（2026-09）：`deepseek-flash` 每百万 token 输入 0.30、命中缓存 0.006、输出 1.20 美元，大模型 `deepseek-v4-pro` 是 1.32 / 0.044 / 3.96。高峰是工作日 UTC 01:00–04:00 和 06:00–10:00，其余时段半价。项目 `config.py` 里记的还是旧模型的单价（0.28 / 0.028 / 0.42），那是仓库里过时的价格表，报数字之前换成当前单价。它的表里也还没有 `deepseek-flash` 这个名字，查不到的模型按单价 0 算，报告里估算的费用就成了 0
+- **模型**：每条条款的输入 token（其中多少命中缓存）+ 输出 token，乘以单价。样例库的 `cost_usd` 按 DeepSeek 的**高峰价**算，以官方价格页为准（2026-09）：`deepseek-flash` 每百万 token 输入 0.30、命中缓存 0.006、输出 1.20 美元，大模型 `deepseek-v4-pro` 是 1.32 / 0.044 / 3.96。高峰是工作日 UTC 01:00–04:00 和 06:00–10:00，其余时段半价。项目 `config.py` 的 `PRICES` 记的就是这组高峰价（2026-09）。注意它的查法：表里查不到的模型按单价 0 算，报告里估算的费用就成了 0，所以换模型时要先把单价加进表里
 - **思考模式**：DeepSeek 默认先思考再回答，思考的 token 按**输出**计费。给一条条款下判定用不着长时间推理，所以 worker 发请求时带上 `"thinking": {"type": "disabled"}`：更快、更便宜，`temperature` 也重新起作用（思考模式下它不起作用）。样例库的输出 token 就是关掉思考时的量；开着思考，每条都会多出一段推理的输出 token，模型费会高不少
 - **BigQuery**：按需查询按扫描字节计费，约 6.25 美元 / TiB，每月前 1 TiB 免费；小表也按每张最低 10 MB 计（以官方价格页为准）。流式写入按量另算，这个规模几乎是零
 - **存储、Pub/Sub、Cloud Run**：这个量级基本在免费额度里或只有几分钱（以官方价格页为准）
@@ -184,6 +184,9 @@ for day, topic, where in week4:
 type: choice
 title: 复习：错误在哪一行抛出
 level: 2
+cards: 每一步都可能失败：至少一次和幂等; d25:Python 客户端：查询、参数、行
+--- context
+今天搭的云上 Clause Check 里，合同上传后要往 Pub/Sub 发任务，看板要查 BigQuery。弄清楚出错时错误从哪一行冒出来，才知道该把哪一行放进 `try` 里接住。
 --- prompt
 复习第 25、27 天。`sql` 里有一个拼错的列名，`topic_path` 指向一个不存在的主题。这两个错误分别在哪一行抛出？
 --- code
@@ -206,6 +209,9 @@ title: 复习：客户的合同和审查数
 level: 2
 lang: sql
 ordered: yes
+cards: d23:LEFT JOIN：没有对上的也留下; d23:JOIN 放大：总数为什么翻倍了
+--- context
+Clause Check 的运营团队想在看板上看每个客户的使用情况：送来了几份合同、一共审了多少条条款。这张表是给人做决定用的，漏掉一个客户、或者把合同数算错，都会误导人。
 --- prompt
 复习第 23 天（LEFT JOIN、JOIN 放大）。下面的查询想列出**每个客户**的合同数和审查条数，但有两个 bug：没有合同的客户不见了；合同数也不对（和审查条数一模一样）。运行它，对照期望结果改好。
 
@@ -234,6 +240,9 @@ type: code
 title: P1 合同上传到桶
 level: 1
 cloud: yes
+cards: 架构：从上传到看板; d26:对象存储：桶、键和字节
+--- context
+这是云上 Clause Check 的第一步：律所上传的合同文字存进 GCS 桶（谷歌云上存文件的地方）。存在什么位置、附带哪些信息，决定了后面每一步能不能找到这份合同、知道它属于哪个客户。
 --- prompt
 **项目第 1 块：上传。** 写 `upload_contract(client, customer_id, contract_id, filename, text)`，把合同文字存进 GCS 桶 `clausecheck-contracts`：
 
@@ -301,6 +310,9 @@ type: code
 title: P2 上传事件 → 发布任务
 level: 2
 cloud: yes
+cards: 架构：从上传到看板; 每一步都可能失败：至少一次和幂等
+--- context
+合同一进桶，桶就会发出一个事件。这个函数把事件变成一条审查任务，发到 Pub/Sub 里，后台 worker 从那里接活。任务里的信息要够用：worker 要靠它知道去哪下载、是哪份合同、是不是已经做过。
 --- prompt
 **项目第 2 块：`on_upload`。** 给桶配置好通知以后，每新建一个对象，GCS 就会发一个事件（经 Eventarc 或桶的 Pub/Sub 通知），事件的数据就是这个对象的元数据，形如：
 
@@ -381,6 +393,9 @@ expect_raises("主题不存在：NotFound 从 result() 抛出", lambda: on_uploa
 type: testwrite
 title: 给幂等键写测试
 level: 2
+cards: 每一步都可能失败：至少一次和幂等; d9:怎么想测试用例
+--- context
+同一个任务可能被投递好几次，worker 靠这个键认出「做过了」。键一旦算错，要么同一份合同被重复审、白花钱，要么律师重新上传的新版本被当成旧的跳过。测试就是给它把关。
 --- prompt
 重投、重复发布都会让 worker 收到同一个任务。worker 用 `job_key` 认出「这个我做过了」。它的要求：
 
@@ -438,6 +453,9 @@ def test_int_and_str_generation_same_key():
 type: code
 title: P3 逐条审查，单条失败不拖垮
 level: 2
+cards: 每一步都可能失败：至少一次和幂等; 架构：从上传到看板
+--- context
+worker 下载合同后，要把它拆成条款，一条一条交给模型审。一份合同有几十条，模型偶尔会超时或回一段坏掉的 JSON；不能因为其中一条出错，整份合同的结果都拿不到。
 --- prompt
 **项目第 3 块：`review_contract_text(text, review_fn)`。** 拆条款的 `split_clauses` 已经写好（算法和第 14 天一样，只是这里返回元组 `[(clause_id, heading, body), ...]`，正文为空的章节标题不返回）。你来写审查的循环：
 
@@ -539,6 +557,9 @@ expect_raises("没有条款：ValueError", lambda: review_contract_text("Just a 
 type: code
 title: P4a 解开 push 消息
 level: 2
+cards: 每一步都可能失败：至少一次和幂等; 架构：从上传到看板
+--- context
+在 GCP 上，Pub/Sub 会把任务「推」给 Cloud Run 上的 worker：发来一个 HTTP 请求，任务就装在请求体里。worker 要先把任务取出来；「消息本身坏了」和「临时出错」后面的处理完全不同，所以坏消息要在这里被清楚地认出来。
 --- prompt
 **项目第 4 块（worker）的第一步。** Pub/Sub 的 push 订阅会向 Cloud Run 发一个 HTTP POST，请求体是这样的 JSON（已经解析成字典）：
 
@@ -607,6 +628,9 @@ title: P4b 结果变成表里的行
 level: 2
 cloud: yes
 dataset: clausecheck
+cards: d25:写入：流式和批量; 架构：从上传到看板
+--- context
+worker 审完一份合同，结果要写进 BigQuery 的 `reviews` 表，就是第 22–25 天你一直在查的那张。之后的看板和成本统计都从这张表里算，行写错了，后面的数字就全跟着错。
 --- prompt
 **项目第 4 块的第二步。** 把 P3 的结果变成 BigQuery 表 `clausecheck.reviews` 的行（这张表就是你第 22–25 天查的那张）。写 `to_review_rows(job, results, first_id, created_at)`，每个结果变成一行字典，键是：
 
@@ -700,6 +724,9 @@ level: 3
 cloud: yes
 mock: yes
 dataset: clausecheck
+cards: 每一步都可能失败：至少一次和幂等; 架构：从上传到看板
+--- context
+这是后台 worker 的主体，把前面几块拼成一次完整的审查：从桶里取合同、逐条审、写进表、写出报告。同一个任务可能来两次，两个 worker 也可能同时抢到它，所以这一步重来必须是安全的。
 --- prompt
 **项目第 4 块：把 worker 拼起来。** 前几块已经在代码里了（`review_contract_text`、`to_review_rows`），还有一个调 DeepSeek 的 `deepseek_review`（用 `deepseek-flash`，关掉了思考模式，原因见「成本估算」卡片）。写 `handle_job(job, gcs, bq, review_fn, first_id, now)`，按这个顺序：
 
@@ -984,6 +1011,9 @@ expect("两个 worker 抢同一个任务：只在不存在时创建，不覆盖�
 type: fix
 title: 修 bug：出错也回 204
 level: 2
+cards: 每一步都可能失败：至少一次和幂等
+--- context
+worker 处理完一个任务，要用 HTTP 状态码告诉 Pub/Sub 结果，Pub/Sub 据此决定把消息丢掉还是过一会儿再送一次。状态码回错了，要么合同永远没人审，要么一条坏消息被没完没了地重送。
 --- prompt
 Cloud Run 收到 Pub/Sub 的 push 请求时调用 `handle_push`，它的返回值就是 HTTP 状态码。Pub/Sub 的规则：102、200、201、202、204 表示**确认**（消息从此消失）；其他状态码表示没处理成功，过一会儿**重投**。测试传进来的 `handle_job(job)` 是只收一个参数的替身。
 
@@ -1075,6 +1105,9 @@ type: order
 title: 排代码：SQS 版的 worker
 level: 2
 cloud: yes
+cards: d27:事件和队列：至少送达一次; 每一步都可能失败：至少一次和幂等
+--- context
+同一个 worker 也可能要部署到 AWS 上，从 SQS 队列里取审查任务。先把最基本的一轮写对，去重和死信队列以后再加。
 --- prompt
 同一个 worker 放在 AWS 上：SQS 是 **pull**（worker 自己去取），不像 push 那样靠状态码确认，而是处理成功后**自己删掉消息**；不删，它过了可见性超时（默认 30 秒）会再次出现。（如果用 Lambda 的 SQS 触发器，收和删由 Lambda 替你做：函数正常返回，这一批就删掉；抛错，这一批过了可见性超时会回来。自己写 worker 时就是下面这样。）
 
@@ -1134,6 +1167,9 @@ expect("处理失败：不删，过了可见性超时再来一次（第 2 次收
 type: choice
 title: 写了一半被停掉
 level: 3
+cards: 每一步都可能失败：至少一次和幂等
+--- context
+云上的实例随时可能被停掉，比如请求超时。面试官很爱问：活干到一半断了，重来一次会留下什么后果？
 --- prompt
 worker 已经把一份合同的 3 行写进了 BigQuery，还没来得及写报告，就被 Cloud Run 停掉了（比如请求超时）。Pub/Sub 没收到表示成功的状态码，过一会儿把同一条消息又投了一次。会发生什么？
 --- options
@@ -1152,6 +1188,9 @@ level: 3
 lang: sql
 bq: yes
 ordered: yes
+cards: d23:每组最新一条; d25:GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+负责人靠看板了解每份合同的进度：还有几条要人看、几条没审成功。表里记着每一次审查，包括重投和重审，数字算多了算少了，人就会漏看或者白忙。
 --- prompt
 **项目第 5 块：看板（BigQuery 写法）。** worker 是「至少一次」，同一条条款可能有好几行（重投、重审）。看板只看每条条款的**最新**一行：每个 `(contract_id, clause_id)` 按 `created_at` 取最新。
 
@@ -1187,6 +1226,9 @@ level: 3
 lang: sql
 bq: yes
 ordered: yes
+cards: 成本估算：钱花在哪; d25:GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+产品打算按合同页数向客户收费。定价之前要先知道：审一页合同我们自己要花多少钱，哪些合同特别贵、又是贵在哪里。
 --- prompt
 **看板第二块：** 产品打算按页收费，先看每页的成本。每份有审查记录的合同返回五列：
 
@@ -1220,6 +1262,9 @@ level: 2
 lang: sql
 bq: yes
 ordered: yes
+cards: d25:时间：DATE_TRUNC 和 TIMESTAMP_DIFF; d25:GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+负责运营的人每周看一次：这周审了多少条、失败了多少、花了多少钱。按周排开来看，才能发现某一周失败突然变多，或者花费突然上涨。
 --- prompt
 **看板第三块：** 每周一行，看审查量、失败数和花费。用 BigQuery 的写法填空：按周截断日期（BigQuery 的周从**星期日**开始，所以 8 月 3 日（周一）算在 8 月 2 日那一周），条件计数，**最新的一周排在最上面**。
 
@@ -1241,6 +1286,9 @@ GROUP BY week
 type: code
 title: P6 每月成本估算
 level: 2
+cards: 成本估算：钱花在哪; d8:dataclass：只装数据的类
+--- context
+面试官很爱问「这个系统一个月要花多少钱」。把估算写成函数，换一个合同数量就能马上算出新数字，还能看出钱主要花在哪一块。
 --- prompt
 **项目第 6 块：成本。** 把「成本估算」卡片的算法写成函数。`Workload` 描述每月的用量（默认值来自样例数据），`PRICES` 是示例单价（以官方价格页为准）。写 `estimate_monthly_cost(w, prices=PRICES)`，返回：
 
@@ -1336,6 +1384,9 @@ expect("缓存命中越多越便宜", lambda: estimate_monthly_cost(Workload(con
 type: local
 title: 本机任务（选做）：架构讲述
 level: 2
+cards: 面试怎么讲这个架构; 架构：从上传到看板
+--- context
+面试里几乎一定会被问「你怎么把它部署到云上」。这一题把这周搭起来的整套架构写成两分钟的英文讲稿，再练到能对着计时器讲出来。
 --- prompt
 1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\cloud_pitch.md`
 2. 用**英文**写「Clause Check 上云」的两分钟讲述，分五段：Goal / Flow / Failures / Cost / Security & trade-offs。参考「面试怎么讲这个架构」卡片，用你自己的话
@@ -1358,6 +1409,9 @@ exam: yes
 level: 3
 lang: sql
 ordered: yes
+cards: d23:每组最新一条; d23:JOIN：把几张表连起来
+--- context
+周考第 1 题。假设 Clause Check 的客户经理想知道，哪些客户的合同里要改写的条款最多，好优先去跟进。数据来自审查结果、合同、客户三张表。
 --- prompt
 普通 SQL（不是 BigQuery 写法，表名直接写 `reviews`、`contracts`、`customers`）。
 
@@ -1386,6 +1440,9 @@ level: 3
 lang: sql
 bq: yes
 ordered: yes
+cards: d25:时间：DATE_TRUNC 和 TIMESTAMP_DIFF; d25:GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+周考第 2 题。团队同时用着两种模型，想按月比较它们的表现：审了多少条、失败率多高、平均要等多久。这些数字决定要不要继续用某个模型。
 --- prompt
 用 BigQuery 写法（表名带数据集：`` `clausecheck-dev.clausecheck.reviews` ``）。按月、按模型统计审查情况，返回五列：
 
@@ -1413,6 +1470,9 @@ exam: yes
 level: 3
 cloud: yes
 dataset: clausecheck
+cards: d25:Python 客户端：查询、参数、行; d23:每组最新一条; d24:参数化查询和 SQL 注入
+--- context
+周考第 3 题。网页上打开一份合同时，要显示每条条款现在的判定和审查时间，数据从 BigQuery 查出来。合同编号来自用户的请求，不能信任它。
 --- prompt
 写 `latest_verdicts(client, contract_id)`（`client` 是 `bigquery.Client()`），查表 `clausecheck-dev.clausecheck.reviews`，返回这份合同每条条款**最新**一行（按 `created_at`）的结果：
 
@@ -1467,6 +1527,9 @@ title: 周考 4（S3）：报告只写一次
 exam: yes
 level: 3
 cloud: yes
+cards: 每一步都可能失败：至少一次和幂等; d26:对象存储：桶、键和字节
+--- context
+周考第 4 题。部署在 AWS 上时，审查报告存进 S3 桶。报告同时也是「这个任务做完了」的标记，两个 worker 抢到同一个任务时，后写的那个不能把先写好的报告盖掉。
 --- prompt
 报告的 AWS 版：存进 S3 桶 `clausecheck-reports`，键是 `reports/<contract_id>/<generation>.json`。`s3` 是 `boto3.client("s3", ...)`，参数一律用关键字。
 
@@ -1545,6 +1608,9 @@ title: 周考 5（SQS + Bedrock）：清空队列
 exam: yes
 level: 3
 cloud: yes
+cards: d27:事件和队列：至少送达一次; d27:托管大模型：Bedrock 和 Vertex AI
+--- context
+周考第 5 题。AWS 版的 worker：队列里排着一条条待审的条款，用 Bedrock 上的模型逐条审。队列会重复投递，模型也会限流；每条条款都要审到，也不能审两遍。
 --- prompt
 写 `drain(sqs, queue_url, bedrock, done)`，把队列里现在能收到的任务全部处理完，返回这次处理成功的结果列表（按处理顺序）：
 

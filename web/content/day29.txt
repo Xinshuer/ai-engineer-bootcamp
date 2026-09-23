@@ -69,7 +69,7 @@ ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"
 
 `extra_body` 里的内容会原样放进请求体（本页用的 langchain-deepseek 1.1 没有专门的思考参数）。`temperature=0` 只有关掉思考以后才有意义。
 
-模型名：`deepseek-chat`、`deepseek-reasoner` 在 2026-07-24 停用了，再用会得到 400 `Model Not Exist`（旧教程和项目的 `config.py` 里还写着它）。现在用 `deepseek-flash`（便宜、快）或 `deepseek-v4-pro`。也可以按字符串选供应商：`init_chat_model("deepseek:deepseek-flash")`，得到的同样是 `ChatDeepSeek`。
+模型名：现在用 `deepseek-flash`（便宜、快）或 `deepseek-v4-pro`。旧教程里的 `deepseek-chat`、`deepseek-reasoner` 官方已经宣布从 2026-07-24 起停用；2026-09 实测还能调用（都由 `deepseek-flash` 回答），但模型列表里已经没有它们，随时可能失效，别再用。模型名写错时返回 400，错误信息是 `The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed ...`。也可以按字符串选供应商：`init_chat_model("deepseek:deepseek-flash")`，得到的同样是 `ChatDeepSeek`。
 --- code
 from langchain_deepseek import ChatDeepSeek
 
@@ -293,6 +293,9 @@ except NotImplementedError:
 type: choice
 title: 复习：框架替你做了什么
 level: 1
+cards: 为什么要框架（以及什么时候不要）; d4:用 requests 发请求
+--- context
+这一周要用 LangChain（一个帮你调用模型的 Python 框架）重写 Clause Check 调模型的部分。先弄清楚：第 4 天亲手写的那几步，换成框架以后分别归谁管。
 --- prompt
 复习第 4 天。你手写过：
 
@@ -315,6 +318,9 @@ answer: 4
 type: code
 title: 第一次用 ChatDeepSeek
 level: 1
+cards: 为什么要框架（以及什么时候不要）; AIMessage 和思考模式
+--- context
+这是用 LangChain 调模型的第一步：建一个聊天模型对象，问一句，把回答交给程序的下一步。本页连的是模拟的服务器，不花钱，也不需要密钥。
 --- prompt
 写 `ask(question)`：用 `ChatDeepSeek` 调 `deepseek-flash`，**关掉思考模式**，返回回答文字（字符串，不是 AIMessage）。
 
@@ -346,6 +352,9 @@ expect("关掉了思考", lambda: (ask("x"), MOCK.calls[-1]["body"].get("thinkin
 type: code
 title: 思考用了多少 token
 level: 2
+cards: AIMessage 和思考模式
+--- context
+Clause Check 每审一条条款，都会记下用了多少 token（模型按它计费），成本统计要靠这些数字。换成 LangChain 以后，这些数字装在返回的消息对象里，要自己去取出来。
 --- prompt
 写 `token_report(model, question)`：用 `model` 回答一次 `question`，返回字典：
 
@@ -392,6 +401,9 @@ expect("有用量但没有 output_token_details", lambda: token_report(GenericFa
 type: predict
 title: 多轮对话发了什么
 level: 2
+cards: 消息
+--- context
+如果律师想对同一份合同连续追问，程序就要做多轮对话。读这段代码，弄清楚每一轮真正发给模型的是什么。
 --- prompt
 写出输出。注意第二次请求发出去的是哪几条消息，以及 `history` 最后有几条。
 --- code
@@ -416,6 +428,9 @@ print(len(history), len(MOCK.calls))
 type: predict
 title: 模板变成了什么
 level: 2
+cards: ChatPromptTemplate
+--- context
+审查用的提示词里，有的部分固定不变，有的每次都要换，比如条款编号和原文；练习里还把「替哪一方审」也留成了空位。LangChain 用模板把这两部分分开，先看清楚模板填好以后变成了什么。
 --- prompt
 写出输出。`input_variables` 是按字母排好序的。
 --- code
@@ -439,6 +454,9 @@ print(customer.invoke({"clause_id": "3.1", "text": "Net 30."}).to_messages()[1].
 type: code
 title: 审查提示词模板
 level: 2
+cards: ChatPromptTemplate; d12:分隔符和提示注入
+--- context
+练习里把审条款的提示词写成 LangChain 模板（比真项目的提示词简单）。以后换一条条款、换成替另一方审，都只是往模板里填不同的值，提示词本身只写一次。
 --- prompt
 写模板 `REVIEW_PROMPT` 和函数 `review_messages(clause_id, text, party="Customer")`：
 
@@ -480,6 +498,9 @@ expect("模板需要的变量", lambda: REVIEW_PROMPT.input_variables, ["clause_
 type: fix
 title: 修 bug：JSON 示例的大括号
 level: 2
+cards: ChatPromptTemplate
+--- context
+在提示词里给模型看一个 JSON 示例，它才知道该回哪些字段，这是写提示词的常用办法。同事照这个办法写了一个模板，结果一调用就报错。
 --- prompt
 同事想在 system 里给模型看一个 JSON 示例。运行一下：先看打印出来的 `input_variables`，再看报错说缺了哪个变量。修好它，要求模型看到的 system 文字里**还是**那个完整的 JSON 示例。
 --- starter
@@ -520,6 +541,9 @@ expect("user", lambda: build("8.1", "Liability is unlimited.")[1].content, "Revi
 type: code
 title: 带历史的对话
 level: 2
+cards: 消息; ChatPromptTemplate
+--- context
+练习里做一个问答助手：律师可以对着一份合同连续追问，比如先问付款条款，再问「那违约呢？」。模型自己不记得上一轮说过什么，得由程序把之前的对话带上。
 --- prompt
 做一个记得上下文的问答助手。
 
@@ -581,6 +605,9 @@ expect("历史里存的是回答文字", lambda: MOCK.calls[1]["body"]["messages
 type: fill
 title: 填空：第一条链
 level: 1
+cards: LCEL：用 | 串成一条链; ChatPromptTemplate
+--- context
+这是 LangChain 最常见的写法：提示词、模型、取出文字，串成一条链。练习里用它给一条条款写一句话摘要，律师扫一眼就知道这条讲什么。
 --- prompt
 填空，完成一条「提示词 → 模型 → 文字」的链，和一个调用它的函数。
 --- template
@@ -609,6 +636,9 @@ expect("system 的内容", lambda: MOCK.calls[-1]["body"]["messages"][0]["conten
 type: fix
 title: 修 bug：零件的顺序
 level: 2
+cards: LCEL：用 | 串成一条链
+--- context
+同事搭了一条回答问题的链，零件看起来都对，一调用却报错，Traceback 又长又难读。用框架以后这种情况很常见，要学会顺着每一步的数据找原因。
 --- prompt
 这条链一调用就报错。运行测试，读报错的最后几行：`Generation` 的 `text` 期望一个字符串，实际收到的是什么类型？对照卡片里「每一步的输入和输出类型」找到原因，改好。
 --- starter
@@ -645,6 +675,9 @@ expect("链的三步", lambda: [type(s).__name__ for s in chain.steps], ["ChatPr
 type: order
 title: 排代码：建一条链
 level: 2
+cards: LCEL：用 | 串成一条链
+--- context
+面试时可能被要求不看资料，写出一条最小的 LangChain 链。能从头到尾默写出来，说明你真懂每个零件在做什么。
 --- prompt
 排出 `one_word(question)`：用一条 `prompt | model | parser` 链回答，返回去掉首尾空白的文字。有两行干扰项。
 --- lines
@@ -670,6 +703,9 @@ expect("system 消息在前", lambda: MOCK.calls[-1]["body"]["messages"][0], {"c
 type: predict
 title: batch 和出错的那一个
 level: 2
+cards: stream 和 batch; Runnable 小积木
+--- context
+一份合同有几十条条款，程序常常要一批一起处理。先用一个不调用模型的小函数，看清楚批量处理时某一条出错会发生什么。
 --- prompt
 写出输出。`RunnableLambda` 把普通函数变成 Runnable，所以它也有 `invoke` 和 `batch`。
 --- code
@@ -697,6 +733,9 @@ except ValueError as e:
 type: code
 title: 批量打标签
 level: 2
+cards: stream 和 batch
+--- context
+一份合同的几十条条款一起批量交给链，比一条一条调用快得多。拿回来的标签要和条款一一对上，报告里才不会把 8.1 的判定写到 9.2 头上。
 --- prompt
 写 `label_clauses(chain, texts)`：
 
@@ -751,6 +790,9 @@ expect("接真的链：每条一个请求", _real, [["Mock reply: Fees are due."
 type: code
 title: 流式显示，跳过空块
 level: 2
+cards: stream 和 batch
+--- context
+律师在网页上提问时，如果回答要等十几秒才一下子出现，看起来就像卡住了。流式输出让字一小段一小段地冒出来，像有人在打字。
 --- prompt
 写 `stream_answer(chain, inputs, show)`：
 
@@ -792,6 +834,9 @@ expect("发的是流式请求", lambda: (_run(OFF, "hi"), MOCK.calls[-1]["body"]
 type: code
 title: 一次拿到摘要和风险
 level: 2
+cards: Runnable 小积木; LCEL：用 | 串成一条链
+--- context
+报告里每条条款旁边，最好既有一句话摘要，又有风险等级。这是两个不相干的问题，分别问模型，再把答案和原文放在一起交给报告。
 --- prompt
 写 `build_brief(model)`，返回一个 Runnable：
 
@@ -844,6 +889,9 @@ expect("真的模型：两个请求", _mock, ["Mock reply: Summarise in one sent
 type: code
 title: 把模型当参数传进来
 level: 2
+cards: 测链不联网：假模型; d19:依赖注入让 RAG 可测
+--- context
+链里真正要测的是你自己写的部分，比如回答的清理。如果模型是在函数里面建的，测试就只能真的联网：又慢又花钱，每次的结果还不一样。
 --- prompt
 写 `build_chain(model)`，返回 `PROMPT | model | StrOutputParser() | 清理`。清理这一步：把回答里连续的空白（空格、换行）合并成一个空格，并去掉首尾空白，`" ".join(s.split())` 一行就行。
 
@@ -891,6 +939,9 @@ expect("返回的是 Runnable，也能 batch", lambda: build_chain(FakeListChatM
 type: testwrite
 title: 写测试：清洗模型的回答
 level: 3
+cards: 测链不联网：假模型; d9:怎么想测试用例
+--- context
+判定词清洗错了，一条该改写的条款可能被当成放行。真模型的回答五花八门，这里用不联网的假模型，把各种可能的回答都试一遍。
 --- prompt
 被测函数 `label(model, text, default="flag")` 让模型只回答一个词，再把回答清洗成 `accept` / `flag` / `redline` 之一；看不懂的回答返回 `default`（交给人看，而不是放行）。
 
@@ -969,6 +1020,9 @@ def test_custom_default():
 type: choice
 title: 为什么没全换成框架
 level: 2
+cards: 为什么要框架（以及什么时候不要）
+--- context
+面试官看到你的项目里 LangGraph 只用在一个文件，其他地方都是手写的调用，很可能会追问原因。
 --- prompt
 Clause Check 的 `review.py` 直接用 `requests` 调 DeepSeek，只有 `graph.py` 用了 LangGraph。面试官问：「为什么不把整个项目都换成 LangChain？」哪个回答最好？
 --- options
@@ -984,6 +1038,9 @@ answer: 3
 type: local
 title: 本机任务（选做）：本机跑一题
 level: 1
+cards: 为什么要框架（以及什么时候不要）
+--- context
+本页跑的是真正的 LangChain，只有网络是模拟的。把一道题搬到自己电脑上跑一遍，确认这里学的代码在本机也一样能用。
 --- prompt
 把今天的一道题拿到自己电脑上跑，确认同样的代码在真正的 Python 里也能运行（不需要 API key，也不花钱）。
 
@@ -1015,6 +1072,9 @@ type: scratch
 title: 闭卷：判定链
 exam: yes
 level: 3
+cards: LCEL：用 | 串成一条链; ChatPromptTemplate
+--- context
+这是用 LangChain 重写的审查核心：给一条条款，拿回一个判定词。判定决定这条条款要不要交给人看，可模型的回答常常不太规矩。
 --- prompt
 写 `make_label_chain(model)`，返回一条链：输入 `{"clause_id": ..., "text": ...}`，输出一个判定词（字符串）。
 
@@ -1058,6 +1118,9 @@ type: scratch
 title: 闭卷：批量审查
 exam: yes
 level: 3
+cards: stream 和 batch
+--- context
+一份合同的所有条款一次批量送去审，结果按条款编号整理好，交给后面生成报告。条款很多时，同时发出去的请求也要有上限，免得被模型服务限流。
 --- prompt
 写 `review_batch(chain, clauses)`：
 
@@ -1105,6 +1168,9 @@ type: scratch
 title: 闭卷：有记忆的会话
 exam: yes
 level: 3
+cards: 消息; ChatPromptTemplate
+--- context
+练习里的合同问答助手要能连续对话，可历史越长，每次请求的 token（模型按它计费）就越多。完整的对话记录要留着，但每次发给模型的不一定是全部。
 --- prompt
 写类 `ChatSession`：
 

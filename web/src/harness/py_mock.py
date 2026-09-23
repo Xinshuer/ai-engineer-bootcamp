@@ -23,10 +23,13 @@ _CC_TOPICS = [
     ("liabil", "liability_cap"), ("renew", "auto_renewal"), ("data", "data_processing"),
     ("fee", "payment"), ("pay", "payment"), ("confiden", "confidentiality"), ("terminat", "termination"),
 ]
-# Current DeepSeek model names (api-docs.deepseek.com, 2026-09): deepseek-flash (DeepSeek-V4.1-Flash),
-# deepseek-v4-pro, and the legacy deepseek-v4-flash that is still routed to Flash. deepseek-chat and
-# deepseek-reasoner were discontinued on 2026-07-24, so they get "Model Not Exist" like any unknown name.
-_CC_MODELS = ("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash")
+# DeepSeek model names as the live API answered on 2026-09-23: /models lists deepseek-flash
+# (DeepSeek-V4.1-Flash) and deepseek-v4-pro. Older names still answer as aliases of Flash:
+# deepseek-v4-flash, and deepseek-chat / deepseek-reasoner (announced as discontinued from
+# 2026-07-24; chat = thinking off by default, reasoner = thinking on). Replies name the model that
+# served them. Any other name: 400 with the real message.
+_CC_MODELS = {"deepseek-flash": "deepseek-flash", "deepseek-v4-pro": "deepseek-v4-pro", "deepseek-v4-flash": "deepseek-flash",
+              "deepseek-chat": "deepseek-flash", "deepseek-reasoner": "deepseek-flash"}
 _CC_STATUS_TEXT = {429: "Rate limit reached, please retry later", 500: "Internal server error", 503: "Service unavailable"}
 
 # Mock embeddings: a deterministic bag of words hashed (FNV-1a) into 256 dimensions, with a few
@@ -135,13 +138,14 @@ class _CCMock:
         if not isinstance(body, dict) or not isinstance(body.get("model"), str) or not isinstance(body.get("messages"), list) or not body["messages"]:
             return 400, {"error": {"message": "Invalid request: the body needs 'model' (a string) and 'messages' (a non-empty list)", "type": "invalid_request_error"}}
         if body["model"] not in _CC_MODELS:
-            return 400, {"error": {"message": f"Model Not Exist: {body['model']}", "type": "invalid_request_error"}}
+            return 400, {"error": {"message": f"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed {body['model']}.", "type": "invalid_request_error"}}
         # thinking mode (DeepSeek V4): on unless the body says {"thinking": {"type": "disabled"}}
         thinking = body.get("thinking")
         if thinking is not None and (not isinstance(thinking, dict) or thinking.get("type") not in ("enabled", "disabled")):
             return 400, {"error": {"message": "Invalid request: 'thinking' must be {\"type\": \"enabled\"} or {\"type\": \"disabled\"}", "type": "invalid_request_error"}}
-        think = not (isinstance(thinking, dict) and thinking.get("type") == "disabled")
-        # thinking mode + tools: every earlier assistant message must carry its reasoning_content
+        think = thinking["type"] == "enabled" if isinstance(thinking, dict) else body["model"] != "deepseek-chat"
+        # thinking mode + tools: every earlier assistant message must carry its reasoning_content. This is the
+        # documented rule; the live API did not enforce it when checked on 2026-09-23, the practice server does
         # ("If your code does not correctly pass back reasoning_content, the API will return a 400 error.")
         if think and body.get("tools"):
             for i, m in enumerate(body["messages"]):
@@ -242,7 +246,7 @@ class _CCMock:
                  "prompt_cache_hit_tokens": cache_hit, "prompt_cache_miss_tokens": prompt_tokens - cache_hit}
         if think:  # not a required field in the API reference: only sent here when there is reasoning
             usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
-        return 200, {"id": f"mock-{len(self.calls)}", "object": "chat.completion", "model": body["model"],
+        return 200, {"id": f"mock-{len(self.calls)}", "object": "chat.completion", "model": _CC_MODELS[body["model"]],
                      "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}
 
 

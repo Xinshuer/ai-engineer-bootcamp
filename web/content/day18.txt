@@ -330,6 +330,9 @@ for (const p of parts) {
 type: predict
 title: 复习：对象展开
 level: 1
+cards: 状态：一个对象从头传到尾; d15:工具类型：从一个类型派生另一个
+--- context
+今天的图执行器里，每个节点只交回它改了的那几个字段，由执行器合并进整体的状态。合并全靠对象展开，先把它的规则看清楚。
 --- prompt
 复习第 5、15 天的对象展开 `...`。执行器合并状态全靠它。写出输出。
 --- code
@@ -350,6 +353,9 @@ console.log(base.verdict);
 type: code
 title: 复习：合并状态
 level: 2
+cards: 状态：一个对象从头传到尾
+--- context
+图里每个节点跑完都会交回一小份更新。大多数字段用新值替掉旧值就行，但像运行日志这样的字段，每个节点都要往里添几行，前面的记录不能丢。旧状态也要原样留着，检查点和排错都靠它。
 --- prompt
 写 `mergeState(state, update)`，返回合并后的**新**状态：
 
@@ -387,6 +393,9 @@ expect("空更新", () => mergeState(S, {}), S);
 type: choice
 title: 哪一步交给 Agent
 level: 1
+cards: 工作流 vs Agent
+--- context
+设计 Clause Check 这样的流程时，每一步都要决定：写成顺序固定的代码，还是交给模型自己决定下一步做什么。选错了，要么多花钱、结果难预测，要么该灵活的地方不够灵活。
 --- prompt
 Clause Check 的流程里，哪一步最适合交给 Agent（由模型决定下一步做什么），而不是写成固定的工作流节点？
 --- options
@@ -402,6 +411,9 @@ answer: 2
 type: fill
 title: 填空：下一个节点
 level: 1
+cards: 边和条件路由
+--- context
+图执行器每跑完一个节点，都要问一句「下一步去哪」。有的节点后面永远接同一个节点，有的要看当前状态再决定，比如汇总之后，要看这份合同里有没有要改写的条款。
 --- prompt
 填空，完成 `nextNode(edges, node, state)`：边是字符串就直接返回；是函数就用状态调用它；没有这条边就 throw。
 --- template
@@ -436,6 +448,9 @@ expectThrows("没有这条边", () => nextNode(EDGES, "load", { redlines: 0 }));
 type: code
 title: 图执行器
 level: 2
+cards: 执行器：从 start 走到 END; 状态：一个对象从头传到尾
+--- context
+执行器是整张图的发动机：`graph.py` 里读合同 → 审查 → 汇总 → 审批 → 导出这几步，就是 LangGraph 的执行器一步步推着走的，这里手写一个小的。走过的路径要记下来，图出问题时一眼能看出卡在了哪里。
 --- prompt
 写 `runGraph(graph, state, start, maxSteps = 10)`，返回 `{ state, path }`：
 
@@ -526,6 +541,9 @@ expectThrows("环：超过步数上限", () => runGraph({ nodes: G.nodes, edges:
 type: code
 title: 运行前先检查图
 level: 2
+cards: 边和条件路由; 执行器：从 start 走到 END
+--- context
+图是手写的一张表，节点名拼错一个字母，要等运行到那一步才会出错，那时可能已经花掉了几十次模型调用的钱。运行前先查一遍，问题当场就暴露出来。
 --- prompt
 图是手写的数据，名字拼错很常见。写 `validateGraph(graph, start)`，在运行之前找出问题，返回问题列表（没问题返回 `[]`）：
 
@@ -586,6 +604,9 @@ expect("起点不存在，问题按顺序列出", () => validateGraph({ nodes: N
 type: predict
 title: 图里的环
 level: 2
+cards: 边和条件路由; 执行器：从 start 走到 END
+--- context
+模型偶尔会给出坏掉的输出，常见的做法是让图绕回去重审，但重审的次数要有限制。这段代码就在模拟这种「校验不过就回去」的环。
 --- prompt
 这个图模拟「模型输出校验不过就重审」：`review` 每次把 `attempts` 加 1，`validate` 在第 2 次时才通过。写出输出。
 --- code
@@ -620,6 +641,9 @@ console.log(state);
 type: fix
 title: 修 bug：原地打转
 level: 2
+cards: 边和条件路由; 执行器：从 start 走到 END; 状态：一个对象从头传到尾
+--- context
+重审了几次记在状态里，路由靠这个数决定再审一遍还是放弃。这个数只要没记对，图就会一直绕圈，直到撞上步数上限；好在执行器报错时会带上走过的路径。
 --- prompt
 这个图应该是「模型输出不是合法 JSON 就重审，最多 3 次」。第一次假模型给坏输出，第二次给好输出，所以正确的路径是 review → validate → review → validate。
 
@@ -719,6 +743,9 @@ expect("起始状态没被改", () => {
 type: translate
 title: 翻译：汇总节点和路由
 level: 2
+cards: 状态：一个对象从头传到尾; 边和条件路由
+--- context
+真实项目 `graph.py` 里，审完之后有一个汇总节点和一个路由函数：前者给报告算出统计，后者决定下一步是先去等人批准，还是直接导出。这里把 Python 写法搬到 TypeScript。
 --- prompt
 把 `graph.py` 风格的两个 Python 函数翻译成 TypeScript：`summarise` 是节点（只返回它改的字段），`route` 是路由函数。
 --- source
@@ -778,6 +805,9 @@ expect("没有 redline 直接导出", () => route({ ...S, counts: { accept: 2, f
 type: fix
 title: 修 bug：审查结果去哪了
 level: 2
+cards: d6:async / await：等网络的时候不卡住; 执行器：从 start 走到 END
+--- context
+真正的审查节点要请求模型，几秒后才有结果。这种 bug 最危险的地方是不报错：报告照样生成，只是一条审查结果都没有，律师会以为整份合同都不用看。
 --- prompt
 `review` 节点要调模型，所以它是 async 的。运行测试：导出结果是 `0 reviewed`，审查结果好像凭空消失了，却没有任何报错。找到原因，修好 `runGraph`（节点都没有问题）。
 
@@ -898,6 +928,9 @@ expectAsync("判定", async () => (await runGraph(GRAPH, INIT, "review")).state.
 type: predict
 title: 状态存成 JSON 会怎样
 level: 2
+cards: 检查点：崩了也能接着跑
+--- context
+检查点要把状态写成 JSON 文字存起来，程序崩了或者第二天，再读回来接着跑。所以要先弄清楚：哪些值存进去、再读出来，会和原来不一样。
 --- prompt
 检查点是 `JSON.stringify` 出来的文字。写出输出，看看哪些东西存不进去。
 --- code
@@ -919,6 +952,9 @@ console.log(Object.keys(back).length);
 type: code
 title: 检查点和崩溃恢复
 level: 3
+cards: 检查点：崩了也能接着跑; 执行器：从 start 走到 END
+--- context
+审 30 条条款要调 30 次模型，如果最后导出时磁盘满了，从头再来就要把钱再付一遍。检查点让程序从出事的地方接着跑。真实项目的 `graph.py` 把检查点存在 SQLite 数据库里。
 --- prompt
 写两个函数：
 
@@ -1036,6 +1072,9 @@ expect("从 END 的检查点恢复：什么也不做", () => resume(G, JSON.stri
 type: choice
 title: 律师明天才批准
 level: 2
+cards: 中断和恢复：停下来等人; 检查点：崩了也能接着跑
+--- context
+有 redline 的合同，导出前要律师点头，可律师常常第二天才回复。这段时间里程序该怎么办，是设计审批流程时绕不开的问题。
 --- prompt
 图跑到 `approve` 节点，需要律师批准，而律师明天才回复。程序应该怎么做？
 --- options
@@ -1051,6 +1090,9 @@ answer: 2
 type: order
 title: 排代码：会暂停的执行器
 level: 2
+cards: 中断和恢复：停下来等人; 执行器：从 start 走到 END
+--- context
+真实项目 `graph.py` 的 `approve` 节点就是这样工作的：图跑到这里停下，状态存好，进程可以直接退出；律师的决定来了，再从这里接着跑。这里手写一个会停下来的执行器。
 --- prompt
 排出 `run`：节点返回的更新里如果有 `interrupt`，就停下来，返回问题和检查点；否则合并状态继续走。类型、`nextNode` 和测试用的图已经写好。有一行干扰项。
 --- lines
@@ -1117,6 +1159,9 @@ expect("已有决定：不再暂停", () => {
 type: code
 title: 审批节点和恢复
 level: 3
+cards: 中断和恢复：停下来等人
+--- context
+律师的决定到了以后，程序从审批那一步接着跑，前面做完的审查不用重做。改不改合同由律师的决定说了算，导出时模型不再参与，这和 `graph.py` 注释里写的原则一样。
 --- prompt
 上一题的 `run` 已经写好。补全两个函数：
 
@@ -1245,6 +1290,9 @@ expect("没有 redline 的合同不打扰人", () => run(GRAPH, init("3.1 Fees w
 type: fix
 title: 修 bug：报告顺序每次都不一样
 level: 2
+cards: 并行：Promise.all 和并发上限
+--- context
+300 条条款一条条审太慢，所以改成同时审。报告里条款的顺序必须和合同原文一致，律师才能一边看报告一边翻合同对照。
 --- prompt
 同事把逐条审查改成了并行，速度快了，但律师抱怨：报告里条款的顺序每次都不一样。测试用一个假的 `review`（不同条款耗时不同）重现了问题。运行、修好它：结果顺序必须和 `ids` 一致。
 --- starter
@@ -1281,6 +1329,9 @@ expectAsync("空列表", () => reviewAll([], fakeReview), []);
 type: code
 title: 带并发上限的 map
 level: 2
+cards: 并行：Promise.all 和并发上限
+--- context
+300 个请求一下子全发出去，很可能被服务商限流，收到 429（请求太多，被暂时拒绝）。真实项目的 `pipeline.py` 现在是一条一条顺序审的，想提速又不被限流，就得控制同时进行的请求数。
 --- prompt
 写 `mapLimit(items, limit, fn)`：对每个元素调用 async 的 `fn`，**同时进行的不超过 `limit` 个**，返回结果数组，顺序和 `items` 一致。
 
@@ -1330,6 +1381,9 @@ expectAsync("空数组", () => mapLimit([], 3, slowDouble), []);
 type: choice
 title: 读 graph.py
 level: 2
+cards: 对照框架：LangGraph 和 Mastra 工作流; 中断和恢复：停下来等人
+--- context
+面试官很可能让你讲自己项目里的 `graph.py`。能把框架的每一个调用对应到今天手写的零件上，是证明你真懂、而不是照抄的最好办法。
 --- prompt
 下面对 `clausecheck/graph.py` 的解读，哪一个是**错的**？
 --- options
@@ -1346,6 +1400,9 @@ type: scratch
 title: 闭卷：图执行器
 exam: yes
 level: 3
+cards: 执行器：从 start 走到 END; 边和条件路由
+--- context
+闭卷手写图执行器。Clause Check 的审查流程就是一张图，汇总之后会根据有没有 redline 走不同的路。能从空白写出它，LangGraph 对你就不再是黑盒。
 --- prompt
 先原样定义这些类型：
 
@@ -1412,6 +1469,9 @@ type: scratch
 title: 闭卷：检查点和恢复
 exam: yes
 level: 3
+cards: 检查点：崩了也能接着跑
+--- context
+闭卷写检查点：一份合同的审查可能中途崩掉，已经付过钱的模型调用不能再做一遍。存下的文字要能在另一次运行里读回来，接着往下跑。
 --- prompt
 类型同闭卷 1（原样定义）：
 
@@ -1493,6 +1553,9 @@ type: scratch
 title: 闭卷：条件路由 + 中断
 exam: yes
 level: 3
+cards: 中断和恢复：停下来等人; 边和条件路由
+--- context
+闭卷写会暂停的图：有 redline 的合同在导出前停下来问律师。律师的决定可能第二天才到，程序凭一段检查点文字就能接着跑。
 --- prompt
 先原样定义这些类型（节点返回的更新里可以带 `interrupt` 字段，表示「停下来问人」）：
 

@@ -254,6 +254,9 @@ print("\ncited:", re.findall(r"\[(c\d+)\]", answer))
 type: code
 title: 复习：把文档读进来
 level: 1
+cards: 为什么需要检索（RAG）; d10:文件夹：mkdir、glob 和「当前目录」
+--- context
+今天做一个「问合同」小工具，用的是 RAG（先找出相关的几段资料，再让模型只根据它们回答）。第一步是把资料读进来：练习里每个 `.txt` 文件是一份资料，文件名就是它的名字。
 --- prompt
 RAG 的第一步是把资料读进来（复习第 10 天）。写 `load_docs(folder)`：读出文件夹里所有 `.txt` 文件，**按文件名排序**，返回 `[{"id": 去掉后缀的文件名, "text": 文件内容}, ...]`。文件夹不存在时返回 `[]`。
 
@@ -293,6 +296,9 @@ expect("文件夹不存在", lambda: load_docs("work/d11/nothing"), [])
 type: choice
 title: 模型说合同里没写
 level: 1
+cards: 为什么需要检索（RAG）
+--- context
+今天的「问合同」小工具先检索几段相关原文，再让模型只根据这几段回答。这是它第一次答错时的情形。
 --- prompt
 你做了一个「问合同」的小工具：先检索 3 个最相关的片段，再让模型只根据片段回答。用户问 "Can we cancel the contract early?"，模型回答「片段里没有提到」。可是样例合同的 11.2 明明写着 Customer may terminate this Agreement only at the end of the then-current Term，正好回答了这个问题（不能提前解约）。你第一步应该做什么？
 --- options
@@ -308,6 +314,9 @@ answer: 3
 type: code
 title: 清洗一页 PDF 文字
 level: 2
+cards: 文本清洗
+--- context
+从 PDF 抽出来的合同文字里，夹着每页都有的页码，还有乱七八糟的空格和换行。不先清掉，页码会混进条款正文，还可能被当成相关内容检索出来。真实项目的 `parse.py` 也会先去掉页眉页脚。
 --- prompt
 写 `clean(text)`，清洗从 PDF 抽出来的一页文字：
 
@@ -343,6 +352,9 @@ expect("空字符串", lambda: clean(""), "")
 type: code
 title: 按长度切块，带重叠
 level: 2
+cards: 切块：按结构、按长度、带重叠
+--- context
+检索的单位叫「块」。有些资料没有编号标题可以切，比如一封很长的谈判邮件，只能按长度切成小块，再拿去检索。
 --- prompt
 写 `chunk_fixed(text, size, overlap)`：
 
@@ -390,6 +402,9 @@ expect_raises("size 为 0", lambda: chunk_fixed("abcdef", 0, 0), ValueError)
 type: fix
 title: 修 bug：末尾多出来的块
 level: 2
+cards: 切块：按结构、按长度、带重叠; d9:常见 bug 模式
+--- context
+同事写的按词数切块，切好的块会存起来供以后检索。每多一块都要占存储、占检索时间，被选进 prompt 还要多花 token。
 --- prompt
 同事写了按**词**切块的 `chunk_words(words, size, overlap)`：每块 `size` 个词，相邻两块重叠 `overlap` 个词。可是最后总会多出一两块，内容完全包含在前一块里，检索时会重复命中、白白浪费 token。
 
@@ -428,6 +443,9 @@ expect("不重叠时刚好切完", lambda: chunk_words(["a", "b", "c", "d"], 2, 
 type: choice
 title: 块切多大
 level: 2
+cards: 切块：按结构、按长度、带重叠
+--- context
+块切多大，是做检索时第一个要定的参数，面试也常问。
 --- prompt
 合同检索里，块切得**太大**（比如一块 3000 个字符）和**太小**（比如一块 50 个字符），各自最可能的问题是？
 --- options
@@ -443,6 +461,9 @@ answer: 1
 type: testwrite
 title: 写测试：token 估算
 level: 2
+cards: token 估算和预算; d9:怎么想测试用例
+--- context
+往 prompt 里放资料之前，要先粗估它有多长：模型按 token 计费，一次能读的长度也有上限。估算写错了，要么超长出错，要么白白浪费空间。
 --- prompt
 下面的 `estimate_tokens(text)` 按一个粗略规则估算 token：**每个汉字算 1 个，其他字符每 4 个算 1 个，合起来向上取整**；空字符串是 0。（`[\u4e00-\u9fff]` 是常用汉字的范围。）
 
@@ -505,6 +526,9 @@ def test_empty_is_zero():
 type: fill
 title: 填空：按预算装块
 level: 2
+cards: token 估算和预算
+--- context
+检索返回的块已经按相关度排好，可 prompt 能装的 token 有上限，还要给系统提示和模型的回答留出地方。
 --- prompt
 补全 `pack_chunks(chunks, budget)`：`chunks` 已经按相关度从高到低排好。按顺序往 prompt 里放，估算的 token 总数**不能超过** `budget`（刚好等于可以）。放不下的这块**跳过**，继续看后面可能更小的块。返回放进去的块（保持原顺序）。
 --- template
@@ -544,6 +568,9 @@ expect("预算够大，全放进去", lambda: ids(pack_chunks(C, 100)), ["c3", "
 type: predict
 title: 分词和关键词重合
 level: 2
+cards: 关键词检索
+--- context
+关键词检索要先把律师的问题和条款原文都拆成单词，再比较两边有哪些词相同。
 --- prompt
 写出输出。注意大小写、标点、`'s`，以及最后一行的 cancel 和 terminate。
 --- code
@@ -567,6 +594,9 @@ print(len(set(tokenize("Cancel early")) & set(tokenize(c))))
 type: code
 title: 分词和关键词打分
 level: 2
+cards: 关键词检索
+--- context
+律师用英文提问，程序要从合同里找出最相关的条款。真实项目不调模型的规则版审查（`rule_based_review`）也是靠数关键词命中，来判断一条条款属于哪个主题。
 --- prompt
 写两个函数：
 
@@ -608,6 +638,9 @@ expect("同义词对不上", lambda: keyword_score("Can we cancel early?", "Eith
 type: code
 title: 关键词 top-k
 level: 3
+cards: 关键词检索; d8:多键排序
+--- context
+打完分以后，只把最相关的几条放进 prompt，其余的不给模型看：既省 token，又不让无关内容分散它的注意力。
 --- prompt
 写 `top_k(query, chunks, k)`：用 `keyword_score`（已写好）给每块的 `text` 打分，返回分数最高的 `k` 块的 `id` 列表：
 
@@ -667,6 +700,9 @@ expect("k 为 1", lambda: top_k("terminate for breach", CHUNKS, 1), ["c3"])
 type: predict
 title: 余弦相似度
 level: 2
+cards: 向量和余弦相似度
+--- context
+另一种检索办法：把每段文字变成一串小数（向量），意思越接近的文字，向量的方向越接近。这段代码量的就是两个方向有多接近。
 --- prompt
 写出输出。先在脑子里想：方向相同、互相垂直、方向相反，各是多少？
 --- code
@@ -693,6 +729,9 @@ print(cosine([0, 0], [1, 2]))
 type: code
 title: 点积、长度、余弦
 level: 2
+cards: 向量和余弦相似度
+--- context
+向量检索的核心就是这个相似度函数：每次提问，都要拿问题的向量和每一块的向量比一遍。它算错了不会报错，只会悄悄把不相关的块排到前面。
 --- prompt
 写三个函数：
 
@@ -745,6 +784,9 @@ type: fix
 title: 修 bug：向量接口 400
 level: 2
 mock: yes
+cards: embeddings 接口; d4:状态码和重试
+--- context
+向量检索要先把每段文字变成向量，这要调用一个专门的向量接口（embeddings）。练习连的是模拟接口，请求和回答的格式和真接口一样。
 --- prompt
 这段代码想取一段文字的 embedding。写它的人平时只用 DeepSeek，就照着聊天接口的写法改了改。运行，看打印出来的状态码和服务器的错误信息，修好它。
 --- starter
@@ -784,6 +826,9 @@ type: code
 title: 一次请求取回一批向量
 level: 2
 mock: yes
+cards: embeddings 接口; d4:用 requests 发请求
+--- context
+一份合同几十条条款，每条都要变成向量，这是建向量检索的第一步；之后每次提问，都拿这些向量来比。
 --- prompt
 写 `embed_texts(texts)`：**一次请求**取回一批文字的 embedding，返回向量列表，顺序和 `texts` 一致。
 
@@ -843,6 +888,9 @@ type: code
 title: 语义检索 top-k
 level: 3
 mock: yes
+cards: embeddings 接口; 向量和余弦相似度; 关键词检索
+--- context
+关键词检索只认字面，律师的用词和合同原文不一样就找不到。按意思检索是 RAG 系统最常用的做法，也是面试常问的话题。
 --- prompt
 写 `semantic_top_k(query, chunks, k)`，用 embeddings 找最相关的块：
 
@@ -937,6 +985,9 @@ type: code
 title: 向量只算一次：存成索引
 level: 3
 mock: yes
+cards: embeddings 接口; d10:JSON 文件：load 和 dump
+--- context
+合同不常变，律师却会反复提问。提前算好、存成文件的向量叫「索引」，就像书后的索引页，查的时候不用把全书重读一遍。
 --- prompt
 真实系统里，文档的向量**只算一次**，存起来；每次提问只算问题的向量。写两个函数：
 
@@ -1044,6 +1095,9 @@ expect("提问两次：每次只算问题的向量", _search, [["c3"], ["c1"], 2
 type: order
 title: 排代码：RAG 的 prompt
 level: 2
+cards: 把检索结果放进 prompt
+--- context
+RAG 的最后一步：把检索到的片段和律师的问题拼成发给模型的一段话。怎么拼，决定了模型会不会只根据片段回答、会不会自己编。
 --- prompt
 排出 `build_rag_prompt(question, chunks)`：先写规则，再列出带编号的片段，**问题放在最后**。有两行干扰项。
 
@@ -1075,6 +1129,9 @@ expect("问题在最后一行", lambda: build_rag_prompt("Is liability capped?",
 type: local
 title: 本机任务：在真实合同上检索
 level: 3
+cards: 关键词检索; d10:命令行参数：argparse; d10:JSON 文件：load 和 dump
+--- context
+在真实的样例合同上试一次自己写的检索，亲眼看看关键词检索能找到什么、找不到什么。面试时讲「为什么需要向量检索」，这就是最好的例子。
 --- prompt
 在真实的 Clause Check 合同上跑你自己写的关键词检索。
 
@@ -1112,6 +1169,9 @@ type: scratch
 title: 闭卷：按标题切块
 exam: yes
 level: 3
+cards: 切块：按结构、按长度、带重叠; 文本清洗
+--- context
+合同有现成的编号标题，一条条款就是一块，这是最适合合同的切法，真实项目的 `split.py` 也是这么切的。
 --- prompt
 写 `chunk_by_heading(text)`，按合同的编号标题切块：
 
@@ -1159,6 +1219,9 @@ type: scratch
 title: 闭卷：关键词检索
 exam: yes
 level: 3
+cards: 关键词检索
+--- context
+「问合同」小工具的检索部分：律师提一个问题，程序要从切好的块里挑出最相关的几块交给模型。
 --- prompt
 写 `retrieve(query, chunks, k)`，用关键词检索找出最相关的块（每块是 `{"id": ..., "text": ...}`）：
 
@@ -1198,6 +1261,9 @@ type: scratch
 title: 闭卷：检索+预算+prompt
 exam: yes
 level: 3
+cards: 把检索结果放进 prompt; token 估算和预算; 关键词检索
+--- context
+「问合同」小工具发请求之前的全部准备：从律师的一句问题，到真正发给模型的那段文字。什么都没找到时，宁可直接说找不到，也别让模型凭空作答。
 --- prompt
 写 `answer_context(query, chunks, k, budget)`，返回要发给模型的 prompt 字符串（每块是 `{"id": ..., "text": ...}`）：
 

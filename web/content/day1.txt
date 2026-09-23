@@ -5,10 +5,27 @@ hours: 4–5 小时
 --- goal
 能写出带参数、有返回值的小函数；会处理字符串和列表；会用 if 做判断；看得懂最常见的三种报错。
 --- checklist
-- 读完 7 张知识卡片，每个例子至少改一处再运行
+- 读完 8 张知识卡片（第 1 张介绍练习题背后的项目），每个例子至少改一处再运行
 - 练习区全部通过（看过答案的题会进复习区，明天重做）
 - 闭卷挑战 3 题：不看提示、不能粘贴
 - 关掉页面，在 VS Code 里新建 day1.py，把今天最难的一题从空白重写一遍并运行
+
+@@ concept project
+title: 先认识我们要做的项目：Clause Check
+--- body
+这门课的练习题几乎都来自同一个真实项目：**Clause Check**，一个帮人审合同的小程序。它按下面的顺序工作：
+
+1. 读进一份合同，按编号切成一条一条的**条款**（clause）。每条有编号（`clause_id`，比如 `"8.1"`）和标题（`heading`，比如 `"Cap on Liability"`，意思是「责任上限」）
+2. 把每条条款发给**大模型**（本课用 DeepSeek），让它对照公司定好的审查规则（叫 **playbook**）给出一个**判定**（verdict），只有三种：
+   - `accept`：没问题，接受
+   - `flag`：有风险，标出来给人看
+   - `redline`：要改写，模型会给出修改建议
+3. 每条再给一个**风险等级**（risk）：`high` 高 / `medium` 中 / `low` 低
+4. 把所有条款的结果汇总成一份报告，交给审合同的人
+
+每道练习题都是这条流水线上的一小块。题目上方的「背景」会说这一块在流水线的哪一步、为什么需要它；「要用到的知识卡片」可以直接打开对应的卡片复习。
+
+这些词不用一次记住，做题时忘了就回来看这张卡片。
 
 @@ concept
 title: 代码怎么跑：print 和注释
@@ -157,6 +174,9 @@ print(clause_idd)
 type: choice
 title: 一个等号是什么意思
 level: 1
+cards: 变量和类型
+--- context
+Clause Check 拿到模型给的判定后，第一件事是把它存进一个名字里，后面才能拿来比较、打印。存的写法就是这一行。
 --- prompt
 下面这行代码做了什么？
 --- code
@@ -174,6 +194,9 @@ answer: 2
 type: predict
 title: print 多个值
 level: 1
+cards: 代码怎么跑：print 和注释; 字符串
+--- context
+报告里每条条款要显示成「编号 + 标题」这样一行。先看清 `print` 和 f-string 各自是怎么把几个值拼成一行字的。
 --- prompt
 不要运行，先在脑子里执行一遍，写出输出（每个 print 一行）。
 --- code
@@ -187,6 +210,9 @@ print("Clause", clause_id + "!")
 type: predict
 title: 字符串方法
 level: 1
+cards: 字符串
+--- context
+从合同文件里切出来的条款文字，首尾常常带着多余的空格。程序要先把空格去掉，后面的判断和计数才准。
 --- prompt
 写出输出。注意 `strip()` 去掉了哪些字符，`len` 数的是去掉之后的长度。
 --- code
@@ -201,6 +227,9 @@ print(clean.startswith("Subject"))
 type: code
 title: 拼一行描述
 level: 1
+cards: 字符串; 函数：def 和 return
+--- context
+报告是给审合同的人看的，每条条款占一行：编号、标题、模型给的判定。这个函数负责拼出这一行。
 --- prompt
 写函数 `describe(clause_id, heading, verdict)`，返回这样的字符串：
 
@@ -226,6 +255,9 @@ expect("返回的是字符串", lambda: type(describe("1", "A", "accept")).__nam
 type: code
 title: 是不是高风险
 level: 1
+cards: if / elif / else; 函数：def 和 return
+--- context
+风险为 `high` 的条款要排在报告最前面，让人先看。要做到这一点，先得能判断一条条款是不是高风险。
 --- prompt
 写 `is_high(risk)`：`risk` 是 `"high"` 时返回 `True`，否则返回 `False`。
 --- starter
@@ -246,6 +278,9 @@ expect("大写 HIGH 不算（大小写不同就是不同的字符串）", lambda
 type: code
 title: 清洗模型的输出
 level: 1
+cards: 字符串; 函数：def 和 return
+--- context
+程序让模型只回答一个判定词（accept / flag / redline），可模型经常多带空格、换行，或者用了大写。原样拿去和 `"redline"` 比较会对不上，所以拿到回答后先清洗一遍。
 --- prompt
 模型有时会返回 `"  REDLINE\n"` 这种带空格、换行、大小写不一的文字。
 
@@ -268,6 +303,9 @@ expect("本来就干净", lambda: normalize("flag"), "flag")
 type: fix
 title: 修 bug：字符串加数字
 level: 1
+cards: 字符串; 读报错：从最后一行往上看
+--- context
+报告里的条款标题要写成 `Clause 12` 这样。条款编号有时是数字 `12` 而不是文字 `"12"`，这时直接拼接就会报错，这是新手最常见的错误之一。
 --- prompt
 下面的函数想返回 `"Clause 12"`，测试却报错了。先点「运行」看报错的最后一行，再修好它。
 --- starter
@@ -287,6 +325,9 @@ expect("label(3)", lambda: label(3), "Clause 3")
 type: choice
 title: 读报错：NameError
 level: 1
+cards: 读报错：从最后一行往上看
+--- context
+写程序时把变量名拼错，每天都会发生。学会一眼认出这种报错，能省下很多排查时间。
 --- prompt
 代码第 1 行是 `heading = "Cap on Liability"`。运行后出现这个报错，原因最可能是什么？
 --- code
@@ -307,6 +348,9 @@ answer: 1
 type: predict
 title: 列表下标和切片
 level: 1
+cards: 列表
+--- context
+合同切好以后，所有条款编号按顺序装在一个列表里。取第一条、最后一条、中间几条，都要用下标和切片。
 --- prompt
 写出输出。提醒：下标从 0 开始，切片不包含结尾那个下标。
 --- code
@@ -320,6 +364,9 @@ print(len(ids))
 type: code
 title: 取章节号
 level: 2
+cards: 字符串; 列表
+--- context
+合同的条款按章节分组：`8.1`、`8.2` 都属于第 8 章。报告要按章节归类，所以先要从编号里取出章节号。
 --- prompt
 条款编号 `"8.1"` 的章节号是 `"8"`，`"12"` 的章节号是 `"12"`，`"10.2.1"` 的是 `"10"`。
 
@@ -342,6 +389,9 @@ expect("10.2.1 多级", lambda: section_of("10.2.1"), "10")
 type: code
 title: 风险标签
 level: 2
+cards: if / elif / else
+--- context
+报告里的风险等级要显示成醒目的标签。模型偶尔会给出意料之外的值，所以最后要有一个兜底的标签，不能让程序出错。
 --- prompt
 写 `risk_label(risk)`：
 
@@ -377,6 +427,9 @@ expect("其他值兜底", lambda: risk_label("urgent"), "UNKNOWN")
 type: fill
 title: 填空：需要人看吗
 level: 1
+cards: if / elif / else; 函数：def 和 return
+--- context
+只有判定为 accept 的条款可以直接放过，flag 和 redline 都要交给人看。程序靠这个判断，决定哪些条款进待办清单。
 --- prompt
 判定不是 `"accept"` 的条款都需要人看。补全空格，让 `needs_attention("accept")` 返回 `False`，其他判定返回 `True`。
 --- template
@@ -396,6 +449,9 @@ expect("redline 要看", lambda: needs_attention("redline"), True)
 type: order
 title: 排代码：包含 Section 吗
 level: 1
+cards: 字符串; if / elif / else
+--- context
+条款里写着 `Section 12`，意思是它引用了第 12 章，审查时要把那一章一起看。程序先要能发现这种引用。
 --- prompt
 点击代码行，按正确顺序排好，写出 `mentions_section(text)`：文字里有 `"Section"` 就返回 `True`，否则返回 `False`。
 
@@ -418,6 +474,9 @@ expect("没有 Section", lambda: mentions_section("Fees are payable in 30 days")
 type: code
 title: 加一条编号，不重复
 level: 2
+cards: 列表; if / elif / else
+--- context
+审查过程中，程序会记下已经看过的条款编号。同一条不能记两次，否则报告里会出现重复。
 --- prompt
 写 `add_clause(ids, new_id)`：把 `new_id` 加到列表 `ids` 的末尾；如果它已经在列表里，就不要重复加。最后返回这个列表。
 --- starter
@@ -440,6 +499,9 @@ expect("空列表", lambda: add_clause([], "1.1"), ["1.1"])
 type: code
 title: 单数还是复数
 level: 2
+cards: if / elif / else; 字符串
+--- context
+报告的汇总行会写「几条条款是某个判定」。英文里 1 条用单数 clause，其他数量用复数 clauses，写错了看起来不专业。
 --- prompt
 写 `count_text(count, verdict)`：
 
@@ -465,6 +527,9 @@ expect("0 条也用复数", lambda: count_text(0, "accept"), "0 clauses: accept"
 type: choice
 title: and 还是 or
 level: 2
+cards: if / elif / else
+--- context
+程序经常要把两个条件合在一起判断，比如「风险高，而且被判为 flag」。先分清 `and` 和 `or` 的区别。
 --- prompt
 当 `risk = "medium"`、`verdict = "flag"` 时，哪个表达式的结果是 `True`？
 --- options
@@ -480,6 +545,9 @@ answer: 2
 type: code
 title: 截断长文本
 level: 2
+cards: 字符串; if / elif / else
+--- context
+网页上的条款列表放不下整段原文，只显示开头一小段，后面加 `...` 表示还有内容。
 --- prompt
 界面只显示前 `n` 个字符。写 `shorten(text, n)`：
 
@@ -506,6 +574,9 @@ type: scratch
 title: 闭卷：条款标题
 exam: yes
 level: 1
+cards: 字符串; 函数：def 和 return
+--- context
+报告里每条条款的前面，都有一行写明编号和条款名的标题。
 --- prompt
 写函数 `clause_title(clause_id, heading)`，返回 `"Clause 8.1 - Cap on Liability"` 这种格式（中间是：空格、短横线、空格）。
 --- solution
@@ -520,6 +591,9 @@ type: scratch
 title: 闭卷：判定的颜色
 exam: yes
 level: 2
+cards: 字符串; if / elif / else
+--- context
+网页用颜色显示判定：绿色放行、橙色要人看、红色要改写。判定来自模型的回答，所以可能带空格或大写。
 --- prompt
 写 `verdict_color(verdict)`：`"accept"` → `"green"`，`"flag"` → `"orange"`，`"redline"` → `"red"`，其他 → `"grey"`。
 
@@ -545,6 +619,9 @@ type: scratch
 title: 闭卷：首尾两个
 exam: yes
 level: 2
+cards: 列表; if / elif / else
+--- context
+报告开头要写「本合同从第几条到第几条」，所以要取出条款列表的第一个和最后一个编号。
 --- prompt
 写 `ends(ids)`：返回一个新列表，包含 `ids` 的第一个和最后一个元素。
 

@@ -20,7 +20,7 @@ title: 从脚本到服务：无状态、环境变量、健康检查
 上云之前，服务要满足三条：
 
 - **无状态**：云会同时开好几个副本（实例），也会随时关掉一个、换一个新的。所以请求之间不能靠内存传东西：要记住的东西放进桶、数据库或队列
-- **配置来自环境变量**：`config.py` 的 `Settings` 全部用 `os.getenv` 读；它调用的 `load_dotenv` 找不到 `.env` 时什么也不做，所以同一份代码在本机读 `.env`，在云上读平台设置的环境变量。模型名也是配置：部署时设 `CLAUSECHECK_DEEPSEEK_MODEL=deepseek-flash`（`config.py` 里的默认值还是 DeepSeek 已经停用的旧名字；它的价格表也要跟着更新，见第 28 天的成本卡片）
+- **配置来自环境变量**：`config.py` 的 `Settings` 全部用 `os.getenv` 读；它调用的 `load_dotenv` 找不到 `.env` 时什么也不做，所以同一份代码在本机读 `.env`，在云上读平台设置的环境变量。模型名也是配置：`config.py` 默认用 `deepseek-flash`，部署时想换成 `deepseek-v4-pro`，设环境变量 `CLAUSECHECK_DEEPSEEK_MODEL` 就行，不用改代码（换了模型，`PRICES` 里要有它的单价，见第 28 天的成本卡片）
 - **健康检查**：平台定期访问 `/health` 之类的地址，不健康的实例会被换掉
 
 下面模拟两个实例，看看「记在内存里」在云上为什么会出错。
@@ -319,6 +319,9 @@ if error_rate["clausecheck-api-00013"] > 2 * error_rate["clausecheck-api-00012"]
 type: predict
 title: 复习：同一条消息来两次
 level: 1
+cards: 事件和队列：至少送达一次; d17:幂等：重试不能发两封邮件
+--- context
+今天要把审查工作交给队列去排队。队列有时会把同一个任务送来两次，worker（在后台干活的程序）要是照做两遍，律师就会收到重复的通知。先用一段小代码回忆第 17 天的办法。
 --- prompt
 复习第 17 天的幂等。今天的队列会把同一条消息送来不止一次，worker 靠一个「做过了」的集合挡住重复。写出输出。
 --- code
@@ -344,6 +347,9 @@ print(len(emails), sorted(done))
 type: choice
 title: 复习：SDK 替你重试了
 level: 1
+cards: 托管大模型：Bedrock 和 Vertex AI; d26:错误和重试：只重试暂时的错误
+--- context
+worker 在 AWS 上调用 Bedrock（亚马逊云上的托管大模型）。合同一多，服务会限流：暂时拒绝请求，让你慢一点。在决定要不要自己写重试之前，先弄清楚用默认设置时会发生什么。
 --- prompt
 复习第 26 天。worker 用默认设置建了 Bedrock 的 client：`boto3.client("bedrock-runtime", region_name="eu-north-1")`。某次调用 `converse` 时，Bedrock 连续返回了 2 次 `ThrottlingException`，第 3 次成功。你的代码会看到什么？
 --- options
@@ -359,6 +365,9 @@ boto3 默认（legacy 模式）一共试 5 次，限流和 5xx 这类暂时的�
 type: code
 title: Lambda 的 HTTP 入口
 level: 2
+cards: AWS Lambda：一个事件，调用一次函数; 从脚本到服务：无状态、环境变量、健康检查
+--- context
+把审查接口部署到 AWS 时，可以放进 Lambda：网页发来的审查请求先经过 API Gateway（AWS 接收 HTTP 请求的入口），变成一个 `event` 字典交给这个函数。请求可能是空的或写坏的，坏请求要在这里挡回去，不能白白花钱调用模型。
 --- prompt
 写 AWS Lambda 的入口 `lambda_handler(event, context, review=review_clause)`，处理 API Gateway 转来的 `POST /review` 请求。请求体是 JSON：`{"clause_id": "8.1", "text": "..."}`。
 
@@ -429,6 +438,9 @@ expect("Lambda 只传两个参数时，用默认的 review_clause", lambda: json
 type: code
 title: 解析 S3 上传事件
 level: 2
+cards: 事件和队列：至少送达一次; AWS Lambda：一个事件，调用一次函数
+--- context
+在 AWS 上，律所把合同上传到 S3 桶（云上存文件的地方）以后，审查不是由网页请求直接启动的，而是由桶发出的「对象已创建」事件触发。worker 先要从事件里读出是哪个桶、哪个文件，才能下载合同开始审。
 --- prompt
 合同上传到 S3 以后，S3 可以发出一个事件（直接触发 Lambda，或者先进 SQS）。事件长这样（只留了用得到的字段）：
 
@@ -481,6 +493,9 @@ type: predict
 title: 消息什么时候回来
 level: 2
 cloud: yes
+cards: 事件和队列：至少送达一次
+--- context
+上传的合同会变成 SQS 队列（AWS 的消息队列）里的审查任务，worker 取走一条就去审。worker 也可能审到一半崩掉，队列怎么对待「取走了却没删掉」的任务，决定了活会不会丢、会不会重做。这段代码用一个模拟时钟演示。
 --- prompt
 写出输出。这个队列的隐身时间设成了 60 秒；`CLOUD.advance(秒数)` 让模拟的时钟往前走。想清楚：被取走但没删除的消息，什么时候会再出现？
 --- code
@@ -511,6 +526,9 @@ type: code
 title: 队列 worker
 level: 3
 cloud: yes
+cards: 事件和队列：至少送达一次; d17:幂等：重试不能发两封邮件
+--- context
+这是后台 worker 的核心一轮：从队列里取出审查任务，交给审查函数去做。真实的队列会重复送同一个任务，审查也可能因为模型出错而失败；这一轮处理完，任务既不能丢，也不能审两遍。
 --- prompt
 写 SQS worker 的一轮处理 `process_batch(sqs, queue_url, handle, seen)`：
 
@@ -583,6 +601,9 @@ type: fix
 title: 修 bug：发不出去的事件
 level: 2
 cloud: yes
+cards: 事件和队列：至少送达一次
+--- context
+在 GCP 上，合同上传以后，由这个函数往 Pub/Sub（GCP 的消息服务）发一条「合同已上传」的消息，订阅它的 worker 收到后才开始审查。要是消息其实没发出去而程序没发现，这份合同就永远没人审。
 --- prompt
 GCP 版的「合同上传了」事件：发一条消息到 Pub/Sub 主题 `contract-uploaded`，worker 订阅它。`publish_uploaded(publisher, topic, contract)` 应该：
 
@@ -631,6 +652,9 @@ type: fill
 title: 填空：Bedrock client
 level: 2
 cloud: yes
+cards: 托管大模型：Bedrock 和 Vertex AI; d26:错误和重试：只重试暂时的错误
+--- context
+假设有客户要求合同数据不离开他们选定的 AWS 账号和区域，Clause Check 就得改用 Bedrock 上的模型来审。第一步是建好 client（和服务通话的对象），再试着问一句。client 的设置决定了遇到限流时由谁来重试。
 --- prompt
 建一个 Bedrock Runtime 的 client：区域是斯德哥尔摩；重试用 standard 模式，**一共最多试 4 次**（包括第一次；standard 模式不设置时是 3 次）。再用 `converse` 问一句话。注意 `converse` 的消息格式和 DeepSeek 不一样：`content` 是块的列表。填空。
 --- template
@@ -676,6 +700,9 @@ type: code
 title: 用 Bedrock 审一条条款
 level: 3
 cloud: yes
+cards: 托管大模型：Bedrock 和 Vertex AI
+--- context
+这是把「审一条条款」这一步搬到 Bedrock 上：发出条款，拿回 JSON 判定，再记下用了多少 token（模型按它计费）。判定会直接进给律师的报告，所以和第 4 天一样，模型说的话要先检查才能用。
 --- prompt
 写 `review_with_bedrock(client, clause_id, text)`：
 
@@ -747,6 +774,9 @@ type: code
 title: Gemini：自己重试
 level: 3
 cloud: yes
+cards: 托管大模型：Bedrock 和 Vertex AI; d26:错误和重试：只重试暂时的错误
+--- context
+同样是审一条条款，这次换成 GCP 的 Vertex AI 上的 Gemini 模型。合同多的时候，模型服务会限流或暂时不可用；如果一遇到就放弃，一份合同的审查就会断在半路。
 --- prompt
 同样的审查，换成 Vertex AI 上的 Gemini。google-genai **默认不重试**，限流（429）和服务端错误（503）会直接到你的代码里，所以这里自己重试。写 `review_with_gemini(client, clause_id, text, sleep, model="gemini-2.5-flash")`：
 
@@ -825,6 +855,9 @@ expect_raises("什么都没生成：ValueError", lambda: review_with_gemini(Fake
 type: code
 title: 一行一条的 JSON 日志
 level: 2
+cards: 结构化日志和告警
+--- context
+服务上线后没人盯着终端，出了问题只能翻日志。云平台会收集程序打印的每一行；写成统一的格式，才能查「条款 8.1 用了多少 token」「过去一小时有几条错误」。合同原文和密钥进了日志就等于泄露。
 --- prompt
 写 `log_event(message, severity="INFO", **fields)`：打印**一行** JSON（结构化日志），供 Cloud Logging / CloudWatch 收集。
 
@@ -873,6 +906,9 @@ expect_raises("不认识的级别", lambda: log_event("x", severity="FATAL"), Va
 type: choice
 title: 长任务放在哪里
 level: 2
+cards: Cloud Run：跑你的容器，按请求扩缩; AWS Lambda：一个事件，调用一次函数; 事件和队列：至少送达一次
+--- context
+律所上传的真实合同常有几十页，逐条审完要好几分钟。部署到云上之前，要先想好这么长的任务放在哪里跑。
 --- prompt
 审一份 40 页的合同：大约 65 条条款，每条调一次模型（3–10 秒），一份合同一共要 5–10 分钟。现在的做法是：一个 HTTP 请求里审完整份合同再返回。部署到云上时，哪个设计最稳妥？
 --- options
@@ -889,6 +925,9 @@ type: order
 title: 排 Dockerfile
 level: 2
 lang: docker
+cards: Docker：镜像、容器和层缓存; Cloud Run：跑你的容器，按请求扩缩
+--- context
+要把 Clause Check 的 API 放到 Cloud Run 上，先得把它打成容器镜像：代码、Python 和依赖装在一起的一个包。Dockerfile 就是打包的步骤单，以后每改一次代码，都要照着它重新打一次包。
 --- prompt
 排出 Clause Check API 的 Dockerfile（这题按行的顺序判分）。要求：
 
@@ -915,6 +954,9 @@ CMD uvicorn clausecheck.api:app --port 8000
 type: choice
 title: 哪些不进镜像
 level: 2
+cards: Docker：镜像、容器和层缓存; d26:密钥管理：不进代码、不进镜像
+--- context
+镜像打好后会上传到云上的镜像仓库，每台运行它的机器都会拉一份。打包时整个项目文件夹都会被复制进去，所以文件夹里的每样东西，都要想想该不该跟着进去。
 --- prompt
 `.dockerignore` 决定 `COPY . .` 时哪些文件**不会**进镜像。Clause Check 的项目根目录里有下面这些，哪些应该写进 `.dockerignore`？（多选）
 --- options
@@ -932,6 +974,9 @@ type: code
 title: TS：有类型的 Lambda
 level: 2
 lang: ts
+cards: AWS Lambda：一个事件，调用一次函数; d6:Zod：TypeScript 的 Pydantic
+--- context
+如果团队的后端用 Node.js，Lambda 的审查入口也可以用 TypeScript 写。它和 Python 版做同一件事：接住 API Gateway 转来的审查请求，检查好了再交给审查函数。
 --- prompt
 用 TypeScript 写同一个 Lambda（Node.js 运行时）。类型已经在起始代码里写好了：真实项目里用 `@types/aws-lambda` 包里的 `APIGatewayProxyEvent` / `APIGatewayProxyResult`，这里自己定义一个简化版。
 
@@ -1023,6 +1068,9 @@ type: translate
 title: 翻译：解析 S3 事件
 level: 2
 lang: ts
+cards: 事件和队列：至少送达一次; d5:从 Python 到 TypeScript
+--- context
+如果 worker 用 Node.js 写，解析 S3 上传事件的那段代码也要有 TypeScript 版。合同文件名里可能有空格、`ö` 这样的字母，还原错了就找不到文件。
 --- prompt
 把今天的 `parse_s3_event` 翻译成 TypeScript 的 `parseS3Event(event)`，返回 `[bucket, key]` 元组的数组。
 
@@ -1074,6 +1122,9 @@ expect("没有 Records", () => parseS3Event({}), []);
 type: code
 title: 上线前的自动检查
 level: 2
+cards: 上线清单和回滚; d26:数据驻留：合同留在欧盟
+--- context
+上线清单靠人记，总有一次会漏掉一项。把其中能自动判断的几条写成代码，放进 CI（每次提交代码都会自动跑的检查），部署配置一有问题就拦下来，不用等上线后才发现。
 --- prompt
 把上线清单的一部分变成代码：部署前在 CI 里跑一遍，发现问题就拦下来。写 `check_deploy(config)`，按下面的顺序检查，返回问题列表（字符串）；没有问题返回 `[]`：
 
@@ -1141,6 +1192,9 @@ expect("AWS 的斯德哥尔摩可以；没有 max_instances 这个键", lambda: 
 type: local
 title: 本机任务（选做）：打一个镜像
 level: 2
+cards: Docker：镜像、容器和层缓存; 从脚本到服务：无状态、环境变量、健康检查
+--- context
+前面的练习都在浏览器里模拟。这一题在你自己的电脑上把 Clause Check 真正打成镜像跑起来，亲眼看到云平台拿到的那个「包」是什么样子；没装 Docker 的话，读懂每一步在做什么也行。
 --- prompt
 如果你装了 Docker Desktop，把 Clause Check 真的打成镜像。没装也没关系：读一遍步骤，然后在下面写出 Dockerfile 每一行的作用（要包含 `FROM` 和 `CMD` 两行）。
 
@@ -1192,6 +1246,9 @@ type: scratch
 title: 闭卷：Lambda 入口
 exam: yes
 level: 3
+cards: AWS Lambda：一个事件，调用一次函数
+--- context
+这是 Clause Check 放到 Lambda 上时的审查入口：网页的请求经 API Gateway 进来，由它决定交给审查还是直接回绝。线上什么样的请求都会来，出错时回给网页的内容，外面的人也都看得到。
 --- prompt
 写 AWS Lambda 的入口 `lambda_handler(event, context, review=review_clause)`，处理 API Gateway（REST API proxy）转来的请求。文件里先定义：
 
@@ -1265,6 +1322,9 @@ title: 闭卷：幂等的队列 worker
 exam: yes
 level: 3
 cloud: yes
+cards: 事件和队列：至少送达一次; d17:幂等：重试不能发两封邮件
+--- context
+后台 worker 要把队列里的审查任务全部处理完。真实的队列会重复送任务，也会有一条怎么都审不过去的坏任务；worker 既不能重复审，也不能被一条坏任务永远卡住。
 --- prompt
 写 `drain(sqs, queue_url, handle, done, dead)`：反复处理一个 SQS 队列，直到某一轮一条消息都没取到为止（最多 10 轮）。
 
@@ -1331,6 +1391,9 @@ title: 闭卷：Bedrock + 重试 + 兜底
 exam: yes
 level: 3
 cloud: yes
+cards: 托管大模型：Bedrock 和 Vertex AI; d26:错误和重试：只重试暂时的错误
+--- context
+客户要求用 Bedrock 审合同时，每条条款都要走这一步。一份合同有几十条条款，其中任何一条遇到限流或者模型答得不对，都不该让整份报告做不出来。
 --- prompt
 写 `review_clause_bedrock(client, clause_id, text, sleep)`。`client` 是 `bedrock-runtime` 的 client，已经设置成 SDK **不重试**（`total_max_attempts=1`），所以限流错误会直接到你这里。
 

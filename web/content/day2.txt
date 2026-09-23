@@ -191,6 +191,9 @@ while attempt <= 3:
 type: predict
 title: for 和 range
 level: 1
+cards: for 循环
+--- context
+审查一份合同，就是把切好的条款一条一条交给模型。程序里「一条一条来」靠的就是循环，先看清它每一轮拿到的是什么。
 --- prompt
 写出输出。
 --- code
@@ -203,6 +206,9 @@ for cid in ["3.1", "8.1"]:
 type: predict
 title: 字典取值的三种方式
 level: 1
+cards: 字典：用名字找值
+--- context
+程序常把「条款编号 → 风险等级」存成一张表，想知道某条的风险，就按编号去查。查之前要知道：表里没有这个编号时会发生什么。
 --- prompt
 写出输出。注意 `get` 在键不存在时返回什么。
 --- code
@@ -217,6 +223,9 @@ print(len(risk))
 type: code
 title: 总字数
 level: 1
+cards: 累加：在循环外准备，在循环里更新; for 循环
+--- context
+发给模型的文字越长，模型处理得越慢、花费也越多。把一份合同所有条款的字数加起来，就能先估一估这份合同有多大。
 --- prompt
 写 `total_length(texts)`：`texts` 是字符串列表，返回所有字符串长度之和。空列表返回 `0`。
 
@@ -244,6 +253,9 @@ expect("三段", lambda: total_length(["Cap", " on ", "Liability"]), 16)
 type: code
 title: 统计每种判定
 level: 2
+cards: 计数的标准写法; 字典：用名字找值
+--- context
+报告开头要告诉审合同的人：这份合同里几条接受、几条标出、几条要改写。输入是模型给每条条款的判定，按条款顺序排好。
 --- prompt
 写 `count_verdicts(verdicts)`：输入判定列表，返回每种判定出现的次数。
 
@@ -272,6 +284,9 @@ expect("空列表", lambda: count_verdicts([]), {})
 type: code
 title: 取出所有编号
 level: 1
+cards: 列表里装字典：真实数据的样子; for 循环
+--- context
+一份合同审完，结果是一个列表，每条条款是一个字典，里面有编号、判定、风险等好几个字段。报告里要列出这份合同有哪些条款时，只需要编号这一列。
 --- prompt
 写 `ids_of(clauses)`：`clauses` 是字典列表（每个有 `"id"` 键），按原顺序返回所有编号组成的列表。
 --- starter
@@ -294,6 +309,9 @@ expect("空", lambda: ids_of([]), [])
 type: code
 title: 高风险条款
 level: 2
+cards: 列表推导式：一行写完筛选和变换; 列表里装字典：真实数据的样子
+--- context
+审合同的人时间有限，最想先知道哪几条是高风险。真实项目的汇总里就有这样一份高风险编号清单（`high_risk`）。
 --- prompt
 写 `high_risk_ids(clauses)`：返回 `risk` 为 `"high"` 的条款编号列表，保持原顺序。
 --- starter
@@ -319,6 +337,9 @@ expect("没有高风险", lambda: high_risk_ids([{"id": "1", "risk": "low"}]), [
 type: code
 title: 按编号找条款
 level: 2
+cards: 函数：默认参数和提前 return; 列表里装字典：真实数据的样子
+--- context
+模型审一条条款时，可能想翻看它提到的另一条，比如「见第 8.1 条」。真实项目的 `get_clause` 工具就要先按编号在整份合同里找到那一条；模型也可能把编号记错。
 --- prompt
 写 `find_clause(clauses, clause_id)`：返回编号等于 `clause_id` 的那个字典；找不到返回 `None`。
 --- starter
@@ -343,6 +364,9 @@ expect("空列表", lambda: find_clause([], "1"), None)
 type: fix
 title: 修 bug：只打印不返回
 level: 1
+cards: d1:函数：def 和 return; 累加：在循环外准备，在循环里更新
+--- context
+报告的汇总部分会调用这个函数，拿它算出的高风险条数写进报告开头。
 --- prompt
 这个函数「看起来」算对了（运行时能看到输出），测试却全部失败。为什么？修好它。
 --- starter
@@ -370,6 +394,9 @@ expect("零条", lambda: count_high([{"risk": "low"}]), 0)
 type: fix
 title: 修 bug：KeyError
 level: 2
+cards: 计数的标准写法; d1:读报错：从最后一行往上看
+--- context
+练习里要统计合同涉及哪些主题（付款、责任上限……）、每个主题有几条。这个函数一运行就报错，整份报告也就出不来。
 --- prompt
 运行测试会报 `KeyError`。读报错，修好这个计数函数。
 --- starter
@@ -395,6 +422,9 @@ expect("空", lambda: count_topics([]), {})
 type: choice
 title: print 和 return
 level: 1
+cards: d1:函数：def 和 return; d1:代码怎么跑：print 和注释
+--- context
+前面「修 bug：只打印不返回」那道题，问题就出在这两个词上。新手写统计函数时，这是最常见的误会之一。
 --- prompt
 关于 `print` 和 `return`，哪个说法是对的？
 --- options
@@ -410,6 +440,9 @@ answer: 2
 type: predict
 title: 列表推导式
 level: 2
+cards: 列表推导式：一行写完筛选和变换; 列表里装字典：真实数据的样子
+--- context
+真实项目 `pipeline.py` 的汇总代码里，到处都是这种一行写完的筛选。先练会一眼读懂它。
 --- prompt
 写出输出。
 --- code
@@ -426,10 +459,13 @@ print(len([c for c in clauses if c["risk"] != "high"]))
 type: code
 title: 按风险排序
 level: 3
+cards: 排序和 while; 字典：用名字找值
+--- context
+报告里「需要关注」那一栏是给审合同的人的待办清单，越靠前越先看。`high`、`medium`、`low` 是文字，按字母排会变成 high、low、medium，所以程序里要另外规定先后。
 --- prompt
 律师想先看高风险。写 `attention_order(clauses)`：返回条款编号列表，排序规则是 `"high"` 在前，`"medium"` 其次，`"low"` 最后；风险相同的保持原来的顺序。
 
-这正是 Clause Check 里 `needs_attention` 的排序方式。
+真实项目的 `needs_attention` 也是把高风险放在最前面（它还会去掉 accept 的条款，风险相同的再按判定和编号排）。
 --- starter
 RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -458,6 +494,9 @@ expect("空", lambda: attention_order([]), [])
 type: order
 title: 排代码：数高风险
 level: 2
+cards: 累加：在循环外准备，在循环里更新; for 循环
+--- context
+报告开头会写「本合同有几条高风险条款」，这个数就由这个函数算出来。数数的函数在统计里最常见，形状几乎都一样，值得熟到不用想。
 --- prompt
 排出 `count_high(clauses)`：返回高风险条款的数量。注意有两行干扰项。
 --- lines
@@ -481,6 +520,9 @@ expect("零条", lambda: count_high([]), 0)
 type: code
 title: 按主题分组
 level: 3
+cards: 字典：用名字找值; 列表里装字典：真实数据的样子; 累加：在循环外准备，在循环里更新
+--- context
+模型除了给判定，还会给每条条款标一个主题，比如 `payment`（付款）、`liability_cap`（责任上限）。审合同的人常按主题看：付款相关的几条放在一起，对照着读。
 --- prompt
 写 `group_by_topic(clauses)`：返回字典，键是主题，值是这个主题下的条款编号列表（保持原顺序）。
 
@@ -519,6 +561,9 @@ expect("空", lambda: group_by_topic([]), {})
 type: code
 title: 汇总报告
 level: 3
+cards: 计数的标准写法; 列表推导式：一行写完筛选和变换; 列表里装字典：真实数据的样子
+--- context
+这是整条流水线的最后一步：所有条款审完后，把一长串结果浓缩成报告开头的几行，让审合同的人一眼看到全貌。真实的 `summarise()` 还会算花了多少钱、用了多长时间，这里只练最核心的部分。
 --- prompt
 写 `summarise(clauses)`，返回这样的字典：
 
@@ -562,6 +607,9 @@ type: code
 title: 第几次成功
 level: 2
 skip_starter: yes
+cards: 排序和 while; 函数：默认参数和提前 return
+--- context
+调用模型的接口有时会失败，程序就隔一会儿再试一次。每次调用，服务器都会回一个数字，叫状态码，说明这次成没成功（200 表示成功）。查问题时常要知道「试到第几次才成」。
 --- prompt
 接口会失败，重试时要知道第几次成功了。写 `first_success(statuses)`：`statuses` 是每次调用返回的状态码，按顺序排列。返回第一个 `200` 出现在第几次（从 1 开始数）；一直没有 200 就返回 `-1`。
 
@@ -594,6 +642,9 @@ expect("空列表", lambda: first_success([]), -1)
 type: choice
 title: range 的范围
 level: 1
+cards: for 循环
+--- context
+重试接口、给条款排序号时，常要一串连续的数字，Python 里一般用 `range` 生成。
 --- prompt
 `list(range(1, 4))` 的结果是？
 --- options
@@ -609,6 +660,9 @@ answer: 2
 type: fill
 title: 填空：计数模板
 level: 1
+cards: 计数的标准写法
+--- context
+报告要写出高、中、低风险各有几条。「按值计数」是统计里最常见的形状，今天的计数题都是它，值得熟到不用想。
 --- prompt
 把计数模板补完整。
 --- template
@@ -627,6 +681,9 @@ expect("空", lambda: count_risks([]), {})
 type: code
 title: 默认参数
 level: 1
+cards: 函数：默认参数和提前 return
+--- context
+报告里条款一般叫 `Clause 8.1`，可有的合同自己用 Section 或 Article（真实项目找条款引用时，这三种叫法都认）。大多数地方用同一个叫法，偶尔才要换。
 --- prompt
 写 `label(clause_id, prefix="Clause")`：返回 `"Clause 8.1"`；如果调用时给了 `prefix`，就用给的，比如 `label("8.1", "Section")` 返回 `"Section 8.1"`。
 --- starter
@@ -647,6 +704,9 @@ type: scratch
 title: 闭卷：数单词
 exam: yes
 level: 2
+cards: 计数的标准写法; d1:字符串
+--- context
+拿到一份新合同，先扫一眼高频词：fees、liability 出现得多，大概就知道这份合同的重点在钱和责任上。
 --- prompt
 写 `count_words(text)`：把文字按空白切开，统一转小写后统计每个单词出现的次数，返回字典。
 
@@ -667,6 +727,9 @@ type: scratch
 title: 闭卷：按判定取编号
 exam: yes
 level: 1
+cards: 列表推导式：一行写完筛选和变换; 列表里装字典：真实数据的样子
+--- context
+审合同的人常会说「先只看要改写的那几条」，或者「把标出来的都列给我」。
 --- prompt
 写 `clauses_by_verdict(clauses, verdict)`：返回判定等于 `verdict` 的条款编号列表（每个条款是有 `"id"` 和 `"verdict"` 的字典），保持原顺序。
 --- solution
@@ -682,6 +745,9 @@ type: scratch
 title: 闭卷：三档风险计数
 exam: yes
 level: 2
+cards: 计数的标准写法; 字典：用名字找值
+--- context
+练习里的报告开头有一张固定三格的风险统计表：高、中、低。网页按这三个名字去取数，哪一格缺了，网页就会出错。
 --- prompt
 写 `risk_counts(clauses)`：返回 `{"high": 数量, "medium": 数量, "low": 数量}`。**三个键必须都在**，没有的就是 0；其他风险值忽略。
 --- solution

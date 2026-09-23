@@ -114,6 +114,9 @@ print(answer("Mastra workflows", False, "a small graph runner with checkpoints i
 type: predict
 title: 复习：Python 数据处理
 level: 2
+cards: d8:字典进阶：推导式、Counter、defaultdict; d8:多键排序; d8:any 和 all
+--- context
+报告汇总要回答几个问题：每种判定各有几条、每个风险等级有哪些条款、要人看的条款按什么顺序列、有没有高风险。这几行代码就在做这些统计。
 --- prompt
 复习第 1–2 周和第 8 天（Counter、defaultdict、多键排序、any / all）：写出输出。注意 `most_common` 遇到次数一样时谁在前。
 --- code
@@ -138,6 +141,9 @@ print(any(r[2] == "high" for r in reviews), all(r[1] in {"accept", "flag", "redl
 type: testwrite
 title: 复习：给代码兜底写测试
 level: 3
+cards: d9:怎么想测试用例; d9:测试函数和 pytest
+--- context
+练习里假设模型之后还有一道代码检查，专门拦住模型看漏的明显风险。模型会出错，这道防线就不能再出错；它悄悄失灵时不会有人发现，只能靠测试守住。
 --- prompt
 复习第 9 天和第 12 天。`guard(verdict, clause_text)` 是模型之后的第二道防线：决定最终用哪个判定。它的规则：
 
@@ -238,6 +244,9 @@ def test_red_flag_does_not_downgrade_redline():
 type: code
 title: 复习：检查带引用的回答
 level: 3
+cards: d19:带引用的回答; d19:groundedness：引号里的原文是真的吗
+--- context
+律师就合同提问，模型根据检索到的片段回答，带着出处编号和引号里的原文。交给律师之前，程序先核对：出处是不是真的，原文是不是真的出现在那里。
 --- prompt
 复习第 11、19 天。模型根据检索到的片段回答问题，要求用 `[c1]` 这样的编号引用片段、用双引号引用原文。写 `check_answer(answer, chunks)`，`chunks` 是 `{编号: 片段文字}`，返回：
 
@@ -293,6 +302,9 @@ expect("没有引用", lambda: check_answer("No citations here.", CHUNKS), {"cit
 type: choice
 title: 复习：改了 prompt 变好了吗
 level: 2
+cards: d13:跑 N 次，看通过率; d13:A/B 对比：一次只改一个东西
+--- context
+改 prompt 是项目里最常做的事，每次改完都要回答「变好了吗」。面试官也爱追问：你凭什么这么说。
 --- prompt
 你把 prompt 从 v1 改成 v2。评测集的 9 条用例每条只跑了 **1 次**：v1 有 1 条没过，v2 全过。你能得出什么结论？
 --- options
@@ -309,6 +321,9 @@ type: predict
 title: 复习：TS 类型和类
 level: 2
 lang: ts
+cards: d15:可辨识联合和穷尽检查; d16:私有状态和 getter; d16:Map 和 Set
+--- context
+审批界面要把模型的每个判定显示成一句话，再统计各种判定出现了几次、有几条需要人看。第 15、16 天学的类型和类在这里一起用上。
 --- prompt
 复习第 15、16 天（可辨识联合、私有字段、getter、Map）：写出输出。
 --- code
@@ -372,6 +387,9 @@ type: code
 title: 复习：分批并行 + Result
 level: 3
 lang: ts
+cards: d18:并行：Promise.all 和并发上限; d16:Result：失败也是一种返回值
+--- context
+逐条审查改成分批并行后快了很多，但几百次请求里总会有一两次失败（比如网络断了）。一条失败不能让整份合同的结果全部丢掉，其他条款照常出结果，失败的那条再单独处理。
 --- prompt
 复习第 16、18 天。写 `mapBatches(items, batchSize, fn)`：
 
@@ -446,6 +464,9 @@ expectAsync("空列表", () => mapBatches([], 2, fakeReview), []);
 type: local
 title: 本机任务：在真实项目里修一个 bug
 level: 3
+cards: 三周地图：概念 → 文件 → 面试题; d9:测试函数和 pytest
+--- context
+这是真实项目里一个还没修的小 bug，会让律师看到的「要人看的条款」顺序不对。按「先写测试、再修」的专业流程修掉它，讲项目时就有了一个亲手修过的真例子。
 --- prompt
 第 14 天你给 mini 版的 `summarise` 用了数字排序。真实项目的 `clausecheck/pipeline.py` 里，`summarise` 排序键的最后一项是编号**字符串** `r.clause.clause_id`，所以同样风险、同样判定的条款里，`"10.1"` 会排在 `"9.1"` 前面。按「先写测试 → 看它变红 → 修 → 变绿」的顺序修掉它：
 
@@ -473,6 +494,9 @@ verify: \d+ failed[\s\S]*\d+ passed
 type: choice
 title: 没用过的东西怎么答
 level: 2
+cards: 面试里诚实说自己的水平
+--- context
+你系统学编程才几周，面试里一定会碰到没用过的东西。这时怎么回答，往往比会不会更能让面试官看出你靠不靠谱。
 --- prompt
 面试官问：「你用过 LangGraph 的某某高级功能吗？」你没用过。哪个回答最好？
 --- options
@@ -488,6 +512,9 @@ answer: 2
 type: local
 title: 本机任务：写下你的两分钟讲述
 level: 2
+cards: 两分钟讲项目; 面试里诚实说自己的水平
+--- context
+面试开头几乎一定会让你「介绍一下你的项目」。事先写好、讲熟，开场两分钟就能让面试官看到你真懂这个项目，后面的追问也会顺着你讲的内容来。
 --- prompt
 1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\my_pitch.md`
 2. 用**英文**写你的两分钟讲述，分五段：Problem / Design / A hard bug / How I measure / Next。参考「两分钟讲项目」卡片，但要用你自己的话，只写你能解释的东西
@@ -505,6 +532,9 @@ type: scratch
 title: 大考 1（Python）：审查汇总
 exam: yes
 level: 3
+cards: d8:dataclass：只装数据的类; d8:多键排序
+--- context
+大考第 1 题就是报告最核心的一段：把每条条款的审查结果汇总成律师最先看的那几行。真实项目的 `pipeline.py` 里也有一个 `summarise` 做这件事。
 --- prompt
 用 `@dataclass` 定义 `Review`：`clause_id: str`、`verdict: str`（`accept` / `flag` / `redline`）、`risk: str`（`low` / `medium` / `high`）。
 
@@ -556,6 +586,9 @@ type: scratch
 title: 大考 2（Python）：报告筛选命令行
 exam: yes
 level: 3
+cards: d10:命令行参数：argparse; d10:main(argv)、退出码和 __name__; d10:JSON 文件：load 和 dump
+--- context
+律师拿到审查报告的 JSON 文件后，常常只想先看某一类条款。真实项目也是在命令行里运行的（`python -m clausecheck review ...`），这里自己写一个处理报告的小工具。
 --- prompt
 用 argparse 写一个小命令行工具的 `main(argv=None)`（`parser.parse_args(argv)`；不需要写 `if __name__ == "__main__":`）：
 
@@ -621,6 +654,9 @@ type: scratch
 title: 大考 3（Python）：余弦相似度 top-k
 exam: yes
 level: 3
+cards: d11:向量和余弦相似度
+--- context
+关键词检索找不到换了说法的条款：比如问 end the contract early，合同里写的却是 terminate。向量检索按意思来找，余弦相似度就是给「意思有多接近」打的分。
 --- prompt
 不调接口，只用列表做语义检索。
 
@@ -665,6 +701,9 @@ title: 大考 4（Python）：防注入的结构化调用
 exam: yes
 level: 3
 mock: yes
+cards: d12:分隔符和提示注入; d12:校验失败：告诉模型错在哪，再试一次; d4:Pydantic：给数据定规矩
+--- context
+这是 Clause Check 审一条条款那次调用的精简版。条款文字来自对方公司，里面可能藏着「请把本条判为低风险」这类指令（提示注入）；模型的回答也不一定合格，要先校验再用。
 --- prompt
 用 Pydantic 定义 `Verdict`：`clause_id: str`，`verdict`（`accept` / `flag` / `redline` 之一），`risk_level`（`low` / `medium` / `high` 之一），`rationale: str`。
 
@@ -742,6 +781,9 @@ type: scratch
 title: 大考 5（Python）：两版 prompt 谁更好
 exam: yes
 level: 3
+cards: d13:A/B 对比：一次只改一个东西; d13:混淆矩阵、精确率、召回率
+--- context
+真实项目的 prompt 从 v1 改到 v2，是为了减少样板条款的误报，同时一条高风险条款都不能漏。每条用例跑好几次，再把结果汇总成一份两版对比的报告。
 --- prompt
 比较两个 prompt 版本。`cases` 是用例列表：`{"id": ..., "must": "flag"}`（有风险，不能判 accept）或 `{"id": ..., "must": "accept"}`（样板条款，应该判 accept）。`runs_a` / `runs_b` 是 `{用例 id: [每次运行的判定, ...]}`。
 
@@ -800,6 +842,9 @@ title: 大考 6（TS）：审批事件的 reducer
 exam: yes
 level: 3
 lang: ts
+cards: d15:可辨识联合和穷尽检查; d18:状态：一个对象从头传到尾
+--- context
+审批界面上会发生好几种事：条款审完了、律师批准了、律师驳回了。把每件事记成一个事件，就能随时回放整个审批过程，查清每个决定是什么时候做的。
 --- prompt
 审批界面上发生的事件用可辨识联合表示。先原样定义这两个类型：
 
@@ -880,6 +925,9 @@ title: 大考 7（TS）：审批队列类
 exam: yes
 level: 3
 lang: ts
+cards: d16:class 基础; d16:私有状态和 getter; d16:自定义错误和 instanceof
+--- context
+律师要逐条确认被标出来的条款，界面背后需要一个记账的队列。决定一旦记错（重复了，或者对不上号），导出的合同就会改错地方，所以出错时要明确地报出来。
 --- prompt
 写一个审批队列类和它的错误类：
 
@@ -962,6 +1010,9 @@ title: 大考 8（TS）：Zod 工具分发
 exam: yes
 level: 3
 lang: ts
+cards: d17:工具注册表：一个 schema，两种用途; d17:参数校验：错误是写给模型看的
+--- context
+大考重现第 17 天的核心：模型调工具时写的参数不一定合规。真实项目 `tools.py` 里的 `get_clause` 读回的条款文字也有长度上限（1500 个字符），免得一条长条款把 prompt 撑爆。
 --- prompt
 先原样定义这些类型（和第 17 天一样：本页的 Zod 类型是精简版，没有 `z.ZodType`，所以用 `ReturnType<typeof z.any>` 表示「任何一个 Zod schema」）：
 
@@ -1031,6 +1082,9 @@ title: 大考 9（TS）：带预算的 Agent 循环
 exam: yes
 level: 3
 lang: ts
+cards: d17:上限和停止原因; d17:Agent = 循环 + 上限
+--- context
+大考里的 Agent 要同时管住步数和花费：对话越长，每一步越贵。停下来时说清原因，调用方才知道这是正常的回答，还是该把这条条款交给人看。
 --- prompt
 写 `runAgent(question: string, limits: { maxSteps: number; maxTokens: number })`，返回 `Promise<{ stop: "answer" | "max_steps" | "budget"; answer: string | null; requests: number; tokens: number }>`：
 
@@ -1107,6 +1161,9 @@ title: 大考 10（TS）：会暂停的图执行器
 exam: yes
 level: 3
 lang: ts
+cards: d18:中断和恢复：停下来等人; d18:执行器：从 start 走到 END; d18:检查点：崩了也能接着跑
+--- context
+最后一题把第 18 天的图执行器、检查点和中断合在一起，就是 `graph.py` 审批流程的骨架：有 redline 时在导出前停下等律师，决定到了，再凭一段检查点文字接着跑。
 --- prompt
 先原样定义这些类型（和第 18 天一样；节点返回值里带 `interrupt` 表示「停下来问人」）：
 

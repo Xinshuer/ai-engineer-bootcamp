@@ -24,7 +24,7 @@ title: Agent 图：model ⇄ tools
 
 `create_agent` 返回的图，节点也叫 `model` 和 `tools`。只需要一个标准的工具循环时，用它就够了；自己搭的好处是能在中间插入自己的节点（审批、记日志、预算检查）。
 
-模型一定要关掉思考：`extra_body={"thinking": {"type": "disabled"}}`。第 30 天讲过：思考模式下带 `tools` 的请求，之前每条 assistant 消息的 `reasoning_content` 都必须传回去，否则 DeepSeek 返回 400；ChatDeepSeek 不会传回，所以思考开着时，这张图第二次调模型就是 400。关掉还更快、少付输出 token。
+模型一定要关掉思考：`extra_body={"thinking": {"type": "disabled"}}`。第 30 天讲过：思考模式下带 `tools` 的请求，之前每条 assistant 消息的 `reasoning_content` 都必须传回去，否则 DeepSeek 返回 400；ChatDeepSeek 不会传回，所以思考开着时，这张图第二次调模型就违反了规定（本页的模拟服务器会回 400）。关掉还更快、少付输出 token。
 --- code
 from langchain_core.tools import tool
 from langchain_deepseek import ChatDeepSeek
@@ -377,6 +377,9 @@ print([m.content for m in kept])
 type: predict
 title: 复习：reducer 和消息
 level: 1
+cards: d32:MessagesState 和 add_messages; d32:State 和 reducer
+--- context
+审查图里常常既有聊天记录，又有自己的键：一份记录走过哪些节点的日志、一个最终判定。先复习这几种键各自怎么合并。
 --- prompt
 复习第 32 天。写出输出。`State` 在 `MessagesState` 的基础上加了两个键：`log` 用 `operator.add` 合并，`verdict` 没有 reducer。注意节点返回的是元组，`add_messages` 会把它变成什么。
 --- code
@@ -412,6 +415,9 @@ print(out["log"], out["verdict"])
 type: predict
 title: tools_condition 看哪条
 level: 1
+cards: Agent 图：model ⇄ tools; ToolNode：错误也是消息
+--- context
+审查代理里，模型每说完一句，程序都要决定下一步去哪儿；模型也可能一次就要查两条规则（比如付款和责任上限）。这段代码把这两个零件单独拿出来看。
 --- prompt
 写出输出。前两行是路由函数 `tools_condition` 的返回值；后面把一条带**两个** tool_calls 的 AIMessage 交给 ToolNode。
 --- code
@@ -445,6 +451,9 @@ for m in out["messages"][1:]:
 type: fill
 title: 填空：搭 Agent 图
 level: 1
+cards: Agent 图：model ⇄ tools
+--- context
+这是审查代理的骨架：模型读条款，需要时调 `lookup_playbook` 这样的工具查公司的审查规则，拿到结果再接着判断，直到给出结论。第 17 天你手写过同样的循环。
 --- prompt
 补全 `build_agent(model, tools)`：`model` 节点调用绑了工具的模型，`tools` 节点执行工具，模型之后按有没有 tool_calls 分路，工具之后回到模型。
 --- template
@@ -488,6 +497,9 @@ expect("模型调了 2 次", lambda: (_run(), len(MOCK.calls))[1], 2)
 type: code
 title: 带 system prompt 的代理
 level: 2
+cards: Agent 图：model ⇄ tools; d32:MessagesState 和 add_messages
+--- context
+system prompt 是写给模型的「身份和规矩」，比如「你是合同审查员，按公司的审查规则判断」。审查代理每次调模型都要带着它，而同一段对话可能要聊很多轮。
 --- prompt
 写 `build_agent(model, tools, system_prompt)`，和上一题一样的 Agent 图，另外：
 
@@ -559,6 +571,9 @@ expect("get_clause 的参数", lambda: _run("Use get_clause to read clause 12.")
 type: fix
 title: 修 bug：一个工具出错，整份审查崩掉
 level: 2
+cards: ToolNode：错误也是消息
+--- context
+真实项目的 `tools.py` 有一条规矩：工具参数不对时，把错误写成消息交还给模型让它改正，而不是让程序崩掉。今天把同样的想法用到 LangGraph 的工具节点上。
 --- prompt
 审查代理用 `lookup_playbook` 查规则。playbook 里没有的 topic（比如管辖法律）会让工具抛 `KeyError`，整个图跟着崩，这份合同前面的审查全白做。
 
@@ -653,6 +668,9 @@ expect_raises("lookup_playbook 本身没改：没规则时还是抛 KeyError", l
 type: choice
 title: 没设 recursion_limit
 level: 2
+cards: recursion_limit：给循环一个上限
+--- context
+代理上线后，最怕模型一直要求调工具、停不下来，每一轮都要调一次模型。事先要清楚：框架会不会替你兜底。
 --- prompt
 你用本页的 LangGraph 版本（1.2）写了 Agent 图，调用时没有传 `recursion_limit`。某次模型一直调工具，不肯给出最终回答。会发生什么？
 --- options
@@ -668,6 +686,9 @@ answer: 2
 type: code
 title: 给代理加上限
 level: 2
+cards: recursion_limit：给循环一个上限
+--- context
+审查代理会放进服务里，用户提交问题后等着拿结果。模型转圈停不下来时，要给用户一句明确的说明，而不是让整个请求出错。练习里问题带 `[loop]` 就模拟这种转圈。
 --- prompt
 写 `ask(app, question, limit=10)`：
 
@@ -727,6 +748,9 @@ expect("默认上限是 10：调 5 次模型", lambda: _calls(lambda: ask(APP, "
 type: code
 title: 按 thread 记住对话
 level: 2
+cards: Checkpointer 和 thread_id
+--- context
+律师审同一份合同时会连续追问：先问 8.1，再问 9.2，第二个问题要结合上一轮才答得对。每份合同（或每个客户）一段独立的对话，互相不串。
 --- prompt
 补全两处：
 
@@ -808,6 +832,9 @@ expect("InMemorySaver 跟着图对象走：重新 build 的图不记得", _new_a
 type: fix
 title: 修 bug：thread_id 放错了地方
 level: 1
+cards: Checkpointer 和 thread_id
+--- context
+每个客户一段独立的聊天，Acme 的对话不能串到别的客户那里。这次程序直接报错了，报错信息就是最好的线索。
 --- prompt
 每个客户一个 thread，`ask(customer, text)` 在客户自己的 thread 上聊天。这段代码是从一个 TypeScript 项目改过来的。运行测试，读报错信息，修好 `ask`。
 --- starter
@@ -872,6 +899,9 @@ expect("不同客户互不相干", _separate, 1)
 type: predict
 title: 停在 export 前的状态
 level: 2
+cards: 改状态：update_state 和时间旅行; 看状态：get_state 和历史
+--- context
+审查结果导出之前，先停下来等律师确认（真实的 `graph.py` 也在导出前停下等批准，只是用了明天要学的另一种写法）。这段代码看停下时的状态和历史记录。
 --- prompt
 写出输出。图编译时用了 `interrupt_before=["export"]`。注意第一次 `invoke` 的返回值里有没有 `__interrupt__`，以及历史的顺序。
 --- code
@@ -908,6 +938,9 @@ print(len(list(app.get_state_history(cfg))))
 type: code
 title: 律师改判再导出
 level: 2
+cards: 改状态：update_state 和时间旅行; 看状态：get_state 和历史
+--- context
+模型把一条条款判成 redline，律师看了觉得标成 flag（提醒注意）就够了。系统要让律师改掉结论再导出，前面的审查不用重做。
 --- prompt
 图（`build()` 已写好）审完一条款后停在 `export` 前，等律师确认。写 `correct_and_export(app, cfg, verdict=None)`：
 
@@ -1003,6 +1036,9 @@ expect("没改判就不调用 update_state", lambda: _sources(None), ["loop", "l
 type: code
 title: 时间旅行：只重跑导出
 level: 3
+cards: 改状态：update_state 和时间旅行; 看状态：get_state 和历史
+--- context
+报告的格式常常要改（比如客户想换一种排版），审查结论却没变。每重审一次都要再调模型、再花钱，所以只想让导出那一步重跑。
 --- prompt
 报告模板改了（`TEMPLATE["text"]`），要重新导出，但**不想重新审查**：`review` 在真实项目里要调模型、要花钱（这里用 `CALLS` 计数）。
 
@@ -1122,6 +1158,9 @@ expect_raises("没有这个节点", lambda: rerun_from(*_setup("r4"), "approve")
 type: order
 title: 排代码：两个「进程」
 level: 2
+cards: SqliteSaver：进程退出也不丢
+--- context
+程序审完合同停下等批准，律师可能第二天才来点「同意」，那时原来的程序早就退出了。真实的 `graph.py` 把检查点存进 `data/checkpoints.sqlite`，另一个进程用同一个 `thread_id` 接着跑。
 --- prompt
 排出 `pause_then_resume(build, path, thread_id, clause)`：删掉旧的检查点文件；第一个 `with` 里审查到 export 前停下；第二个 `with`（像另一个进程）从文件里接着跑完。返回 `(first, final)`。`build(saver)` 返回一个带 `interrupt_before=["export"]` 的编译好的图。有两行干扰项。
 --- lines
@@ -1172,6 +1211,9 @@ expect("每次都从空文件开始：上一次的 report 不会混进来", lamb
 type: code
 title: 哪些合同在等律师
 level: 3
+cards: SqliteSaver：进程退出也不丢; 看状态：get_state 和历史
+--- context
+律所后台要有一个「待批准」列表，律师一打开就知道今天要处理哪几份合同。真实的 `graph.py` 里也有一个函数，从另一个进程查看某个停下的 thread。
 --- prompt
 所有合同的检查点都在同一个 SQLite 文件里，每份合同一个 thread。后台页面要列出「哪些合同停在 export 前、等律师批准」。
 
@@ -1250,6 +1292,9 @@ expect("空文件", _empty, [])
 type: choice
 title: 记在哪里
 level: 2
+cards: 长期记忆：Store; Checkpointer 和 thread_id
+--- context
+律师在审查中说的话，下一次审查可能还用得上。记在哪一层，决定了代理下次能不能想起来。
 --- prompt
 Acme 的律师在一次审查里说：「我们接受 24 个月的责任上限」。下周审 Acme 的**另一份**合同（新的 thread）时，代理也应该知道这件事。存在哪里最合适？
 --- options
@@ -1265,6 +1310,9 @@ checkpointer 按 thread 存，新合同是新 thread，上一段对话看不到�
 type: code
 title: 按客户读偏好
 level: 2
+cards: 长期记忆：Store
+--- context
+每个客户的底线不一样：Acme 能接受 24 个月的责任上限，别的客户不一定。审查时要用上当前这个客户自己的说法，而不是一律按通用规则判。
 --- prompt
 写两处：
 
@@ -1361,6 +1409,9 @@ expect("同一个 key 再存会覆盖", _overwrite, ["net 60", 1])
 type: fix
 title: 修 bug：裁剪后 API 报 400
 level: 3
+cards: 长期记忆：Store; d32:MessagesState 和 add_messages
+--- context
+聊天记录会一直变长，而每次请求都按 token（模型按它计费）收钱，所以只把最近几条发给模型是常见做法。裁剪只影响发出去的内容，状态里的完整历史还在。
 --- prompt
 为了省 token，`call_model` 只把最后几条消息发给模型。短对话没问题，但一段调用过工具的长对话一裁剪，DeepSeek（这里是 mock）就返回 400。
 
@@ -1432,6 +1483,9 @@ expect("只裁发给模型的，state 里的历史一条不少", lambda: len(app
 type: testwrite
 title: 写测试：继续还是停
 level: 2
+cards: Agent 图：model ⇄ tools; recursion_limit：给循环一个上限
+--- context
+模型查了一轮又一轮规则、迟迟不下结论时，与其等到总步数用完再报错，不如早点转去一个收尾的节点。这种路由函数不用搭图，直接构造几条消息就能测。
 --- prompt
 被测函数 `should_continue(state, max_rounds=3)` 是一个自己写的路由函数，用来替代 `tools_condition`，多了一个「工具轮数」上限：
 
@@ -1567,6 +1621,9 @@ def test_earlier_plain_answers_are_not_rounds():
 type: local
 title: 本机任务（选做）：看真实的检查点文件
 level: 2
+cards: SqliteSaver：进程退出也不丢; Checkpointer 和 thread_id
+--- context
+真实项目的图模式把检查点写进 `data/checkpoints.sqlite`。亲眼看一下这个文件，就明白律师隔天批准时，程序凭什么能接着跑。`--mode mock` 不调模型，不花钱。
 --- prompt
 在真实项目里跑一次 LangGraph 版本的审查，然后直接查 SQLite 文件，看每个 thread 存了多少个检查点（免费：`--mode mock` 不调模型）。在 PowerShell 里：
 
@@ -1591,6 +1648,9 @@ type: scratch
 title: 闭卷：有上限、不怕工具出错的代理
 exam: yes
 level: 3
+cards: Agent 图：model ⇄ tools; ToolNode：错误也是消息; recursion_limit：给循环一个上限
+--- context
+把今天的几块拼成一个能上线的审查代理：会查规则，工具出错不崩，转圈时按上限停下，并交代查过哪些工具，方便人接手。
 --- prompt
 写 `review_agent(question, tools, limit=10)`，搭一个审查代理并运行一次：
 
@@ -1657,6 +1717,9 @@ type: scratch
 title: 闭卷：导出前让律师改判
 exam: yes
 level: 3
+cards: 改状态：update_state 和时间旅行; Checkpointer 和 thread_id
+--- context
+一份合同审完后停在导出前，律师逐条看模型的结论，改掉不同意的几条再导出。律师给的编号可能写错，结果里不能因此多出不存在的条款。
 --- prompt
 写 `review_and_correct(clauses, corrections)`：
 
@@ -1711,6 +1774,9 @@ type: scratch
 title: 闭卷：记得客户的助手
 exam: yes
 level: 3
+cards: 长期记忆：Store; Checkpointer 和 thread_id
+--- context
+给律师用的问答助手：同一段对话里记得前面聊过什么（短期记忆），换一段对话也记得这个客户的长期笔记（长期记忆）。
 --- prompt
 写两个函数：
 

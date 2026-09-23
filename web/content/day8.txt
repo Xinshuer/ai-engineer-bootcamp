@@ -253,6 +253,9 @@ except TypeError as e:
 type: code
 title: 复习：按风险计数
 level: 1
+cards: d2:计数的标准写法; 字典进阶：推导式、Counter、defaultdict
+--- context
+报告汇总里有一行「高风险几条、低风险几条」，律师靠这几个数估计这份合同要花多少时间看。
 --- prompt
 先热身，复习第 2 天的计数写法。写 `count_by_risk(reviews)`：`reviews` 是字典列表，每个字典有 `"risk"` 键。返回每种风险出现的次数。
 
@@ -284,6 +287,9 @@ expect("空列表", lambda: count_by_risk([]), {})
 type: predict
 title: 复习：sorted 和 key
 level: 1
+cards: d2:排序和 while; 多键排序
+--- context
+报告要把高风险条款排在最前面，可程序别的地方还在用原来那份按合同顺序排的列表。
 --- prompt
 写出输出。注意最后一行：`sorted` 有没有改动原来的列表？
 --- code
@@ -305,6 +311,9 @@ print(reviews[0]["id"])
 type: predict
 title: 拆包、enumerate 和 zip
 level: 1
+cards: 元组和拆包; enumerate 和 zip
+--- context
+条款编号和模型的判定常常分别装在两个列表里，要按位置一一对上；报告里还要显示「第几条」。
 --- prompt
 写出输出。特别注意两个列表长度不一样时 `zip` 怎么处理。
 --- code
@@ -325,6 +334,9 @@ print(dict(zip(ids, verdicts)))
 type: code
 title: 返回两个值
 level: 1
+cards: 元组和拆包
+--- context
+模型给的判定要先检查合不合法。只知道「不合法」不够，还要说清原因：原因可以写进报告，也可以回传给模型让它改正。
 --- prompt
 写 `check_verdict(verdict)`：
 
@@ -365,6 +377,9 @@ expect("可以拆包", _unpack, True)
 type: code
 title: 带序号的清单
 level: 1
+cards: enumerate 和 zip
+--- context
+律师把待看清单打印出来开会，大家会说「看第 3 条」，所以每行前面要有序号。真实项目 `pipeline.py` 显示「第几条 / 共几条」的审查进度，也是同样的写法。
 --- prompt
 律师想要一份带序号的清单。写 `numbered(ids)`：返回字符串列表，每项是 `"序号. 编号"`，序号从 1 开始。
 
@@ -390,6 +405,9 @@ expect("空", lambda: numbered([]), [])
 type: code
 title: 两个列表配成字典
 level: 2
+cards: enumerate 和 zip; d3:raise：主动报错
+--- context
+假设模型一次审了一批条款，按顺序返回一串判定。只要少了一条，后面的编号和判定就全错了位，报告会把 flag 安到别的条款头上，而且没人发现。
 --- prompt
 模型按顺序返回了一串判定，要和条款编号一一配对。写 `verdict_map(ids, verdicts)`，返回 `{编号: 判定}`。
 
@@ -424,6 +442,9 @@ expect("错误信息", _message, "length mismatch: 1 ids, 2 verdicts")
 type: predict
 title: 集合运算
 level: 2
+cards: 集合 set
+--- context
+模型的回答会列出它依据的 playbook 规则编号（真实项目里的 `rule_ids`），同一条可能写好几遍。审查时要拿它和这类条款该依据的规则对照。
 --- prompt
 写出输出。每个集合都用 `sorted` 变成了排好序的列表，所以输出顺序是确定的。
 --- code
@@ -443,6 +464,9 @@ print(type({}).__name__)
 type: code
 title: 漏掉了哪些规则
 level: 2
+cards: 集合 set
+--- context
+模型判一条责任条款，却没引用 playbook 里管责任上限的规则，说明它可能没查规则就下了结论。找出漏掉的规则，报告就能提醒律师复核这一条。
 --- prompt
 playbook 要求这类条款必须依据某些规则（`required`），模型的回答引用了一些规则（`cited`）。两个都是列表，可能有重复。
 
@@ -468,6 +492,9 @@ expect("required 里有重复", lambda: missing_rules(["PB-02", "PB-02"], []), [
 type: choice
 title: 元组、列表、集合还是字典
 level: 1
+cards: 集合 set; 元组和拆包; d2:字典：用名字找值
+--- context
+写代码前先选对装数据的容器，后面的代码会简单很多。下面四个场景都是审合同时会碰到的数据。
 --- prompt
 下面四个场景，哪一个最适合用**集合**？
 --- options
@@ -483,6 +510,9 @@ answer: 3
 type: fill
 title: 填空：字典推导式
 level: 1
+cards: 字典进阶：推导式、Counter、defaultdict; enumerate 和 zip
+--- context
+报告的「待处理」部分只列需要人看的条款，律师按编号查到它的判定。
 --- prompt
 补全 `attention_map(ids, verdicts)`：用 `zip` 把编号和判定配对，只保留不是 `accept` 的，返回 `{编号: 判定}`。
 
@@ -501,6 +531,9 @@ expect("全部 accept", lambda: attention_map(["3.1"], ["accept"]), {})
 type: code
 title: 用 defaultdict 分组
 level: 2
+cards: 字典进阶：推导式、Counter、defaultdict
+--- context
+律师喜欢按主题看合同：付款的条款放一起，责任的条款放一起。主题来自模型判定时给出的 `topic`（真实项目 `models.py` 里的 `Topic`）。
 --- prompt
 用 `defaultdict(list)` 重写第 2 天的分组。写 `group_by_topic(reviews)`：返回 `{主题: [编号, ...]}`，编号保持原顺序。
 
@@ -545,6 +578,9 @@ expect("空", lambda: group_by_topic([]), {})
 type: code
 title: 问题最多的主题
 level: 2
+cards: 字典进阶：推导式、Counter、defaultdict
+--- context
+一份合同审完，律师想先知道问题集中在哪几类，比如「责任上限有 2 条要处理」，谈判时就从这几类开始谈。
 --- prompt
 写 `top_topics(reviews, n)`：只看判定**不是** `accept` 的条款，统计每个主题出现几次，返回次数最多的前 `n` 个 `(主题, 次数)` 组成的列表。次数相同的，先出现的排前面（`Counter.most_common` 本来就是这样）。
 
@@ -583,6 +619,9 @@ expect("全是 accept", lambda: top_topics([DATA[0]], 3), [])
 type: code
 title: 有没有、是不是都
 level: 2
+cards: any 和 all
+--- context
+假设报告开头有两个是非题：这份合同有没有要改写的条款？模型给的判定是不是全都合法？只要有一条判定不合法，这份报告就不能直接交给律师。
 --- prompt
 写两个函数，各用一个 `any` 或 `all`：
 
@@ -623,6 +662,9 @@ expect("空列表不算合法", lambda: all_valid([]), False)
 type: code
 title: 先看风险，再看编号
 level: 3
+cards: 多键排序; 元组和拆包
+--- context
+练习里「需要处理」清单这样排：律师从最危险的条款看起，同样危险的按合同里的先后看，翻合同时不用来回跳。
 --- prompt
 写两个函数：
 
@@ -667,6 +709,9 @@ expect("空", lambda: sort_reviews([]), [])
 type: code
 title: Clause dataclass
 level: 2
+cards: dataclass：只装数据的类
+--- context
+每条条款要带着编号、正文、风险、标签走完整条流水线。用一个类把它们装在一起，比到处传字典更不容易拼错键名。真实项目的配置 `Settings`（`config.py`）也是这种写法。
 --- prompt
 用 `@dataclass` 定义 `Clause`，字段依次是：
 
@@ -713,6 +758,9 @@ expect("自动生成的打印格式", lambda: repr(Clause("8.1", "x")), "Clause(
 type: fix
 title: 修 bug：可变默认参数
 level: 2
+cards: dataclass：只装数据的类; d2:函数：默认参数和提前 return
+--- context
+审查时要给每条条款打上主题标签（payment、liability_cap……），报告按标签分组。标签一旦串到别的条款上，律师看到的分组就是错的。
 --- prompt
 `add_tag(tag, tags)` 把标签加进列表并返回。只调用一次看不出问题，**连续调用**就不对了。先运行，看输出的第二行，再看测试里「再调用一次」得到了什么，然后修好它。
 --- starter
@@ -743,6 +791,9 @@ expect("传入已有列表就往里加", lambda: add_tag("b", ["a"]), ["a", "b"]
 type: fix
 title: 修 bug：列表默认值
 level: 2
+cards: dataclass：只装数据的类; d1:读报错：从最后一行往上看
+--- context
+`Review` 记录一条条款的审查结果，以及它引用了哪些规则。这个类一加载就出错，整个程序都跑不起来。
 --- prompt
 这段代码一运行就报错，连测试都跑不到。读最后一行错误信息：Python 其实已经告诉你该怎么改了。
 --- starter
@@ -784,6 +835,9 @@ expect("每个对象各有一份", _two, [["PB-03"], []])
 type: choice
 title: dataclass 或 Pydantic
 level: 2
+cards: dataclass：只装数据的类; d4:Pydantic：给数据定规矩
+--- context
+读真实项目会发现两种写数据类的方式并存。能说清为什么各用各的，是面试里「讲讲你的设计」的好素材。
 --- prompt
 Clause Check 里，程序内部的配置 `Settings` 是一个 `@dataclass`（`config.py`），而模型返回的判定 `ClauseVerdict` 用的是 Pydantic（`models.py`）。模型输出为什么不用 dataclass？
 --- options
@@ -799,6 +853,9 @@ dataclass 只是替你写 `__init__`，类型标注在运行时不检查（第 3
 type: order
 title: 排代码：dataclass
 level: 2
+cards: dataclass：只装数据的类; 多键排序
+--- context
+练习里假设每条审查结果带一个风险分数，分数越高越危险。交给律师的清单要把最危险的放在最前面。
 --- prompt
 排出程序：定义 `Review` dataclass（`clause_id` 字符串、`risk_score` 整数），再写 `riskiest_first(reviews)`：按 `risk_score` **从大到小**，分数相同按 `clause_id` **从小到大**，返回编号列表。有两行干扰项。
 --- lines
@@ -825,6 +882,9 @@ expect("空", lambda: riskiest_first([]), [])
 type: choice
 title: 读懂星号参数
 level: 2
+cards: *args、**kwargs 和只能按名字传的参数
+--- context
+读真实项目时会碰到带星号的参数，比如 `run_evals.py` 里的 `Settings(**kw)`。先弄清一个函数能接受哪些调用写法。
 --- prompt
 读下面的代码。哪个调用会报 `TypeError`？
 --- code
@@ -846,6 +906,9 @@ type: scratch
 title: 闭卷：审查汇总
 exam: yes
 level: 3
+cards: 字典进阶：推导式、Counter、defaultdict; 多键排序
+--- context
+真实项目 `pipeline.py` 里 `summarise` 的简化版：所有条款审完后，生成报告开头给律师看的那一段汇总。
 --- prompt
 写 `summarise(reviews)`。`reviews` 是字典列表，每个字典有 `"id"`（如 `"8.1"`）、`"verdict"`（`accept` / `flag` / `redline`）、`"risk"`（`high` / `medium` / `low`）。返回：
 
@@ -891,6 +954,9 @@ type: scratch
 title: 闭卷：Rule dataclass
 exam: yes
 level: 2
+cards: dataclass：只装数据的类; any 和 all
+--- context
+playbook 里每条规则都带着一组关键词。真实项目不调模型的规则版审查（mock 模式）就是看条款里出现了哪些关键词，来猜这条条款属于哪个主题。
 --- prompt
 用 `@dataclass` 写 `Rule`，字段依次是：`id`（字符串）、`topic`（字符串）、`keywords`（字符串列表，默认空列表，每个对象各有一份）。
 
@@ -926,6 +992,9 @@ type: scratch
 title: 闭卷：规则变更
 exam: yes
 level: 2
+cards: 集合 set
+--- context
+客户的审查规则会改版，真实的 `playbook.json` 里就记着版本日期。改版后要把规则的变化列出来，律师据此决定哪些已经审过的合同要重新看。
 --- prompt
 playbook 改版了。写 `diff_rules(before, after)`：两个参数都是规则编号列表（可能有重复）。返回：
 

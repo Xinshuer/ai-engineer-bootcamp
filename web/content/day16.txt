@@ -346,6 +346,9 @@ console.log("constructor" in plain, new Map<string, number>().has("constructor")
 type: code
 title: 复习：可辨识联合
 level: 2
+cards: d15:可辨识联合和穷尽检查
+--- context
+审一条条款时，模型可能先调几次工具，最后才给出回答，中途也可能出错。Clause Check 的 `review.py` 就是这样一步步处理 `Step` 的；最后要从这一串步骤里拿到能写进报告的结果。
 --- prompt
 复习第 15 天。`Step` 是模型一次回复的三种可能（和 `review.py` 里的 `Step.stop` 一样）。写 `finalText(steps)`，按顺序看每一步：
 
@@ -394,6 +397,9 @@ expect("空", () => finalText([]), "(no answer)");
 type: code
 title: Counter 类
 level: 1
+cards: class 基础
+--- context
+报告的汇总要数每种判定各有几条，评测也要数哪种失败最常见。Python 有现成的 `Counter`，TypeScript 没有，那就自己写一个小类。
 --- prompt
 写 `class Counter`：
 
@@ -452,6 +458,9 @@ expect("每个对象各自计数", () => { const a = new Counter(); a.add("x"); 
 type: translate
 title: 翻译：Playbook 类
 level: 2
+cards: 私有状态和 getter; class 基础
+--- context
+`playbook.py` 里的 `Playbook` 类把客户的审查规则按主题分好组，`lookup_playbook` 工具就靠它按主题查规则。把它翻成 TypeScript，以后用 TypeScript 写 Agent 时就用得上。
 --- prompt
 把 `clausecheck/playbook.py` 里的 `Playbook`（去掉了 `load`）翻译成 TypeScript。对应关系：
 
@@ -542,6 +551,9 @@ expect("返回的是副本", () => { pb.forTopic("liability_cap").push(RULES[1])
 type: predict
 title: getter 与私有字段
 level: 2
+cards: 私有状态和 getter; static 和工厂方法
+--- context
+调模型要花钱，所以要给 token 设一个预算；客户端里还存着 API 密钥。这两样东西，都不该让类外面的代码随便读写。
 --- prompt
 写出输出。注意 `#` 字段和 `private` 字段在运行时的区别。
 --- code
@@ -579,6 +591,9 @@ console.log(JSON.stringify(new Client()));
 type: code
 title: TokenBudget
 level: 2
+cards: 私有状态和 getter; 自定义错误和 instanceof
+--- context
+审一份很长的合同可能要调几十次模型。给每份合同设一个 token 上限，免得一份奇怪的合同把一个月的预算烧光；已经用了多少，也不能被别处的代码偷偷改掉。
 --- prompt
 写 `class TokenBudget`（错误类 `BudgetExceededError` 已经写好，后面「自定义错误」那张卡片会细讲）：
 
@@ -659,6 +674,9 @@ expect("内部字段不外露", () => JSON.stringify(new TokenBudget(5)), '{"lim
 type: fix
 title: 丢掉的 this
 level: 2
+cards: class 基础
+--- context
+`Counter` 能一个一个地加，可报告汇总时更常见的是一次交进一整批判定，所以同事给它加了一个批量添加的方法。
 --- prompt
 运行测试：`addAll` 报了一个 TypeError，而类型检查一声不吭。读报错，想想 `this` 为什么是 undefined，然后修好 `addAll`（只需要改一行）。
 --- starter
@@ -696,6 +714,9 @@ expect("addAll 之后还能 add", () => { const c = new Counter(); c.addAll(["x"
 type: code
 title: static fromJSON
 level: 3
+cards: static 和工厂方法; d15:unknown 和类型守卫; 自定义错误和 instanceof
+--- context
+playbook 是人手写的 JSON 文件，写错在所难免。在门口就拦下坏数据、说清错在第几条，比审到一半才冒出怪错好查得多。真实项目的 `Playbook.load` 也是先校验、再创建对象。
 --- prompt
 给 `Playbook` 写工厂方法 `static fromJSON(raw: unknown): Playbook`（`PlaybookError` 已经写好）：
 
@@ -796,6 +817,9 @@ expect("重复 id", () => errorOf({ rules: [{ id: "PB-01", topic: "x" }, { id: "
 type: code
 title: 错误类层级
 level: 2
+cards: 自定义错误和 instanceof
+--- context
+调模型接口失败的原因不同，该做的事也不同：被限流了就等一等再试，密钥错了重试多少次都没用，得让人去改配置。调用方要能分清是哪一种。
 --- prompt
 为 DeepSeek 接口的失败设计错误类（每个都要设置 `name`）。`ApiError` 已经写好，你来写：
 
@@ -860,6 +884,9 @@ expect("500 → 普通 ApiError", () => { const e = errorFor(500, "boom"); retur
 type: fix
 title: 忘了 super
 level: 2
+cards: 自定义错误和 instanceof; class 基础
+--- context
+被限流时，服务器常常会告诉你多少秒以后再试。把这个秒数存进错误对象里，负责重试的代码就知道该等多久。
 --- prompt
 运行一下，类型检查报了两个错。读懂它们，修好 `RateLimitError`：它的 message 是 `"rate limited, retry after 5 s"` 这样（5 是 `retryAfterSeconds`），status 固定是 429。
 --- starter
@@ -900,6 +927,9 @@ expect("还是 ApiError", () => new RateLimitError(30) instanceof ApiError, true
 type: predict
 title: instanceof 的顺序
 level: 2
+cards: 自定义错误和 instanceof
+--- context
+处理错误的函数要把各种失败翻译成一句给人看的说明，写进日志，或者显示给律师看。
 --- prompt
 写出输出。注意 `label` 里几个 if 的顺序。
 --- code
@@ -941,6 +971,9 @@ RateLimitError 也是 ApiError（也是 Error），所以第一个 if 就命中�
 type: code
 title: 只重试限流
 level: 3
+cards: 自定义错误和 instanceof; d15:泛型：类型的参数
+--- context
+审一份合同要连续调很多次模型，中途被限流一次就让整份合同失败，太可惜。可也不是每种失败都值得再试一次。
 --- prompt
 写 `withRetry(fn, tries)`：调用 async 函数 `fn`，成功就返回结果。
 
@@ -1044,6 +1077,9 @@ expectAsync("第一次就成功", async () => {
 type: choice
 title: throw 还是 Result
 level: 2
+cards: Result：失败也是一种返回值
+--- context
+Clause Check 从启动到审完一份合同，会碰到各种各样的失败。团队要约定：哪些失败用 throw 抛出去，哪些当成普通的返回值交回来。
 --- prompt
 下面哪种情况最适合返回 `Result`（`{ ok: false, error }`），而不是 throw？
 --- options
@@ -1059,6 +1095,9 @@ answer: 2
 type: code
 title: safeParseVerdict
 level: 2
+cards: Result：失败也是一种返回值; d6:Zod：TypeScript 的 Pydantic
+--- context
+模型交回一段 JSON 判定，可能是坏 JSON，也可能某个字段不合格。把失败原因原样交给调用方，调用方再决定是让模型重答，还是交给人看。
 --- prompt
 写 `safeParseVerdict(raw): Result<Verdict>`，任何情况都不 throw：
 
@@ -1121,6 +1160,9 @@ expect("用 ok 收窄后读 value", () => { const r = safeParseVerdict('{"clause
 type: order
 title: 排代码：分拣 Result
 level: 2
+cards: Result：失败也是一种返回值; d15:可辨识联合和穷尽检查
+--- context
+逐条审完一批条款，手里是一串结果，有的成功，有的失败。报告要把成功的判定放进正文，失败的原因单独列出来给人看。
 --- prompt
 排出 `collectResults`：把一组 Result 分成成功的值和错误信息两堆，各自保持原顺序。有两行干扰项，想想它们为什么过不了类型检查。
 --- lines
@@ -1152,6 +1194,9 @@ expect("空", () => collectResults([]), { values: [], errors: [] });
 type: code
 title: 注入 fetch 的客户端
 level: 3
+cards: 依赖注入：把外部世界传进来; Result：失败也是一种返回值; d6:fetch：TypeScript 里的 requests.post
+--- context
+这是 TypeScript 版的模型客户端，只管发请求、收回答。真请求要花钱，结果也不固定，所以联网这件事要能换成假的。真实项目 `review.py` 的审查循环也只认一个传进来的后端对象。
 --- prompt
 写 `DeepSeekClient` 的 `review(clauseText)` 方法，返回 `Promise<Result<string>>`：
 
@@ -1241,6 +1286,9 @@ expectAsync("不传 fetchFn：用全局 fetch（本页是模拟服务器）", as
 type: fill
 title: 填空：注入时钟的缓存
 level: 2
+cards: 依赖注入：把外部世界传进来; 私有状态和 getter
+--- context
+律师在网页上常常反复点开同一条条款，每次都重新调模型，又慢又费钱。先把审查结果记一阵子，过期了再重新审，免得规则改了还一直用旧结果。
 --- prompt
 补全一个带过期时间的缓存：同一段条款文字的审查结果，在 `ttlMs` 毫秒内不再重复调用模型。时钟从构造函数注入，测试用假时钟控制时间。当前时间**大于或等于** `expires` 就算过期。
 --- template
@@ -1278,6 +1326,9 @@ expect("没有的键", () => cache.get("Fees are due in 30 days."), undefined);
 type: choice
 title: 模块的依赖方向
 level: 2
+cards: 模块：一个文件一件事
+--- context
+代码已经拆成了几个文件，每个文件只管一件事。现在要加一个新函数，得决定它该放进哪个文件。
 --- prompt
 你把代码拆成了 `types.ts`（类型和错误类）、`client.ts`（DeepSeekClient，它 import 了 types.ts）、`main.ts`（组装）。现在想加一个函数 `defaultClient()`，它会 `new DeepSeekClient(process.env.DEEPSEEK_API_KEY ?? "")`。放在哪里最好？
 --- options
@@ -1293,6 +1344,9 @@ client.ts 已经 import 了 types.ts，如果 types.ts 再 import client.ts，�
 type: code
 title: RuleIndex（Map）
 level: 2
+cards: Map 和 Set; 私有状态和 getter
+--- context
+`lookup_playbook` 按主题查规则，报告里又要按编号找回某一条规则。规则表建好以后要查得快；两条规则要是用了同一个编号，报告里引用的到底是哪一条就说不清了。
 --- prompt
 写 `class RuleIndex`，内部用 `Map` 按 id 存规则：
 
@@ -1376,6 +1430,9 @@ expect("「constructor」也只是普通的键", () => new RuleIndex().find("con
 type: local
 title: 本机：拆成三个模块
 level: 2
+cards: 模块：一个文件一件事; 依赖注入：把外部世界传进来
+--- context
+网页里每题只有一个文件。这一步在自己电脑上把模型客户端真的拆成几个模块，用真的 DeepSeek 跑通一次，熟悉真实项目里多个文件互相配合的写法。
 --- prompt
 本页每题只有一个文件。今天在自己电脑上真的拆一次模块，并用真的 DeepSeek 跑通。
 
@@ -1406,6 +1463,9 @@ type: scratch
 title: 闭卷：限流器
 exam: yes
 level: 3
+cards: 私有状态和 getter; 依赖注入：把外部世界传进来
+--- context
+模型服务限制一段时间里能调用几次，超了就返回限流错误。与其等服务器拒绝，不如在自己这边先把发请求的速度控制好。
 --- prompt
 写 `class RateLimiter`：任意连续 `windowMs` 毫秒内最多允许 `max` 次调用。
 
@@ -1456,6 +1516,9 @@ type: scratch
 title: 闭卷：错误层级
 exam: yes
 level: 3
+cards: 自定义错误和 instanceof
+--- context
+程序出错时，律师看到的不该是一大段报错，而是一句能照着做的话：等几秒再试、去检查密钥，还是程序有 bug，得找开发者。
 --- prompt
 设计错误类并写一个处理函数：
 
@@ -1516,6 +1579,9 @@ type: scratch
 title: 闭卷：批量解析
 exam: yes
 level: 3
+cards: Result：失败也是一种返回值; d15:unknown 和类型守卫
+--- context
+一批条款审完，每条都交回一段 JSON 文字，其中几段可能是坏的。一条坏的不该拖垮整批：好的照常进报告，坏的要记下是第几条、坏在哪里，交给人去看。
 --- prompt
 模型对一批条款各返回了一段 JSON 文字。不用 Zod，写：
 

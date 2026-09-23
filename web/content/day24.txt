@@ -287,6 +287,9 @@ level: 2
 lang: sql
 dataset: clausecheck
 ordered: yes
+cards: d23:JOIN：把几张表连起来; d22:GROUP BY 和 HAVING
+--- context
+今天开始往数据库里写数据，先用前两天的查询热热身。redline 多的合同，谈判时最费劲，律师要优先安排人手。
 --- prompt
 复习第 22、23 天：找出 redline **至少 2 条**的合同。返回四列：`contract_id`、`title`、`customer`（客户名）、`redlines`（redline 条数），按 redlines 从多到少，同样多的按 contract_id 从小到大。
 --- solution
@@ -311,6 +314,9 @@ lang: sql
 dataset: clausecheck
 ordered: yes
 check: SELECT p.name, upper(p.type) AS type, (p."notnull" OR p.pk > 0) AS required, p.pk, p.dflt_value, (SELECT sql LIKE '%CHECK%severity%' AND sql LIKE '%''low''%' AND sql LIKE '%''medium''%' AND sql LIKE '%''high''%' FROM sqlite_master WHERE name = 'playbook_rules') AS has_check FROM pragma_table_info('playbook_rules') AS p ORDER BY p.cid
+cards: CREATE TABLE：给数据立规矩
+--- context
+项目的审查规则（playbook）现在存在一个 JSON 文件里，每条规则有编号（像 `PB-01`）、主题、标题和严重程度。放进数据库以后，别的表就能引用它，写错的值也能在进库时被拦下。
 --- prompt
 把 playbook 的规则也放进数据库。写一条 `CREATE TABLE playbook_rules`，列按这个顺序：
 
@@ -339,6 +345,9 @@ type: code
 title: 约束挡住坏数据
 level: 2
 dataset: clausecheck
+cards: CREATE TABLE：给数据立规矩
+--- context
+第 18 天的工作流会在导出改写之前停下来，等律师批准或驳回。这个决定要可靠地存下来，后面的步骤就靠它决定要不要真的去改合同。
 --- prompt
 第 18 天的工作流里，律师要批准或驳回每一条 redline。把决定存进表 `approvals`：在字符串 `SCHEMA` 里写建表语句，要求：
 
@@ -411,6 +420,9 @@ level: 2
 lang: sql
 dataset: clausecheck
 check: SELECT id, verdict, risk FROM reviews ORDER BY id
+cards: INSERT、UPDATE、DELETE：先 SELECT 再动手; d22:NULL：「不知道」
+--- context
+审查失败的条款没有判定。只按 flag、redline 挑待办的报表会把它们漏掉，这些条款就再也没人看了。批量改数据之前，也要先确认条件真的选中了想改的那几行。
 --- prompt
 失败的审查（`error` 不是 NULL）不能被当成「没问题」。团队规定：失败的行一律标成 `verdict = 'flag'`、`risk = 'high'`，让律师人工看。
 
@@ -437,6 +449,9 @@ level: 2
 lang: sql
 dataset: clausecheck
 check: SELECT c.id, c.title, COUNT(r.id) AS reviews FROM contracts AS c LEFT JOIN reviews AS r ON r.contract_id = c.id GROUP BY c.id, c.title ORDER BY c.id
+cards: INSERT、UPDATE、DELETE：先 SELECT 再动手; CREATE TABLE：给数据立规矩
+--- context
+有人做测试时把假合同写进了真库，它们会混进看板和账单，必须清掉。删除没有撤销键，一条真数据都不能误伤。
 --- prompt
 有人做测试时往库里插了几份假合同，标题都以 `TEST: ` 开头（注意有冒号和空格），它们还带着几条审查。写一个脚本（两条 DELETE）把这些**测试合同和它们的审查**都删掉，真实数据一行都不能动。
 
@@ -466,6 +481,9 @@ level: 2
 lang: sql
 dataset: clausecheck
 check: SELECT * FROM latest_verdicts ORDER BY contract_id, clause_id
+cards: UPSERT：重跑也不怕
+--- context
+worker（在后台审合同的程序）崩溃后，会把整份合同重跑一遍（第 17 天的幂等），同一个条款的结论会再写一次。律师手写的备注是人工劳动，重跑时不能把它冲掉。
 --- prompt
 `latest_verdicts` 保存每个条款最新的结论，主键是 `(contract_id, clause_id)`；`note` 是律师手写的备注。表里已经有 `(103, '8.1', 'redline', 1022, 'anna: ask for a 12-month cap')` 和 `(109, '3.1', 'accept', 1060, NULL)`。
 
@@ -507,6 +525,9 @@ type: predict
 title: fetchone 和 fetchall
 level: 1
 dataset: clausecheck
+cards: sqlite3：在 Python 里用数据库
+--- context
+后端代码从数据库读出结果后，还要接着取值、判断有没有查到。先弄清拿回来的东西长什么样，后面的代码才不会写错。
 --- prompt
 写出输出。注意：只有一列时，一行长什么样？没有行时 `fetchone()` 和 `fetchall()` 各返回什么？数据库里的 NULL 到了 Python 里是什么？
 --- code
@@ -529,6 +550,9 @@ type: code
 title: 一份合同的审查
 level: 2
 dataset: clausecheck
+cards: sqlite3：在 Python 里用数据库; 参数化查询和 SQL 注入
+--- context
+假设审查结果已经存进数据库：网页打开一份合同时，后端要取出这份合同的所有审查，交给前端显示。合同编号来自网页请求，用户可以随便改。
 --- prompt
 写 `reviews_for(conn, contract_id)`：返回这份合同的所有审查，**按 id 从小到大**，每行是一个字典，键是 `id`、`clause_id`、`verdict`、`risk`。合同不存在时返回 `[]`。
 
@@ -575,6 +599,9 @@ type: fix
 title: 修 bug：撇号和注入
 level: 2
 dataset: clausecheck
+cards: 参数化查询和 SQL 注入
+--- context
+客户名是用户在搜索框里输入的，可能带撇号（`O'Brien`），也可能是故意构造的恶意输入。这个函数直接连着数据库，一旦被骗，别的客户的数据就泄露了。
 --- prompt
 `customer_ids(conn, name)` 按客户名找 id（按 id 排序）。它有两个毛病：名字里有撇号（`O'Brien Legal`）就报错；有人输入 `x' OR '1'='1`，就拿到了所有客户的 id。
 
@@ -605,6 +632,9 @@ type: choice
 title: 列名能用 ? 吗
 level: 2
 dataset: clausecheck
+cards: 参数化查询和 SQL 注入
+--- context
+看板上的表格可以点列名排序，后端要按用户点的那一列去查数据库。列名同样来自用户，也得防注入。
 --- prompt
 下面的函数想按调用方给的列从大到小排序，于是把列名也写成了 `?`。`top_reviews(conn, "cost_usd")` 会怎样？
 --- code
@@ -627,6 +657,9 @@ type: fill
 title: 填空：命名参数
 level: 2
 dataset: clausecheck
+cards: 参数化查询和 SQL 注入; sqlite3：在 Python 里用数据库
+--- context
+律师想只看某份合同里某个风险等级的条款，默认看高风险。合同编号和风险等级都来自网页上的筛选条件。
 --- prompt
 补全 `risky_clauses(conn, contract_id, risk="high")`：用**命名参数**（`:名字`）查出这份合同里指定风险等级的条款，按 id 排序，返回字典列表，每个字典有 `clause_id` 和 `verdict`。
 
@@ -653,6 +686,9 @@ expect("没有匹配", lambda: risky_clauses(fresh_db(), 108), [])
 type: code
 title: 把一次调用记进表
 level: 2
+cards: sqlite3：在 Python 里用数据库; 参数化查询和 SQL 注入
+--- context
+第 13 天的追踪（trace）会记下每次模型调用用了哪个模型、多少 token、花了多久。现在把这些记录存进数据库，以后就能用 SQL 算费用、找慢调用。
 --- prompt
 每次调用大模型都记一行追踪数据（第 13 天的 span，这次存进数据库）。表结构在起始代码的 `SCHEMA` 里，`init_db(conn)` 负责建表。写 `log_call(conn, call)`：
 
@@ -745,6 +781,9 @@ type: order
 title: 排代码：主题统计
 level: 2
 dataset: clausecheck
+cards: 参数化查询和 SQL 注入; d22:GROUP BY 和 HAVING
+--- context
+报表页面让使用者自己设一个门槛，只看审查条数够多的主题，好知道合同里最常见的是哪几类条款。
 --- prompt
 排出 `topic_counts(conn, min_n)`：返回审查条数**至少** `min_n` 的主题，列表里是 `(topic, n)` 元组，按 n 从大到小、同样多的按 topic 字母顺序。SQL 被拆成了几段字符串（Python 会把挨着的字符串自动接起来），它们的顺序也要排对。有两行干扰项。
 --- lines
@@ -772,6 +811,9 @@ expect("门槛太高", lambda: topic_counts(fresh_db(), 13), [])
 type: testwrite
 title: 为 ORDER BY 白名单写测试
 level: 3
+cards: 参数化查询和 SQL 注入
+--- context
+列名没法用参数传，看板的排序只能靠白名单（只认几个事先写好的列名）把关。这段代码一旦放进坏值，别人就能把任意 SQL 塞进查询，所以值得用测试守住它。
 --- prompt
 看板要让用户选「按什么排序」。列名不能用 `?` 参数（前面的选择题），所以 `order_by(column, direction="desc")` 用白名单生成一段安全的 ORDER BY：
 
@@ -859,6 +901,9 @@ def test_bad_direction_rejected():
 type: fix
 title: 修 bug：留下了半批数据
 level: 3
+cards: 事务：要么全成，要么全不
+--- context
+律师在网页上一次提交一批反馈。如果写到一半出错，库里留下半批，看起来像是提交成功了，其实少了几条，谁也不会发现。
 --- prompt
 `insert_batch(conn, rows)` 把一批律师反馈写进 `feedback` 表，应该**要么全部写入，要么一条都不写**：
 
@@ -944,6 +989,9 @@ level: 2
 lang: sql
 dataset: clausecheck
 ordered: yes
+cards: JSON 列：json_extract 和 json_each
+--- context
+模型给出判定时，会写明依据的是 playbook 的哪几条规则，存在 `rule_ids` 列里。统计每条规则被用了多少次，能看出哪些规则最常起作用，哪些几乎用不上。
 --- prompt
 `reviews.rule_ids` 是 JSON 数组文字。统计每个规则 id 在所有审查里一共被引用了几次。返回两列：`rule_id`、`n`，按 n 从多到少，同样多的按 rule_id。
 
@@ -962,6 +1010,9 @@ ORDER BY n DESC, rule_id;
 type: choice
 title: JSON 列还是拆表
 level: 2
+cards: JSON 列：json_extract 和 json_each; CREATE TABLE：给数据立规矩
+--- context
+法务团队对规则引用提了几个新需求。数据一开始怎么存，决定了以后这些需求好不好做。
 --- prompt
 法务团队提了三个新需求：① 统计每条规则每个月被引用几次；② 保证审查里引用的规则 id 一定存在于 `playbook_rules` 表；③ 按规则 id 很快地查出所有相关审查。`rule_ids` 继续存成 JSON 文字，还是换一种存法？
 --- options
@@ -978,6 +1029,9 @@ type: choice
 title: pgvector 这句在做什么
 level: 2
 lang: sql
+cards: 生产环境：Postgres、pgvector 和索引
+--- context
+第 11 天的 RAG 用到了 embedding（一串代表文字意思的数字）。线上系统常把 playbook 片段和它们的 embedding 一起存进 Postgres，这种查询在面试里常被拿来问。
 --- prompt
 Clause Check 把 playbook 片段的 embedding 存进了 Postgres（pgvector）。`%s` 是 psycopg 的参数占位符，传进去的是用户问题的 embedding。下面这条查询在做什么？
 --- code
@@ -998,6 +1052,9 @@ answer: 1
 type: local
 title: 本机任务：打开项目里的数据库
 level: 2
+cards: sqlite3：在 Python 里用数据库; 生产环境：Postgres、pgvector 和索引
+--- context
+项目里的 LangGraph 流程每走一步都会存一个检查点，写在一个 SQLite 文件里；审查中途停下以后还能接着跑，靠的就是它。现在用自己学的 `sqlite3` 打开看看里面有什么。
 --- prompt
 项目里已经有一个真正的 SQLite 数据库：LangGraph 的检查点文件 `data/checkpoints.sqlite`（`clausecheck/graph.py` 里的 `SqliteSaver` 写的）。用今天学的 `sqlite3` **只读**打开它看看。
 
@@ -1035,6 +1092,9 @@ type: scratch
 title: 闭卷：批量保存最新结论
 exam: yes
 level: 3
+cards: UPSERT：重跑也不怕; 事务：要么全成，要么全不
+--- context
+每审完一份合同，worker 都要把所有条款的结论存进 `latest_verdicts`，报告和看板都从这张表读。
 --- prompt
 库里已经有这张表（测试会建好，你不用建）：
 
@@ -1116,6 +1176,9 @@ title: 闭卷：可选条件的搜索
 exam: yes
 level: 3
 dataset: clausecheck
+cards: 参数化查询和 SQL 注入; sqlite3：在 Python 里用数据库
+--- context
+看板上有一个搜索框，可以按主题、按风险等级筛选审查，也可以什么都不选。每个筛选值都来自用户的输入。
 --- prompt
 写 `search_reviews(conn, topic=None, risk=None, limit=20)`，在 `reviews` 表里搜索，返回审查 id 的列表（整数），按 id 从小到大，最多 `limit` 条：
 
@@ -1162,6 +1225,9 @@ level: 3
 lang: sql
 dataset: clausecheck
 check: SELECT rule_id, COUNT(*) AS n, MIN(review_id) AS first_review, (SELECT COUNT(*) FROM pragma_table_info('review_rules') WHERE pk > 0) AS pk_columns, (SELECT SUM("notnull") FROM pragma_table_info('review_rules')) AS required_columns, (SELECT COUNT(*) FROM pragma_foreign_key_list('review_rules') WHERE "table" = 'reviews' AND "from" = 'review_id') AS fk_to_reviews FROM review_rules GROUP BY rule_id ORDER BY rule_id
+cards: JSON 列：json_extract 和 json_each; CREATE TABLE：给数据立规矩
+--- context
+`reviews.rule_ids` 里的规则引用，要能被数据库检查、也要能按规则快速查到。这一题把已有的数据真正搬进一张新表。
 --- prompt
 把 `reviews.rule_ids`（JSON 数组文字）规范化成一张表。写一个脚本：
 

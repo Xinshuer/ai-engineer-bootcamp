@@ -294,6 +294,9 @@ for (const p of parts) {
 type: predict
 title: 复习：可辨识联合
 level: 1
+cards: d15:可辨识联合和穷尽检查; Agent = 循环 + 上限
+--- context
+今天要写的 Agent 每走一步，结果只有几种：调了一次工具、给出了回答、或者被上限拦下。用可辨识联合把每一步描述清楚，后面记录轨迹、显示给律师看都要用到它。
 --- prompt
 复习第 15 天。Agent 的每一步可以用一个可辨识联合来描述。写出输出。
 --- code
@@ -329,6 +332,9 @@ console.log(describe({ kind: "stopped", reason: "budget" }));
 type: code
 title: 复习：参数必须是对象
 level: 1
+cards: 参数校验：错误是写给模型看的; d16:Result：失败也是一种返回值
+--- context
+模型要调工具时，参数是它自己写的一段 JSON 文字，可能写坏，也可能不是工具要的形状。这是进工具之前的第一道检查：查出问题要变成一句错误说明，而不是让整个审查崩掉。
 --- prompt
 复习第 16 天的 `Result`。工具参数必须是一个 JSON **对象**。写 `parseJsonObject(text)`：
 
@@ -372,6 +378,9 @@ expect("字符串不算", () => parseJsonObject('"payment"'), { ok: false, error
 type: code
 title: 从 Zod 生成工具定义
 level: 2
+cards: 工具注册表：一个 schema，两种用途
+--- context
+模型要先知道有哪些工具、每个工具要什么参数，才会去调用，这些说明每次请求都随 `tools` 一起发过去。参数规则已经用 Zod 写了一份，从它生成给模型看的说明，就不用手写第二份，两边也不会对不上。
 --- prompt
 写 `toolSpec(tool)`，返回发给 API 的工具对象：
 
@@ -426,6 +435,9 @@ expect("没有 $schema", () => "$schema" in toolSpec(GET_CLAUSE).function.parame
 type: choice
 title: 限制写在哪里
 level: 1
+cards: 工具注册表：一个 schema，两种用途; 参数校验：错误是写给模型看的
+--- context
+`lookup_playbook` 按主题查客户的审查规则。模型有时会编一个 playbook 里没有的主题名，这时查不到规则，给出的判定就没有依据。
 --- prompt
 `lookup_playbook` 的参数 `topic` 只能是 playbook 里的 11 个主题之一。这个限制放在哪里最好？
 --- options
@@ -441,6 +453,9 @@ description 和 prompt 是给模型的「建议」，模型可能不听；schema
 type: fill
 title: 填空：注册表
 level: 1
+cards: 工具注册表：一个 schema，两种用途; d16:Map 和 Set
+--- context
+Agent 收到的工具调用里只有一个工具名。注册表就是「名字 → 工具」的一张表：程序启动时建好，循环里每次按名字去找。模型偶尔会写一个不存在的工具名。
 --- prompt
 填空，完成 `buildRegistry`（名字重复就 throw）和 `findTool`（找不到时返回一段列出可用工具的错误文字，模型看到就知道该用哪个名字）。
 --- template
@@ -481,6 +496,9 @@ expectThrows("名字重复", () => buildRegistry([mk("get_clause"), mk("get_clau
 type: predict
 title: 模型看到的参数说明
 level: 2
+cards: 工具注册表：一个 schema，两种用途
+--- context
+你用 Zod 写的参数规则，发给模型之前会变成一段 JSON Schema。模型决定怎么填参数时只看得到这一段，所以要知道你的写法最后变成了什么样子。
 --- prompt
 写出输出。注意 `.optional()` 的字段在不在 `required` 里，`.describe(...)` 变成了什么。
 --- code
@@ -502,6 +520,9 @@ console.log(Object.keys(schema.properties).length);
 type: code
 title: 解析并校验参数
 level: 2
+cards: 参数校验：错误是写给模型看的; 工具注册表：一个 schema，两种用途
+--- context
+模型写的参数可能缺字段、类型不对。真实项目的 `tools.py` 也是先校验再执行：出错时回给模型一句带字段名的说明，它下一步通常会自己改对。
 --- prompt
 写 `parseArgs(tool, text)`，返回 `Result<any>`：
 
@@ -509,7 +530,7 @@ level: 2
 - `tool.schema.safeParse` 失败：取第一个 issue，`{ ok: false, error: "INVALID_ARGS: " + 路径 + ": " + message }`，路径用 `issue.path.join(".")`
 - 成功：`{ ok: true, value: r.data }`
 
-注意返回 `r.data` 而不是原始对象：Zod 会补上默认值（下面 `max_chars` 默认 1500，和 `tools.py` 里的 `MAX_CLAUSE_CHARS` 一样）。
+注意返回 `r.data` 而不是原始对象：Zod 会补上默认值（下面 `max_chars` 默认 1500，和 `tools.py` 里的 `MAX_CLAUSE_CHARS` 同一个数；真实的 `get_clause` 没有这个参数，直接用这个常量截断）。
 --- starter
 import { z } from "zod";
 
@@ -561,6 +582,9 @@ expect("类型不对", () => head(parseArgs(GET_CLAUSE, '{"clause_id": "12", "ma
 type: code
 title: 分发一次工具调用
 level: 2
+cards: 参数校验：错误是写给模型看的; 工具注册表：一个 schema，两种用途
+--- context
+这是 Agent 循环里「执行工具」的那一步：拿到模型的一次调用，找到工具、查过参数、真正去做。以后改合同、发邮件的工具也走这里，参数不对还照样执行的话，后果可能收不回来。
 --- prompt
 写 `dispatch(registry, call)`（async），返回 `ToolResult`：
 
@@ -660,6 +684,9 @@ expectAsync("参数不合法：不执行工具", async () => {
 type: code
 title: 有上限的 Agent 循环
 level: 3
+cards: Agent = 循环 + 上限; 上限和停止原因
+--- context
+把前面几题的零件装成一个完整的 Agent：审一条条款时，模型可以先调 `lookup_playbook` 查规则，再给判定。真实项目 `review.py` 的循环默认最多 6 步；没有上限的话，模型一直调工具，每一步都在花钱。
 --- prompt
 写 `runAgent(question, registry, maxSteps = 4)`，返回 `RunResult`：
 
@@ -815,6 +842,9 @@ expectAsync("[loop]：请求 3 次后停下", async () => {
 type: fix
 title: 修 bug：少了一条消息
 level: 2
+cards: Agent = 循环 + 上限; d4:工具调用：模型说「帮我查一下」
+--- context
+Agent 的第一次请求总是好的，问题常常出在第二次：前面的对话要按接口的规矩带上，请求才会被接受。这类 bug 在工具循环里非常常见，面试的找 bug 题也爱考。
 --- prompt
 这个循环一到第二次请求就出错。DeepSeek / OpenAI 接口规定：每条 `tool` 消息前面，必须有那条带 `tool_calls` 的 assistant 消息（模型要知道「我刚才调了什么」），否则返回 400。本页的模拟服务器也按这个规矩检查，所以代码拿到的是 400 的错误回答，读 `choices[0]` 时就崩了。运行测试，看第二次请求的角色顺序，修好它。
 --- starter
@@ -878,6 +908,9 @@ expectAsync("assistant 消息里带着 tool_calls", async () => {
 type: fix
 title: 修 bug：多请求了一次
 level: 2
+cards: 上限和停止原因; Agent = 循环 + 上限
+--- context
+步数上限不只是防死循环，也是账单的上限：每多请求一次模型，就多付一次钱。上线后发现账单对不上，是这类问题最常见的暴露方式。
 --- prompt
 上线后发现：设置 `maxSteps = 3` 的条款，账单上每条都有 4 次请求。用 `[loop]` 让模型停不下来，运行测试，找到多出来的那一次并修好。
 --- starter
@@ -944,6 +977,9 @@ expectAsync("正常回答不受影响", () => agent("Is unlimited liability acce
 type: order
 title: 排代码：循环的主体
 level: 2
+cards: Agent = 循环 + 上限
+--- context
+这十来行就是 Agent 的心脏。真实项目 `review.py` 审每一条条款，用的是同样形状的循环；面试让你手写一个 Agent，写的也是它。
 --- prompt
 排出 `agentLoop`。`callModel(messages)`（发请求并返回解析后的回答）和 `dispatch(call)`（执行一个工具，返回文字）已经写好。有两行干扰项。
 --- lines
@@ -991,6 +1027,9 @@ expectAsync("消息顺序", async () => {
 type: translate
 title: 翻译：轨迹摘要
 level: 2
+cards: 轨迹：每一步都记下来
+--- context
+律师问「8.1 为什么被 flag」时，要能看到模型调了哪些工具。真实项目的报告表格里有一列 `tools`，把每条条款的工具调用缩成 `get_clause:12` 这样的短标签，一眼就能看完。
 --- prompt
 把下面的 Python 翻译成 TypeScript 的 `summarizeTrace(trace)`。它把轨迹变成 Clause Check 报告里 `tools` 那一列的标签（简化版）：成功的调用是 `工具名:clause_id`（没有就用 topic，都没有就只写工具名），失败的是 `工具名:INVALID_ARGS`。
 
@@ -1054,6 +1093,9 @@ expect("clause_id 优先于 topic", () => summarizeTrace([{ tool: "get_clause", 
 type: local
 title: 本机任务：看真实项目的工具轨迹
 level: 2
+cards: 轨迹：每一步都记下来; Agent = 循环 + 上限
+--- context
+前面在网页里写的轨迹，真实项目里也有。用免费的 mock 模式（规则审查器代替模型）跑一遍示例合同，看每条条款调了哪些工具，把今天的代码和真实的输出对上。
 --- prompt
 在真实项目里看一次轨迹。在 PowerShell 里运行（mock 模式不调模型、不花钱）：
 
@@ -1078,6 +1120,9 @@ verify: lookup_playbook:\w+[\s\S]*get_clause:\d
 type: code
 title: 预算上限 + 轨迹
 level: 3
+cards: 上限和停止原因; 轨迹：每一步都记下来
+--- context
+对话越长，每次请求越贵，光限制步数管不住花费，token（模型按它计费）也要有上限。真实项目的 `ReviewTrace` 同样记下步数、token 数和停止原因，事后才能查清一条条款花了多少、为什么停。
 --- prompt
 在上一版循环上加两样东西。写 `runAgent(question, registry, limits)`，返回 `RunResult`：
 
@@ -1250,6 +1295,9 @@ expectAsync("[loop] + 预算上限：第 3 步超预算，不再执行工具", a
 type: code
 title: 审批关卡
 level: 3
+cards: 人在回路：危险的工具要人批准
+--- context
+查规则、读条款是只读的，调错了也无所谓；发修订邮件、改合同就有后果了。真实项目里 `propose_redline` 只是记下一个提议，真正把修改写进导出文件之前，要等人拍板。
 --- prompt
 写 `gatedDispatch(registry, call, approve)`：和 `dispatch` 一样，但多一道关：
 
@@ -1386,6 +1434,9 @@ expectAsync("坏参数不打扰人", async () => {
 type: choice
 title: 谁来批准
 level: 2
+cards: 人在回路：危险的工具要人批准
+--- context
+发给客户的修订邮件必须先经律师同意。同事嫌审批弹窗麻烦，想了一个「看起来也能用」的捷径。
 --- prompt
 同事想省事：给 `send_redline_email` 的 schema 加了一个参数 `approved: z.boolean()`，description 里写「只有用户明确同意时才传 true」，代码里 `if (args.approved) send()`。问题在哪？
 --- options
@@ -1401,6 +1452,9 @@ answer: 2
 type: code
 title: 只发一次的发件箱
 level: 2
+cards: 幂等：重试不能发两封邮件; d16:私有状态和 getter
+--- context
+同一个动作可能被执行不止一次：模型重复调用、出错后整步重试、从检查点恢复。查规则多做一次没关系，给客户发修订邮件却会发出两封，很不专业。
 --- prompt
 写 `Outbox` 类，让发送变成幂等的：
 
@@ -1466,6 +1520,9 @@ expect("失败后重试能发出去", () => flaky.send("12", "redline_email"), "
 type: choice
 title: 对照 Mastra
 level: 2
+cards: 对照框架：Mastra 和 LangGraph; 工具注册表：一个 schema，两种用途
+--- context
+面试官常问「你用过 Mastra 吗」。今天手写的零件在框架里都有现成的对应，能说清一一对应的关系，就说明你知道框架在替你做什么。
 --- prompt
 Mastra 里定义工具和 Agent 的写法（示意）：
 
@@ -1489,6 +1546,9 @@ type: scratch
 title: 闭卷：工具分发
 exam: yes
 level: 3
+cards: 参数校验：错误是写给模型看的; 工具注册表：一个 schema，两种用途
+--- context
+闭卷写 Agent 里执行工具的那一步。审一份合同要调几十次工具，任何一次出问题都只能影响这一次调用，不能让整份合同的审查崩掉。
 --- prompt
 写 `dispatch(registry, call)`（async）。先原样定义这些类型：
 
@@ -1562,6 +1622,9 @@ type: scratch
 title: 闭卷：有上限的循环
 exam: yes
 level: 3
+cards: Agent = 循环 + 上限; 上限和停止原因
+--- context
+闭卷写一个有步数上限的 Agent 循环：审条款时模型可以先查 playbook 规则再回答。面试里「手写一个 Agent」考的就是它，停不下来的循环会一直花钱。
 --- prompt
 写 `agent(question: string, maxSteps: number)`，返回 `Promise<{ reason: "answer" | "max_steps"; answer: string | null; steps: number }>`。
 
@@ -1623,6 +1686,9 @@ type: scratch
 title: 闭卷：审批 + 幂等
 exam: yes
 level: 3
+cards: 幂等：重试不能发两封邮件; 人在回路：危险的工具要人批准
+--- context
+闭卷把今天的两道安全关合在一起：有后果的动作（比如给客户发某条条款的修订）要先经律师同意，同一个动作重试时也不能做第二次。
 --- prompt
 写 `ActionRunner` 类：
 

@@ -132,7 +132,7 @@ title: bind_tools 和 tool_calls
 - 执行：`工具.invoke(call)`，把**整个** call 传进去，得到一条 `ToolMessage`，`tool_call_id` 自动对上
 - 下一次请求的 messages：……、那条 AIMessage、每个调用各一条 ToolMessage。少一条或者 id 对不上，真接口会返回 400（第 17 天的规则），本页的模拟服务器也一样
 
-**思考模式和工具**：DeepSeek 的文档写明，思考模式下带 `tools` 的请求，之前每一条 assistant 消息的思考内容（`reasoning_content`）都必须在后面的请求里传回去，否则返回 400。ChatDeepSeek 不会把它传回去（本页用的 langchain-deepseek 1.1 是这样，以后的版本可能会改），所以思考开着的工具循环，第二次请求就是 400（本页的模拟服务器也一样，例子最后演示）。做工具循环和 Agent 时关掉思考：能跑、更快、也更便宜。`with_structured_output` 发的也是 tools，同样关掉：它只有一次请求，暂时碰不到这个 400，但以后改成多轮就会踩到，而且思考按输出价收钱。
+**思考模式和工具**：DeepSeek 的文档写明，思考模式下带 `tools` 的请求，之前每一条 assistant 消息的思考内容（`reasoning_content`）都必须在后面的请求里传回去，否则返回 400。ChatDeepSeek 不会把它传回去（本页用的 langchain-deepseek 1.1 是这样，以后的版本可能会改），所以思考开着的工具循环，第二次请求就违反了这条规定。2026-09 实测真接口暂时没有拒绝，但文档写明了，接口随时可能开始检查；本页的模拟服务器按文档执行，会返回 400（例子最后演示）。做工具循环和 Agent 时关掉思考：能跑、更快、也更便宜。`with_structured_output` 发的也是 tools，同样关掉：它只有一次请求，暂时碰不到这个 400，但以后改成多轮就会踩到，而且思考按输出价收钱。
 --- code
 import openai
 from langchain_core.messages import HumanMessage
@@ -324,7 +324,7 @@ DeepSeek 当前的价格（2026 年 9 月官方价格页，美元 / 百万 token
 
 - `input_tokens` **已经包括**命中缓存的部分，所以没命中的 = input − cache_read
 - 思考的 token 算在 `output_tokens` 里，按**输出价**收费。一次审查思考几百个 token，比回答本身贵好几倍，这就是分类、审查要关掉思考的原因
-- 价格变得很快：写进配置，报数字之前先看官方价格页（项目 `config.py` 里记的还是停用前 deepseek-chat 的价格）
+- 价格变得很快：写进配置，报数字之前先看官方价格页（项目 `config.py` 的 `PRICES` 记的是 2026-09 的高峰价，DeepSeek 调价以后要跟着改）
 --- code
 from langchain_deepseek import ChatDeepSeek
 
@@ -355,6 +355,9 @@ show("off + cache ", off)     # 同样的开头再来一次：命中缓存
 type: code
 title: 复习：一条审查链
 level: 1
+cards: d29:LCEL：用 | 串成一条链; d29:ChatPromptTemplate
+--- context
+今天要给审查链加上结构化输出和工具。先复习昨天的写法，把一条最基本的审查链搭起来，后面的题都在它的基础上改。
 --- prompt
 复习第 29 天。写模板 `PROMPT` 和 `build_review_chain(model)`：
 
@@ -399,6 +402,9 @@ expect("模型收到的消息", lambda: (build_review_chain(RunnableLambda(spy))
 type: predict
 title: 模型收到了什么工具
 level: 2
+cards: with_structured_output：直接拿到对象
+--- context
+昨天的链拿回的是一段文字，还得自己解析。Clause Check 要的是字段固定的判定对象；读这段代码，看清 LangChain 为了拿到这样的对象，实际往请求里放了什么。
 --- prompt
 写出输出。`with_structured_output` 把 Pydantic 类变成了一个工具，并强制模型调用它。模拟模型会按条款内容填字段（含 `twenty-four` 的判 medium），不认识的字符串字段填 `"mock 字段名"`。
 --- code
@@ -427,6 +433,9 @@ print(type(result).__name__, result.risk_level, "|", result.reason)
 type: code
 title: 审查一条条款，拿到对象
 level: 2
+cards: with_structured_output：直接拿到对象; d4:Pydantic：给数据定规矩
+--- context
+这是 Clause Check 审一条条款的核心一步，改用 LangChain 来写：直接拿回一个判定对象，后面的汇总和报告可以直接用它的字段，不用再自己解析 JSON。
 --- prompt
 写 `review_clause(model, clause_id, text)`，返回 `ClauseReview` 对象：
 
@@ -490,6 +499,9 @@ expect("模型抄错了编号：以我们的为准", _wrong_id, ["Schedule 2", "
 type: choice
 title: 坏参数时拿到什么
 level: 2
+cards: method、include_raw 和 None
+--- context
+模型偶尔会给出格式坏掉的回答。在写兜底代码之前，先得知道这种时候框架到底交回来什么。
 --- prompt
 模型这次给的工具参数是坏 JSON（`[bad-args]`）。`result` 是什么？
 --- code
@@ -508,6 +520,9 @@ answer: 2
 type: code
 title: 拿不到结果就交给人
 level: 2
+cards: method、include_raw 和 None; with_structured_output：直接拿到对象
+--- context
+一份合同几十条条款，总会有一条模型没答好。程序在这里崩掉，整份报告就出不来；当成通过，有风险的条款就漏过去了。`review.py` 的最后也有同样的一段兜底。
 --- prompt
 写 `safe_review(model, clause_id, text)`：
 
@@ -568,6 +583,9 @@ expect("编号以我们的为准", lambda: safe_review(MODEL, "A-7", "Fees are d
 type: code
 title: 用 @tool 定义工具
 level: 2
+cards: @tool：把函数变成工具; d12:工具定义：description 也是 prompt
+--- context
+Clause Check 的模型审条款时，会调用 `lookup_playbook` 去查公司的审查规则。这里用 LangChain 的写法重新定义这个工具；模型看不到函数里面的代码，只能看到它的名字、说明和参数。
 --- prompt
 用 `@tool` 写 `lookup_playbook(topic: str) -> str`：
 
@@ -616,6 +634,9 @@ expect("模型调用它", _with_model, "PB-01: Mutual cap at 12 months of fees; 
 type: fix
 title: 修 bug：工具没有说明
 level: 1
+cards: @tool：把函数变成工具
+--- context
+`get_clause` 让模型在条款里看到「见第 12 条」这类话时，能把那一条的原文取来一起看。同事用 LangChain 写这个工具，第一次运行就出错了。
 --- prompt
 同事写了一个工具，一运行就报错。读报错信息，修好它：模型看到的说明应该是 `Fetch another clause of the same contract by its number, e.g. '12'. Use it when the clause says 'subject to Section X'.`
 --- starter
@@ -652,6 +673,9 @@ expect("找不到", lambda: get_clause.invoke({"clause_id": "99"}), "No clause 9
 type: code
 title: 执行模型要的所有工具
 level: 3
+cards: bind_tools 和 tool_calls; 手写工具循环
+--- context
+模型一次可能要调好几个工具，比如先查规则、再取另一条条款。每个工具调用都得有一条回复，模型才能接着往下审；工具出了错也照样要告诉它，而不是让整个审查崩掉。
 --- prompt
 写 `run_tools(ai_message, tools)`，返回 ToolMessage 列表，下一次请求要把它们放在 `ai_message` 后面：
 
@@ -727,6 +751,9 @@ expect("坏参数：回一条 INVALID_ARGS，下一次请求不再 400", _bad_ar
 type: fix
 title: 修 bug：id 对不上
 level: 2
+cards: bind_tools 和 tool_calls
+--- context
+模型要查规则，程序执行完工具，再把结果送回去，模型才能给出最终判定。这段代码工具执行成功了，可结果送回去时服务器却不认。
 --- prompt
 这段代码执行了工具，再请求时却收到 400。运行，读服务器的错误信息：它说哪个 `tool_call_id` 找不到？模型的调用 id 又是什么？修好它。
 --- starter
@@ -784,6 +811,9 @@ expect("tool 消息的 tool_call_id 是这次调用的 id（call_1），不是�
 type: testwrite
 title: 写测试：run_tools
 level: 3
+cards: bind_tools 和 tool_calls; d9:怎么想测试用例
+--- context
+`run_tools` 稍有差错，模型就会收不到某个工具的结果，或者把一个工具的结果当成另一个的，整个审查就会跑偏或中断。这里用手工造的消息来测它，不需要联网。
 --- prompt
 被测函数是第 8 题的 `run_tools`。写测试（`def test_...():` 里用 `assert`），要求在正确的函数上全部通过，同时抓住几个藏起来的有 bug 的版本。
 
@@ -954,6 +984,9 @@ def test_unknown_tool():
 type: code
 title: 有上限的工具循环
 level: 3
+cards: 手写工具循环; d17:Agent = 循环 + 上限
+--- context
+这就是 `review.py` 审一条条款时跑的那种循环：模型要工具就替它执行，给出答案就结束。模型有时会没完没了地要工具，程序不能跟着它一直转下去。
 --- prompt
 写 `run_agent(question, max_steps=4)`，返回字典 `{"answer": ..., "steps": ..., "called": [...]}`：
 
@@ -1056,6 +1089,9 @@ expect("[bad-args]：错误回给模型，而不是返回空回答", lambda: _ru
 type: predict
 title: SDK 替你重试了几次
 level: 2
+cards: 容错：重试和备用模型
+--- context
+上线以后，模型服务偶尔会限流或出故障。先看清楚：在你还没写任何重试代码的时候，底层的 SDK（官方提供的调用工具包）遇到这些错误会怎么做。
 --- prompt
 写出输出。`MOCK.fail_next(状态码, n)` 让模拟服务器接下来 n 次返回这个错误；`MOCK.sleeps` 记录 SDK 每次重试前的等待（只看个数）。`ChatDeepSeek` 的 `max_retries` 没设，用的是 openai SDK 的默认值。
 --- code
@@ -1083,16 +1119,19 @@ except openai.APIStatusError as e:
 
 MOCK.reset()
 try:
-    ChatDeepSeek(model="deepseek-chat").invoke("hi")
+    ChatDeepSeek(model="gpt-4o").invoke("hi")
 except openai.BadRequestError as e:
     print("400 | requests:", len(MOCK.calls))
 --- explain
-默认再试 2 次，所以连着两次 429 以后第三次成功（3 个请求、等了 2 次）；连着三次 503 就用完了，抛 `InternalServerError`（`APIStatusError` 的子类）。`max_retries=0` 一次都不重试。400 说明请求本身写错了（这里是已经停用的模型名），重试多少次都一样，所以 SDK 不重试。自己再在外面包一层重试之前，先想想 SDK 已经试了几次：两层叠起来，一次故障可能变成 9 个请求。
+默认再试 2 次，所以连着两次 429 以后第三次成功（3 个请求、等了 2 次）；连着三次 503 就用完了，抛 `InternalServerError`（`APIStatusError` 的子类）。`max_retries=0` 一次都不重试。400 说明请求本身写错了（这里是把别家的模型名 `gpt-4o` 发给了 DeepSeek），重试多少次都一样，所以 SDK 不重试。自己再在外面包一层重试之前，先想想 SDK 已经试了几次：两层叠起来，一次故障可能变成 9 个请求。
 
 @@ item d30-13
 type: code
 title: 给自己的步骤加重试
 level: 2
+cards: 容错：重试和备用模型
+--- context
+练习里假设审查规则放在一个单独的 playbook 服务上，它偶尔会连不上。网络抖一下就让一条条款审不成，太亏了；但如果是输入本身有问题，再试多少次也没用。
 --- prompt
 playbook 服务偶尔会连不上。写 `make_reliable(fn, attempts=3)`，返回 `RunnableLambda(fn)` 加上重试：
 
@@ -1138,6 +1177,9 @@ expect("attempts=1：不重试", lambda: _run(1, attempts=1), ["ConnectionError"
 type: order
 title: 排代码：备用模型
 level: 2
+cards: 容错：重试和备用模型
+--- context
+如果主力模型一直被限流或者服务出了故障，整份合同就审不下去了。练习里给它配一个备用模型，主力撑不住时顶上。
 --- prompt
 排出 `ask(question)`：先用 flash，它的 429 / 5xx 重试用完了就换 v4-pro；400 这种请求写错的错误不换模型；两个都失败时返回 `"FAILED: 状态码"`。有两行干扰项。
 --- lines
@@ -1173,6 +1215,9 @@ expect("400 是你的 bug：不换模型，直接报出来", lambda: _run(400, 1
 type: fill
 title: 填空：一批调用用了多少 token
 level: 1
+cards: 观测：回调; 成本：按用量算钱
+--- context
+审完一批条款，要知道这一批一共用了多少 token（模型按它计费），成本统计和告警都靠这个数。
 --- prompt
 填空：跑完一批输入，返回这批调用一共用了多少输入 token 和输出 token。
 --- template
@@ -1202,6 +1247,9 @@ expect("每次只算这一批（不会把上一批加进来）", lambda: batch_t
 type: code
 title: 自己写一个回调
 level: 3
+cards: 观测：回调
+--- context
+线上要知道每条条款调了几次模型、用了多少 token、出过几次错。真实项目在 `tracing.py` 里用 Langfuse（一个追踪平台）记这些；这里自己写一个最小的记录器。
 --- prompt
 写回调类 `CallLog(BaseCallbackHandler)`，统计经过它的模型调用：
 
@@ -1293,6 +1341,9 @@ expect("假模型不报用量：加 0", _fake, [1, 0])
 type: code
 title: 这次调用花了多少钱
 level: 2
+cards: 成本：按用量算钱
+--- context
+Clause Check 的报告摘要里有一项估算费用，面试也常被问「审一条要多少钱」。这个函数把一次调用的用量换算成美元。
 --- prompt
 写 `cost_of(usage, model="deepseek-flash", peak=True)`，按 `PRICES`（美元 / 百万 token，高峰时段）算一次调用的费用：
 
@@ -1343,6 +1394,9 @@ expect("真的一次调用（思考开着，思考按输出价算）", lambda: c
 type: choice
 title: 思考占了多少钱
 level: 2
+cards: 成本：按用量算钱
+--- context
+审一条条款的钱花在哪里，决定了该从哪里省。这道题拿一次审查的用量，自己估一估各部分大概占多少。
 --- prompt
 一次条款审查，思考模式开着，用 `deepseek-flash`、高峰价（命中缓存 0.006、没命中 0.30、输出 1.20 美元 / 百万 token）。用量：输入 2000 token（其中 1500 命中缓存），回答 60 token，思考 900 token。思考大约占这次费用的多少？
 --- options
@@ -1359,6 +1413,9 @@ type: scratch
 title: 闭卷：稳妥的结构化审查
 exam: yes
 level: 3
+cards: method、include_raw 和 None; 容错：重试和备用模型; with_structured_output：直接拿到对象
+--- context
+这是 LangChain 版「审一条条款」的完整写法。一份合同几十条条款，模型答坏了也好，服务一直出故障也好，都不能让这一条从报告里消失，更不能被当成通过。
 --- prompt
 定义 Pydantic 模型 `Verdict`，类的 docstring 是 `"Verdict for one contract clause."`，字段：`clause_id`（字符串）、`verdict`（只能是 `accept` / `flag` / `redline`）、`risk_level`（只能是 `low` / `medium` / `high`）、`rationale`（字符串）。
 
@@ -1413,6 +1470,9 @@ type: scratch
 title: 闭卷：查条款的工具循环
 exam: yes
 level: 3
+cards: 手写工具循环; @tool：把函数变成工具
+--- context
+条款里常写着「受第 12 条约束」这样的话，只看这一条会判错。这个小 Agent 让模型自己决定要不要去取别的条款，看完再回答。
 --- prompt
 `CLAUSES = {"12": "The limitations in Section 8 shall not apply to Customer.", "8.1": "Each party's liability is capped at the fees paid."}`
 
@@ -1466,6 +1526,9 @@ type: scratch
 title: 闭卷：一批审查花了多少钱
 exam: yes
 level: 3
+cards: 成本：按用量算钱; 观测：回调
+--- context
+审完一批条款，除了结果，还要知道这一批花了多少钱。Clause Check 的报告摘要里就有一项估算费用，面试里的「一个月多少钱」也从这里算起。
 --- prompt
 价格（美元 / 百万 token，高峰时段；低谷时段半价）：
 

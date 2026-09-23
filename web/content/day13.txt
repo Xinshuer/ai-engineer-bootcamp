@@ -277,6 +277,9 @@ for case_id in A:
 type: predict
 title: 复习：Counter、all 和 any
 level: 1
+cards: d8:字典进阶：推导式、Counter、defaultdict; d8:any 和 all; 跑 N 次，看通过率
+--- context
+同一条条款让模型审了 5 次，拿回 5 个判定。评测要从这串结果里看出：最常见的是哪个判定、几成是放行、是不是每次都一样。
 --- prompt
 写出输出。复习第 8 天的 `Counter` 和 `all` / `any`，想一想最后一行和 pass^k、pass@k 的关系。
 --- code
@@ -294,6 +297,9 @@ print(all(v == "accept" for v in verdicts), any(v == "accept" for v in verdicts)
 type: code
 title: 检查一条用例
 level: 2
+cards: 评测用例是数据，不是感觉
+--- context
+Clause Check 的评测用例写在 `evals/cases.json` 里，每条写明哪些答案算对，比如有风险的条款判 flag 或 redline 都行。检查结果不光要说过没过，还要说清错在哪一项，调 prompt 时才知道从哪下手。
 --- prompt
 写 `check_case(case, result)`，和 `harness.py` 的 `check()` 一样，返回**失败原因的列表**（空列表 = 通过）。按这个顺序检查：
 
@@ -340,6 +346,9 @@ type: code
 title: 一条用例的通过率
 level: 2
 mock: yes
+cards: 跑 N 次，看通过率
+--- context
+模型审同一条条款，这次对、下次错，只跑一次看不出来。项目的 `run_evals.py` 会把每条用例重复跑好几次，表里报的是通过率。本页模拟的模型对 AS IS 免责条款故意时判时放。
 --- prompt
 写 `pass_rate(case, runs, review=classify)`：
 
@@ -425,6 +434,9 @@ expect_raises("runs 是 0", lambda: pass_rate(UNLIMITED, 0), ValueError)
 type: code
 title: 混淆矩阵
 level: 2
+cards: 混淆矩阵、精确率、召回率
+--- context
+评测跑完，要把每条用例的结果归到四个格子里：该拦的拦住了没有，不该拦的有没有被误拦。律师最怕的是有风险的条款被放过去。
 --- prompt
 写 `confusion(cases, predictions)`：
 
@@ -476,6 +488,9 @@ expect("没有用例", lambda: confusion([], {}), {"TP": 0, "FP": 0, "FN": 0, "T
 type: code
 title: 精确率和召回率
 level: 2
+cards: 混淆矩阵、精确率、召回率
+--- context
+四个格子里的数还要变成两个比例，才能回答律师最关心的两件事：标出来的有多少是真问题，真有风险的抓住了多少。项目的 `run_evals.py` 要求高风险召回率至少 0.9。
 --- prompt
 写 `precision_recall(counts)`：`counts` 是上一题返回的字典。返回元组 `(precision, recall)`，两个数都用 `round(x, 2)`：
 
@@ -506,6 +521,9 @@ expect("分母都是 0", lambda: precision_recall({"TP": 0, "FP": 0, "FN": 0, "T
 type: choice
 title: 合同审查先看哪个数
 level: 2
+cards: 混淆矩阵、精确率、召回率
+--- context
+调 prompt 时，一个数变好，另一个数常常跟着变差，所以动手之前得先定下最看重哪一个。
 --- prompt
 律师说：「漏掉一条无限责任条款，客户可能损失几百万；多标一条，我花 30 秒看一眼。」你在调 Clause Check 时，最该先盯住哪个数？
 --- options
@@ -521,6 +539,9 @@ answer: 2
 type: testwrite
 title: 给 recall 写测试
 level: 3
+cards: 混淆矩阵、精确率、召回率; d9:怎么想测试用例; d9:测试报错和小数：raises、approx
+--- context
+召回率是评测里最要紧的数。要是算错了，报告会说「一条都没漏」，其实漏了好几条。写测试，就是要把几种容易算错的写法都揪出来。
 --- prompt
 给 `recall(results)` 写测试。`results` 是 `(真有风险吗, 标记了吗)` 元组的列表；召回率 = 抓住的风险条款数 ÷ 全部风险条款数；一条风险条款都没有时返回 `1.0`。
 
@@ -585,6 +606,9 @@ def test_no_risky_clauses():
 type: predict
 title: 装饰器什么时候运行
 level: 2
+cards: 函数是值：装饰器
+--- context
+Clause Check 的 `tracing.py` 用装饰器 `@observe` 给审查函数加上追踪：配好追踪平台的密钥后，每次调用都会记一笔。在自己写装饰器之前，先弄清它里面的每一行各是在什么时候运行的。
 --- prompt
 写出输出。注意 `decorating` 那一行是什么时候打印的。
 --- code
@@ -611,6 +635,9 @@ print(verdict("liability is unlimited"))
 type: code
 title: 数调用次数的装饰器
 level: 2
+cards: 函数是值：装饰器
+--- context
+评测时想知道模型到底被调用了几次：次数多一倍，花的钱就多一倍。不改原函数的一行代码，只在外面包一层来数，正是装饰器擅长的事。
 --- prompt
 写装饰器 `count_calls(fn)`：返回的包装函数每被调用一次，就把自己的属性 `calls` 加 1（从 0 开始），然后调用原函数并返回它的结果。用 `functools.wraps` 保留原函数的名字。
 
@@ -673,6 +700,9 @@ expect("两个函数各数各的", _separate, [2, 1])
 type: fix
 title: 修 bug：装了追踪就返回 None
 level: 2
+cards: 函数是值：装饰器
+--- context
+项目里的 `@observe` 套在审查函数外面，给整条流水线做追踪。追踪装饰器只该在旁边记账：加上它之后，程序的表现要和没加时一模一样，追踪记录也要对得上是哪个函数。
 --- prompt
 同事写了一个追踪装饰器 `traced`。加上以后，`review` 返回的全是 `None`，而且 `review.__name__` 变成了 `wrapper`（日志和追踪里全是 wrapper，没法查）。
 
@@ -732,6 +762,9 @@ expect("span 照样记了", lambda: SPANS[-1]["name"], "review")
 type: code
 title: 带假时钟的计时装饰器
 level: 3
+cards: 计时、假时钟、带参数的装饰器
+--- context
+要找出审一份合同时哪一步最慢，就得给每一步计时，每次计时记成一条 span。真时钟每次读数都不同，测试没法写死答案，所以时钟要能换成假的。
 --- prompt
 写**带参数**的装饰器 `timed(clock=time.perf_counter)`，用法：
 
@@ -822,6 +855,9 @@ expect("默认用真时钟，名字保留", _default, ["8", "section_of", True])
 type: order
 title: 排代码：出错也要记下的 span
 level: 2
+cards: with 和上下文管理器
+--- context
+有时要计时的不是整个函数，而是函数里的一小段，比如调用模型的那几行，这时用 `with` 包起来最方便。追踪最需要的恰恰是出错那次的记录，不能因为出错就漏记。
 --- prompt
 排出上下文管理器 `span(name, clock=time.perf_counter)`：`with` 里面的代码运行完（**包括出错**），都往 `SPANS` 里记一条 `{"name": ..., "ms": ...}`，错误照样往外抛。
 
@@ -867,6 +903,9 @@ expect("出错：照样记一条，错误照样抛出", _error, [{"name": "revie
 type: code
 title: span 树：谁套着谁
 level: 3
+cards: with 和上下文管理器; 计时、假时钟、带参数的装饰器
+--- context
+在 Langfuse（一个记录每次调用的追踪平台）里，审一条条款的记录是一棵树：外层是 `review_clause`，里面套着调模型、查 playbook 等步骤。有了父子关系，才看得出慢的是哪一层里的哪一步。
 --- prompt
 真实的追踪是一棵树：`review_clause` 里面套着 `call_model`、`lookup_playbook`。Langfuse 的 `@observe` 嵌套调用时会自动变成父子 span（`tracing.py` 开头的注释），这里自己写一个小的。写上下文管理器 `span(name, spans, clock=time.perf_counter)`：
 
@@ -953,6 +992,9 @@ type: code
 title: token 汇总和缓存命中率
 level: 2
 mock: yes
+cards: token、缓存命中率、延迟分位数
+--- context
+每次调用模型，回答里都带着这次用了多少 token。审完一份合同，Clause Check 报告的汇总里就有总 token 和缓存命中率 `cache_hit_ratio`；命中率低，说明请求开头有东西在变。
 --- prompt
 写两个函数：
 
@@ -1009,6 +1051,9 @@ expect("模拟服务器的三次真实调用：hit + miss = 输入，命中率�
 type: code
 title: 延迟分位数
 level: 2
+cards: token、缓存命中率、延迟分位数
+--- context
+给客户说「审一份合同要多久」时，只看平均会骗人：一次 30 秒的卡顿会被一堆 1 秒的调用平均掉。所以要看一半的调用有多快，以及最慢的那批有多慢。
 --- prompt
 写 `percentile(values, p)`，用 nearest-rank 方法：
 
@@ -1051,6 +1096,9 @@ expect_raises("p 超过 100", lambda: percentile(LAT, 101), ValueError)
 type: fill
 title: 填空：对齐表格
 level: 2
+cards: A/B 对比：一次只改一个东西
+--- context
+项目的 `run_evals.py` 会在终端打印一张通过率表。列对齐了，几十行数字才看得清；两版 prompt 并排放时，一眼就能看出哪条用例变差了。
 --- prompt
 填空：让对比表对齐。第一列左对齐占 28 格；后面每一列右对齐占 6 格，通过率显示成不带小数的百分比（0.8 → `80%`）。
 --- template
@@ -1071,6 +1119,9 @@ expect("除不尽的通过率四舍五入", lambda: row("payment-net-30", 0.667,
 type: code
 title: A/B 对比表
 level: 3
+cards: A/B 对比：一次只改一个东西
+--- context
+改了 prompt，总分变高不代表每条都变好：一条用例从回回都对掉到偶尔才对，就是回归（改完反而变差）。所以两版的结果要逐条并排来看，不能只比总分。
 --- prompt
 写 `ab_table(results_a, results_b, name_a="A", name_b="B")`，用 `print` 打印两个版本的对比表（不是 return）：
 
@@ -1130,6 +1181,9 @@ expect_output("没有用例", lambda: ab_table({}, {}), "case                   
 type: choice
 title: 两张表一模一样？
 level: 2
+cards: A/B 对比：一次只改一个东西
+--- context
+项目的评测脚本有几种模式，其中 mock 模式免费、几秒就跑完。你想先省点钱，用 mock 模式比一比两版 prompt。
 --- prompt
 你在自己电脑上用 mock 模式跑了两次评测：`run_evals.py --mode mock --prompt v1` 和 `--prompt v2`。两张表一模一样，连 token 都是 0。这说明什么？
 --- options
@@ -1145,6 +1199,9 @@ answer: 2
 type: local
 title: 本机任务：真的比一次 v1 和 v2
 level: 2
+cards: A/B 对比：一次只改一个东西; 跑 N 次，看通过率; 混淆矩阵、精确率、召回率
+--- context
+网页里的 A/B 都是模拟的。这一步用真的 DeepSeek 把项目的两版 prompt 各跑一遍评测，亲手拿到一组能在面试里讲的数字：新版有没有漏掉高风险条款，误报少了没有。
 --- prompt
 在项目里跑一次真正的 A/B。
 
@@ -1155,21 +1212,9 @@ cd "G:\Contract Clause Reviewer"
 python evals/run_evals.py --mode mock --runs 3 --out evals/results.mock.json
 ```
 
-2. 项目是照着 DeepSeek 旧的接口写的，调真模型之前要补一处代码。DeepSeek 默认开着思考模式，它的文档写着：开着思考模式、请求里又带着 `tools` 时，之后的每次请求都要把回答里的 `reasoning_content` 原样传回去，否则返回 400。项目的工具循环没传它，所以模型一调工具，下一次请求就失败。最简单的修法是关掉思考模式：审条款本来就用不着长推理，关掉还更快、更便宜，项目设的 `temperature`（0.3）也重新生效。
-
-打开 `clausecheck/review.py`，找到 `OpenAICompatBackend` 的 `_post`。如果 `body` 里还没有 `"thinking"`，就在 `r = self.requests.post(...)` 那一行**上面**加两行，缩进和 `r =` 对齐：
+2. 再用 DeepSeek 分别跑两版 prompt。项目已经为 DeepSeek 调好了：默认模型 `deepseek-flash`，`clausecheck/review.py` 的 `_post` 在 deepseek 模式下关掉了思考模式（第 7 天的本机任务读过这两行），所以不用改代码：
 
 ```
-        if self.settings.mode == "deepseek":
-            body["thinking"] = {"type": "disabled"}
-```
-
-只在 deepseek 模式加：同一个类也用来连 LM Studio 这样的本地服务器，那边用不着它。
-
-3. 再用 DeepSeek 分别跑两版 prompt。项目 `config.py` 里默认的 DeepSeek 模型名也是旧的，DeepSeek 已经停用了它，所以第一行先用环境变量 `CLAUSECHECK_DEEPSEEK_MODEL` 指定 `deepseek-flash`（只对这个终端窗口有效；想一直用，就在 `.env` 里加一行 `CLAUSECHECK_DEEPSEEK_MODEL=deepseek-flash`）：
-
-```
-$env:CLAUSECHECK_DEEPSEEK_MODEL = "deepseek-flash"
 python evals/run_evals.py --mode deepseek --runs 3 --prompt v1 --out evals/results.deepseek.v1.json
 python evals/run_evals.py --mode deepseek --runs 3 --prompt v2 --out evals/results.deepseek.v2.json
 ```
@@ -1178,13 +1223,13 @@ python evals/run_evals.py --mode deepseek --runs 3 --prompt v2 --out evals/resul
 
 `--out` 让两次结果分开保存（`evals/results*.json` 不会进 git）。
 
-4. 把两遍 DeepSeek 的通过率表粘贴到下面（至少要有两行 `high-risk recall`），然后对照 `learn/05_prompt_ab.md` 回答自己三个问题：高风险召回掉了吗？must_accept 用例的误报变少了吗？有没有哪条用例变差？
+3. 把两遍 DeepSeek 的通过率表粘贴到下面（至少要有两行 `high-risk recall`），然后对照 `learn/05_prompt_ab.md` 回答自己三个问题：高风险召回掉了吗？must_accept 用例的误报变少了吗？有没有哪条用例变差？
 placeholder: 粘贴两张 DeepSeek 通过率表
 verify: high-risk recall[\s\S]*high-risk recall
 --- hints
 - 看到 401 或 `needs DEEPSEEK_API_KEY`：检查项目根目录 `.env` 里的 `DEEPSEEK_API_KEY`。
-- 每条都失败、错误里有 `HTTP 400` 和 `Model Not Exist`：模型名没设上。看输出的第一行（`mode=deepseek model=...`），应该是 `model=deepseek-flash`；换了新的终端窗口，要重新运行 `$env:` 那一行。
-- 错误里有 `HTTP 400`，但不是 `Model Not Exist`：多半是第 2 步那两行没加上，或者加在了 `r = self.requests.post(...)` 的**下面**（要在发请求之前改 `body`）。想先便宜地试一条：`python evals/run_evals.py --mode deepseek --runs 1 --only unlimited-liability`。
+- 每条都失败、错误里有 `HTTP 400` 和 `The supported API model names are ...`：模型名不对。看输出的第一行（`mode=deepseek model=...`），应该是 `model=deepseek-flash`；不是的话，看看 `.env` 里是不是写了别的 `CLAUSECHECK_DEEPSEEK_MODEL`。
+- 想先便宜地试一条：`python evals/run_evals.py --mode deepseek --runs 1 --only unlimited-liability`。
 - 表太长就只粘贴每遍最后的表格部分（从 `case  kind  pass rate` 那一行开始）。
 
 @@ item d13-e1
@@ -1192,6 +1237,9 @@ type: scratch
 title: 闭卷：每条用例的通过率
 exam: yes
 level: 3
+cards: 跑 N 次，看通过率; 评测用例是数据，不是感觉
+--- context
+这是评测脚本的核心：拿一批用例，看每条用例在多次运行里稳不稳。得到的是一张「用例 → 通过率」的表，改 prompt 前后各跑一次，就能拿来比较。
 --- prompt
 写 `evaluate(cases, predict, runs)`：
 
@@ -1230,6 +1278,9 @@ type: scratch
 title: 闭卷：重试装饰器
 exam: yes
 level: 3
+cards: 计时、假时钟、带参数的装饰器; 函数是值：装饰器
+--- context
+调模型偶尔会碰上网络抖动、服务器太忙这类临时失败，再试一次往往就好了。与其在每个调模型的函数里都写一遍重试，不如写成装饰器，哪里需要就套在哪里。
 --- prompt
 写带参数的装饰器 `retry(times)`，用法：
 
@@ -1290,6 +1341,9 @@ type: scratch
 title: 闭卷：评测报告
 exam: yes
 level: 3
+cards: 混淆矩阵、精确率、召回率
+--- context
+评测跑完，最后要给出一份简短的成绩单：四个格子各有几条，再加一行精确率和召回率，可以直接贴进周报，也能和上一次的成绩对比。
 --- prompt
 写 `report(cases, predictions)`：
 

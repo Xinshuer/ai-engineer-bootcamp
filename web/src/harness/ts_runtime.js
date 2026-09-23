@@ -143,8 +143,9 @@ const __RULES = [
   ["subject to section", "flag", "high", "liability_cap"],
 ];
 const __TOPICS = [["liabil", "liability_cap"], ["renew", "auto_renewal"], ["data", "data_processing"], ["fee", "payment"], ["pay", "payment"], ["confiden", "confidentiality"], ["terminat", "termination"]];
-// current DeepSeek model names (mirror of py_mock.py _CC_MODELS; deepseek-chat / deepseek-reasoner were discontinued 2026-07-24)
-const __MODELS = ["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"];
+// DeepSeek model names -> the model that serves them (mirror of py_mock.py _CC_MODELS: live API, 2026-09-23;
+// deepseek-chat / deepseek-reasoner are aliases announced as discontinued, chat thinks only when asked)
+const __MODELS = { "deepseek-flash": "deepseek-flash", "deepseek-v4-pro": "deepseek-v4-pro", "deepseek-v4-flash": "deepseek-flash", "deepseek-chat": "deepseek-flash", "deepseek-reasoner": "deepseek-flash" };
 const __STATUS_TEXT = { 429: "Rate limit reached, please retry later", 500: "Internal server error", 503: "Service unavailable" };
 // mock embeddings: same hashed bag of words as py_mock.py (FNV-1a into 256 dims, contract synonyms folded)
 const __EMBED_DIM = 256;
@@ -225,13 +226,15 @@ const MOCK = {
     if (isEmbed) return this.embeddings(body);
     if (!body || typeof body !== "object" || typeof body.model !== "string" || !Array.isArray(body.messages) || body.messages.length === 0)
       return err(400, "Invalid request: the body needs 'model' (a string) and 'messages' (a non-empty list)", "invalid_request_error");
-    if (!__MODELS.includes(body.model)) return err(400, `Model Not Exist: ${body.model}`, "invalid_request_error");
-    // thinking mode (DeepSeek V4): on unless the body says { thinking: { type: "disabled" } }
+    if (!Object.hasOwn(__MODELS, body.model)) return err(400, `The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed ${body.model}.`, "invalid_request_error");
+    // thinking mode (DeepSeek V4): on unless the body says { thinking: { type: "disabled" } }; a value the
+    // live API cannot read is 422 (mirror of py_mock.py)
     const thinking = body.thinking;
-    if (thinking !== undefined && thinking !== null && (typeof thinking !== "object" || !["enabled", "disabled"].includes(thinking.type)))
-      return err(400, `Invalid request: 'thinking' must be {"type": "enabled"} or {"type": "disabled"}`, "invalid_request_error");
-    const think = !(thinking && thinking.type === "disabled");
-    // thinking mode + tools: every earlier assistant message must carry its reasoning_content (mirror of py_mock.py)
+    if (thinking !== undefined && thinking !== null && (typeof thinking !== "object" || !["adaptive", "enabled", "disabled"].includes(thinking.type)))
+      return err(422, `Failed to deserialize the JSON body into the target type: thinking.type: unknown variant \`${typeof thinking === "object" ? thinking.type : thinking}\`, expected one of \`adaptive\`, \`enabled\`, \`disabled\``, "invalid_request_error");
+    const think = thinking ? thinking.type !== "disabled" : body.model !== "deepseek-chat";
+    // thinking mode + tools: every earlier assistant message must carry its reasoning_content (the documented rule,
+    // enforced here although the live API did not on 2026-09-23; mirror of py_mock.py)
     if (think && body.tools && body.tools.length) {
       const i = body.messages.findIndex((m) => m && m.role === "assistant" && typeof m.reasoning_content !== "string");
       if (i >= 0) return err(400, `Invalid request: thinking mode with tools needs the reasoning_content of every earlier assistant message passed back (message at index ${i} has none). Pass it back, or send "thinking": {"type": "disabled"}`, "invalid_request_error");
@@ -318,7 +321,7 @@ const MOCK = {
       completionTokens += reasoningTokens;
     }
     return [200, {
-      id: `mock-${this.calls.length}`, object: "chat.completion", model: body.model,
+      id: `mock-${this.calls.length}`, object: "chat.completion", model: __MODELS[body.model],
       choices: [{ index: 0, message, finish_reason: finish }],
       usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, prompt_cache_hit_tokens: cacheHit, prompt_cache_miss_tokens: promptTokens - cacheHit, ...(think ? { completion_tokens_details: { reasoning_tokens: reasoningTokens } } : {}) },
     }];

@@ -77,6 +77,9 @@ print(needs_attention([]))
 type: code
 title: 综合一：拆条款（Python）
 level: 3
+cards: 读 Clause Check 的路线图; d3:正则入门：在文字里找模式; 拿到一道新题的五步
+--- context
+合同变成文字以后，第一件事是把它切成一条条条款。后面调模型、校验、汇总都是一条一条做的，这一步切错了，后面全错。真实项目的 `split.py` 做的就是这件事，今天不看提示，从空白写一遍。
 --- prompt
 写 `split_clauses(text)`：合同文字里，**单独成行**、以编号开头、后面跟空格和大写字母开头标题的行是条款标题，比如 `8.1 Cap on Liability`、`12 Exclusions`。标题下面直到下一个标题之前的行是正文。
 
@@ -128,6 +131,9 @@ type: code
 title: 综合二：批量审查并汇总（Python）
 level: 3
 mock: yes
+cards: d2:计数的标准写法; d2:排序和 while; 读 Clause Check 的路线图
+--- context
+切好条款后，逐条交给模型判定，再汇总成报告开头的数字和待看清单，律师从最要紧的条款看起。真实项目里这两步分别在 `review.py` 和 `pipeline.py` 的 `summarise`。练习连的是模拟的模型服务，不花钱。
 --- prompt
 写 `review_all(clauses)`：`clauses` 是上一题的输出格式。对每一条调用 `classify(f"Review clause {id}: {text}")`（已写好），返回：
 
@@ -198,6 +204,9 @@ expect("每条调用一次模型", lambda: (MOCK.reset(), review_all(CLAUSES), l
 type: code
 title: 综合三：估算费用
 level: 2
+cards: 拿到一道新题的五步; d4:Chat API 的请求和回答长什么样
+--- context
+真实项目的 `summarise` 会按 token（模型按它计费）用量估算一次审查花了多少美元，写进报告。逐条审查时，每次请求开头那一大段（审查说明和合同内容）都一样，服务器认出这段刚处理过，叫「命中缓存」，这部分收费低得多。
 --- prompt
 写 `estimate_cost(usage, price)`：
 
@@ -233,6 +242,9 @@ type: code
 title: 综合四：拆条款（TypeScript）
 level: 3
 lang: ts
+cards: d5:从 Python 到 TypeScript; d5:数组、对象和 type; d3:正则入门：在文字里找模式
+--- context
+面试的公司用 TypeScript（Mastra 框架）写 Agent。假设要把 Clause Check 搬到 TypeScript 上，拿到合同文字后同样要先切成条款。
 --- prompt
 把第 1 题翻译成 TypeScript 的 `splitClauses(text)`，规则完全一样。
 --- starter
@@ -282,6 +294,9 @@ type: code
 title: 综合五：批量审查并汇总（TypeScript）
 level: 3
 lang: ts
+cards: d6:async / await：等网络的时候不卡住; d6:fetch：TypeScript 里的 requests.post; d5:Record 和计数
+--- context
+接着上一题：TypeScript 版的流水线也要逐条调模型、再汇总成报告。在 TypeScript 里，每次网络请求的结果都要等，批量调用时，顺序和等待是最容易写错的地方。
 --- prompt
 把第 2 题翻译成 TypeScript 的 `reviewAll(clauses)`（async）。**按顺序**一条一条 await。
 --- starter
@@ -346,6 +361,9 @@ type: code
 title: 综合六：Agent 循环（TypeScript）
 level: 3
 lang: ts
+cards: d4:工具调用：模型说「帮我查一下」; d6:工具分发：名字到函数的表; d6:async / await：等网络的时候不卡住
+--- context
+真实的审查不是问一次就完：模型先调用 `lookup_playbook` 查客户的规则，看到结果再下判定。这个来回就是 Agent，`review.py` 里是一个有步数上限的循环，没有上限的话，模型一直要求调工具，程序就停不下来。
 --- prompt
 把第 4 天的 `mini_agent` 翻译成 TypeScript 的 `miniAgent(question, maxSteps = 3)`：带 `TOOLS` 请求（模型 `deepseek-flash`，和第 4 天一样关掉思考模式）；`finish_reason` 是 `"tool_calls"` 就执行第一个工具，把模型那条消息和 `{ role: "tool", tool_call_id, content }` 加进 messages 再请求；否则返回回答；步数用完返回 `"STOPPED"`。
 --- starter
@@ -403,6 +421,9 @@ expectAsync("步数用完", () => miniAgent("Is unlimited liability acceptable?"
 type: choice
 title: 排错：先怀疑谁
 level: 2
+cards: 读 Clause Check 的路线图
+--- context
+上线后最常见的场景：律师说某条判错了，你要决定先查哪里。trace 是程序记下的「每次送进模型的内容和模型的回答」。
 --- prompt
 上线后律师说：「这份合同第 8.1 条明明写了无限责任，工具却判了 accept。」你打开 trace，发现送进模型的 8.1 正文是 `CloudNotes Confidential / Page 3 of 5`。第一步应该改哪里？
 --- options
@@ -418,6 +439,9 @@ answer: 3
 type: choice
 title: pass@k 和 pass^k
 level: 2
+cards: d4:随机性：跑一次不算数
+--- context
+项目的 `run_evals.py` 打印的表里，除了每条用例的通过率，还有一列 `pass^k`。这道题就是这一列背后的算术，面试也常问。
 --- prompt
 一个步骤单次成功率 90%。一个无人值守的 Agent 要连续 5 次都做对，大约有多大概率？
 --- options
@@ -433,6 +457,9 @@ answer: 3
 type: predict
 title: 综合预测（Python）
 level: 2
+cards: d2:列表推导式：一行写完筛选和变换; d2:排序和 while; d2:字典：用名字找值
+--- context
+这段代码是报告汇总的缩小版，和今天第 2 题做的是同一件事。面试里常有「读代码、说输出」的题。
 --- prompt
 写出输出。
 --- code
@@ -452,6 +479,9 @@ type: predict
 title: 综合预测（TypeScript）
 level: 2
 lang: ts
+cards: d5:数组方法：map、filter、find; d5:Record 和计数
+--- context
+TypeScript 版的报告汇总。每条审查结果除了判定，还记着这次调用用掉的 token 数，费用就是按它算的。
 --- prompt
 写出输出。`reduce` 把数组「折叠」成一个值：从初始值 0 开始，每个元素加到累计值上。
 --- code
@@ -469,6 +499,9 @@ console.log(`${flagged.length}/${reviews.length} need attention`);
 type: local
 title: 本机任务：给真实项目加一条规则
 level: 3
+cards: 读 Clause Check 的路线图; d4:随机性：跑一次不算数
+--- context
+真实工作里最常见的改动：客户多了一条审查要求。只改 playbook 不够，还要有一条评测用例证明程序真的会按新规则判，再跑全部测试，确认原来的功能没被改坏。面试问「你会怎么改这个项目」，讲的就是这一套。
 --- prompt
 在 Clause Check 项目里做一次完整的改动，全程自己动手：
 
@@ -495,23 +528,25 @@ verify: \d+ passed[\s\S]*high-risk recall
 type: local
 title: 本机任务：用 DeepSeek 跑一次评测
 level: 2
+cards: d4:随机性：跑一次不算数; 读 Clause Check 的路线图
+--- context
+mock 模式（离线，不调模型，只按关键词判）的评测只能证明代码流程是通的。模型会不会真的按你的规则判，要用真模型把每条用例跑几轮才知道。跑完看哪条用例不稳定，学会从失败原因判断问题出在哪一类。
 --- prompt
-用真实模型跑一次项目的评测，看看你的规则在真模型下表现如何。项目是在 DeepSeek 改版之前写的，跑之前先做两处准备。
+用真实模型跑一次项目的评测，看看你的规则在真模型下表现如何。
 
-**模型名**：`clausecheck/config.py` 默认还是停用的旧名字，下面的命令用环境变量换成 `deepseek-flash`（也可以把 `CLAUSECHECK_DEEPSEEK_MODEL=deepseek-flash` 写进 `.env`，或者自己改掉 config.py 里的默认值）。
-
-**思考模式**：项目的后端没关它。开着思考模式时，带工具的请求必须把模型上一轮的 `reasoning_content` 原样传回去，否则真接口返回 400；而 `review.py` 回传模型消息时只留了 `role`、`content`、`tool_calls`。所以打开 `clausecheck/review.py`，在 `OpenAICompatBackend._post` 里 `body = {...}` 这个字典后面、`r = self.requests.post(...)` 前面加两行（和 `body` 对齐缩进）：
+先花几分钟读懂项目是怎么调 DeepSeek 的。打开 `clausecheck/config.py`：DeepSeek 默认用 `deepseek-flash`，`PRICES` 里记着它的单价，报告里的花费就按它算。再打开 `clausecheck/review.py`，找到 `OpenAICompatBackend` 的 `_post`，发请求之前有这两行：
 
 ```python
         if self.settings.mode == "deepseek":
             body["thinking"] = {"type": "disabled"}
 ```
 
-只对 DeepSeek 生效，LM Studio 的本地模式不受影响。关掉以后还更快、更便宜，`temperature` 0.3 也重新生效。然后运行：
+`deepseek-flash` 默认开着思考模式。审条款用不着长篇推理，关掉以后更快、更便宜（思考用掉的 token 按输出计费），项目设的 `temperature`（0.3）也重新生效。还有一个原因：开着思考模式时，DeepSeek 的文档要求带工具的对话把每一轮的 `reasoning_content` 传回去，而这个工具循环回传模型消息时只留了 `role`、`content`、`tool_calls`。`if` 只对 DeepSeek 生效，同一个类连 LM Studio 时不受影响。
+
+读懂以后运行：
 
 ```
 cd "G:\Contract Clause Reviewer"
-$env:CLAUSECHECK_DEEPSEEK_MODEL="deepseek-flash"
 python evals/run_evals.py --mode deepseek --runs 3
 ```
 
@@ -526,14 +561,17 @@ placeholder: 粘贴通过率表
 verify: high-risk recall
 --- hints
 - 看到 401：`.env` 里的 `DEEPSEEK_API_KEY` 不对。
-- 每条都失败、原因里有 `Model Not Exist`：模型名没换过来。`$env:...` 那一行要和 `python ...` 在同一个终端窗口里运行，第一行输出里的 `model=` 应该是 `deepseek-flash`。
-- 失败原因是 `trace error: api_error: HTTP 400`，但不是 `Model Not Exist`：多半是思考模式没关掉。检查 `_post` 里那两行是不是在 `r = self.requests.post(...)` 前面。
+- 每条都失败、原因里有 `HTTP 400` 和 `The supported API model names are ...`：模型名不对。看第一行输出里的 `model=`，应该是 `deepseek-flash`；不是的话，看看 `.env` 里是不是写了别的 `CLAUSECHECK_DEEPSEEK_MODEL`，删掉那一行就用默认值。
+- 想先便宜地试一条：`python evals/run_evals.py --mode deepseek --runs 1 --only unlimited-liability`。
 
 @@ item d7-e1
 type: scratch
 title: 周考 1：解析并计数（Python）
 exam: yes
 level: 3
+cards: d3:JSON：文字和字典之间的桥; d3:try / except：预料到的错误要接住; d2:计数的标准写法
+--- context
+模型返回的一批 JSON 回答里，总有几条格式坏了或缺字段。汇总之前要先弄清有多少条能用、多少条要重审，程序不能因为一条坏数据就整个停下。
 --- prompt
 写 `parse_and_count(raw_list)`：`raw_list` 是模型返回的一组 JSON 文字，有的格式坏了，有的缺 `verdict` 字段。返回：
 
@@ -569,6 +607,9 @@ type: scratch
 title: 周考 2：Pydantic 批量加载（Python）
 exam: yes
 level: 3
+cards: d4:Pydantic：给数据定规矩; d4:校验失败：ValidationError
+--- context
+真实项目的 `models.py` 用 Pydantic 给每种数据定规矩。这批条款数据来自一段 JSON 文字，里面混着风险等级写错的条目；坏条目混进报告，后面的排序和计数都会出错。
 --- prompt
 用 Pydantic 定义 `Clause`：`id` 字符串、`risk` 为 `low` / `medium` / `high`。
 
@@ -606,6 +647,9 @@ title: 周考 3：带重试的批量判定（Python）
 exam: yes
 level: 3
 mock: yes
+cards: d4:状态码和重试; d4:用 requests 发请求
+--- context
+批量审查一份合同要连着调几十次模型，服务器忙时偶尔会回 429（请求太频繁，稍后再来）。遇到一次就放弃整份合同太可惜，一直重试又可能永远停不下来。练习连的是模拟服务器。
 --- prompt
 写 `classify_all(texts)`：对每段文字调用 DeepSeek（`https://api.deepseek.com/v1/chat/completions`，模型 `deepseek-flash`，`json_object` 格式，关掉思考模式，密钥读环境变量 `DEEPSEEK_API_KEY`），返回每段的 `verdict` 组成的列表。
 
@@ -651,8 +695,11 @@ title: 周考 4：解析并计数（TypeScript）
 exam: yes
 level: 3
 lang: ts
+cards: d6:try / catch / throw; d5:Record 和计数
+--- context
+周考 1 的 TypeScript 版。假如流水线的这一步用 TypeScript 写，收到模型的一批回答时，同样要先分清哪些能用、哪些不能用。
 --- prompt
-写 `parseAndCount(rawList: string[])`，规则和闭卷 1 一样，返回 `{ valid, invalid, counts }`。
+写 `parseAndCount(rawList: string[])`，规则和周考 1 一样，返回 `{ valid, invalid, counts }`。
 --- solution
 function parseAndCount(rawList: string[]): { valid: number; invalid: number; counts: Record<string, number> } {
   let valid = 0;
@@ -686,6 +733,9 @@ title: 周考 5：Zod 批量加载（TypeScript）
 exam: yes
 level: 3
 lang: ts
+cards: d6:Zod：TypeScript 的 Pydantic; d6:z.infer：一份定义，两处使用
+--- context
+周考 2 的 TypeScript 版。在 TypeScript 里，Zod 扮演 Pydantic 的角色，把不合规矩的条目挡在报告外面。
 --- prompt
 用 Zod 定义 `ClauseSchema`：`id` 字符串、`risk` 为 `low` / `medium` / `high`。写 `loadClauses(raw: string)`：返回 JSON 数组里合法的条目，不合法的跳过；整个不是合法 JSON 时返回 `[]`。
 --- solution
@@ -721,8 +771,11 @@ title: 周考 6：带重试的批量判定（TypeScript）
 exam: yes
 level: 3
 lang: ts
+cards: d6:fetch：TypeScript 里的 requests.post; d6:async / await：等网络的时候不卡住; d4:状态码和重试
+--- context
+周考 3 的 TypeScript 版：同样是一段段调模型、偶尔遇到 429（服务器说请求太频繁），只是这次换成 TypeScript 来写。
 --- prompt
-写 `classifyAll(texts: string[]): Promise<string[]>`，规则和闭卷 3 一样（同一个 URL，`deepseek-flash`，`json_object` 格式，关掉思考模式，密钥 `process.env.DEEPSEEK_API_KEY`）：按顺序逐段调用，429 重试，同一段最多 3 次，失败就 throw。
+写 `classifyAll(texts: string[]): Promise<string[]>`，规则和周考 3 一样（同一个 URL，`deepseek-flash`，`json_object` 格式，关掉思考模式，密钥 `process.env.DEEPSEEK_API_KEY`）：按顺序逐段调用，429 重试，同一段最多 3 次，失败就 throw。
 --- solution
 const URL_ = "https://api.deepseek.com/v1/chat/completions";
 

@@ -316,6 +316,9 @@ for n in (100, 1000):
 type: choice
 title: 复习：错误在哪一步抛出
 level: 1
+cards: d25:Python 客户端：查询、参数、行; 错误和重试：只重试暂时的错误
+--- context
+看板后端查 BigQuery 时，想在出错时给用户一句友好的提示，而不是让整个程序崩掉。
 --- prompt
 复习第 25 天。下面的代码想在查询出错时打印 `query failed`，可是表名 `clausecheck.review` 少写了一个 s（`client` 是 `bigquery.Client()`）。运行时会发生什么？
 --- code
@@ -339,6 +342,9 @@ answer: 2
 type: code
 title: 合同的键名
 level: 2
+cards: 对象存储：桶、键和字节
+--- context
+假设 Clause Check 上了云：客户上传的合同放进对象存储（云上存文件的地方），每个文件靠一个名字（键）找到。这个函数决定每份合同在桶里叫什么，文件名是用户起的，什么字符都可能有。
 --- prompt
 合同在桶里的名字（键）要**可预测**：按客户分前缀，列出一个客户的全部合同、给某个客户单独授权，都只要看前缀。写 `contract_key(customer_id, contract_id, filename)`，返回 `contracts/<customer_id>/<contract_id>/<清理后的文件名>`。
 
@@ -378,6 +384,9 @@ type: predict
 title: S3 读回来是什么
 level: 1
 cloud: yes
+cards: 对象存储：桶、键和字节
+--- context
+审查报告存成 JSON，放在 S3（AWS 的对象存储）里，前端要读回来显示。写读取的代码之前，先看清 S3 返回的到底是什么。
 --- prompt
 写出输出。注意三件事：`Body` 读出来是什么类型；元数据的键名大小写；`ContentType` 从哪里来。
 --- code
@@ -407,6 +416,9 @@ type: code
 title: 上传合同
 level: 2
 cloud: yes
+cards: 对象存储：桶、键和字节; 错误和重试：只重试暂时的错误
+--- context
+客户上传的合同文字要存进 S3。文件旁边还能挂几个小标签（元数据），记下合同编号和 prompt 版本，以后不打开文件也知道它是哪份合同、按哪版 prompt 审的。
 --- prompt
 写 `upload_contract(s3, bucket, key, text, contract_id, prompt_version)`：把合同文字上传到 S3，返回 S3 给的 `ETag`。
 
@@ -464,6 +476,9 @@ type: fix
 title: 修 bug：错误被吞掉了
 level: 2
 cloud: yes
+cards: 错误和重试：只重试暂时的错误; 对象存储：桶、键和字节
+--- context
+前端会反复来问「报告好了没」：还没生成就返回空，前端继续等。可如果真正的问题是配置写错了，前端就会永远等下去，谁也不知道出了错。
 --- prompt
 同事写的 `read_report_or_none` 在桶名拼错时也安安静静地返回 `None`，前端于是一直显示「报告生成中」，大家排查了一下午。
 
@@ -514,6 +529,9 @@ type: code
 title: 分页列出所有键
 level: 2
 cloud: yes
+cards: 对象存储：桶、键和字节
+--- context
+给一个客户导出或清理数据时，要先拿到他所有合同文件的名字。大客户有几千份合同，漏掉一部分也不会报错，最难发现。
 --- prompt
 一个客户可能有几千份合同，而 `list_objects_v2` 一次最多返回 1000 个键。写 `list_all_keys(s3, bucket, prefix, page_size=1000)`，返回**所有**以 `prefix` 开头的键（列表，保持 S3 返回的顺序）：
 
@@ -575,6 +593,9 @@ type: predict
 title: GCS 对象的属性
 level: 2
 cloud: yes
+cards: 对象存储：桶、键和字节
+--- context
+同样的报告也可以放在 GCP 的对象存储 GCS 里。换了一家云，写法和返回的东西都不一样，先读懂它的对象长什么样。
 --- prompt
 写出输出。关键问题：`bucket.blob(...)` 和 `client.bucket(...)` 会不会发请求？对象的大小什么时候才知道？
 --- code
@@ -600,6 +621,9 @@ type: code
 title: GCS 存取报告
 level: 2
 cloud: yes
+cards: 对象存储：桶、键和字节; 错误和重试：只重试暂时的错误
+--- context
+审查完成后，报告存进 GCS，律师打开网页时再读出来。客户多在北欧，名字里常有 `ö` 这样的字母。
 --- prompt
 在 GCS 上存取审查报告。写两个函数：
 
@@ -652,6 +676,9 @@ type: fix
 title: 修 bug：只能遍历一次
 level: 2
 cloud: yes
+cards: 对象存储：桶、键和字节
+--- context
+运维要一个小统计：某个前缀下有几个报告、一共多大，用来估算存储费用。
 --- prompt
 `storage_summary` 要返回一个前缀下的对象个数、总字节数和名字列表，可是一运行就报 `ValueError: Iterator has already started`。
 
@@ -688,6 +715,9 @@ expect("没有匹配", lambda: storage_summary(C, "clausecheck-reports", "archiv
 type: choice
 title: worker 该有什么权限
 level: 2
+cards: IAM：只给需要的权限
+--- context
+worker 是在后台一直运行的审查程序。它访问桶时用的是自己的身份（AWS 叫角色），能做什么、不能做什么，全看这个身份挂了哪些权限。
 --- prompt
 Clause Check 的审查 worker 运行在 AWS 上。它要做两件事：读 `clausecheck-contracts` 里的合同，把报告写进 `clausecheck-reports`。给它的角色挂哪份策略最合适？
 --- options
@@ -704,6 +734,9 @@ type: code
 title: 读密钥并缓存
 level: 2
 cloud: yes
+cards: 密钥管理：不进代码、不进镜像
+--- context
+上线以后，调用模型要用的 API 密钥不放在 `.env` 里，而是放在 GCP 的 Secret Manager（专门保管密钥的服务）里，程序处理每个请求都要用到它。
 --- prompt
 写 `get_secret(client, secret_id)`：从 GCP Secret Manager 读密钥的**最新版本**，返回字符串。
 
@@ -753,6 +786,9 @@ type: code
 title: 本机用 .env，线上用密钥服务
 level: 2
 cloud: yes
+cards: 密钥管理：不进代码、不进镜像; 身份和凭证：谁在调用
+--- context
+同一份代码既要在你的电脑上跑，也要在 AWS 上跑，两边的密钥放在不同的地方。找不到密钥时，报错要让人一看就知道该怎么补上。
 --- prompt
 Clause Check 在本机用 `.env` 里的 `DEEPSEEK_API_KEY`，在 AWS 上从 Secrets Manager 读。写 `load_api_key(sm, env)`：
 
@@ -822,6 +858,9 @@ type: testwrite
 title: 为 is_retryable 写测试
 level: 3
 cloud: yes
+cards: 错误和重试：只重试暂时的错误
+--- context
+worker 调云服务时会遇到各种错误：有的等一会儿就好，有的重试一百次也没用。判断错了，要么白白重试浪费时间，要么在该等一等的时候直接放弃。
 --- prompt
 重试只该重试「暂时的」错误。下面的 `is_retryable(error)` 判断一个异常值不值得重试：
 
@@ -930,6 +969,9 @@ type: code
 title: 指数退避
 level: 3
 cloud: yes
+cards: 错误和重试：只重试暂时的错误
+--- context
+worker 调云服务或模型时，常会遇到限流（请求太多，被要求等一等）。这个函数包在这些调用外面，让暂时的错误自己过去，真正的错误马上暴露出来。
 --- prompt
 写 `with_backoff(fn, sleep, attempts=4, base=0.5)`：调用 `fn()`，遇到**可以重试**的错误就等一会儿再试。
 
@@ -1000,6 +1042,9 @@ expect("attempts 和 base 可以改", lambda: run(9, attempts=2, base=1), ("Slow
 type: choice
 title: 瑞典客户的合同放哪
 level: 1
+cards: 数据驻留：合同留在欧盟; 云是什么：租来的电脑，按用量付钱
+--- context
+Nordlys AB 是样例库里的瑞典客户（第 22 天的 `customers` 表）。Clause Check 要上云，第一步就要决定数据放在哪个区域（机房所在地）。
 --- prompt
 斯德哥尔摩的律所 Nordlys AB 要用 Clause Check。他们的合同里有员工和客户的姓名、联系方式，他们和我们签的合同里写着「Customer Data is stored and processed within the EU/EEA」。合同存放的桶、审查用的大模型，区域怎么选？
 --- options
@@ -1016,6 +1061,9 @@ type: fill
 title: 填空：分页器
 level: 2
 cloud: yes
+cards: 对象存储：桶、键和字节; 成本和命令行
+--- context
+运维想知道某个客户的合同一共占了多少存储空间，用来估算每月的存储费。文件太多，要分好几页才列得完。
 --- prompt
 boto3 的**分页器**（paginator）替你处理 `ContinuationToken`：`for page in paginator.paginate(...)` 每次给你一页响应。用它统计一个前缀下所有对象的个数和总字节数。`PageSize` 设成 2，是为了在测试的小数据上也能分出好几页。填空。
 --- template
@@ -1049,6 +1097,9 @@ type: order
 title: 排代码：存进去再读回来
 level: 2
 cloud: yes
+cards: 对象存储：桶、键和字节
+--- context
+报告写进 S3 以后马上读回来看一眼，是上线初期常用的保险做法：存进去就变了样的问题（编码、类型），能尽早发现。
 --- prompt
 排出 `save_and_check(report)`：把报告存进 S3，再读回来，返回读回来的字典（用来确认存进去的内容没问题）。有两行干扰项。
 --- lines
@@ -1077,6 +1128,9 @@ type: code
 title: 预签名下载链接
 level: 3
 cloud: yes
+cards: IAM：只给需要的权限; 对象存储：桶、键和字节
+--- context
+审查报告放在不公开的 S3 桶里，只有有权限的程序能读。律师在网页上点「下载报告」时，得有一个办法让他拿到这一份文件，又不用给他开云账号。
 --- prompt
 律师要下载一份报告，但我们不想把桶公开，也不想给律师开 AWS 账号。常见做法是**预签名 URL**：用 worker 自己的凭证在本地签出一个带有效期的链接，拿到链接的人在有效期内可以下载这一个对象。（上传也可以这么做：给浏览器一个 `put_object` 的预签名 URL，合同就直接传进桶里，不经过你的服务器。）
 
@@ -1126,6 +1180,9 @@ expect_raises("0 分钟：ValueError", lambda: link(0), ValueError)
 type: local
 title: 本机任务（选做）：装上真的 SDK
 level: 1
+cards: 身份和凭证：谁在调用; 成本和命令行
+--- context
+前面用的云 SDK（官方的 Python 工具包）都是模拟的。这一题在你自己的电脑上装上真的 boto3 和 google-cloud-storage，看看它们在没有云账号时怎么表现。
 --- prompt
 在你的电脑上装上真的 SDK，顺便亲眼看看「凭证在第一次调用时才检查」。不需要云账号，也不花钱。在 PowerShell 里逐行运行：
 
@@ -1152,6 +1209,9 @@ title: 闭卷：归档一个客户的合同
 exam: yes
 level: 3
 cloud: yes
+cards: 对象存储：桶、键和字节; 成本和命令行
+--- context
+客户解约以后，他的合同不能马上删（以后可能还要查），但也不该留在每天使用的桶里。挪到单独的归档桶，以后还能换成更便宜的冷存储。
 --- prompt
 写 `archive_contracts(s3, customer_id, page_size=1000)`：把一个客户的所有合同从桶 `clausecheck-contracts` 挪到归档桶 `clausecheck-archive`（测试里已经建好）。
 
@@ -1208,6 +1268,9 @@ title: 闭卷：给报告加批注
 exam: yes
 level: 3
 cloud: yes
+cards: 对象存储：桶、键和字节; 错误和重试：只重试暂时的错误
+--- context
+律师在网页上给审查报告加批注，每条批注都要写回 GCS 里的那份报告。网络不稳时，同一个请求可能被发送两次。
 --- prompt
 律师可以给审查报告加批注。写 `add_note(client, contract_id, note)`（`client` 是 `storage.Client()`）：
 
@@ -1248,6 +1311,9 @@ title: 闭卷：带抖动的重试
 exam: yes
 level: 3
 cloud: yes
+cards: 错误和重试：只重试暂时的错误
+--- context
+很多 worker 同时被限流时，如果都等一样久再重试，会在同一瞬间又一起撞上去。每个 worker 等的时间带一点随机，重试就会错开。
 --- prompt
 写 `call_with_retry(fn, sleep, rand, attempts=5, base=0.2, cap=2.0)`：
 

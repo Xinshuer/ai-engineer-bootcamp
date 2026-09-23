@@ -200,6 +200,9 @@ type: sql
 title: 复习：不稳定的评测用例
 level: 1
 ordered: yes
+cards: d22:GROUP BY 和 HAVING; d22:聚合：把很多行变成一个数
+--- context
+第 13 天的评测会把同一个用例重复跑几次，因为模型每次的回答可能不一样。结果存在 `evals` 表里；时过时不过的用例最值得先看，它说明 prompt 在这里还不够稳。
 --- prompt
 复习昨天的 GROUP BY 和 HAVING，顺便认识 `evals` 表：每一行是一个评测用例（`case_id`）用某个 prompt 版本（`prompt_version`）跑一次，`run` 是第几次，`passed` 是 1（通过）或 0。
 
@@ -218,6 +221,9 @@ ORDER BY case_id, prompt_version;
 type: sql
 title: 合同和客户
 level: 1
+cards: JOIN：把几张表连起来
+--- context
+`contracts` 表里只存了客户的编号 `customer_id`，客户的名字和国家在 `customers` 表里。给人看的报表要写客户名，不能只写一个编号。
 --- prompt
 每份合同一行，三列：`title`、`customer`（客户名，`customers.name`）、`country`（客户所在国家）。行的顺序不限。
 --- starter
@@ -236,6 +242,9 @@ type: sql
 title: redline 带上客户名
 level: 2
 ordered: yes
+cards: JOIN：把几张表连起来
+--- context
+每位客户的法务都要收到一封提醒，列出他们哪些条款被建议改写。客户不认得我们内部的编号，提醒里要写他们认得的公司名和合同标题。
 --- prompt
 要给每位客户的法务发提醒：列出所有 `verdict` 是 `redline` 的审查，四列：`customer`（客户名）、`title`（合同标题）、`clause_id`、`heading`。按 `customer`、`title`、`clause_id` 排序（`clause_id` 这里按文字排就行）。
 --- solution
@@ -254,6 +263,9 @@ type: sql
 title: 工具读了哪一条
 level: 2
 ordered: yes
+cards: JOIN：把几张表连起来; d22:WHERE：挑出需要的行
+--- context
+审查时模型会调用工具，比如用 `get_clause` 读同一份合同里被引用的另一条条款。每次调用都记在 `tool_calls` 表里；排查模型的行为时，要把调用和它所在的那次审查放在一起看。
 --- prompt
 `tool_calls` 记录了每次审查调用的工具，参数 `args` 是一段 JSON 文字，比如 `'{"clause_id": "12"}'`。SQLite 用 `json_extract(args, '$.clause_id')` 取出里面的值（BigQuery 写 `JSON_VALUE(args, '$.clause_id')`，第 24 天再细讲 JSON 列）。
 
@@ -278,6 +290,9 @@ ORDER BY t.review_id;
 type: choice
 title: LEFT JOIN 之后数一数
 level: 2
+cards: LEFT JOIN：没有对上的也留下; d22:聚合：把很多行变成一个数
+--- context
+月报要列出每个客户有几份合同，刚注册、还没上传合同的客户（Amsterdam Data BV）也在客户表里。写这种统计之前，先弄清查询对这样的客户会给出什么。
 --- prompt
 客户 6 Amsterdam Data BV 还没有任何合同。下面这条查询里，它那一行的 `n` 是多少？如果把 `LEFT JOIN` 换成 `JOIN` 呢？
 --- code
@@ -299,6 +314,9 @@ type: sql
 title: 每个客户几份合同
 level: 2
 ordered: yes
+cards: LEFT JOIN：没有对上的也留下
+--- context
+这是给销售看的客户列表：谁用得多，谁注册了却一份合同都还没传。后一种客户最需要有人去跟进。
 --- prompt
 每个客户一行，**包括还没有合同的客户**：两列 `name`、`contracts`（合同份数）。按 `contracts` 从多到少，一样多的按 `name`。
 --- solution
@@ -317,6 +335,9 @@ type: sql
 title: 修 bug：9 月的客户少了
 level: 2
 ordered: yes
+cards: LEFT JOIN：没有对上的也留下
+--- context
+每月的客户报告要给销售看：谁这个月很活跃，谁一份合同都没传。报告里少了两个客户，就恰好漏掉了最需要跟进的人。
 --- prompt
 月报要列出**每一个**客户 9 月上传了几份合同（`uploaded_at` 在 `'2026-09-01'` 或之后），没上传的写 0。下面的查询只返回了 4 个客户，Fjord Health AS 和 Amsterdam Data BV 不见了。
 
@@ -344,6 +365,9 @@ type: sql
 title: 修 bug：页数翻了好几倍
 level: 3
 ordered: yes
+cards: JOIN 放大：总数为什么翻倍了; JOIN：把几张表连起来
+--- context
+客户汇总表要同时给出合同总页数（用来估算律师的工作量）和审查条数。这种错误不会报错，只是数字不对，所以最容易混进报表。
 --- prompt
 每个客户一行：合同总页数 `pages` 和审查条数 `reviews`。下面的查询审查条数是对的，页数却大得离谱：Nordlys AB 三份合同一共 20 页（12 + 6 + 2），查询说是 178 页。
 
@@ -382,6 +406,9 @@ ORDER BY cu.name;
 type: sql
 title: 用过 v4-pro 的合同
 level: 2
+cards: 子查询：IN、EXISTS、一个数
+--- context
+`reviews` 表的 `model` 列记着每次审查用的是哪个模型。负责人想知道：那个很少用的模型，都用在了哪几份合同上，好检查换模型是不是真有必要。
 --- prompt
 Clause Check 平时用 flash 模型（表里记作 `deepseek-v4-flash`），只在少数高风险条款上换成更大的 `deepseek-v4-pro`：它更慢，单价也高得多，输出的 token 也更多。哪些合同的审查用到了它？两列 `id`、`title`，用 `WHERE id IN (子查询)` 写，每份合同只出现一次。行的顺序不限。
 --- solution
@@ -399,6 +426,9 @@ WHERE id IN (SELECT contract_id
 type: sql
 title: 从没收到 redline 的客户
 level: 2
+cards: 子查询：IN、EXISTS、一个数
+--- context
+客户团队想找出合同一直很「干净」的客户：从来没有条款被建议改写。可能是他们的合同本来就写得好，也可能是还没怎么用，都值得去了解一下。
 --- prompt
 哪些客户**从来没有**收到过 redline？还没有合同的客户也算。返回一列 `name`，用 `NOT EXISTS` 写。行的顺序不限。
 --- solution
@@ -421,6 +451,9 @@ type: sql
 title: CTE：需要人看的合同
 level: 2
 ordered: yes
+cards: CTE：用 WITH 给每一步起名字; d22:CASE WHEN：贴标签、按条件计数
+--- context
+律师要先看问题多的合同：模型没有放行的条款、审查失败的条款，最后都得有人来处理。
 --- prompt
 用 `WITH` 分两步写：
 
@@ -450,6 +483,9 @@ ORDER BY p.attention DESC, c.title;
 type: order
 title: 排代码：CTE
 level: 2
+cards: CTE：用 WITH 给每一步起名字
+--- context
+长合同切出来的条款多，律师要花的时间也多。这张小表把条款多的合同挑出来，带上标题，方便安排人手。
 --- prompt
 排出这条查询：先用 CTE 算出每份合同的审查条数，再拿到合同标题，只要至少 5 条的，条数多的在前（一样多的按标题）。有两行干扰项。
 --- lines
@@ -474,6 +510,9 @@ HAVING p.reviews >= 5
 type: choice
 title: 并列时的三种编号
 level: 2
+cards: 窗口函数：每行都留下
+--- context
+看板要给问题最多的主题排名，好让大家先改进最常出问题的那类条款。有几个主题的问题数一样多，这时名次怎么写要先说清楚。
 --- prompt
 CTE `topic_problems` 就是昨天填空题的结果（每个主题 flag + redline 一共几条），它有 5 行：liability_cap 7、auto_renewal 4、data_processing 4、payment 4、confidentiality 3。下面的查询里，confidentiality 那一行的 `rn`、`rnk`、`drnk` 分别是多少？
 --- code
@@ -503,6 +542,9 @@ type: sql
 title: 客户内部给合同排名
 level: 3
 ordered: yes
+cards: 窗口函数：每行都留下; CTE：用 WITH 给每一步起名字
+--- context
+客户经理想知道：这位客户的哪份合同最费模型调用的钱，好判断他买的套餐收费够不够抵这些成本。
 --- prompt
 每位客户的合同，按审查总费用排名。四列：
 
@@ -536,6 +578,9 @@ type: sql
 title: 修 bug：窗口函数的位置
 level: 2
 ordered: yes
+cards: 每组最新一条; 窗口函数：每行都留下
+--- context
+同一个条款可能审过好几次：失败以后重跑，或者换了 prompt 重审。报告里每个条款只该出现一次，而且要是最近那次的结果，不然律师会看到互相矛盾的判定。
 --- prompt
 合同 109 的 8.1 第一次审查失败（429），后来重跑成功了；合同 106 的 10.1 失败以后还没有重跑。报告里每个「合同 + 条款」只要**最新**的一次：重跑过的显示重跑的结果，还没重跑的就显示那次失败。同事的查询报错：`misuse of aliased window function rn`。
 
@@ -567,6 +612,9 @@ type: fill
 title: 填空：只算最新的一次
 level: 2
 ordered: yes
+cards: 每组最新一条
+--- context
+给客户的报告里，每个条款只应该有一个最终结论。重审过的条款以最后一次为准，报告里的汇总数字才会和律师看到的条款一致。
 --- prompt
 每个「合同 + 条款」只算最新的一次审查，再数每种 verdict 各几条。填好以后和昨天的结果（accept 37、flag 14、redline 12、NULL 2）比一比：哪些数变了？为什么？
 --- template
@@ -591,6 +639,9 @@ type: sql
 title: 每天的累计费用
 level: 3
 ordered: yes
+cards: LAG 和累计; CTE：用 WITH 给每一步起名字
+--- context
+这张图用来盯模型费用的预算：一眼看出哪天花得多，累计下来有没有超出计划。
 --- prompt
 画一张「费用随时间累计」的图，需要这样的数据：每个有审查的日子一行，三列：
 
@@ -620,6 +671,9 @@ type: sql
 title: 延迟突然变大
 level: 3
 ordered: yes
+cards: LAG 和累计
+--- context
+律师在网页上等审查结果，哪条审查突然慢了好几秒，他们最先感觉到。先把这些审查找出来，才能去查原因。
 --- prompt
 找出延迟突然变大的审查：在**同一份合同**里按 `created_at` 排，每条审查和它的上一条比，`latency_ms` 增加了 4000 以上（`> 4000`）的。四列：`id`、`model`、`latency_ms`、`jump_ms`（这条的 `latency_ms` 减去上一条的），按 `id` 排序。
 
@@ -644,6 +698,9 @@ type: sql
 title: v1 和 v2 并排
 level: 3
 ordered: yes
+cards: d22:CASE WHEN：贴标签、按条件计数
+--- context
+第 13 天用评测比较过 v1 和 v2 两版 prompt。把两版放在同一行，一眼就能看出每个用例是变好了、变差了，还是没变。
 --- prompt
 把 `evals` 里每个用例的 v1 和 v2 并排放在一行：三列 `case_id`、`v1_passes`（v1 跑的几次里通过了几次）、`v2_passes`，按 `case_id` 排序。
 --- solution
@@ -663,6 +720,9 @@ title: 闭卷：合同 103 的最终结论
 exam: yes
 level: 3
 ordered: yes
+cards: 每组最新一条; d22:ORDER BY：排序和前 N 名
+--- context
+合同 103 先整份用 v1 prompt 审过，后来有的条款换成 v2 又审了一次。给客户的最终报告里，每个条款只能有一个结论。
 --- prompt
 `reviews` 表里，合同 103 有的条款审查过不止一次。每个条款（`clause_id`）只保留**最新**的一次审查（`created_at` 最大），返回三列 `clause_id`、`verdict`、`prompt_version`。
 
@@ -685,6 +745,9 @@ title: 闭卷：每个客户的花费
 exam: yes
 level: 3
 ordered: yes
+cards: LEFT JOIN：没有对上的也留下; d22:NULL：「不知道」
+--- context
+月底财务要看每位客户带来了多少模型费用，再和他们买的套餐（`plan`）比一比，看哪些客户的成本偏高。
 --- prompt
 用 `customers`、`contracts`（`customer_id` 指向客户）和 `reviews`（`contract_id` 指向合同）。每个客户一行，**包括还没有任何合同的客户**，三列：
 
@@ -709,6 +772,9 @@ title: 闭卷：v1 和 v2 的通过率
 exam: yes
 level: 3
 ordered: yes
+cards: CTE：用 WITH 给每一步起名字; d22:CASE WHEN：贴标签、按条件计数
+--- context
+决定要不要把线上的 prompt 从 v1 换成 v2，要看每个评测用例的通过率变化。只看总数会藏住细节：可能修好了几个用例，又弄坏了另一个。
 --- prompt
 `evals` 表每一行是一个用例（`case_id`）用某个 prompt 版本（`prompt_version`，`'v1'` 或 `'v2'`）跑一次，`passed` 是 1 或 0。每个用例一行，四列：
 

@@ -206,6 +206,9 @@ console.log([...risks].sort((a, b) => RISK_ORDER[a] - RISK_ORDER[b]));
 type: choice
 title: let 还是 const
 level: 1
+cards: 从 Python 到 TypeScript
+--- context
+从今天起，用 TypeScript 把 Clause Check 的各个小块再写一遍。第一件和 Python 不一样的事：声明变量时要用 `let` 或 `const` 开头。
 --- prompt
 下面哪段代码会被 TypeScript 报错？
 --- options
@@ -221,6 +224,9 @@ answer: 2
 type: predict
 title: 模板字符串和数组
 level: 1
+cards: 从 Python 到 TypeScript; 数组、对象和 type
+--- context
+报告里的「编号 + 标题」和条款编号列表，在 TypeScript 里怎么拼、怎么打印，和 Python 有一些小差别。
 --- prompt
 写出输出。`console.log` 打印数组时的格式和 Python 不一样：`[ '3.1', '4.2' ]`（单引号、括号内有空格）。
 --- code
@@ -235,6 +241,9 @@ console.log(heading.toUpperCase(), heading.includes("Cap"));
 type: code
 title: 拼一行描述（TS 版）
 level: 1
+cards: 函数和箭头函数; 数组、对象和 type
+--- context
+报告每行一条条款：编号、标题、判定。这次判定的类型只允许三个词，传错了代码还没运行就会被发现，这是 TypeScript 比 Python 多出来的保护。
 --- prompt
 写 `describe(id, heading, verdict)`，返回 `"8.1 Cap on Liability: flag"`。和第 1 天那题一样，这次用 TypeScript。
 --- starter
@@ -260,6 +269,9 @@ expect("4.2", () => describe("4.2", "Automatic Renewal", "redline"), "4.2 Automa
 type: code
 title: 是不是高风险（TS 版）
 level: 1
+cards: 函数和箭头函数; 从 Python 到 TypeScript
+--- context
+高风险条款要排在报告最前面，先得能判断一条是不是高风险。逻辑和第 1 天一样，这次练 TypeScript 的写法。
 --- prompt
 写 `isHigh(risk)`：`risk` 是 `"high"` 时返回 `true`，否则 `false`。参数和返回值都要标类型。
 --- starter
@@ -281,6 +293,9 @@ expect("HIGH 不算", () => isHigh("HIGH"), false);
 type: code
 title: 取章节号（TS 版）
 level: 1
+cards: 函数和箭头函数; d1:字符串
+--- context
+报告要按章节归类：`8.1`、`8.2` 都放在第 8 章下面。第 1 天用 Python 做过同一件事，这次换成 TypeScript。
 --- prompt
 写 `sectionOf(id)`：`"8.1"` → `"8"`，`"12"` → `"12"`，`"10.2.1"` → `"10"`。
 --- starter
@@ -302,6 +317,9 @@ expect("10.2.1", () => sectionOf("10.2.1"), "10");
 type: translate
 title: 翻译：统计每种判定
 level: 2
+cards: Record 和计数; if 和循环
+--- context
+报告开头的判定统计（几条接受、几条标出、几条改写），换成 TypeScript 来写。Python 版你已经会了，这次重点看两种语言的写法怎么一一对应。
 --- prompt
 把上面的 Python 函数翻译成 TypeScript 的 `countVerdicts`。返回类型是 `Record<string, number>`。
 --- source
@@ -334,6 +352,9 @@ expect("空", () => countVerdicts([]), {});
 type: code
 title: 高风险编号（filter + map）
 level: 2
+cards: 数组方法：map、filter、find; 数组、对象和 type
+--- context
+审合同的人最想先看高风险条款的编号清单。这种「挑出一部分、再取出一个字段」的写法，在 TypeScript 代码里到处都是。
 --- prompt
 写 `highRiskIds(clauses)`：返回 `risk` 为 `"high"` 的条款编号数组，保持原顺序。试着用 `filter` 和 `map` 一行写完。
 --- starter
@@ -365,6 +386,9 @@ expect("没有", () => highRiskIds([{ id: "1", risk: "low" }]), []);
 type: fix
 title: 修类型错误
 level: 2
+cards: 类型标注和类型错误; 数组、对象和 type
+--- context
+用 TypeScript 写审查结果时，条款的形状（有哪些字段、判定能取哪些值）都写在类型里。和 Python 不同，写错的地方在运行之前就会被标出来。
 --- prompt
 这段代码有两处类型错误（运行后看「类型检查」区域）。修好它们，并让 `needsAttention` 在判定不是 `accept` 时返回 `true`。
 --- starter
@@ -397,6 +421,9 @@ expect("example 合法", () => example.verdict, "flag");
 type: predict
 title: sort 的两个坑
 level: 2
+cards: 排序的两个坑
+--- context
+报告要按编号或风险排序。TypeScript 的排序有两个和 Python 不一样的地方，不知道的话，条款顺序会悄悄排错。
 --- prompt
 写出输出。回忆知识卡片里的两个坑。
 --- code
@@ -411,6 +438,9 @@ console.log(ids.sort());
 type: code
 title: 按风险排序（TS 版）
 level: 3
+cards: 排序的两个坑; 数组方法：map、filter、find
+--- context
+报告的「需要关注」栏要高风险在前。传进来的条款数组，别的地方还要按原顺序用（比如逐条显示全文），排序时不能把它打乱。
 --- prompt
 写 `attentionOrder(clauses)`：返回编号数组，`high` 在前、`medium` 其次、`low` 最后，同级保持原顺序。**不要修改传进来的数组。**
 --- starter
@@ -444,6 +474,9 @@ expect("原数组没被改", () => (attentionOrder(DATA), DATA.map((c) => c.id))
 type: order
 title: 排代码：数高风险（TS 版）
 level: 2
+cards: if 和循环; 从 Python 到 TypeScript
+--- context
+报告开头要写「本合同有几条高风险条款」。这个函数第 2 天用 Python 写过，换成 TypeScript 逻辑一样，只是写法不同。
 --- prompt
 排出 `countHigh`。有两行干扰项，想想它们错在哪。
 --- lines
@@ -471,6 +504,9 @@ expect("零条", () => countHigh([]), 0);
 type: code
 title: 单数还是复数（TS 版）
 level: 1
+cards: if 和循环; 从 Python 到 TypeScript
+--- context
+报告的汇总行会写「3 clauses: flag」这样的句子，英文单复数写错了看起来不专业。第 1 天做过 Python 版，这次换 TypeScript。
 --- prompt
 写 `countText(count, verdict)`：`count` 为 1 返回 `"1 clause: flag"`，否则返回 `"3 clauses: flag"`（0 也用复数）。
 --- starter
@@ -495,6 +531,9 @@ expect("0", () => countText(0, "accept"), "0 clauses: accept");
 type: code
 title: 找条款（find）
 level: 2
+cards: 数组方法：map、filter、find; 函数和箭头函数
+--- context
+模型审查时可能要翻看它提到的另一条条款，程序要按编号从合同里取出那一条。模型给的编号可能根本不存在，TypeScript 会要求你在类型里写明这种可能。
 --- prompt
 写 `findClause(clauses, id)`：返回编号等于 `id` 的条款；找不到返回 `undefined`。注意返回类型怎么写。
 --- starter
@@ -520,6 +559,9 @@ expect("找不到", () => findClause(DATA, "99"), undefined);
 type: choice
 title: == 和 ===
 level: 1
+cards: 从 Python 到 TypeScript
+--- context
+Clause Check 里到处都在比较：判定是不是 `redline`、编号是不是 `8.1`。JavaScript 有两种写「相等」的方式，写 TypeScript 时一般只用其中一种。
 --- prompt
 为什么 TypeScript / JavaScript 里推荐用 `===` 而不是 `==`？
 --- options
@@ -535,6 +577,9 @@ answer: 2
 type: translate
 title: 翻译：按主题分组
 level: 3
+cards: Record 和计数; if 和循环; 数组、对象和 type
+--- context
+按主题（付款、责任上限……）把条款分组，是报告里「按主题看」的基础。第 2 天写过 Python 版，这次把它搬到 TypeScript。
 --- prompt
 把 Python 的 `group_by_topic` 翻译成 TypeScript 的 `groupByTopic`。
 --- source
@@ -581,6 +626,9 @@ expect("空", () => groupByTopic([]), {});
 type: fill
 title: 填空：TS 计数模板
 level: 1
+cards: Record 和计数; if 和循环
+--- context
+报告要写出高、中、低风险各有几条。这个计数的形状在 TypeScript 里同样会反复出现，值得熟到不用想。
 --- prompt
 补全计数函数。
 --- template
@@ -602,6 +650,9 @@ expect("空", () => countRisks([]), {});
 type: code
 title: 清洗模型输出（TS 版）
 level: 1
+cards: 从 Python 到 TypeScript; d1:字符串
+--- context
+模型回答的判定常带多余的空格、换行或大写字母，原样拿去比较会对不上。拿到回答后先清洗一遍，这一步这次用 TypeScript 写。
 --- prompt
 写 `normalize(text)`：去掉首尾空白，转成小写。
 --- starter
@@ -622,6 +673,9 @@ expect("大小写", () => normalize("Accept"), "accept");
 type: code
 title: 默认参数（TS 版）
 level: 1
+cards: 函数和箭头函数
+--- context
+报告里条款一般写成 `Clause 8.1`，个别合同习惯叫 Section。第 2 天用 Python 写过同样的函数，这次看 TypeScript 的写法。
 --- prompt
 写 `label(id, prefix)`：`prefix` 不传时默认 `"Clause"`。`label("8.1")` → `"Clause 8.1"`，`label("8.1", "Section")` → `"Section 8.1"`。
 --- starter
@@ -642,6 +696,9 @@ expect("自定义", () => label("8.1", "Section"), "Section 8.1");
 type: predict
 title: 真假值和 ??
 level: 2
+cards: Record 和计数; 从 Python 到 TypeScript
+--- context
+处理审查结果时，常要给「没有值」一个兜底，比如没有备注时显示「无备注」。但 `0` 条、空文字有时本身就是正确的值，兜底时要分清楚。
 --- prompt
 写出输出。`||` 在左边是「假值」（`0`、`""`、`null`、`undefined`、`false`）时取右边；`??` 只在左边是 `null` / `undefined` 时取右边。
 --- code
@@ -656,6 +713,9 @@ console.log(empty || "empty", JSON.stringify(empty ?? "empty"));
 type: code
 title: 拼接编号
 level: 1
+cards: 数组方法：map、filter、find; if 和循环
+--- context
+报告里要有一行「需要关注：3.1, 4.2, 8.1」。一条都没有时，空着像是程序出了错，写一个明确的说法更好。
 --- prompt
 写 `joinIds(ids)`：返回 `"3.1, 4.2, 8.1"` 这样用逗号加空格连接的字符串；数组为空时返回 `"(none)"`。
 --- starter
@@ -681,6 +741,9 @@ type: scratch
 title: 闭卷：条款标题（TS）
 exam: yes
 level: 1
+cards: 函数和箭头函数; 从 Python 到 TypeScript
+--- context
+报告里每条条款前面都有一行标题，写明编号和条款名。
 --- prompt
 写 `clauseTitle(id, heading)`，返回 `"Clause 8.1 - Cap on Liability"`。参数和返回值都要标类型。
 --- solution
@@ -696,6 +759,9 @@ type: scratch
 title: 闭卷：三档风险计数（TS）
 exam: yes
 level: 2
+cards: Record 和计数; if 和循环
+--- context
+练习里的报告开头有一张固定三格的风险统计表：高、中、低。网页按这三个名字取数，哪一格缺了，网页就显示不出来。
 --- prompt
 写 `riskCounts(clauses)`：`clauses` 的每个元素有 `risk: string`。返回 `{ high: 数量, medium: 数量, low: 数量 }`，三个键都要有，其他值忽略。
 --- solution
@@ -718,6 +784,9 @@ type: scratch
 title: 闭卷：截断文本（TS）
 exam: yes
 level: 2
+cards: if 和循环; 函数和箭头函数
+--- context
+网页上的条款列表每行只有一点地方，整段原文放不下，只能先露出开头一截。
 --- prompt
 写 `shorten(text, n)`：长度不超过 `n` 原样返回；超过则返回前 `n` 个字符加 `"..."`。
 --- solution

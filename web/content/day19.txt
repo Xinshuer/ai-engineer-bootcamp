@@ -239,6 +239,9 @@ print(reply.splitlines()[0])
 type: code
 title: 复习：关键词检索
 level: 1
+cards: d11:关键词检索
+--- context
+下午要给 RAG 回答加上引用，先复习检索这一步：用户就合同提一个问题，程序先从切好的片段里挑出最相关的几段，再交给模型去回答。
 --- prompt
 复习第 11 天。写 `top_k(query, chunks, k)`：
 
@@ -292,6 +295,9 @@ expect("返回的是片段字典", lambda: top_k("invoice", CHUNKS, 1), [CHUNKS[
 type: predict
 title: 复习：合并状态
 level: 1
+cards: 图执行器（Python 版）; TypedDict：给字典状态写类型
+--- context
+`graph.py` 的状态是一个字典，每个节点只交回它改了的几个键，再合并进去。第 18 天在 TypeScript 里做过同样的事，这里看 Python 的写法。
 --- prompt
 写出输出。第 18 天在 TypeScript 里用 `{ ...state, ...update }` 合并状态，Python 的写法是 `{**state, **update}`。注意哪个在后面，以及 TypedDict 在运行时到底是什么。
 --- code
@@ -317,6 +323,9 @@ print(type(new).__name__)
 type: fill
 title: 找下一个节点
 level: 1
+cards: 图执行器（Python 版）
+--- context
+和第 18 天一样，图执行器每跑完一个节点都要找下一步。这次用 Python 写，和真实项目的 `graph.py` 是同一种语言。
 --- prompt
 补全 `next_node(edges, node, state)`：`edges[node]` 可能是字符串（固定的下一个节点），也可能是路由函数（传入 state，返回下一个节点名）。`node` 不在 `edges` 里时抛 `ValueError`。
 --- template
@@ -341,6 +350,9 @@ expect_raises("拼错的节点名", lambda: next_node(EDGES, "reviw", {}), Value
 type: code
 title: 图执行器
 level: 2
+cards: 图执行器（Python 版）
+--- context
+真实项目的 `graph.py` 是 Python 写的，所以把第 18 天的执行器用 Python 再写一遍。写完它，读 LangGraph 的代码时就能一行行对上。
 --- prompt
 写 `run_graph(nodes, edges, state, start, max_steps=20)`，返回 `(最终 state, 路径)`：
 
@@ -414,6 +426,9 @@ expect_raises("节点不存在", lambda: run_graph(NODES, {"load": "reviw"}, {},
 type: predict
 title: 图走哪条路
 level: 2
+cards: 图执行器（Python 版）
+--- context
+模型第一次的输出坏了，图绕回去让它再审一次。这种「回头重来」的环在审查流程里很常见，读懂它走过的路，才能排查图为什么多跑或少跑了一步。
 --- prompt
 写出输出。`review` 第一次模型输出坏了，路由让它回到自己重审一次。
 --- code
@@ -451,6 +466,9 @@ print(state["tries"], state["ok"], "approve" in path)
 type: code
 title: 路由函数：四个去向
 level: 2
+cards: 图执行器（Python 版）; d18:边和条件路由
+--- context
+练习里的审查节点可能留下没审完的条款（比如模型的回答坏了）。审完之后下一步去哪有好几种可能；路由函数只看状态、不调模型，所以能单独测试。重审不能无限次，每次都要花钱。
 --- prompt
 写 `route_after_review(state)`，按顺序判断：
 
@@ -488,6 +506,9 @@ expect("没有条款", lambda: route_after_review({"errors": [], "reviews": []})
 type: code
 title: 存检查点、读检查点
 level: 2
+cards: 检查点文件; d10:pathlib：路径是对象; d10:JSON 文件：load 和 dump
+--- context
+审一份合同要好几分钟，中途可能崩掉，也可能要等律师一整天。把「下一步去哪 + 当前状态」存成文件，每次运行一个文件，之后读回来就能接着跑。
 --- prompt
 写两个函数：
 
@@ -543,6 +564,9 @@ expect("同一个 run_id 再存会覆盖", _overwrite, {"next": "export", "state
 type: fix
 title: 修 bug：检查点存错了位置
 level: 3
+cards: 检查点文件
+--- context
+检查点的全部意义在于：恢复时，已经做完的节点不再重跑。审查节点重跑一次，就等于把整份合同的模型调用再付一遍钱，token 统计也会算重。
 --- prompt
 `run_saving` 每跑完一个节点就存一次检查点，`resume_saving` 从检查点接着跑。测试模拟了一次崩溃：`export` 第一次运行时抛错（磁盘满了），然后从检查点恢复。
 
@@ -640,6 +664,9 @@ expect("正常跑完后，检查点指向 END", _finished, "END")
 type: order
 title: 排代码：从文件恢复
 level: 2
+cards: 检查点文件
+--- context
+这是「第二天接着跑」的那一半：比如律师批准之后，另一个进程读出存好的检查点，从上次停下的地方把剩下的节点跑完。
 --- prompt
 排出 `resume_from_file(nodes, edges, path)`：读检查点文件，从 `next` 接着跑到 END，返回最终 state。有两行干扰项。
 --- lines
@@ -679,6 +706,9 @@ expect("从 export 开始", lambda: resume_from_file(NODES, EDGES, "work/d19/ord
 type: code
 title: 中断和恢复
 level: 3
+cards: 读 graph.py：和你写的一一对应; 图执行器（Python 版）; d18:中断和恢复：停下来等人
+--- context
+这是 `graph.py` 审批那一步的核心：有 redline 时图停下来，把问题交给律师；律师回复后再接着跑，按他的决定导出。自己写一遍，就知道 LangGraph 的 `interrupt()` 在替你做什么。
 --- prompt
 给执行器加上「中断 → 恢复」，就像 `graph.py` 的 `interrupt()` 加 `Command(resume=...)`。
 
@@ -751,6 +781,9 @@ expect("没有 redline：不中断", lambda: run(NODES, EDGES, {"reviews": REVIE
 type: choice
 title: 读 graph.py：interrupt
 level: 2
+cards: 读 graph.py：和你写的一一对应
+--- context
+`graph.py` 的审批节点在导出前停下来，等律师决定要不要把 redline 写进导出的合同副本。面试官很可能让你讲清楚，这一步到底发生了什么。
 --- prompt
 `clausecheck/graph.py` 的 `approve` 节点调用了 `interrupt(...)`。下面哪个说法是对的？
 --- options
@@ -766,6 +799,9 @@ answer: 3
 type: local
 title: 本机任务：跑一次真实的图
 level: 2
+cards: 读 graph.py：和你写的一一对应; d18:中断和恢复：停下来等人
+--- context
+把今天手写的「中断 → 人批准 → 恢复」放到真实项目里亲手跑一遍。mock 模式用规则审查器代替模型，不花钱，图的流程和用真模型时一样。
 --- prompt
 在真实项目里跑一次 LangGraph 版本的流程，亲眼看到「中断 → 人批准 → 恢复」：
 
@@ -793,6 +829,9 @@ verify: Interrupted before export[\s\S]*approved=True
 type: code
 title: 抠出引用编号
 level: 1
+cards: 带引用的回答
+--- context
+练习的场景：用户就合同提问（比如「客户能提前解约吗」），模型只能根据检索到的片段回答，每句话后面标上出处编号。要检查这些出处，先得把编号从回答里找出来。
 --- prompt
 写 `extract_citations(answer)`：返回回答里所有 `[c数字]` 引用的编号（不带方括号），**按第一次出现的顺序，去掉重复**。
 
@@ -824,6 +863,9 @@ expect("没有方括号的不算", lambda: extract_citations("clause c3 and [3]"
 type: testwrite
 title: 写测试：抠引用
 level: 2
+cards: 带引用的回答; d9:怎么想测试用例
+--- context
+引用检查是 RAG 评测的地基：它要是悄悄漏掉一个编号，后面的评分就全不可信，而且不会有人发现。测试就是给它上的保险。
 --- prompt
 被测函数是你上一题写的 `extract_citations`。写测试函数（`def test_...():` 里用 `assert`），要求：在正确的函数上全部通过，同时能抓住几个藏起来的有 bug 的版本。
 
@@ -892,6 +934,9 @@ def test_bare_ids_are_not_citations():
 type: code
 title: 检查引用
 level: 2
+cards: 带引用的回答
+--- context
+模型有时会引用一个它根本没看到的片段编号，看起来有出处，其实是编的；也可能一个出处都不标。这样的回答都不能直接交给律师。
 --- prompt
 写 `check_citations(answer, allowed_ids)`。`allowed_ids` 是这次检索到、放进了 prompt 的片段编号（列表或集合都行）。返回：
 
@@ -944,6 +989,9 @@ expect("编的引用出现两次只算一次", lambda: check_citations("[c7] [c7
 type: code
 title: 抠出引文
 level: 2
+cards: groundedness：引号里的原文是真的吗
+--- context
+回答里常用引号摘录合同原文。下一题要核对这些原文是不是真的出现在片段里，这里先把它们一段段找出来。
 --- prompt
 写 `extract_quotes(answer)`：返回回答里所有被双引号括起来的文字，按出现顺序，去掉首尾空格，空的不要。直引号 `"…"` 和弯引号 `“…”` 都要认，模型经常输出弯引号。
 
@@ -976,6 +1024,9 @@ expect("单引号（撇号）不算", lambda: extract_quotes("Customer's data [c
 type: code
 title: groundedness 检查
 level: 3
+cards: groundedness：引号里的原文是真的吗; 带引用的回答
+--- context
+引用编号都对，引号里的「原文」也可能是模型编的，而律师最相信的恰恰是引号里的字。这个检查只用代码、不再调模型，每个回答都能跑，是一种很便宜的自动评测。
 --- prompt
 写 `grounded(answer, chunks)`：返回回答里**没有依据**的引文列表（按出现顺序）。
 
@@ -1047,6 +1098,9 @@ expect("没有引文", lambda: grounded("Sixty days' notice [c1].", CHUNKS), [])
 type: choice
 title: groundedness 能抓什么
 level: 2
+cards: groundedness：引号里的原文是真的吗
+--- context
+你的 RAG 评测里有一项 groundedness 检查。一条回答通过了它，你要能向律师或面试官说清楚，这到底说明了什么。
 --- prompt
 你的 RAG 评测里，`grounded(answer, chunks)` 对一条回答返回了 `[]`（没找到无依据的引文）。能得出什么结论？
 --- options
@@ -1062,6 +1116,9 @@ groundedness 只检查「引文是不是真的」。模型可以引用真实的�
 type: code
 title: 带引用的 RAG 回答
 level: 3
+cards: 依赖注入让 RAG 可测; 带引用的回答
+--- context
+把今天的零件串成一个完整的合同问答：律师问一句，程序给出带出处、能查证的回答。调模型的函数从外面传进来，测试时换成假的，不联网、不花钱，结果每次都一样。
 --- prompt
 把今天的 RAG 部分串起来。写 `rag_answer(question, chunks, llm, k=2)`：
 
@@ -1187,6 +1244,9 @@ type: scratch
 title: 闭卷：带条件边的图执行器
 exam: yes
 level: 3
+cards: 图执行器（Python 版）
+--- context
+闭卷用 Python 写带条件边的图执行器，也就是 `graph.py` 背后 LangGraph 替你做的事。面试官让你解释框架时，能从空白写出它最有说服力。
 --- prompt
 写 `run_graph(nodes, edges, state, start, max_steps=10)`：
 
@@ -1233,6 +1293,9 @@ type: scratch
 title: 闭卷：引用检查报告
 exam: yes
 level: 3
+cards: 带引用的回答
+--- context
+闭卷写 RAG 评测里的引用检查。除了编造的编号，也看检索到了却没被用上的片段：它们白占了 prompt 里的 token（模型按它计费），也可能说明检索不够准。
 --- prompt
 RAG 回答里的引用写成 `[c数字]`，比如 `[c2]`、`[c10]`。写 `citation_report(answer, retrieved_ids)`，返回：
 
@@ -1269,6 +1332,9 @@ type: scratch
 title: 闭卷：引文核查
 exam: yes
 level: 3
+cards: groundedness：引号里的原文是真的吗
+--- context
+闭卷写引文核查。律师最相信引号里的原文，所以每一段都要能在它引用的片段里找到；得出的分数可以放进评测报告，和其他指标一起看。
 --- prompt
 写 `groundedness(answer, chunks)`：
 

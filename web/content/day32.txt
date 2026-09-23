@@ -388,6 +388,9 @@ for route in [with_literal, without]:
 type: predict
 title: 复习：create_agent 是一张图
 level: 1
+cards: d31:create_agent：现成的工具循环; 从你的执行器到 StateGraph
+--- context
+第 31 天用 `create_agent` 搭的审查助手，内部其实就是一张 LangGraph 图。今天要自己动手搭图，先回头看看这张现成的图里面是什么样子。
 --- prompt
 复习第 31 天。写出输出。模拟服务器第一次会让模型调工具，拿到工具结果后回答 `"Based on the playbook: "` 加上工具结果的前 80 个字符。
 --- code
@@ -414,6 +417,9 @@ print(len(MOCK.calls), "model calls")
 type: choice
 title: 复习：没设上限的 agent
 level: 1
+cards: d31:create_agent：现成的工具循环; 从你的执行器到 StateGraph
+--- context
+真实服务里，模型偶尔会卡在「再查一次规则」的循环里出不来，而每一轮都要调一次模型、花一次钱。上线前得弄清楚：没设上限时，这种循环会怎样收场。
 --- prompt
 复习第 31 天。一个 `create_agent` 做的 agent，调用时**没有**传 `recursion_limit`。某次模型卡住了，每一轮都要求再调一次工具。在本课用的 LangGraph 1.2 上会发生什么？
 --- options
@@ -429,6 +435,9 @@ answer: 2
 type: code
 title: 第一张图
 level: 1
+cards: 从你的执行器到 StateGraph
+--- context
+真实项目的 `clausecheck/graph.py` 把审查流程写成一张图：读合同、逐条审查、汇总。练习用三个简化的节点搭出同样的骨架：输入两行条款文字，最后得到一句汇总。
 --- prompt
 三个节点函数已经写好。写 `build_app()`：用 `StateGraph(State)` 把它们连成 `START → load → review → summarise → END`，返回 `compile()` 之后的 app。
 
@@ -497,6 +506,9 @@ expect("节点", lambda: list(build_app().get_graph().nodes), ["__start__", "loa
 type: predict
 title: 覆盖还是追加
 level: 2
+cards: State 和 reducer
+--- context
+审查图里有的键只该留最新的值（比如判定），有的键要把各个节点的记录攒起来（比如备注）。这段代码让三个节点依次写这两种键，看最后留下了什么。
 --- prompt
 写出输出。`verdict` 没有 reducer，`notes` 有 `operator.add`。注意 `third` 返回的是什么，还有输入 `invoke(...)` 本身也经过 reducer。
 --- code
@@ -536,6 +548,9 @@ print(len(out["notes"]))
 type: choice
 title: 两个分支写同一个键
 level: 2
+cards: 并行分支和 superstep; State 和 reducer
+--- context
+法务检查和成本检查互不依赖，放在同一步里一起跑能省时间。可两边的结果最后都要交到同一个 `reviews` 键里。
 --- prompt
 State 里 `reviews: list[dict]`（**没有** reducer）。`legal_check` 和 `cost_check` 都从 `START` 出发（并行），各自返回 `{"reviews": [...]}`。`invoke` 时会怎样？
 --- options
@@ -551,6 +566,9 @@ answer: 3
 type: code
 title: 自定义 reducer：取最高风险
 level: 2
+cards: State 和 reducer; 并行分支和 superstep
+--- context
+一条条款要同时过好几项检查（责任、数据、付款），每项各给一个风险等级。报告只关心最严重的那个：只要有一项是 high，这条就要排到最前面让人先看。
 --- prompt
 三个检查节点从 `START` 并行出发，各自返回一个 `risk`（`"low"` / `"medium"` / `"high"`）。最终状态里的 `risk` 应该是**最高**的那个。
 
@@ -633,6 +651,9 @@ expect("全是 low", lambda: build_app().invoke({"text": "Fees are payable in 30
 type: code
 title: 条件边：批准还是导出
 level: 2
+cards: 条件边; 看图：draw_mermaid
+--- context
+真实的 `graph.py` 在汇总之后分岔：有要改写（redline）的条款，就先停下等人批准再导出；一条都没有，就直接导出报告。练习里的 `path` 记下走过的节点，测试靠它检查走的是哪条路。
 --- prompt
 写路由函数和图：
 
@@ -708,6 +729,9 @@ expect("图上画出了两条条件边（要有 Literal 标注）", lambda: sort
 type: fix
 title: 修 bug：图悄悄停了
 level: 2
+cards: 报错的错误和悄悄的错误; 条件边
+--- context
+图出了问题不一定会报错，它可能只是提前停下。放到线上，就是要改写的条款没人批准、报告也没导出，却没人察觉。学会抓这种「悄悄的错误」，比修会报错的 bug 更要紧。
 --- prompt
 有 redline 时，这张图应该走 `summarise → approve → export`。可测试显示它在 `summarise` 之后就结束了，没有任何异常，只有一条不起眼的警告（真实服务的日志里很容易被淹没）。
 
@@ -801,6 +825,9 @@ expect("以后再拼错会直接 KeyError", _typo_now_raises, "KeyError")
 type: testwrite
 title: 写测试：审查后的路由
 level: 2
+cards: 条件边; 报错的错误和悄悄的错误
+--- context
+练习里假设审查可能没做完（比如模型的回答没法用），这时要决定：再审一遍、交给人，还是往下走。这个路由一旦写错，没审完的合同就可能被当成审完的交出去。
 --- prompt
 被测函数 `route_after_review(state)` 决定审查之后去哪儿，按顺序判断：
 
@@ -895,6 +922,9 @@ def test_failure_beats_redlines():
 type: code
 title: 并行检查再汇合
 level: 3
+cards: 并行分支和 superstep; State 和 reducer
+--- context
+练习里的审查分两路同时进行：法务一路，成本一路（成本还要多估算一步）。最后的总结要看到两路的全部发现，提前跑或者跑两遍，报告里都会出现不完整的总结。
 --- prompt
 写 `build_app()`，让图这样走：
 
@@ -989,6 +1019,9 @@ expect("四个节点都跑了，各跑一次", lambda: sorted(name for update in
 type: fix
 title: 修 bug：InvalidUpdateError
 level: 2
+cards: 并行分支和 superstep; State 和 reducer; 报错的错误和悄悄的错误
+--- context
+两项检查并行跑完，各自带回一些发现，要交给汇总节点一起统计。这次图没有悄悄出错，而是直接报错，这反而是好事：错误信息会告诉你问题在哪。
 --- prompt
 两个检查节点并行跑，然后汇合到 `summarise`。运行测试，读错误信息（它把解决办法也写出来了），只改 State 里的一行。
 --- starter
@@ -1063,6 +1096,9 @@ expect("只有一条", lambda: build_app().invoke({"text": "Liability is unlimit
 type: predict
 title: stream 的 updates
 level: 2
+cards: stream：看每一步做了什么; 条件边
+--- context
+图跑完只给最终结果时，看不出中间走了哪条路。调试的时候，或者要在网页上显示「正在进行哪一步」时，就要看每一步各自的输出。
 --- prompt
 写出输出。每跑完一个节点，`stream_mode="updates"` 给一个 `{节点名: 它返回的更新}`；`stream_mode="values"` 每一步之后给一次完整状态（第一次是输入）。
 --- code
@@ -1109,6 +1145,9 @@ updates 按执行顺序列出每个节点返回了什么，走哪条路一目了
 type: fix
 title: 修 bug：审查结果没写进去
 level: 2
+cards: 报错的错误和悄悄的错误; stream：看每一步做了什么
+--- context
+条款 8.3 写着责任无上限（unlimited），本该判为 redline，导出结果却一直是初始值 pending。程序没报错，只能看每一步的更新找线索。
 --- prompt
 导出的结果总是 `8.3: pending`，好像 review 节点从来没跑过。可是没有任何报错。
 
@@ -1184,6 +1223,9 @@ expect("review 节点本身（不用搭图也能测）", lambda: review({"text":
 type: code
 title: 调试小工具：走过的路
 level: 2
+cards: stream：看每一步做了什么; 报错的错误和悄悄的错误
+--- context
+这是给自己写的调试工具，不是审查功能本身。以后改图的结构（加节点、改路由），跑一下就能对比前后走的路和改动的键是不是还一样。
 --- prompt
 写 `trace(app, inputs)`：用 `app.stream(inputs, stream_mode="updates")` 跑一遍图，返回一个列表，每跑完一个节点加一项 `(节点名, 它更新的键，排好序的列表)`。节点什么都没写进状态（更新是 `None`）时，键列表是 `[]`。
 
@@ -1286,6 +1328,9 @@ expect("写错的键不见了，None 变成 []，键排好序", lambda: trace(_g
 type: order
 title: 排代码：搭一张带路由的图
 level: 2
+cards: 从你的执行器到 StateGraph; 条件边
+--- context
+这是一张最小的审查图：审一条条款，要改写的去批准节点，否则直接结束。练习里跑的是一条写着责任无上限（unlimited）的条款。
 --- prompt
 排出完整程序：定义 State 和节点，搭图（`START → review`，`review` 之后按路由去 `approve` 或 `END`，`approve → END`），编译后跑一次，结果存进 `OUT`。有两行干扰项。
 --- lines
@@ -1324,6 +1369,9 @@ expect("没有 redline 时直接结束", lambda: app.invoke({"text": "Fees are d
 type: fill
 title: 填空：reducer 和条件边
 level: 1
+cards: State 和 reducer; 条件边
+--- context
+这是 `graph.py` 里「汇总 → 按需批准」那一段的缩小版。`path` 是给测试看的：它记下图实际走过的节点。
 --- prompt
 补全：`path` 要**追加**每个节点的名字；`summarise` 之后用 `route` 决定去 `approve` 还是直接结束；最后编译。
 --- template
@@ -1363,6 +1411,9 @@ expect("没有 redline：直接结束", lambda: app.invoke({"redlines": 0})["pat
 type: code
 title: 聊天节点：MessagesState
 level: 2
+cards: MessagesState 和 add_messages; d29:消息
+--- context
+审合同的人常会连着追问：「8.1 这条正常吗？」「那 9.2 呢？」第二个问题要结合上一轮才答得对，所以聊天记录要跟着对话保存下来。system prompt 是写给模型的「身份和规矩」。
 --- prompt
 搭一个一个节点的聊天图：
 
@@ -1434,6 +1485,9 @@ expect("system prompt 没有存进状态", lambda: [type(m).__name__ for m in as
 type: code
 title: 裁剪历史：RemoveMessage
 level: 3
+cards: MessagesState 和 add_messages
+--- context
+对话越长，每次发给模型的历史就越多，token（模型按它计费）也越多，还可能超出模型一次能读的长度。练习里的模型是模拟服务器，测试会检查它实际收到了几条消息。
 --- prompt
 聊天越长，每次发给模型的 token 越多。加一个 `trim` 节点，放在 `chat` 前面：
 
@@ -1499,6 +1553,9 @@ type: scratch
 title: 闭卷：审查流程图
 exam: yes
 level: 3
+cards: 从你的执行器到 StateGraph; 条件边
+--- context
+闭卷把 `clausecheck/graph.py` 的骨架从头写一遍：读合同、审查、汇总，再按有没有要改写的条款分岔。面试时被问「你的项目怎么用 LangGraph」，这张图就是答案的核心。
 --- prompt
 用 LangGraph（`from langgraph.graph import StateGraph, START, END`）写 `build_review_graph()`，返回编译好的图。State 的键：`text: str`、`clauses: list[str]`、`redlines: list[str]`、`summary: str`、`approved: bool`、`exported: str`。
 
@@ -1563,6 +1620,9 @@ type: scratch
 title: 闭卷：并行检查与汇合
 exam: yes
 level: 3
+cards: 并行分支和 superstep; State 和 reducer
+--- context
+一条条款同时过三项检查，每项给一个风险等级，最后由一个节点给出判定。这是并行和汇合在审查里最常见的用法。
 --- prompt
 写 `build_checks()`，返回编译好的 LangGraph 图（`import operator`、`from typing import Annotated, TypedDict`、`from langgraph.graph import StateGraph, START, END`）：
 
@@ -1618,6 +1678,9 @@ type: scratch
 title: 闭卷：带裁剪的聊天图
 exam: yes
 level: 3
+cards: MessagesState 和 add_messages
+--- context
+给审查员用的问答助手：记得前面聊过什么，但历史太长时只留最近几条，免得每次请求越来越贵。
 --- prompt
 写 `build_chat(model, keep)`，返回编译好的 LangGraph 图，State 用 `MessagesState`（`from langgraph.graph import StateGraph, START, END, MessagesState`）：
 

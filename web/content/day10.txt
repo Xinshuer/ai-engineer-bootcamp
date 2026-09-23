@@ -265,6 +265,9 @@ print(os.getenv("CLAUSECHECK_MODE", "mock"))
 type: predict
 title: 复习：拆行和 Counter
 level: 1
+cards: 读写文件：open、with、encoding; d8:字典进阶：推导式、Counter、defaultdict
+--- context
+假设审查日志存在一个文本文件里，每行是「编号 判定」。读进来以后，要先按行拆开，再做统计。
 --- prompt
 写出输出。复习第 8 天的 `Counter`，同时注意：文件内容通常以 `"\n"` 结尾，`split("\n")` 和 `splitlines()` 的结果差在哪里？
 --- code
@@ -282,6 +285,9 @@ print(Counter(verdicts).most_common(1))
 type: code
 title: 数非空行
 level: 1
+cards: 读写文件：open、with、encoding
+--- context
+从 PDF 抽出来的合同文字里夹着很多空行。先数一数有内容的行有几行，能快速看出文件是不是读对了，还是读出了一堆空白。
 --- prompt
 写 `count_lines(path)`：返回文件里**非空行**的行数（只有空格的行也算空行）。用 `with open(path, encoding="utf-8") as f:` 打开。
 
@@ -317,6 +323,9 @@ expect("有 § 和 ö 这样的字符", lambda: count_lines("work/d10/lines/d.tx
 type: fix
 title: 修 bug：日志只剩一行
 level: 2
+cards: 读写文件：open、with、encoding
+--- context
+审查时每判完一条，就往日志文件里记一行，出了问题可以回头查：是哪一条、判成了什么。
 --- prompt
 `log_verdict` 应该把每次的判定**追加**到日志文件末尾，一行一条，比如 `8.1,flag`。可是连着调用三次以后，文件里只剩最后一行。
 
@@ -354,6 +363,9 @@ expect("文件不存在时自动新建", _fresh, "12,accept\n")
 type: predict
 title: 拆开一个路径
 level: 1
+cards: pathlib：路径是对象
+--- context
+命令行工具拿到合同文件的路径后，还要算出报告存在哪里。真实项目的 `cli.py` 在用户没给 `--out` 时，就拿合同的路径换一个后缀，当作报告的路径。
 --- prompt
 写出输出。本页是 Linux 风格的路径，打印用 `/`。注意文件名里有两个点时，`.stem` 和 `.suffix` 各是什么。
 --- code
@@ -372,6 +384,9 @@ print(Path("data/sample_contract.txt").stem)
 type: code
 title: 读合同，报清楚的错
 level: 2
+cards: pathlib：路径是对象; d3:raise：主动报错
+--- context
+这是命令行工具的入口：`python -m clausecheck review 合同文件` 先要把合同读进来。真实项目的 `split.load_contract` 在合同里找不到条款时，也会报一条写明文件名的错。
 --- prompt
 仿照项目的 `split.load_contract` 写 `load_contract(path)`：
 
@@ -422,6 +437,9 @@ expect("空文件的信息只写文件名", lambda: _msg("blank.txt", ValueError
 type: choice
 title: 明明有这个文件
 level: 2
+cards: 文件夹：mkdir、glob 和「当前目录」
+--- context
+在项目里新建一个小脚本读 playbook，结果报「找不到文件」，这是新手最常遇到的问题之一。
 --- prompt
 你在 `G:\Contract Clause Reviewer\tools\` 里新建了 `stats.py`，里面写着 `Path("data/playbook.json").read_text(encoding="utf-8")`，然后在终端运行下面两行，报了 `FileNotFoundError: ... 'data\\playbook.json'`。可是 `G:\Contract Clause Reviewer\data\playbook.json` 明明存在。原因是？
 --- code
@@ -440,6 +458,9 @@ answer: 2
 type: code
 title: 保存报告
 level: 2
+cards: JSON 文件：load 和 dump; 文件夹：mkdir、glob 和「当前目录」
+--- context
+审完一份合同，报告要存成 JSON 文件，之后网页、评测或者律师都能再打开看。真实项目的 `cli.py` 审完也会把报告写成一个 `.report.json` 文件。
 --- prompt
 写 `save_report(report, path)`：把字典 `report` 写成 JSON 文件，**缩进 2 格、中文原样写出**；上级文件夹不存在时自动创建。返回这个文件的 `Path` 对象。
 
@@ -483,6 +504,9 @@ expect("中文原样写出", lambda: "需要律师看" in _text(), True)
 type: fix
 title: 修 bug：json.dump
 level: 2
+cards: JSON 文件：load 和 dump
+--- context
+把字典写成 JSON 文件，是存报告、存配置最常用的一步。这里的错误几乎每个人都犯过一次。
 --- prompt
 `write_json` 想把字典写进文件，可是一调用就报错。运行，读测试结果里报错的最后一行，想一想 `json.dump` 的第二个参数应该是什么，然后修好。
 --- starter
@@ -521,6 +545,9 @@ expect("缩进 2 格", _indent, '{\n  "a": 1\n}')
 type: code
 title: 读出一整个文件夹的报告
 level: 3
+cards: 文件夹：mkdir、glob 和「当前目录」; JSON 文件：load 和 dump
+--- context
+每审一份合同就存一个报告文件，时间一长，一个文件夹里就有很多份。想做每周统计，先得把它们全读进来。
 --- prompt
 一个文件夹里存着很多次审查的报告 `*.json`。写 `load_reports(folder)`：
 
@@ -587,6 +614,9 @@ expect("坏 JSON：报错信息里有文件名", _msg, "bad JSON in b.json")
 type: fill
 title: 填空：导出 CSV
 level: 2
+cards: CSV：让律师用 Excel 打开
+--- context
+律师不读 JSON，他们用 Excel。练习里把审查结果导出成表格文件，律师就能在自己熟悉的工具里筛选、排序、加批注。
 --- prompt
 补全 `export_csv(reviews, path)`：把审查结果导出成 CSV，只要 `FIELDS` 里的四列（字典里别的键，比如 `tokens`，忽略掉），返回写了几行数据（不算表头）。
 
@@ -629,6 +659,9 @@ expect("第一行是表头", lambda: (export_csv(REVIEWS, OUT), Path(OUT).read_t
 type: code
 title: 读回律师改过的 CSV
 level: 2
+cards: CSV：让律师用 Excel 打开
+--- context
+接上一题：律师在 Excel 里改完判定，又把表格存了回来。程序要读回人改过的结果，因为最终以律师的判断为准。
 --- prompt
 律师在 Excel 里改完判定，又存回了 CSV（列：`clause_id,verdict,tokens`）。写 `csv_summary(path)`，返回：
 
@@ -670,6 +703,9 @@ expect("只有表头", lambda: csv_summary("work/d10/csv_in/empty.csv"), {"rows"
 type: predict
 title: argparse 解析出什么
 level: 2
+cards: 命令行参数：argparse
+--- context
+真实项目在终端里这样用：`python -m clausecheck review data/sample_contract.txt --mode mock`。程序拿到的只是一串文字，要先变成有名字、有类型的参数。
 --- prompt
 写出输出。注意：没给的参数是什么值、`type=int` 做了什么、`--only-risk` 在 `args` 里叫什么。
 --- code
@@ -693,6 +729,9 @@ print(b.path, b.limit, b.only_risk, b.verbose)
 type: code
 title: 写参数解析器
 level: 2
+cards: 命令行参数：argparse
+--- context
+这是命令行工具的「说明书」：用户能给哪些参数、各是什么类型、能取哪些值。真实项目 `cli.py` 的 `review` 命令也有 `--out` 和 `--mode`。参数给错了，程序在开始干活之前就该拦下来。
 --- prompt
 写 `build_parser()`，返回一个 `argparse.ArgumentParser(prog="clausecheck")`，支持：
 
@@ -735,6 +774,9 @@ expect_raises("--limit 不是数字", lambda: P("c.txt", "--limit", "abc"), Syst
 type: order
 title: 排代码：main(argv)
 level: 2
+cards: main(argv)、退出码和 __name__; 命令行参数：argparse
+--- context
+一个完整小命令行工具的骨架。写成 `main(argv)`，测试时传一个列表就能跑，不用开终端；它的返回值告诉系统这次运行是成功还是失败。
 --- prompt
 排出一个小命令行工具：`main(argv=None)` 解析参数；文件不存在就打印 `error: <路径> not found` 并返回 `1`；否则打印 `<文件名>: <行数> lines` 并返回 `0`。有两行干扰项。
 --- lines
@@ -771,6 +813,9 @@ expect("文件不存在返回 1", lambda: main(["work/d10/order/nope.txt"]), 1)
 type: code
 title: 一个真正的小命令行工具
 level: 3
+cards: main(argv)、退出码和 __name__; 命令行参数：argparse; pathlib：路径是对象
+--- context
+把今天学的拼起来：一个在终端里查看合同有几条条款的小工具，类似真实项目的 `python -m clausecheck clauses`。调试时只看前几条，能省很多时间。
 --- prompt
 写 `main(argv=None)`。解析器 `build_parser()` 已经写好（参数：`path`、`--mode`、`--limit`、`--verbose`），`load_clause_ids(text)` 也写好了，返回合同里所有条款编号。要求：
 
@@ -859,6 +904,9 @@ expect("文件不存在返回 1", lambda: main(["work/d10/cli/missing.txt"]), 1)
 type: choice
 title: 导入时会跑 main 吗
 level: 2
+cards: main(argv)、退出码和 __name__
+--- context
+给命令行工具写测试（第 9 天的 pytest）时，测试文件要先从 `cli.py` 里导入 `main`。
 --- prompt
 `clausecheck/cli.py` 的最后两行是下面这样。测试文件里写了 `from clausecheck.cli import main`，这时会发生什么？
 --- code
@@ -877,6 +925,9 @@ answer: 2
 type: code
 title: 配置的优先级
 level: 2
+cards: 环境变量和配置
+--- context
+用户可能在 `.env` 里设了运行模式，临时想换一种，就在命令行里加 `--mode`。几个地方都设了的时候，程序得有一条固定的规矩决定听谁的。
 --- prompt
 写 `resolve_mode(cli_value, env)`，按「命令行 > 环境变量 > 默认值」决定运行模式：
 
@@ -926,6 +977,9 @@ expect("不认识的模式 → ValueError", _msg, "unknown mode: fast")
 type: testwrite
 title: 为 env_int 写测试
 level: 3
+cards: 环境变量和配置; d9:怎么想测试用例
+--- context
+真实项目的 `config.py` 从环境变量读「最多几步」这类数字设置。环境变量读出来永远是文字，一个值设错，整个审查的行为都会变，所以这种读配置的小函数最值得写测试。
 --- prompt
 下面的 `env_int(env, name, default)` 从环境变量字典里读一个整数设置，就像 `config.py` 里的 `int(os.getenv("CLAUSECHECK_MAX_STEPS", "6"))`，但更严格：
 
@@ -1011,6 +1065,9 @@ def test_bad_value_raises_with_name():
 type: local
 title: 本机任务：跑真实的命令行
 level: 2
+cards: 命令行参数：argparse; main(argv)、退出码和 __name__
+--- context
+把今天学的放回真实项目：看它的命令行怎么解析参数、把报告写到哪里、参数不合法时怎么退出。面试时现场演示项目，用的就是这些命令。
 --- prompt
 在你电脑上的真实项目里，把今天的内容跑一遍。打开 VS Code 的终端（PowerShell），逐行运行：
 
@@ -1044,6 +1101,9 @@ type: scratch
 title: 闭卷：合并多份报告
 exam: yes
 level: 3
+cards: JSON 文件：load 和 dump; 文件夹：mkdir、glob 和「当前目录」
+--- context
+每周要给团队一份总账：这周审了哪些合同、一共有多少条被标记。每份合同的报告各存在一个文件里，要把它们合成一份。
 --- prompt
 写 `merge_reports(folder, out_path)`：
 
@@ -1095,6 +1155,9 @@ type: scratch
 title: 闭卷：统计判定的命令行
 exam: yes
 level: 3
+cards: 命令行参数：argparse; CSV：让律师用 Excel 打开; main(argv)、退出码和 __name__
+--- context
+律师导出的审查表格（CSV），有时只想在终端里快速看一眼各种判定各有几条。练习里把它做成一个独立的小命令行工具。
 --- prompt
 用 argparse 写命令行工具 `count-verdicts` 的 `main(argv=None)`（`prog="count-verdicts"`）：
 
@@ -1140,6 +1203,9 @@ type: scratch
 title: 闭卷：校验 playbook
 exam: yes
 level: 3
+cards: JSON 文件：load 和 dump; d3:raise：主动报错
+--- context
+审查规则都存在 `data/playbook.json` 里，模型按主题查规则（真实项目的 `playbook.py` 就按主题把规则分好组）。有人手改这个文件时很容易漏写字段，要在程序一启动时就发现。
 --- prompt
 写 `load_playbook(path)`，读取并校验一个 playbook JSON 文件：
 

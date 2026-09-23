@@ -208,6 +208,9 @@ for day, topic, files in week2:
 type: predict
 title: 复习：编号怎么排序
 level: 1
+cards: d8:多键排序; d8:dataclass：只装数据的类
+--- context
+今天要把一周学的东西拼成一个小工具，它的报告要把条款按编号、按紧急程度排好。条款编号是 `10.1` 这样的文字，怎么排才对，是今天要先想清楚的事。
 --- prompt
 复习第 8 天（dataclass、多键排序）：写出输出。注意字符串排序和按数字排序的区别。
 --- code
@@ -240,6 +243,9 @@ print(reviews[0])
 type: choice
 title: 哪个改动放错了地方
 level: 1
+cards: 项目怎么拆：五个文件，三种数据
+--- context
+mini Clause Check 照真实项目的样子拆成五个文件，每个只管一件事。以后往里加功能时，要先想清楚这段代码该放进哪个文件。
 --- prompt
 你要给 mini Clause Check 加功能。下面哪个做法**破坏**了「一个文件只做一件事」？
 --- options
@@ -255,6 +261,9 @@ answer: 1
 type: code
 title: P1 读合同文件
 level: 1
+cards: 校验放在「门口」; d10:pathlib：路径是对象
+--- context
+整个工具的第一步：从硬盘上读进一份合同，对应真实项目 `split.py` 里的 `load_contract`。文件路径是用户给的，可能打错，文件也可能是空的；在这里说清楚出了什么事，比到后面莫名其妙地出错好查得多。
 --- prompt
 **项目第 1 块（split.py）。** 写 `read_contract(path)`：读取合同文本文件（UTF-8），返回全文。
 
@@ -305,6 +314,9 @@ expect_raises("只有空白：ValueError", lambda: read_contract("work/d14/p1/bl
 type: code
 title: P2 拆成 Clause
 level: 2
+cards: 项目怎么拆：五个文件，三种数据; d8:dataclass：只装数据的类
+--- context
+读进来的合同全文要切成一条条条款，后面才能逐条交给模型审。第 7 天切出来的是字典，今天换成 dataclass，写法也更接近真实的 `split.py`。
 --- prompt
 **项目第 2 块（split.py）。** 把第 7 天的拆条款改成返回 dataclass，并且更接近真实项目：
 
@@ -380,6 +392,9 @@ type: fill
 title: P3 前半：发请求
 level: 2
 mock: yes
+cards: d4:状态码和重试; 从小到大：先让一条跑通
+--- context
+这是 mini 工具里唯一发网络请求的地方，对应真实项目的 `review.py`。一份合同要连着调用几十次模型，中途碰上一次服务器忙就让整份合同失败，太不划算。
 --- prompt
 **项目第 3 块（review.py）的前半。** `call_model(messages)` 把 messages 发给模型、要求 JSON 格式，返回**整个**回答字典（后面既要读 `content`，也要读 `usage`）：
 
@@ -447,6 +462,9 @@ type: code
 title: P3 后半：校验和纠正
 level: 3
 mock: yes
+cards: 校验放在「门口」; d12:校验失败：告诉模型错在哪，再试一次
+--- context
+模型的回答是从外面进来的数据，要在这个门口检查。通过检查的判定变成 `ClauseReview`，后面汇总、写报告的代码就可以放心用，不用再到处写检查。
 --- prompt
 **项目第 3 块的后半。** 写 `review_clause(clause, call=call_model)`，返回 `ClauseReview`（messages 和 tokens 的开头已经写好）：
 
@@ -610,6 +628,9 @@ expect_raises("两次都不合法：RuntimeError", _fake_twice, RuntimeError)
 type: choice
 title: 校验应该放在哪
 level: 2
+cards: 校验放在「门口」
+--- context
+一个不合规矩的值从模型的回答进来，会一路经过审查、汇总、写报告好几个环节。团队在讨论，应该在哪一环把它拦下。
 --- prompt
 模型偶尔会把 `risk_level` 写成 `"HIGH"`。这个检查应该放在哪里？
 --- options
@@ -625,6 +646,9 @@ answer: 2
 type: code
 title: P4 汇总
 level: 2
+cards: d8:多键排序; 项目怎么拆：五个文件，三种数据
+--- context
+律师拿到报告，先看汇总：一共几条、每种判定各几条、先看哪几条。真实项目 `pipeline.py` 的 `summarise` 做的就是这件事，它的 `needs_attention` 也把风险最高的排在最前面。
 --- prompt
 **项目第 4 块（pipeline.py）。** 写两个函数：
 
@@ -706,6 +730,9 @@ expect("空列表", lambda: summarise([]), {"clauses": 0, "counts": {"accept": 0
 type: testwrite
 title: 给 summarise 写测试
 level: 3
+cards: d9:怎么想测试用例; d9:测试函数和 pytest
+--- context
+`summarise` 的结果决定律师先看哪一条。顺序排错一点，最危险的条款就可能被埋在列表后面。写测试，就是让这类错误一出现就被发现。
 --- prompt
 下面的「被测函数」是正确的 `summarise`。给它写测试：你的测试在它上面要全部通过，同时要抓住藏起来的几个 bug 版本（每个 bug 版本都要让至少一个测试失败）。
 
@@ -884,6 +911,9 @@ def test_tokens_and_clauses():
 type: code
 title: P5 写报告文件
 level: 2
+cards: d10:JSON 文件：load 和 dump; d10:文件夹：mkdir、glob 和「当前目录」
+--- context
+汇总好的报告要存成一个 JSON 文件交出去：律师可以打开看，别的程序也能读进去接着用。这是 mini 工具 `pipeline.py` 的最后一块。
 --- prompt
 **项目第 5 块（pipeline.py）。** 写 `write_report(report, path)`：把字典 `report` 写成 JSON 文件，并返回这个文件的 `Path`。
 
@@ -927,6 +957,9 @@ expect("中文原样保存，不是 \\u 转义", lambda: (_write(), "需要律�
 type: order
 title: 排代码：串起流水线
 level: 2
+cards: 项目怎么拆：五个文件，三种数据
+--- context
+前面几块都各自跑通了，现在要把它们接成一条流水线：合同文件进去，一份报告出来。真实项目里做这件事的是 `pipeline.py` 的 `review_contract`。
 --- prompt
 **把前面几块串起来（pipeline.py）。** 排出 `review_contract(path, review)`：读文件 → 拆条款 → 逐条审查 → 汇总 → 组装报告字典。
 
@@ -994,6 +1027,9 @@ expect("reviews 是字典列表", lambda: _R()["reviews"], [{"clause_id": "1.1",
 type: fix
 title: 修 bug：第二份合同混进了第一份
 level: 2
+cards: d9:调试流程：先复现，再猜，一次只改一处; d9:常见 bug 模式
+--- context
+Clause Check 的 `api.py` 把审查做成了网络服务：别人把合同传上来，它审完就返回报告。律所一天会通过它审很多份合同，每一份的报告都只能有这份合同自己的内容。
 --- prompt
 同事给网页服务（像 `clausecheck/api.py` 那样一直开着的进程）写了一个直接接收合同全文的 `review_text`。上线后律师投诉：**第二份合同的报告里混进了第一份合同的条款**。
 
@@ -1112,6 +1148,9 @@ expect("连续跑三次，每次结果一样", lambda: [review_text(B, keyword_r
 type: code
 title: P6 命令行参数
 level: 2
+cards: d10:命令行参数：argparse; 校验放在「门口」
+--- context
+做成命令行工具以后，律师或同事不用改代码，在终端里敲一行命令就能审一份合同。真实项目的 `cli.py` 也是这样接收参数的。
 --- prompt
 **项目第 6 块（cli.py）的前半。** 写 `build_parser()`，返回一个 `argparse.ArgumentParser`（`prog="minicheck"`），参数：
 
@@ -1149,6 +1188,9 @@ expect_raises("缺少路径：argparse 退出", lambda: _P([]), SystemExit)
 type: predict
 title: asdict 之后是字典
 level: 2
+cards: d8:dataclass：只装数据的类; 项目怎么拆：五个文件，三种数据
+--- context
+报告最后要写成 JSON，而 JSON 只认字典、列表这类普通数据，所以每条审查结果进报告之前，都要从 dataclass 变成字典。之后读它的代码写法也跟着变了。
 --- prompt
 写出输出。`asdict` 之后，每条审查变成了普通字典：取值要写 `r["risk"]`，不能再写 `r.risk`。下一题的 `--only-risk` 过滤就是在这种字典上做的。
 --- code
@@ -1182,6 +1224,9 @@ type: code
 title: P7 端到端：main
 level: 3
 mock: yes
+cards: 本机的样子：包、入口和 README; d10:main(argv)、退出码和 __name__; 校验放在「门口」
+--- context
+这是把所有零件接起来的最后一步：在终端敲一条命令，从合同文件一路走到报告文件。真实项目的 `cli.py` 里也有一个 `main(argv)`，靠它返回的退出码，别的脚本才知道这次是成功还是失败。
 --- prompt
 **项目第 7 块（cli.py）：把整个工具接起来。** 前面所有函数都在下面了，按文件分好了段。写 `main(argv=None)`：
 
@@ -1530,6 +1575,9 @@ expect("空文件：返回 1", lambda: main(["work/d14/p7/empty.txt", "--out", O
 type: local
 title: 本机任务：做成真正的命令行工具
 level: 3
+cards: 本机的样子：包、入口和 README; 项目怎么拆：五个文件，三种数据; 从小到大：先让一条跑通
+--- context
+网页里的 mini 工具只连着模拟服务器。这一步把它搬到自己电脑上，做成真能在终端运行的命令行工具，用真的 DeepSeek 审示例合同，再和真实项目的结果对比：playbook、工具调用这些你还没做的部分，到底带来了多少差别。
 --- prompt
 把今天的 mini 工具搬到你的电脑上，用真的 DeepSeek 跑一遍示例合同，再和真实项目的结果对比。
 
@@ -1537,28 +1585,18 @@ level: 3
 2. 把第 15 题里每一段 `# ===== xxx.py =====` 下面的代码放进对应的文件（最好照着理解重打一遍），`main` 用你自己写的版本
 3. 每个文件顶部补上它自己用到的 `import`。包内互相导入要加点，比如 `cli.py` 里写 `from .pipeline import review_contract, write_report` 和 `from .review import review_clause`
 4. `review.py` 顶部再加三行，读仓库根目录的 `.env`（只有本机需要，网页里的模拟服务器不用）：`from pathlib import Path`、`from dotenv import load_dotenv`、`load_dotenv(Path(__file__).resolve().parents[2] / ".env")`
-5. 真实项目是照着 DeepSeek 旧的接口写的，跑之前先补一处代码（第 13 天的本机任务做过的话，已经补好了）：打开 `clausecheck/review.py`，找到 `OpenAICompatBackend` 的 `_post`；如果 `body` 里还没有 `"thinking"`，就在 `r = self.requests.post(...)` 那一行**上面**加两行，缩进和 `r =` 对齐：
-
-```
-        if self.settings.mode == "deepseek":
-            body["thinking"] = {"type": "disabled"}
-```
-
-原因：DeepSeek 默认开着思考模式，这时带着 `tools` 的对话要把回答里的 `reasoning_content` 传回去，否则返回 400；项目的工具循环没传，模型一调工具就失败。关掉思考模式最简单，也更快、更便宜。
-
-6. 在终端运行你的工具，再运行真实项目（两个报告都写在 `data/` 里，`.gitignore` 已经忽略了 `*.report.json`）：
+5. 在终端运行你的工具，再运行真实项目（两个报告都写在 `data/` 里，`.gitignore` 已经忽略了 `*.report.json`）：
 
 ```
 cd "G:\Contract Clause Reviewer\learn"
 python -m minicheck ..\data\sample_contract.txt --out ..\data\mini.report.json
 cd "G:\Contract Clause Reviewer"
-$env:CLAUSECHECK_DEEPSEEK_MODEL = "deepseek-flash"
 python -m clausecheck review data/sample_contract.txt --mode deepseek --out data/ds.report.json
 ```
 
-`$env:` 那一行是因为项目 `config.py` 里默认的 DeepSeek 模型名是旧的，已经被 DeepSeek 停用了，要用环境变量换成 `deepseek-flash`。两边都关了思考模式，按 `deepseek-flash` 现在的价格（高峰时段输入 0.30、输出 1.20 美元每百万 token，非高峰时段减半；以官方价格页为准（2026-09）），两边加起来一般不到 0.2 美元。真实项目输出里的 `est_cost` 会显示 0：项目的旧价格表里没有 `deepseek-flash` 这一行（想看真实数字，可以自己在 `config.py` 的 `PRICES` 里加上）。
+两边都用 `deepseek-flash`、都关了思考模式（真实项目在 `clausecheck/review.py` 的 `_post` 里关，第 7 天读过）。按 `deepseek-flash` 现在的价格（高峰时段输入 0.30、输出 1.20 美元每百万 token，非高峰时段减半；以官方价格页为准（2026-09）），两边加起来一般不到 0.2 美元。真实项目输出里的 `est_cost` 就是按 `config.py` 的 `PRICES` 估算的。
 
-7. 把两边输出里 `counts=` 开头的那一行都粘贴到下面
+6. 把两边输出里 `counts=` 开头的那一行都粘贴到下面
 
 两边的数字不一样很正常：真实项目有 playbook、工具调用和长得多的 prompt。对比一下两边的 `needs_attention`：哪几条只有一边标了？你觉得为什么？
 placeholder: 粘贴两行 counts=…（你的 minicheck 一行，真实项目一行）
@@ -1567,12 +1605,15 @@ verify: counts=\{[\s\S]*counts=\{
 - `ModuleNotFoundError: No module named 'minicheck'`：确认你是在 `learn` 文件夹里运行的（第一个 `cd`），而且 `minicheck` 文件夹里有 `__init__.py`。
 - `ImportError: attempted relative import with no known parent package`：不要直接 `python cli.py`，要用 `python -m minicheck`。
 - 401：`.env` 里的 key 不对，或者 `load_dotenv` 那一行的路径不对。在那一行下面 `print(Path(__file__).resolve().parents[2])` 看看是不是仓库根目录。
-- 真实项目输出的最后有 `errors on clauses: [...]`：打开 `data/ds.report.json`，看那几条 `rationale` 里的错误。有 `Model Not Exist`：`$env:CLAUSECHECK_DEEPSEEK_MODEL` 那一行没在这个终端窗口里运行过；是别的 `HTTP 400`：多半是第 5 步那两行没加上，或者加在了发请求那一行的下面。
+- 真实项目输出的最后有 `errors on clauses: [...]`：打开 `data/ds.report.json`，看那几条 `rationale` 里的错误。有 `The supported API model names are ...`：模型名不对，看看 `.env` 里是不是写了别的 `CLAUSECHECK_DEEPSEEK_MODEL`。
 
 @@ item d14-17
 type: local
 title: 本机任务（选做）：给 split 加测试
 level: 2
+cards: d9:测试函数和 pytest; d9:怎么想测试用例; 周复盘：本周每个概念在哪个文件
+--- context
+真实项目的 `tests/test_split.py` 已经有几条测试，守着「把合同切成条款」这一步。这一步切错了，后面整条流水线审的就都是错的内容。这是你第一次往真项目里加测试。
 --- prompt
 在真实项目的 `tests/test_split.py` 末尾，**自己**加一个测试函数，测一件现有测试还没测的事。三个可选的主意：
 
@@ -1599,6 +1640,9 @@ type: scratch
 title: 周考 1：按条款合并问题
 exam: yes
 level: 3
+cards: d8:dataclass：只装数据的类; d8:多键排序
+--- context
+按 playbook 检查时，同一条条款可能违反好几条规则，每条规则各报一个问题。律师不想把同一条条款看好几遍，他要的是每条条款一行，从最要紧的开始看。
 --- prompt
 一条条款可能违反好几条规则。用 `@dataclass` 定义 `Finding`：`clause_id: str`、`rule_id: str`、`severity: str`（`low` / `medium` / `high`）。
 
@@ -1649,6 +1693,9 @@ type: scratch
 title: 周考 2：追加评测历史
 exam: yes
 level: 3
+cards: d10:JSON 文件：load 和 dump; d10:文件夹：mkdir、glob 和「当前目录」; d3:try / except：预料到的错误要接住
+--- context
+项目的 `evals/results.json` 每跑一次评测就被整个覆盖，想看这一周通过率是涨是跌就没法看了。所以要另外留一份历史记录，文件又不能越积越大。
 --- prompt
 评测每跑一次，就把结果追加到一个历史文件里（像 `evals/results.json`，但保留多次）。写 `append_run(history_path, run, keep=5)`：
 
@@ -1703,6 +1750,9 @@ type: scratch
 title: 周考 3：按条款检索，标题加权
 exam: yes
 level: 3
+cards: d11:关键词检索; d11:切块：按结构、按长度、带重叠
+--- context
+律师问「合同终止以后数据怎么处理」，程序要先从几十条条款里找出最相关的几条，再交给模型细看。先缩小范围，模型要读的字少了，又快又省钱。
 --- prompt
 合同本身就是按条款切好的块。写 `find_clauses(text, query, k)`：
 
@@ -1762,6 +1812,9 @@ title: 周考 4：带纠正的结构化调用
 exam: yes
 level: 3
 mock: yes
+cards: d12:校验失败：告诉模型错在哪，再试一次; d4:状态码和重试; 校验放在「门口」
+--- context
+这是 mini 工具里 `review.py` 的全部职责，压缩成一个函数：交出一条条款，拿回一个可以放心使用的判定。网络会出问题，模型也会答错格式，两种情况都得应付。
 --- prompt
 用 Pydantic 定义 `Verdict`：`clause_id: str`，`verdict` 只能是 `accept` / `flag` / `redline`，`risk_level` 只能是 `low` / `medium` / `high`。
 
@@ -1834,6 +1887,9 @@ type: scratch
 title: 周考 5：评测结果的最后一行
 exam: yes
 level: 3
+cards: d13:混淆矩阵、精确率、召回率; d13:跑 N 次，看通过率; 周复盘：本周每个概念在哪个文件
+--- context
+项目的 `run_evals.py` 跑完一整套评测，最后会打印一行总结，改完 prompt 一眼就能看出结果还行不行。时对时错的用例尤其要留意：它说明这条能不能过，全凭运气。
 --- prompt
 模仿 `evals/run_evals.py` 最后打印的那一行。`cases` 是 `[{"id": ..., "kind": ...}]`，`kind` 可能是 `must_flag`、`trap`、`must_accept` 或别的；`runs` 是 `{用例 id: [每次运行的判定, ...]}`。写 `eval_line(cases, runs)`，返回一行文字，格式（两段之间是两个空格）：
 

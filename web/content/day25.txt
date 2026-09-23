@@ -296,6 +296,9 @@ type: sql
 title: 复习：每个模型最慢的两条
 level: 2
 ordered: yes
+cards: d23:窗口函数：每行都留下; d23:CTE：用 WITH 给每一步起名字
+--- context
+排查延迟问题时，常先把每种模型最慢的几次审查挑出来，看它们审的是哪些条款、有没有共同点。
 --- prompt
 复习第 23 天的窗口函数（这题用普通 SQLite 写法，表名不用带数据集）：找出每个模型延迟最高的**两条**审查。返回四列：`model`、`id`、`clause_id`、`latency_ms`，按 model 排序，同一个模型里按 latency_ms 从高到低。用 `ROW_NUMBER()`。
 --- solution
@@ -319,6 +322,9 @@ title: 修 bug：搬到 BigQuery 报错
 level: 1
 bq: yes
 ordered: yes
+cards: GoogleSQL 方言：表名、除法、COUNTIF; 数据仓库和 BigQuery
+--- context
+假设 Clause Check 上线后，审查记录都放进 BigQuery（Google Cloud 的数据仓库）。在 SQLite 里写好的查询搬过去，常会因为方言（各家 SQL 写法上的小差别）而报错。
 --- prompt
 这条查询统计「已完成（status = 'reviewed'）的合同」里每种判定有几条成功的审查。它在 SQLite 里好好的，搬到 BigQuery 就报错。运行，读报错，修好它。结果两列：`verdict`、`n`，按 n 从多到少。
 --- starter
@@ -345,6 +351,9 @@ title: 各版本的 redline 率
 level: 1
 bq: yes
 ordered: yes
+cards: GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+负责人想知道换成 v2 prompt 以后，模型建议改写的比例有没有变化。比例突然升高，可能是新 prompt 让模型变得过于严格。
 --- prompt
 看板第一个问题：每个 prompt 版本的 redline 率。只算成功的审查（`error IS NULL`）。返回四列：
 
@@ -374,6 +383,9 @@ title: 每份合同的缓存命中率
 level: 2
 bq: yes
 ordered: yes
+cards: GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+命中缓存的输入 token 越多，审查越便宜（第 12 天的前缀缓存）。按合同来看命中率，能找出哪些合同没省下这笔钱。
 --- prompt
 缓存命中率 = 命中缓存的输入 token ÷ 全部输入 token（第 12、13 天）。算每份合同的命中率，返回三列：`contract_id`、`reviews`（审查条数）、`cache_hit_ratio`（`SUM(cache_hit_tokens)` ÷ `SUM(prompt_tokens)`，`ROUND(..., 3)`），按命中率从低到高。
 
@@ -397,8 +409,11 @@ title: 每月每客户的花费
 level: 2
 bq: yes
 ordered: yes
+cards: 时间：DATE_TRUNC 和 TIMESTAMP_DIFF; d23:JOIN：把几张表连起来
+--- context
+客户按套餐付钱，模型费用却是每审一条就花一笔。按客户、按月把模型费用加起来，才知道每个客户的成本是多少、套餐定价够不够。
 --- prompt
-给客户开账单：每个月、每个客户的审查花费。按**审查时间**算月份，失败的审查也花了钱，也要算。返回四列：
+核算成本：每个月、每个客户的审查花费。按**审查时间**算月份，失败的审查也花了钱，也要算。返回四列：
 
 - `month_start`：`DATE_TRUNC(DATE(r.created_at), MONTH)`
 - `customer`：客户名
@@ -428,6 +443,9 @@ title: 多久开审，有没有重审
 level: 2
 bq: yes
 ordered: yes
+cards: 时间：DATE_TRUNC 和 TIMESTAMP_DIFF
+--- context
+客户上传合同后要等多久才开审，直接影响他们觉得快不快。过了好些天又出现新的审查，多半是换了新版 prompt 重审，或者失败以后重跑。
 --- prompt
 两个运营问题：合同上传以后多久开始审？后来有没有被重审？每份合同返回三列：
 
@@ -456,6 +474,9 @@ title: 延迟 p50 和 p95
 level: 3
 bq: yes
 ordered: yes
+cards: 本页跑不了的 BigQuery 写法; d23:窗口函数：每行都留下
+--- context
+律师感到的「慢」，多半来自最慢的那一小部分审查，平均数会把它们藏起来（第 13 天）。按 prompt 版本看 p50 和 p95，才知道换 prompt 以后体验有没有变好。
 --- prompt
 延迟不能只看平均（第 13 天）。按 prompt_version 算延迟的 p50 和 p95，用 nearest-rank：排序后的第 ceil(p × n) 个。返回五列：`prompt_version`、`n`（条数）、`p50_ms`、`p95_ms`、`avg_ms`（`ROUND(AVG(latency_ms))`），按 prompt_version 排序。
 
@@ -489,6 +510,9 @@ title: 填空：每周失败率
 level: 2
 bq: yes
 ordered: yes
+cards: 时间：DATE_TRUNC 和 TIMESTAMP_DIFF; GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+失败的审查要重跑，也照样花钱。按周看失败率，能早点发现哪一周出了问题，比如被限流得太多。
 --- prompt
 补全这条看板查询：按周（从星期日算起）统计审查条数、失败条数和失败率（`error` 不是 NULL 就是失败），按周从早到晚。
 --- template
@@ -508,6 +532,9 @@ ORDER BY week_start;
 type: choice
 title: LIMIT 省钱吗
 level: 1
+cards: 怎么收费：扫多少列、多少分区
+--- context
+同事刚接触 BigQuery，想先看看表里的数据长什么样。BigQuery 按用量收费，每条查询都有价钱，先弄清这条会被收多少。
 --- prompt
 同事想看看 `clausecheck.reviews`（假设整张表 2 TiB）长什么样，在 BigQuery 里写了 `SELECT * FROM clausecheck.reviews LIMIT 10`。按需计费时，这条查询大约按多少数据收费？
 --- options
@@ -523,6 +550,9 @@ answer: 2
 type: choice
 title: 哪条扫得最少
 level: 2
+cards: 怎么收费：扫多少列、多少分区
+--- context
+这张表存了一整年的审查，看板每天都要查它很多次。按用量收费时，写法上的一点小差别，一年下来就是一笔不小的账单。
 --- prompt
 `clausecheck.reviews` 按 `DATE(created_at)` 分区、按 `customer_id` 聚簇，存了一整年的数据。下面哪条查询扫描的数据**最少**？
 --- options
@@ -541,6 +571,9 @@ level: 2
 lang: py
 cloud: yes
 dataset: clausecheck
+cards: Python 客户端：查询、参数、行
+--- context
+看板后端用 Python 从 BigQuery 取数据。拿回来的行、空值和时间列各是什么样子，决定了后面的代码该怎么写。
 --- prompt
 写出输出。注意：NULL 到 Python 里是什么？TIMESTAMP 列回来是什么类型（`.day` 能用吗）？`job.result()` 能遍历两次吗？
 --- code
@@ -567,6 +600,9 @@ level: 2
 lang: py
 cloud: yes
 dataset: clausecheck
+cards: Python 客户端：查询、参数、行; d24:参数化查询和 SQL 注入
+--- context
+客户在网页上点开「我的报告」，后端按客户编号从 BigQuery 查出每份合同的汇总。客户编号来自网页请求。
 --- prompt
 写 `run_report(client, customer_id)`：用起始代码里的 `SQL` 查出这个客户每份合同的汇总，返回字典列表（`dict(row.items())`），按 contract_id 排序；没有合同的客户返回 `[]`。
 
@@ -633,6 +669,9 @@ level: 2
 lang: py
 cloud: yes
 dataset: clausecheck
+cards: Python 客户端：查询、参数、行; d24:参数化查询和 SQL 注入
+--- context
+看板可以按主题筛选审查，主题值来自网页请求，可以被人改成任何文字。
 --- prompt
 `reviews_by_topic(client, topic)` 返回某个主题的审查 id（按 id 排序）。它把 topic 直接拼进了 SQL：值里有撇号就报错，还能被注入。运行测试，然后改成 `@topic` 参数（类型 `"STRING"`）。昨天在 SQLite 里修过一模一样的 bug，这次换成 BigQuery 的写法。
 --- starter
@@ -671,6 +710,9 @@ level: 2
 lang: py
 cloud: yes
 dataset: clausecheck
+cards: dry run、字节上限和缓存; 怎么收费：扫多少列、多少分区
+--- context
+BigQuery 按扫描量收费，一条写得不好的查询可能一次扫完整张大表。看板上线前，想先知道每条查询要花多少钱，又不想为了知道价钱而真的花钱。
 --- prompt
 写 `estimate_cost(client, sql, usd_per_tib=6.25)`：用 **dry run** 估算这条查询的扫描量和费用，返回 `{"bytes": 扫描字节数, "usd": 美元}`，其中 `usd = bytes / 2**40 * usd_per_tib`（不四舍五入；6.25 只是示例单价，以官方价格页为准）。
 
@@ -720,6 +762,9 @@ level: 3
 lang: py
 cloud: yes
 dataset: clausecheck
+cards: dry run、字节上限和缓存
+--- context
+看板让使用者自己组合查询，一不小心就会扫一整张大表。这个函数是查询的安全带：钱花超之前先拦住。
 --- prompt
 写 `safe_query(client, sql, max_bytes)`：
 
@@ -775,6 +820,9 @@ level: 3
 lang: py
 cloud: yes
 dataset: clausecheck
+cards: 写入：流式和批量
+--- context
+worker 每审完一条条款，就把结果写进 BigQuery，几秒后看板上就能看到。写入出问题时不会抛异常，不检查的话，数据会悄悄丢掉。
 --- prompt
 写 `stream_reviews(client, rows)`，把审查行流式写进 `TABLE`，返回 `{"inserted": 写进去的行数, "bad": [坏行的下标，从小到大]}`：
 
@@ -847,6 +895,9 @@ level: 2
 lang: py
 cloud: yes
 dataset: clausecheck
+cards: Python 客户端：查询、参数、行
+--- context
+合同详情页要显示高、中、低风险各有几条。这些数字从 BigQuery 查出来，整理成字典交给前端。
 --- prompt
 排出 `risk_counts(client, contract_id)`：返回这份合同每个风险等级的审查条数，形如 `{"low": 8, "medium": 2, "high": 2}`；失败的审查（risk 是 NULL）不算。contract_id 用参数传。有两行干扰项。
 --- lines
@@ -879,6 +930,9 @@ type: local
 title: 本机任务（选做）：BigQuery 沙盒
 level: 2
 lang: py
+cards: 怎么收费：扫多少列、多少分区; dry run、字节上限和缓存
+--- context
+前面的 BigQuery 都是模拟的。这一题在真的 BigQuery 沙盒（免费的试用环境）里跑一条查询，亲眼看看扫描量的估算和实际计费。
 --- prompt
 BigQuery 有一个免费的**沙盒**：用 Google 账号就能开，不用信用卡、不用建结算账号。按官方「BigQuery sandbox」页面的说明：和免费额度一样每月 1 TiB 查询，存储一共 10 GiB（删了数据也不退回额度），表 60 天后自动过期，不支持流式写入和改数据的 DML（规则会变，以官方页面为准）。打不开 Google 服务的话，跳过这一题。
 
@@ -918,6 +972,9 @@ exam: yes
 level: 3
 bq: yes
 ordered: yes
+cards: 时间：DATE_TRUNC 和 TIMESTAMP_DIFF; GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+客户经理每月和客户开会时要带上这张表：这个月他们的合同里，有多大比例的条款被建议改写，和上个月比是多了还是少了。
 --- prompt
 用 BigQuery 写法：每个月、每个客户的 redline 率，只算成功的审查（`error IS NULL`），月份按审查时间算。返回五列：
 
@@ -950,6 +1007,9 @@ level: 3
 lang: py
 cloud: yes
 dataset: clausecheck
+cards: dry run、字节上限和缓存; Python 客户端：查询、参数、行
+--- context
+看板后端要保证两件事：任何一条查询都不会意外花掉一大笔钱，查询里的值也都安全地交给数据库。
 --- prompt
 写 `guarded_query(client, sql, params, max_usd, usd_per_tib=6.25)`，用 `from google.cloud import bigquery`：
 
@@ -998,6 +1058,9 @@ exam: yes
 level: 3
 bq: yes
 ordered: yes
+cards: GoogleSQL 方言：表名、除法、COUNTIF
+--- context
+评测用例按期望的判定分成几类：该放行的、该标记的、该改写的。按类看通过率，才知道 v2 prompt 的改动对哪一类影响最大。
 --- prompt
 用 BigQuery 写法，从 `clausecheck.evals` 算每种期望判定（`expected`）在每个 prompt 版本下的通过率。`passed` 列是 1（通过）或 0。返回五列：
 

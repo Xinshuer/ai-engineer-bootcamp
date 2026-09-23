@@ -47,7 +47,8 @@ function parseContent(file) {
     }
     flush();
     if (kind === "day") { day = { ...obj, checklist: list(obj.checklist), concepts: [], items: [] }; DAYS.push(day); }
-    else if (kind === "concept") { obj.id = `d${day.id}-c${day.concepts.length + 1}`; day.concepts.push(normalize(obj, day)); }
+    // concepts are numbered d<day>-c<n>; a named one (`@@ concept intro`) is d<day>-intro and does not shift the numbers
+    else if (kind === "concept") { obj.id = id ? `d${day.id}-${id}` : `d${day.id}-c${day.concepts.filter((c) => !c.named).length + 1}`; obj.named = !!id; day.concepts.push(normalize(obj, day)); }
     else if (kind === "item") day.items.push(normalize(obj, day));
     else throw new Error(`${file}: unknown block ${kind}`);
   }
@@ -242,6 +243,74 @@ function lintLangchain(o) {
 }
 for (const day of DAYS) for (const c of day.concepts) if (c.langchain && c.code) lintLangchain(c);
 
+// ---------------------------------------------------------------- context, cards, checks
+// `--- context`: a few sentences of background above the task. `cards: 字符串; d1:列表` names the knowledge
+// cards the item uses (same day by title, another day as dN:title); the page links them. `checks` is what the
+// grader looks at, shown before the first run: every expect line's label, plus the call and the value when the
+// line calls the learner's own function with nothing the tests define.
+const conceptByTitle = (dayId, title) => (DAYS.find((d) => Number(d.id) === Number(dayId))?.concepts || []).find((c) => c.title === title);
+function splitTop(s) {
+  const out = [];
+  let depth = 0, quote = null, cur = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    cur += ch;
+    if (quote) { if (ch === "\\") cur += s[++i] ?? ""; else if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+    else if ("([{".includes(ch)) depth++;
+    else if (")]}".includes(ch)) depth--;
+    else if (ch === "," && depth === 0) { out.push(cur.slice(0, -1).trim()); cur = ""; }
+  }
+  if (quote || depth) return null;
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+const unquote = (s) => { const m = /^[rf]?(["'`])([\s\S]*)\1$/.exec(s); return m ? m[2].replace(/\\(["'\\])/g, "$1") : s; };
+function checksOf(it) {
+  if (!it.tests || !["code", "fix", "fill", "order", "scratch"].includes(it.type) || it.lang === "sql") return [];
+  const own = new Set();
+  for (const m of (it.solution || "").matchAll(/^(?:export\s+)?(?:async\s+)?(?:def|class|function|const|let)\s+(\w+)/gm)) own.add(m[1]);
+  const theirs = new Set(["MOCK", "_cc", "mock"]);
+  for (const m of it.tests.matchAll(/^(?:(?:async\s+)?(?:def|class|function|const|let|var)\s+(\w+)|(\w+)\s*(?::[^=\n]*)?=(?!=))/gm)) theirs.add(m[1] || m[2]);
+  const out = [];
+  for (const line of it.tests.split("\n")) {
+    const head = /^(expect\w*)\(/.exec(line);
+    if (!head) continue;
+    const args = splitTop(line.slice(head[0].length).replace(/\)\s*;?\s*$/, ""));
+    const label = args && args[0] ? unquote(args[0]) : (/^\w+\(\s*[rf]?(["'])(.*?)\1/.exec(line) || [])[2];
+    if (!label) continue;
+    const check = { label };
+    const kind = head[1];
+    if (args && /^(expect|expect_raises|expectThrows)$/.test(kind) && args.length === (kind === "expectThrows" ? 2 : 3)) {
+      const call = args[1].replace(/^lambda\s*:\s*/, "").replace(/^\(\)\s*=>\s*/, "");
+      const value = kind === "expect" ? args[2] : kind === "expect_raises" ? `报错 ${args[2]}` : "报错";
+      const fn = /^(\w+)\s*\(/.exec(call);
+      const words = (call + " " + (kind === "expect" ? value : "")).match(/[A-Za-z_]\w*/g) || [];
+      if (fn && own.has(fn[1]) && !words.some((w) => theirs.has(w)) && call.length <= 110 && value.length <= 90 && !/^async|await /.test(call)) Object.assign(check, { call, value });
+    }
+    out.push(check);
+  }
+  return out;
+}
+for (const day of DAYS) for (const it of day.items) {
+  if (it.context !== undefined) {
+    if (!it.context.trim()) bad(it.id, "empty --- context");
+    else if ([...it.context].length > 240) bad(it.id, `--- context is ${[...it.context].length} characters; keep it to a few sentences (max 240)`);
+  }
+  if (it.cards !== undefined) {
+    it.cardIds = [];
+    for (const ref of it.cards.split(";").map((s) => s.trim()).filter(Boolean)) {
+      const m = /^d(\d+):\s*(.+)$/.exec(ref);
+      const c = m ? conceptByTitle(m[1], m[2].trim()) : conceptByTitle(day.id, ref);
+      if (!c) bad(it.id, `cards: no knowledge card titled "${m ? m[2].trim() : ref}" on day ${m ? m[1] : day.id}`);
+      else if (m && Number(m[1]) > Number(day.id)) bad(it.id, `cards: "${ref}" is on a later day`);
+      else if (!it.cardIds.includes(c.id)) it.cardIds.push(c.id);
+    }
+    delete it.cards;
+  }
+  it.checks = checksOf(it);
+}
+
 const ids = new Set();
 for (const day of DAYS) {
   const validate = onlyDays === null || onlyDays.has(Number(day.id));
@@ -345,6 +414,8 @@ for (const day of DAYS) {
 // ---------------------------------------------------------------- report + emit
 const counts = DAYS.map((d) => `D${d.id}:${d.items.length}+${d.concepts.length}c`).join(" ");
 console.log(`checked ${checked} | ${counts} | items ${DAYS.reduce((n, d) => n + d.items.length, 0)}`);
+const allItems = DAYS.flatMap((d) => d.items);
+console.log(`context ${allItems.filter((it) => it.context).length}/${allItems.length} | cards ${allItems.filter((it) => it.cardIds?.length).length} | checks with a call ${allItems.filter((it) => it.checks.some((c) => c.call)).length}/${allItems.filter((it) => it.checks.length).length}`);
 if (problems.length) { console.log(`\n${problems.length} PROBLEM(S):\n- ` + problems.join("\n- ")); process.exitCode = 1; }
 else console.log(EMIT ? "all exercises valid" : `day ${[...onlyDays].join(",")} valid (validation only, dist/ not written)`);
 if (!EMIT) process.exit();

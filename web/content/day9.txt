@@ -235,6 +235,9 @@ print(label("high"), label("low"))
 type: code
 title: 复习：引用过的规则
 level: 1
+cards: d8:集合 set
+--- context
+假设报告末尾要列出这份合同审查时用到了哪些 playbook 规则，律师可以一条条核对。每条审查结果里的 `rule_ids` 就是模型说它依据的规则（真实项目 `models.py` 里的字段）。
 --- prompt
 复习第 8 天的集合。每条审查结果里有一个 `"rule_ids"` 列表。写 `cited_rules(reviews)`：返回所有被引用过的规则编号，**去重并排好序**。
 
@@ -265,6 +268,9 @@ expect("空", lambda: cited_rules([]), [])
 type: predict
 title: assert 的输出
 level: 1
+cards: assert：最小的测试
+--- context
+写测试离不开 `assert`：它检查一个条件，不成立就报错。这段代码用它挡住不合法的判定，比如模型把风险等级错填进了判定。
 --- prompt
 写出输出。注意最后一个 assert 没有写说明文字。
 --- code
@@ -288,6 +294,9 @@ assert 通过时什么也不做，函数照常返回。失败时，逗号后面�
 type: testwrite
 title: 写测试：预算够不够
 level: 1
+cards: 测试函数和 pytest; 怎么想测试用例
+--- context
+假设程序发请求前先估算用量：token（模型按它计费）超出预算就不发。这个判断一旦写错，要么白花钱，要么该审的条款被跳过，所以要用测试把它的行为固定下来。
 --- prompt
 第一道「写测试」题。被测函数 `fits_budget(tokens, budget)`：`tokens` **不超过**预算（小于或等于 `budget`）时返回 True，否则返回 False。
 
@@ -331,6 +340,9 @@ def test_another_budget():
 type: testwrite
 title: 写测试：清洗判定
 level: 2
+cards: 怎么想测试用例; 测试函数和 pytest
+--- context
+模型回答的判定常带空格、大小写也不一定。清洗函数守在模型和报告之间，它出错时最危险的后果，是把有问题的条款悄悄放行。
 --- prompt
 被测函数 `normalize_verdict(text)` 清洗模型返回的判定：先去掉首尾空白、转小写；结果是 `accept` / `flag` / `redline` 之一就返回它，否则返回 `"flag"`（拿不准的交给人看，**绝不能**默认 accept）。
 
@@ -391,6 +403,9 @@ def test_unknown_goes_to_a_human():
 type: choice
 title: 哪个测试能抓住它
 level: 2
+cards: 怎么想测试用例; 常见 bug 模式
+--- context
+网页把条款列表分页显示，每页 10 条，要先算出一共几页。这次不写代码，而是挑一个测试来检验别人写的代码。
 --- prompt
 `pages(n_clauses)` 应该返回放下所有条款需要几页（每页 10 条，最后一页不满也算一页）。下面的实现有 bug。哪个测试能抓住它？
 --- code
@@ -409,6 +424,9 @@ answer: 4
 type: testwrite
 title: 写测试：取章节号
 level: 2
+cards: 怎么想测试用例; 测试函数和 pytest
+--- context
+报告按章节分组，靠的是从条款编号里取出的章节号（第 1 天写过这个函数）。章节号取错，条款就会被归到别的章下面。
 --- prompt
 被测函数 `section_of(clause_id)` 返回条款所属的章：`"8.1"` → `"8"`，`"12"` → `"12"`，`"10.2.1"` → `"10"`。
 
@@ -449,6 +467,9 @@ def test_three_levels():
 type: fill
 title: 填空：pytest.raises
 level: 1
+cards: 测试报错和小数：raises、approx
+--- context
+模型把风险等级写成 `urgent` 这类不存在的值时，程序应该大声报错，而不是悄悄放过。测试要能证明：该报错的时候，它真的报了错。
 --- prompt
 补全测试函数：检查 `parse_risk("urgent")` 会抛出 `ValueError`，并且错误信息里有 `unknown risk`。
 --- template
@@ -484,6 +505,9 @@ expect("换成吞掉错误的版本，测试会失败", _swallowing, "测试失�
 type: testwrite
 title: 写测试：解析判定
 level: 2
+cards: 测试报错和小数：raises、approx; 怎么想测试用例
+--- context
+模型偶尔不按要求回 JSON，而是先来一句客套话。解析函数这时必须报错，让重试或人工接手；要是悄悄返回空值，这条条款就会在报告里「消失」。
 --- prompt
 被测函数 `parse_verdict(raw)`，`raw` 是模型返回的 JSON 文字：
 
@@ -572,6 +596,9 @@ def test_unknown_verdict_names_the_value():
 type: testwrite
 title: 写测试：通过率
 level: 2
+cards: 测试报错和小数：raises、approx; d4:随机性：跑一次不算数
+--- context
+评测要把同一条用例跑好几次，看通过的比例（真实项目 `run_evals.py` 表里的 pass rate）。一条用例算不算合格就看这个比例，它算错了，评测结论也跟着错。
 --- prompt
 被测函数 `pass_rate(results)`：`results` 是每次运行是否通过的列表（True / False），返回通过的比例（0 到 1 的小数）；空列表返回 `0.0`。
 
@@ -619,6 +646,9 @@ def test_empty_is_zero():
 type: order
 title: 排代码：一个测试文件
 level: 2
+cards: 测试函数和 pytest; 测试报错和小数：raises、approx
+--- context
+统计用量时常要算平均每次调用用掉多少 token，好估计下一份合同大概要用多少。这种小函数也该配一个测试文件，就像真实项目 `tests/` 文件夹里的那些。
 --- prompt
 排出一个小测试文件：被测函数 `average_tokens(calls)` 返回平均 token 数；一个测试检查正常情况，另一个检查空列表会抛出 `ZeroDivisionError`。有两行干扰项。
 --- lines
@@ -645,6 +675,9 @@ expect("test_empty_raises 通过", lambda: (test_empty_raises(), "passed")[1], "
 type: code
 title: 找出第一个出错的输入
 level: 2
+cards: 调试流程：先复现，再猜，一次只改一处; d3:try / except：预料到的错误要接住
+--- context
+一份合同几十条条款，程序在其中一条上崩了。先找出是哪一条、报了什么错，才能拿这一条单独排查，而不是每次都跑整份合同。
 --- prompt
 调试的第一步是找到**能稳定复现的最小输入**。写 `first_failing(inputs, fn)`：按顺序用每个输入调用 `fn(输入)`，返回第一个让 `fn` 抛出异常的 `(输入, "错误类型: 错误信息")`；全部正常就返回 `None`。
 
@@ -687,6 +720,9 @@ expect("空列表", lambda: first_failing([], section_number), None)
 type: fix
 title: 修 bug：读 Traceback
 level: 2
+cards: 调试流程：先复现，再猜，一次只改一处; d3:读懂多层的 Traceback
+--- context
+这段代码把模型返回的一批 JSON 回答解析出来，排出需要律师看的条款清单。它一运行就崩，正好拿来练习今天的排查顺序。
 --- prompt
 `attention(raws)` 应该返回需要人看的条款编号（风险高的在前）。运行测试会报错。按今天的调试流程来：
 
@@ -740,6 +776,9 @@ expect("空", lambda: attention([]), [])
 type: choice
 title: 调试的第一步
 level: 2
+cards: 调试流程：先复现，再猜，一次只改一处
+--- context
+一份长合同里只有一条的结果不对，这是排查时最常遇到的局面。
 --- prompt
 `review_all` 审完一份 40 条的合同，结果里第 17 条的判定是 `None`，其他都正常。下面哪种做法最符合今天的调试流程？
 --- options
@@ -755,6 +794,9 @@ answer: 3
 type: predict
 title: logging 的输出
 level: 2
+cards: logging：给程序留下记录
+--- context
+Clause Check 的 `api.py` 能把它变成一直运行、等别人来调用的网络服务。服务出了问题时没人盯着屏幕，只能事后翻日志，而每条日志都标着它的重要程度。
 --- prompt
 写出输出。想一想：哪一条记录会被 `level=logging.INFO` 过滤掉？
 --- code
@@ -775,6 +817,9 @@ DEBUG 比 INFO 低，被过滤掉了，另外三条按 `format` 输出成「级�
 type: code
 title: 给函数加上日志
 level: 2
+cards: logging：给程序留下记录; d3:try / except：预料到的错误要接住
+--- context
+批量审查时，某一条的回答解析失败，不该让整份合同审不下去；但失败必须留下记录，事后才知道是哪一条、为什么。
 --- prompt
 写 `safe_classify(clause_id, text, classify)`：
 
@@ -847,6 +892,9 @@ expect_raises("别的错误不要吞掉", lambda: safe_classify("4.2", "x", othe
 type: fix
 title: 修 bug：第一条不见了
 level: 2
+cards: 常见 bug 模式; d8:enumerate 和 zip
+--- context
+导出给律师的编号清单少了一条，律师就会漏看那一条条款，而且很难察觉。
 --- prompt
 律师反映：导出的清单里**第一条总是不见了**。运行，对照输出找到原因，修好它。修好后想一想：只有一条条款的合同，原来的代码会输出什么？
 --- starter
@@ -874,6 +922,9 @@ expect("空", lambda: numbered_lines([]), [])
 type: fix
 title: 修 bug：边遍历边删除
 level: 2
+cards: 常见 bug 模式; d2:列表推导式：一行写完筛选和变换
+--- context
+报告的「待处理」清单要去掉已经放行的条款。原来那份完整的列表后面还要用来生成整份报告，所以不能被改动。
 --- prompt
 `drop_accepted(reviews)` 应该去掉所有 accept，只留下需要人看的。可它有时会漏删。先运行看输出，再修好。
 
@@ -924,6 +975,9 @@ expect("空列表", lambda: drop_accepted([]), [])
 type: fix
 title: 修 bug：is 和 ==
 level: 2
+cards: 常见 bug 模式
+--- context
+程序要判断模型是不是放行了一条条款。这类比较写错时程序不会报错，只会悄悄给出错误的结果。
 --- prompt
 `is_accept(raw)` 判断模型返回的文字是不是 accept。输入明明是 `" Accept "`，它却说 False。运行看看，输出最上面还有一行 Python 给的 `SyntaxWarning`，读一读它说了什么。
 --- starter
@@ -950,6 +1004,9 @@ expect("不是 accept", lambda: is_accept("flag"), False)
 type: testwrite
 title: 写测试：截断文字
 level: 3
+cards: 怎么想测试用例; 测试报错和小数：raises、approx
+--- context
+网页表格放不下整段条款原文，只显示开头一段。截断写错了，要么表格被撑乱，要么律师看到的开头少了字。
 --- prompt
 被测函数 `truncate(text, n)` 把条款正文截短，放进表格里显示：
 
@@ -1013,6 +1070,9 @@ def test_n_below_one_raises():
 type: local
 title: 本机任务：看一次红和绿
 level: 2
+cards: 测试函数和 pytest; 怎么想测试用例
+--- context
+在自己电脑上用 pytest 跑测试，就是真实项目 `tests/` 文件夹平时的用法。亲眼看一次测试变红再变绿，才会相信测试真能抓住 bug。
 --- prompt
 在自己电脑上，亲手看一次测试从绿变红、再变绿。
 
@@ -1041,6 +1101,9 @@ type: scratch
 title: 闭卷：校验审查结果
 exam: yes
 level: 3
+cards: d3:raise：主动报错; 怎么想测试用例
+--- context
+模型返回的每条审查结果，进报告之前都要检查一遍。报错信息要说清缺了什么、哪个值不对，这样重试时可以原样告诉模型让它改。
 --- prompt
 写 `validate_review(d)`，检查模型返回的一条审查结果（字典）：
 
@@ -1080,6 +1143,9 @@ type: scratch
 title: 闭卷：去重并保留顺序
 exam: yes
 level: 2
+cards: d8:集合 set
+--- context
+模型给出的依据规则（`rule_ids`）要列进报告给律师核对。同一条规则要是出现两次，律师会以为是两条不同的规则。
 --- prompt
 模型返回的 `rule_ids` 经常有重复，还带着空格。写 `dedupe_keep_order(items)`：
 
@@ -1111,6 +1177,9 @@ type: scratch
 title: 闭卷：滑动窗口
 exam: yes
 level: 2
+cards: d1:列表; 常见 bug 模式
+--- context
+有的条款单独读看不懂，比如 `3.2` 写着「上述费用」，要连着 `3.1` 一起读才知道指什么。练习里把相邻的几条编号分成一组，一组一组交给模型。
 --- prompt
 审一条条款时，常常要连着看它前后的条款。写 `window(items, size)`：返回所有长度为 `size` 的**连续**片段（每个片段是一个列表），按顺序排列。
 

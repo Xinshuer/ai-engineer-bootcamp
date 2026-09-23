@@ -185,6 +185,9 @@ answer.forEach(([step, note], i) => console.log(`${i + 1}. ${step.padEnd(14)} ${
 type: predict
 title: 复习：默认参数
 level: 1
+cards: d9:常见 bug 模式; d2:函数：默认参数和提前 return; 读代码的顺序
+--- context
+审查时要把需要注意的条款编号收集进一个列表，这是一种很自然的写法，也是 Python 面试里的常客。
 --- prompt
 复习第 8、9 天。写出输出。这是面试官很爱问的一题。
 --- code
@@ -204,6 +207,9 @@ print(b is a, c)
 type: predict
 title: 循环里的闭包
 level: 2
+cards: d13:函数是值：装饰器; 读代码的顺序
+--- context
+练习里想按几个不同的门槛生成一批检查函数，用一个循环一次造出来。面试官常用这种写法，考你对函数和变量的理解。
 --- prompt
 写出输出。`lambda` 里用到的 `limit`，是创建时的值，还是调用时的值？
 --- code
@@ -223,6 +229,9 @@ lambda 记住的是**变量**，不是当时的值。调用时循环早就结束
 type: predict
 title: 排序的稳定性
 level: 2
+cards: d8:多键排序; d2:排序和 while
+--- context
+报告要把高风险的条款排在最前面，让律师先看最要紧的。排序看起来简单，面试里却常考它的细节。
 --- prompt
 写出输出。Python 的排序是**稳定**的：key 相同的元素保持原来的先后顺序，加了 `reverse=True` 也一样。
 --- code
@@ -244,6 +253,9 @@ type: predict
 title: var 和 let
 level: 2
 lang: ts
+cards: d5:从 Python 到 TypeScript; 读代码的顺序
+--- context
+老的 JavaScript 代码和网上的例子里还常能见到 `var`。面试官爱用这段代码考你：在循环里造出的一批函数，各自记住的是哪个值。
 --- prompt
 写出输出。`var` 是老式的声明，整个函数共用**一个**变量；`let` 在 for 循环里**每一轮都是新的一份**。
 --- code
@@ -265,6 +277,9 @@ type: predict
 title: 异步的执行顺序
 level: 3
 lang: ts
+cards: d6:async / await：等网络的时候不卡住
+--- context
+审查代码里到处是 `await`：请求模型、等回答。弄清楚它们实际的执行先后，排查「日志顺序怎么对不上」这类问题时才不会乱猜。
 --- prompt
 写出输出，一行一个。三条规则：
 
@@ -291,6 +306,9 @@ type: fix
 title: 修 bug：工具结果丢了
 level: 2
 mock: yes
+cards: 找 bug 的清单; d17:Agent = 循环 + 上限
+--- context
+面试里最常见的找 bug 题，就是一段坏掉的 Agent 循环。这个循环在查完 playbook 之后的第二次请求就出错，对照清单一条条过，比盯着代码看快得多。
 --- prompt
 这个 Agent 循环有 bug。运行测试：第二次请求报错 `KeyError: 'choices'`，因为服务器回的是 400，错误信息说带 `tool_calls` 的 assistant 消息后面缺了 tool 消息。对照 Agent 循环的检查清单，找出原因并修好。
 
@@ -363,6 +381,9 @@ expect_true("tool 消息的 tool_call_id 和模型的调用 id 一致", _ids_mat
 type: fix
 title: 修 bug：吞掉的错误
 level: 2
+cards: 找 bug 的清单; d3:try / except：预料到的错误要接住
+--- context
+出错时悄悄当成 accept，等于把可能有风险的条款直接放行，律师还看不到任何提示。真实项目在自动审查没能完成时，会把这条标成 flag，并写明需要人看。
 --- prompt
 这个函数上线一周后，律师发现几条明显有风险的条款被判成了 accept，日志里却一条错误都没有。原因：`except Exception` 把所有错误都吞了，还默认成最危险的 accept。改成：
 
@@ -409,6 +430,9 @@ type: fix
 title: 修 bug：forEach 不等人
 level: 2
 lang: ts
+cards: 找 bug 的清单; d6:async / await：等网络的时候不卡住
+--- context
+逐条审查时，每一条都要等模型回答。这类 bug 不会报错，只是交出去的结果是空的，报告看起来就像「没有需要注意的条款」，非常危险。
 --- prompt
 `reviewAll` 应该按顺序审完所有条款再返回结果，测试却拿到了空数组。运行，读测试输出，修好它。
 --- starter
@@ -454,6 +478,9 @@ type: fix
 title: 修 bug：快照全变了
 level: 2
 lang: ts
+cards: 找 bug 的清单; d18:状态：一个对象从头传到尾
+--- context
+练习里的审批界面要保存每一步之后的状态，方便律师回看、撤销。道理和检查点一样：旧的记录必须一直保持当时的样子。
 --- prompt
 `replay` 要保存每一步之后的状态快照（像检查点一样，可以回看、撤销）。测试发现所有快照都变成了最后一步的样子。原因在 `apply`：它直接改了传进来的 state。改成返回一个**新对象**，旧的不动。
 --- starter
@@ -517,6 +544,9 @@ expect("apply 不改传进来的状态（里面的 counts 和 seen 也不改）"
 type: code
 title: 重构：加一种判定
 level: 3
+cards: 重构的原则
+--- context
+报告汇总的代码常常是一点点堆起来的：每来一种判定就复制一段。业务总会加新的判定和风险等级，结构不整理，每加一种都要改好几个地方，还容易漏掉。
 --- prompt
 下面的 `summary` 能用，但很乱：三个计数器、三段几乎一样的循环。新需求：
 
@@ -589,6 +619,9 @@ type: code
 title: 重构：工具分发表
 level: 3
 lang: ts
+cards: 重构的原则; d6:工具分发：名字到函数的表
+--- context
+Agent 的工具会越来越多，真实项目里就还有 `mark_for_review`（把条款交给人看）。每加一个工具就多一段 else if，很快就难以维护；工具名写错时的提示是给模型看的，要能帮它改对。
 --- prompt
 `runTool` 能用，但每加一个工具就要多一段 `else if`。新需求：
 
@@ -657,6 +690,9 @@ expect("坏 JSON 不崩", () => runTool("get_clause", '{"clause_id": '), "ERROR:
 type: code
 title: 去重条款
 level: 2
+cards: 复杂度直觉; d8:字典进阶：推导式、Counter、defaultdict
+--- context
+合同模板里常有一字不差的样板条款，比如同一段保密条款出现好几次。练习里假设：审过一条，重复的就直接沿用它的结果，省下模型调用的钱。
 --- prompt
 合同模板里常有重复的样板条款：审过一条，一模一样的就不用再花钱审了。写两个函数：
 
@@ -714,6 +750,9 @@ type: code
 title: 合并 redline 区间
 level: 2
 lang: ts
+cards: 面试题的五种形式
+--- context
+一条条款可能有好几处要改，每处用一段字符位置表示。真实项目 `graph.py` 导出时从后往前替换文字，前面的位置才不会乱；可如果两处要改的地方叠在一起，还是会把原文改坏。
 --- prompt
 一条条款可能有好几处要改，每处是一个字符区间 `[start, end]`（包含 start，不包含 end）。区间重叠的话，像 `graph.py` 那样从后往前替换文字就会出错，所以要先合并。写 `mergeSpans(spans)`：
 
@@ -759,6 +798,9 @@ expect("不改传进来的数组", () => {
 type: code
 title: 按限流分批
 level: 3
+cards: 面试题的五种形式; d11:token 估算和预算
+--- context
+服务商会限制每分钟能发多少请求、多少 token（模型按它计费）。把整份合同的条款一口气全发出去会被拒绝，所以要提前排好每一分钟发哪几条。
 --- prompt
 OpenAI 等服务会按「每分钟请求数」和「每分钟 token 数」限流（具体数字看各家文档）。写 `plan_batches(clauses, max_requests, max_tokens)`，规划每一分钟发哪些条款：
 
@@ -804,6 +846,9 @@ expect_raises("一条就超过 token 上限", lambda: plan_batches([{"id": "9.1"
 type: choice
 title: 设计题：先看哪个指标
 level: 2
+cards: 设计题的回答框架; d13:混淆矩阵、精确率、召回率
+--- context
+面试的设计题常被追问「你怎么衡量它好不好」。Clause Check 的评测会算出好几个数字，不同的指标对应不同的错误代价。
 --- prompt
 律师说：「漏掉一条有风险的条款，比多标一条没问题的条款严重得多。」你的评测把「有风险」当作正类。你先盯哪个指标，往哪个方向调？
 --- options
@@ -819,6 +864,9 @@ answer: 2
 type: choice
 title: 设计题：合同太慢
 level: 2
+cards: 设计题的回答框架; 复杂度直觉
+--- context
+这是设计题的经典开场：系统能跑，但客户嫌慢。面试官会顺着你的第一句话一路追问下去。
 --- prompt
 客户上传了一份 300 页、600 条的合同，审完要 40 分钟。面试官问：「你第一步做什么？」最好的回答是：
 --- options
@@ -835,6 +883,9 @@ type: scratch
 title: 闭卷：需要复查的条款（Python）
 exam: yes
 level: 3
+cards: 面试题的五种形式; d8:多键排序
+--- context
+条款 8.1 写着 “subject to Section 12”：它本身看起来没问题，可第 12 条一旦要改写，8.1 的意思也跟着变。真实项目审查时也会去读被引用的条款，这种「连带」的风险最容易看漏。
 --- prompt
 条款之间有交叉引用（比如 "subject to Section 12"）。一条条款本身判了 accept，但它引用的条款判了 redline，它就需要复查。
 
@@ -870,6 +921,9 @@ title: 闭卷：应用 redline（TypeScript）
 exam: yes
 level: 3
 lang: ts
+cards: 面试题的五种形式
+--- context
+律师批准以后，要把 redline 真正写进导出的合同副本，真实项目 `graph.py` 导出时做的就是这件事。每处修改的位置都是按原文算的，而一条条款要改的地方常常不止一处。
 --- prompt
 定义 `type Edit = { start: number; end: number; replacement: string }`，写 `applyRedlines(text: string, edits: Edit[]): string`：把每个 edit 的区间（包含 start，不包含 end）替换成 `replacement`。
 
@@ -912,6 +966,9 @@ title: 闭卷：重写重试函数（TypeScript）
 exam: yes
 level: 3
 lang: ts
+cards: 找 bug 的清单; d4:状态码和重试
+--- context
+调模型时偶尔会遇到网络抖动或 429（请求太多、被暂时拒绝），常见的做法是自动重试几次。审查流程里的每个请求，都可能套上这样一层。
 --- prompt
 下面的 `withRetry` 有 3 个 bug。不要在它上面修修补补：在空白编辑器里从头写出正确的版本。
 

@@ -133,7 +133,7 @@ title: 生产化清单
 上线前逐条过一遍（括号里是今天在哪一块做）：
 
 - **分类任务关掉 thinking**：DeepSeek V4 默认开 thinking，思考过程按**输出** token 计费，还更慢；而且 thinking 开着时 `temperature` 不起作用。逐条审查用 `extra_body={"thinking": {"type": "disabled"}}` 加 `temperature=0`（P2）
-- **带工具的模型必须关 thinking**：`with_structured_output`、`bind_tools`、Agent 都会发 `tools`。DeepSeek 规定 thinking 模式下带 tools 的请求，之后每次都要把前面的 `reasoning_content` 传回去，否则返回 400；LangChain 不传，所以工具循环在第二次调模型时就报错
+- **带工具的模型必须关 thinking**：`with_structured_output`、`bind_tools`、Agent 都会发 `tools`。DeepSeek 规定 thinking 模式下带 tools 的请求，之后每次都要把前面的 `reasoning_content` 传回去，否则返回 400；LangChain 不传，所以工具循环第二次调模型就违反规定（模拟服务器回 400；2026-09 实测真接口暂时没拒绝，但文档写明了就要照做）
 - **结构化输出可能返回 None**：参数是坏 JSON 时不抛错，要判成 flag 交给人（P2）
 - **重试和降级**：openai SDK 自己会重试 429 / 5xx（默认 `max_retries=2`，一共 3 次）；还不行就 `.with_fallbacks([...])` 换一个模型（同一家的另一个模型，或者另一家、本地模型）。并行分支很多时，用 `config={"max_concurrency": 4}` 限制同时发出的请求，少挨 429
 - **recursion_limit**：这个版本默认 10007（很多旧教程写 25）。有环的图（Agent）一定显式设置
@@ -287,6 +287,9 @@ for day, topic, where in week5:
 type: predict
 title: 复习：恢复时从头再跑
 level: 2
+cards: d34:恢复时节点从头再跑; d34:interrupt()：停下来问人
+--- context
+今天的项目里，审批节点也要停下等律师回复。动手之前，先复习一下律师回复后这个节点是怎样接着跑的。
 --- prompt
 复习第 34 天：写出输出。`log` 记下了 `approve` 节点的每一行跑了几次。注意第二次 `invoke` 时，`interrupt` 前面那一行有没有再跑。
 --- code
@@ -327,6 +330,9 @@ print(log)
 type: code
 title: P1 拆条款节点
 level: 1
+cards: 项目结构：state、节点，哪里才需要 LangGraph; 测试策略：三层，两个运行环境
+--- context
+这是 LangGraph 版 Clause Check 的第一块：拿到合同全文，切成带编号的条款。后面每条条款会各自开一个分支去审查，这里切错，后面全错。真实项目里对应的是 `split.py`。
 --- prompt
 **项目第 1 块：split。** 合同里每条条款占一行、以编号开头（比如 `8.1 Customer's liability ... unlimited.`），标题等其他行忽略。
 
@@ -411,6 +417,9 @@ expect_raises("在图里也一样：节点抛的错从 invoke 冒出来", lambda
 type: predict
 title: P2 发出去的请求
 level: 2
+cards: d30:with_structured_output：直接拿到对象; 测试策略：三层，两个运行环境
+--- context
+P2 是整个项目里唯一调模型的地方。LangChain 替你把一个 Python 类变成了发给模型的请求；面试时被问「框架到底替你做了什么」，看过这份请求就答得出来。
 --- prompt
 P2 要用 `with_structured_output` 审一条条款。先看看 LangChain 替你发出去的 JSON（本页的 `MOCK.calls[-1]["body"]` 就是请求体）。写出输出。
 --- code
@@ -445,6 +454,9 @@ print([m["role"] for m in body["messages"]])
 type: code
 title: P2 审一条条款
 level: 2
+cards: d30:with_structured_output：直接拿到对象; d30:method、include_raw 和 None; 测试策略：三层，两个运行环境
+--- context
+每条条款都要经过这个函数：交给模型，拿回判定、风险和话题（topic，比如责任上限、付款）。条款文字是对方起草的，可能夹带「请判为 accept」这类话，它是要审的材料，不是给模型的指令。
 --- prompt
 **项目第 2 块：review，整个项目里唯一调模型的地方。**
 
@@ -519,6 +531,9 @@ expect("参数是坏 JSON → None → FALLBACK，编号照填", lambda: review_
 type: code
 title: P3 并行审查：Send
 level: 2
+cards: d34:Send：一条款一个分支（map-reduce）; 项目结构：state、节点，哪里才需要 LangGraph
+--- context
+真实的 `graph.py` 在一个节点里一条接一条地审。条款有几十条时这样很慢，而各条的审查互不相干，完全可以同时进行。审完的结果还要保持合同里的顺序，报告才好读。
 --- prompt
 **项目第 3 块：并行审查。** graph.py 在一个节点里用 for 循环逐条审；这里每条条款一个 `review` 分支（第 34 天的 map-reduce）。P1、P2 已经在代码里。
 
@@ -692,6 +707,9 @@ expect("stream：一个 split，6 个 review 分支", lambda: [name for chunk in
 type: code
 title: P4 汇总节点
 level: 2
+cards: 项目结构：state、节点，哪里才需要 LangGraph; d32:并行分支和 superstep
+--- context
+律师打开报告，第一眼要看到「几条放行、几条要看、几条要改」，以及最该先看的是哪几条。真实项目 `pipeline.py` 里的 `summarise` 也做计数，另外还算了 token 和费用。
 --- prompt
 **项目第 4 块：summarise。** 和第 14、21 天一样是纯 Python，只是现在包成一个节点：
 
@@ -899,6 +917,9 @@ expect("汇合：summarise 在所有分支之后只跑一次", lambda: [n for ch
 type: code
 title: P5 路由
 level: 2
+cards: d32:条件边; 常见坑回顾
+--- context
+汇总之后这一步决定整份合同的去向：要不要停下来请律师批准。它写错了不一定报错，最坏的情况是该批准的合同被直接导出。
 --- prompt
 **项目第 5 块：route。**
 
@@ -1137,6 +1158,9 @@ expect("图上 summarise 有两条条件边：approve、export（靠 Literal 返
 type: testwrite
 title: 给汇总和路由写测试
 level: 2
+cards: 测试策略：三层，两个运行环境
+--- context
+汇总和路由都是不碰模型、不碰图的普通函数，属于三层测试里最便宜、最快的那一层。律师先看哪几条、要不要停下批准，全看这两个函数对不对。
 --- prompt
 被测的是 P4 的 `summarise(reviews)` 和 P5 的 `route(state)`（`state` 里有 `"summary"`）。它们决定哪些条款要人看、要不要停下来等审批，写错了不会报错，只会**悄悄**漏掉风险。规则：
 
@@ -1282,6 +1306,9 @@ def test_one_redline_needs_approval():
 type: code
 title: P6 人工审批
 level: 3
+cards: d34:interrupt()：停下来问人; d34:恢复时节点从头再跑; d33:SqliteSaver：进程退出也不丢
+--- context
+律师可能隔几个小时才来批准，那时原来的程序早已退出，只有存下来的检查点能让流程接着跑。真实 `graph.py` 用 `approve` 节点加上存进 SQLite 的检查点，做的正是这件事。
 --- prompt
 **项目第 6 块：approve。** 这正是 Clause Check 引入 LangGraph 的原因：停下来等人，几个小时后（可能换了一个进程）接着跑。
 
@@ -1547,6 +1574,9 @@ expect("没有 redline：不停下来", lambda: "__interrupt__" in build_graph(M
 type: code
 title: P7 由代码执行决定
 level: 3
+cards: d34:读 graph.py; 项目结构：state、节点，哪里才需要 LangGraph
+--- context
+律师批准的是一份确定的清单，执行的也必须正是这份清单，所以由代码动手改合同，模型不再插手。最危险的错误是律师明明拒绝了，合同还是被改了。
 --- prompt
 **项目第 7 块：export。** 人批准以后，由**代码**执行决定，模型不再参与（graph.py 的开头写着：The approved decision is executed by code）。写 `export(state)`，返回两个键：
 
@@ -1844,6 +1874,9 @@ expect("export 是普通函数，可以直接测：拒绝时不改", lambda: exp
 type: order
 title: 排代码：跑到审批再恢复
 level: 2
+cards: d34:读 graph.py; d33:SqliteSaver：进程退出也不丢
+--- context
+把整个项目包成一个入口函数，命令行只要调它就行。真实项目的命令行加 `--graph` 时，走的就是 `graph.py` 里同样的流程。
 --- prompt
 把整个项目包成一个函数，和 graph.py 的 `run_graph` 一样：打开 SQLite 检查点 → 跑图 → 停在审批就问人（`decide(payload)` 返回 True / False）→ 用人的决定恢复 → 返回报告。`build_graph` 和 `MODEL` 就是 P1–P7 的成果，测试里已经准备好。
 
@@ -2031,6 +2064,9 @@ expect("决定存在文件里：新实例也读得到", _persisted, True)
 type: predict
 title: 同一个 thread 跑两份合同
 level: 2
+cards: 常见坑回顾; d33:Checkpointer 和 thread_id
+--- context
+夜里批量审合同时，最省事的写法是所有合同共用一个 `thread_id`。这段代码看看这样做时，后面几次运行的状态里会有什么。
 --- prompt
 写出输出。checkpointer 按 `thread_id` 保存 state。注意第二次调用用的还是同一个 thread，而 `reviews` 有 reducer。
 --- code
@@ -2069,6 +2105,9 @@ print(app.invoke({"contract": "B"}, {"configurable": {"thread_id": "review-B"}})
 type: fix
 title: 修 bug：共用 thread
 level: 3
+cards: 常见坑回顾; d33:Checkpointer 和 thread_id
+--- context
+律所夜里批量审一整批合同，第二天早上律师看报告。一份合同的结果混进另一份，律师就会去改一份根本不需要改的合同，这比程序崩掉还糟。
 --- prompt
 夜里批量审合同的脚本 `review_contracts(app, contracts, decide)`：`contracts` 是 `{合同编号: 全文}`，逐份跑图，遇到审批就调用 `decide(payload)` 拿到人的决定，返回 `{合同编号: report}`。项目代码（P1–P7）已经在上面。
 
@@ -2392,6 +2431,9 @@ expect("换个顺序、拒绝：结果也对", _order, [False, [], {"accept": 2,
 type: code
 title: P8 给界面推送进度
 level: 3
+cards: d34:流式：让界面看到进度; d32:stream：看每一步做了什么
+--- context
+网页上的审查页面要显示进度条，需要批准时还要弹出待批清单。这一块负责把图里的动静实时转成界面能用的数据。
 --- prompt
 **项目第 8 块：进度。** 一份合同几十条条款，审完要一两分钟，界面上要能显示「3/10」。
 
@@ -2716,6 +2758,9 @@ expect("stream 停下以后，同一个 thread 照样能恢复", _resume, ["4.2"
 type: fill
 title: 一次运行花多少钱
 level: 2
+cards: d30:成本：按用量算钱; d30:观测：回调
+--- context
+面试常被问「审一份合同要花多少钱」。真实项目 `pipeline.py` 的汇总里也按 token 算了费用。练习里用 callback（挂在每次模型调用上的记录器）收集整张图的用量，再按价格表折算。
 --- prompt
 面试官问：「一份合同审一遍要多少钱？」用 callback 量出来，而不是猜。
 
@@ -2906,6 +2951,9 @@ expect("同一份合同开着 thinking：有思考 token，贵 3 倍以上", _th
 type: choice
 title: 上线前清单
 level: 2
+cards: 生产化清单; 常见坑回顾
+--- context
+这张图要交给真实客户用了。上线前的每一条检查，都对应这一周踩过的某个坑。
 --- prompt
 这张图要给真实客户用了。下面哪些是上线前**应该**做的？（多选）
 --- options
@@ -2922,6 +2970,9 @@ answer: 1,3,5
 type: choice
 title: 面试：为什么只在审批用图
 level: 2
+cards: 面试：LangChain、LangGraph 还是纯 Python
+--- context
+这是面试里几乎一定会被问到的问题，而你的项目正好是一个现成的例子：只有一部分用了框架。
 --- prompt
 面试官：「你的 Clause Check 大部分是纯 Python，只有审批流程用了 LangGraph。为什么不全部用 LangChain / LangGraph？」哪个回答最好？
 --- options
@@ -2937,6 +2988,9 @@ answer: 2
 type: local
 title: 本机任务（选做）：真正的多线程
 level: 2
+cards: 测试策略：三层，两个运行环境
+--- context
+网页里的练习跑在一个模拟的单线程环境中；放到你自己的电脑上，才是真实服务运行的样子。这一步确认你写的项目离开网页也能跑通。
 --- prompt
 本页的 Python 只有一个线程：`Send` 分出的 review 分支一个接一个跑。你电脑上的 Python 会真的并行。把完整的项目放到本机跑一遍：
 
@@ -2971,6 +3025,9 @@ type: scratch
 title: 周考 1：批量结构化审查
 exam: yes
 level: 3
+cards: d30:with_structured_output：直接拿到对象; d29:stream 和 batch; 周复盘和周考说明
+--- context
+周考第 1 题：不用图，只用 LangChain 把一整批条款一次审完。面试里「只是想同时调很多次模型，需要 LangGraph 吗？」说的就是这种情况。
 --- prompt
 写两个函数。用到的 import：`from typing import Literal`、`from pydantic import BaseModel`、`from langchain_core.prompts import ChatPromptTemplate`、`from langchain_deepseek import ChatDeepSeek`。先把这两段原样写进代码：
 
@@ -3045,6 +3102,9 @@ type: scratch
 title: 周考 2：手写工具循环
 exam: yes
 level: 3
+cards: d30:手写工具循环; d17:Agent = 循环 + 上限; 周复盘和周考说明
+--- context
+周考第 2 题：不借助 `create_agent` 和 LangGraph，自己写审查代理的核心循环。真实项目的 `review.py` 就是这样一个自己写的、有步数上限的工具循环。
 --- prompt
 用 LangChain 的消息对象手写一个有界的工具循环（第 17、30 天；不用 `create_agent`，也不用 LangGraph）。用到的 import：`from langchain_core.tools import tool`、`from langchain_core.messages import HumanMessage, SystemMessage`。先把这两个常量原样写进代码：
 
@@ -3107,6 +3167,9 @@ type: scratch
 title: 周考 3：带来源的 RAG
 exam: yes
 level: 3
+cards: d31:Retriever 和 RAG 链; d31:向量库：向量算一次，查很多次; 周复盘和周考说明
+--- context
+周考第 3 题：律师用大白话问合同里的问题，助手先从合同里找出相关的条款，再只根据这些条款回答，并标出条款号，方便律师核对原文。
 --- prompt
 用到的 import：`from langchain_core.documents import Document`、`from langchain_core.output_parsers import StrOutputParser`、`from langchain_core.prompts import ChatPromptTemplate`、`from langchain_core.vectorstores import InMemoryVectorStore`、`from langchain_openai import OpenAIEmbeddings`。先把提示词原样写进代码：
 
@@ -3180,6 +3243,9 @@ type: scratch
 title: 周考 4：Agent 图和记忆
 exam: yes
 level: 3
+cards: d33:Agent 图：model ⇄ tools; d33:Checkpointer 和 thread_id; 周复盘和周考说明
+--- context
+周考第 4 题：一个能查公司审查规则（playbook）的问答助手，同一段对话里记得前面问过什么，转圈时按上限停下。
 --- prompt
 用 LangGraph 搭第 33 天的 Agent 图。用到的 import：`from langgraph.graph import START, MessagesState, StateGraph`、`from langgraph.prebuilt import ToolNode, tools_condition`、`from langgraph.errors import GraphRecursionError`、`from langchain_core.messages import HumanMessage, SystemMessage`、`from langchain_core.tools import tool`。先把这些原样写进代码：
 
@@ -3255,6 +3321,9 @@ type: scratch
 title: 周考 5：审批和输入校验
 exam: yes
 level: 3
+cards: d34:审批的几种回答; d34:Command：在节点里更新 + 跳转; 周复盘和周考说明
+--- context
+周考第 5 题：律师对一条条款做最终决定，采用改写还是放弃。回答来自输入框，可能打错，而决定错了就会改错合同。
 --- prompt
 一个审批小图：人回答 `apply` 或 `discard`，回答不合法就再问一次。用到的 import：`import operator`、`from typing import Annotated, Literal, TypedDict`、`from langgraph.graph import END, START, StateGraph`、`from langgraph.types import Command, interrupt`。先把 State 原样写进代码：
 

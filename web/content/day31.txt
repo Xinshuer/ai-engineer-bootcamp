@@ -175,7 +175,7 @@ result = agent.invoke({"messages": [("user", "...")]})
 - 返回的是一张**编译好的 LangGraph 图**：节点 `model` 和 `tools`，`get_graph().draw_mermaid()` 能画出来（实线是固定边，虚线是条件边）。明天你自己搭这样的图
 - 步数上限：`agent.invoke(..., {"recursion_limit": 10})`，超了抛 `GraphRecursionError`。这一版的默认上限是 10007（很多旧教程说 25），不设约等于没有上限
 
-为什么 agent 的模型一定要关掉 thinking（`extra_body={"thinking": {"type": "disabled"}}`）：DeepSeek 文档写明，思考模式下只要请求带着 tools，之前每条 assistant 消息的 `reasoning_content` 都必须原样传回去，否则返回 400；而 LangChain 的 ChatDeepSeek 把消息转成请求时会丢掉它。所以开着 thinking，agent 第二次调模型就是 400（本页的模拟服务器也按这条规则回 400）。另外，一次任务要调好几次模型，每次的思考都按输出 token 计费，还更慢。
+为什么 agent 的模型一定要关掉 thinking（`extra_body={"thinking": {"type": "disabled"}}`）：DeepSeek 文档写明，思考模式下只要请求带着 tools，之前每条 assistant 消息的 `reasoning_content` 都必须原样传回去，否则返回 400；而 LangChain 的 ChatDeepSeek 把消息转成请求时会丢掉它。所以开着 thinking，agent 第二次调模型就违反了这条规定（本页的模拟服务器按文档回 400；2026-09 实测真接口暂时没拒绝，但不能指望它一直不查）。另外，一次任务要调好几次模型，每次的思考都按输出 token 计费，还更慢。
 --- code
 from langchain_core.tools import tool
 from langchain_deepseek import ChatDeepSeek
@@ -325,6 +325,9 @@ print("agent:      ", len(MOCK.calls), "model call(s)")
 type: code
 title: 复习：结构化输出
 level: 1
+cards: d30:with_structured_output：直接拿到对象; d30:method、include_raw 和 None
+--- context
+今天会把审查交给 agent 去做，但最后要的仍然是一个判定对象。先复习昨天的结构化输出，以及模型答坏时怎么兜底。
 --- prompt
 复习第 30 天。写 `review(text)`：
 
@@ -378,6 +381,9 @@ expect("请求里强制调用 ClauseReview", lambda: (review("Review clause 3.1"
 type: predict
 title: 复习：tool_calls 和 ToolMessage
 level: 1
+cards: d30:bind_tools 和 tool_calls
+--- context
+今天的 agent 背后跑的还是昨天那个工具循环。先读一段代码回忆一下：模型想用工具时，程序拿到的是什么，执行完又交回什么。
 --- prompt
 复习第 30 天。写出输出。模拟服务器看到问题里有 fee，会让模型用 `topic="payment"` 调第一个工具；模拟服务器给的调用 id 依次是 `call_1`、`call_2`……
 --- code
@@ -403,6 +409,9 @@ print(type(msg).__name__, "|", msg.content, "|", msg.tool_call_id)
 type: predict
 title: 切分器怎么切
 level: 2
+cards: 切分器：按长度，还是按结构
+--- context
+做合同问答，要先把长文字切成小块，才能存进向量库里检索。LangChain 自带一个按长度切的切分器，先看看它对一段合同文字到底是怎么切的。
 --- prompt
 写出输出。回想卡片：先按 `"\n\n"` 切；某段超过 `chunk_size` 再按 `"\n"` 切；最后把相邻小段合并，只要合并后（算上中间的分隔符）不超过 `chunk_size`。`start_index` 从 0 数。
 --- code
@@ -421,6 +430,9 @@ for d in docs:
 type: code
 title: 合同变成 Document
 level: 2
+cards: Document：带出处的片段; d19:带引用的回答
+--- context
+要让程序在合同里查找条款，先得把合同切成一块一块。这里照 `split.py` 的思路一条条款切一块，出处信息跟着一起存，检索到以后才说得出「这是第几条」。
 --- prompt
 写 `split_contract(text, source)`，像 `split.py` 一样，一条条款一个 `Document`：
 
@@ -486,6 +498,9 @@ expect_raises("没有编号：不猜", lambda: split_contract("This agreement ha
 type: fix
 title: 修 bug：取回的条数不对
 level: 2
+cards: Retriever 和 RAG 链
+--- context
+检索回来的条款会全部塞进提示词，条数多一倍，token（模型按它计费）就多一倍。同事的检索器取回的条数不对，程序却一声不吭。
 --- prompt
 同事写的 `make_retriever(docs, k=2)` 应该每次取回 k 条，可 prompt 里总是塞了 4 条，token 白白翻倍。代码不报错、没有警告。运行测试，找到原因，改一行。
 --- starter
@@ -535,6 +550,9 @@ expect("k=3", lambda: len(make_retriever(DOCS, k=3).invoke("Can the provider can
 type: code
 title: 建库并检索条款号
 level: 2
+cards: 向量库：向量算一次，查很多次; Document：带出处的片段
+--- context
+练习里的合同问答要先建一个向量库：每条条款算好向量存起来，之后每个问题都在里面找最像的几条。律师有时只关心某一类条款，比如只看责任条款，这时要能缩小查找范围。
 --- prompt
 写两个函数：
 
@@ -608,6 +626,9 @@ expect("过滤后不足 k 条", lambda: search_ids(STORE, "When is the invoice d
 type: testwrite
 title: 写测试：format_docs
 level: 2
+cards: Retriever 和 RAG 链; d19:带引用的回答; d9:怎么想测试用例
+--- context
+检索到的条款要拼成一段文字放进提示词，每条都标着编号，模型回答时才能注明出处。格式差一点，引用就对不上号，所以要用测试把它钉住。
 --- prompt
 被测函数 `format_docs(docs)` 把检索到的 Document 拼成放进 prompt 的文字：每个文档一行，行首是 `[条款号]`（来自 `metadata["clause_id"]`），行与行之间用一个换行。
 
@@ -667,6 +688,9 @@ def test_empty():
 type: predict
 title: 链里流过什么
 level: 2
+cards: Retriever 和 RAG 链
+--- context
+这是合同问答链的前半段：问题进来，先去检索，再和检索结果一起填进提示词。读这段代码，看清楚模型最终会收到什么。
 --- prompt
 写出输出。这条链到 `prompt` 为止，不调模型。向量库里只有两条，`k=1`，问发票（invoice）什么时候到期，取回的是 3.1。
 --- code
@@ -698,6 +722,9 @@ for m in value.to_messages():
 type: fill
 title: 填空：RAG 链
 level: 1
+cards: Retriever 和 RAG 链; d29:LCEL：用 | 串成一条链
+--- context
+律师问合同里的问题，程序先找出相关条款，再让模型只根据这些条款回答。这就是 RAG（先检索、再回答），这里用 LangChain 最常见的写法把它搭起来。
 --- prompt
 补全 RAG 链：`context` 走「检索 → 拼成带编号的文字」，`question` 原样传过去，最后把模型的 AIMessage 变成字符串。
 --- template
@@ -734,6 +761,9 @@ expect("模型收到了带编号的片段", lambda: (chain.invoke("Can the provi
 type: code
 title: 带出处的回答
 level: 3
+cards: Retriever 和 RAG 链; d19:带引用的回答
+--- context
+给律师的回答必须说明依据的是哪几条条款，律师才能回到原文核对。回答和出处要一起交回去，而且出处必须就是这次真正用到的那几条。
 --- prompt
 写 `answer_with_sources(question, retriever, model)`，返回 `{"answer": 回答文字, "sources": [条款号, ...]}`：
 
@@ -833,6 +863,9 @@ expect("用传进来的 retriever 和 model，不是全局的", _own_parts, [["1
 type: code
 title: 把检索做成工具
 level: 2
+cards: d30:@tool：把函数变成工具; create_agent：现成的工具循环
+--- context
+接下来要让 agent 自己决定查不查合同、查什么。模型只能通过工具做事，而它能看到的只有工具的名字、说明和参数。
 --- prompt
 agent 要能自己决定什么时候查合同。把检索包成一个工具：
 
@@ -913,6 +946,9 @@ expect("检索不到", _nothing, "no matching clauses")
 type: code
 title: create_agent 跑一次
 level: 2
+cards: create_agent：现成的工具循环
+--- context
+前两天你亲手写过工具循环。LangChain 1.x 里有现成的 agent，一行就能搭好；先跑一次，看看它的轨迹和你手写的循环是不是同一回事。
 --- prompt
 用上一题的工具搭一个 agent：
 
@@ -1001,6 +1037,9 @@ expect("AGENT 是编译好的图", lambda: list(AGENT.get_graph().nodes), ["__st
 type: order
 title: 排代码：搭一个 agent
 level: 2
+cards: create_agent：现成的工具循环
+--- context
+面试时可能被要求不看资料写出一个最小的 agent。能从头到尾默写出来，说明你分得清工具、模型和 agent 各自是什么。
 --- prompt
 排出一个完整的小程序：定义 playbook 工具，搭 agent，问一个问题，把最终回答存进 `ANSWER`。有两行干扰项。
 --- lines
@@ -1032,6 +1071,9 @@ expect("工具被模型用 topic=liability_cap 调用", lambda: result["messages
 type: fix
 title: 修 bug：DeepSeek 上的 response_format
 level: 2
+cards: response_format：结构化的最终答案
+--- context
+agent 最后说的是一段自由文字，程序不好用。同事想让它最后交一个判定对象，结果一调用就出错。
 --- prompt
 同事想让 agent 最后交一个 `ClauseReview` 对象。运行测试：模型调用直接 400，错误信息里有 `json_schema`。
 
@@ -1101,6 +1143,9 @@ expect("答案是一个额外的工具，tool_choice 是 required", _request, [[
 type: code
 title: agent 交结构化答案
 level: 3
+cards: response_format：结构化的最终答案; create_agent：现成的工具循环; d13:评测用例是数据，不是感觉
+--- context
+项目的评测会检查审查过程：8.1 看起来是一条普通的责任上限，可第 12 条让这个上限对客户不再适用，所以审 8.1 时必须去读第 12 条。要检查这一点，就得知道 agent 一路调过哪些工具。
 --- prompt
 写 `review_with_agent(text)`，返回：
 
@@ -1196,6 +1241,9 @@ expect("review 是 ClauseReview 对象", lambda: type(review_with_agent("Review 
 type: code
 title: 给 agent 设上限
 level: 2
+cards: create_agent：现成的工具循环
+--- context
+agent 有时会卡住，不停地调工具，每一步都在花钱。线上的服务不能跟着它一直转下去，出了这种情况也要给调用方一个清楚的结果。
 --- prompt
 写 `ask_safely(agent, question, limit)`：
 
@@ -1256,6 +1304,9 @@ expect("limit 越小，调用越少", lambda: _stuck(3)[1], 2)
 type: code
 title: 批准后才发出去
 level: 3
+cards: middleware：在调用前后插一手; d17:人在回路：危险的工具要人批准
+--- context
+练习里的 `send_redline` 会把修改意见真的发给合同对方，发出去就收不回来。Clause Check 的原则是模型只提建议，由人来决定。
 --- prompt
 `send_redline` 会把修改意见真的发给对方，必须人批准。`AGENT` 已经配好 `HumanInTheLoopMiddleware` 和 `InMemorySaver`。写两个函数：
 
@@ -1360,6 +1411,9 @@ expect("两个 thread 互不影响：只批准了 t-b", _two_threads, ["9.1"])
 type: choice
 title: overlap 等于 size
 level: 2
+cards: 切分器：按长度，还是按结构
+--- context
+同事给合同问答配切分器时，想让相邻的块多重叠一些，免得一句话正好被切断，信息就丢了。
 --- prompt
 同事为了「重叠多一点，别漏信息」，写了 `RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=200)`。会发生什么？
 --- options
@@ -1375,6 +1429,9 @@ answer: 2
 type: choice
 title: 选哪种写法
 level: 2
+cards: 什么时候用哪一种
+--- context
+面试常问：什么时候用固定的链，什么时候用 agent，什么时候上 LangGraph。拿 Clause Check 的三个需求来练一练。
 --- prompt
 Clause Check 有三个需求：
 
@@ -1390,13 +1447,16 @@ Clause Check 有三个需求：
 - 三个都写成固定链，agent 太不可控
 answer: 1
 --- explain
-A 的步骤事先知道，写死最便宜、最好测。B 要不要取、取哪条取决于条款内容，这正是 agent 的用处（项目里是 `review.py` 手写的有界循环）。C 要跨进程、跨时间恢复，需要检查点和中断，README 里写的 `graph.py` 引入 LangGraph 的理由正是这个。全用 agent 会多花调用、路径不可预测；「等人输入的 while 循环」进程一退出就什么都没了。
+A 的步骤事先知道，写死最便宜、最好测。（真实的 `review.py` 把 `lookup_playbook` 也做成了工具，由系统提示词要求模型每条先调它；照这道题的思路，也可以改成在代码里先取好规则，每条省一次调用。）B 要不要取、取哪条取决于条款内容，这正是 agent 的用处（项目里是 `review.py` 手写的有界循环）。C 要跨进程、跨时间恢复，需要检查点和中断，README 里写的 `graph.py` 引入 LangGraph 的理由正是这个。全用 agent 会多花调用、路径不可预测；「等人输入的 while 循环」进程一退出就什么都没了。
 
 @@ item d31-e1
 type: scratch
 title: 闭卷：条款索引与检索
 exam: yes
 level: 3
+cards: Document：带出处的片段; 向量库：向量算一次，查很多次
+--- context
+合同问答的第一步：把一份合同按条款建成可以检索的索引。之后律师问什么，都能找出最相关的几条条款的编号。
 --- prompt
 写两个函数：
 
@@ -1454,6 +1514,9 @@ type: scratch
 title: 闭卷：带出处的 RAG
 exam: yes
 level: 3
+cards: Retriever 和 RAG 链; d19:带引用的回答
+--- context
+律师问合同里的问题，程序要找出相关条款，让模型只根据它们回答，并附上出处。合同里根本没提到的事，不能让模型凭空编一个答案。
 --- prompt
 写 `rag(question, retriever, model)`，返回 `{"answer": ..., "sources": [...]}`：
 
@@ -1505,6 +1568,9 @@ type: scratch
 title: 闭卷：agent 审条款
 exam: yes
 level: 3
+cards: create_agent：现成的工具循环; response_format：结构化的最终答案
+--- context
+用现成的 agent 审一条条款：它自己决定去查规则还是读别的条款，最后交出判定。同时要留下它调过哪些工具，供评测检查审查过程。
 --- prompt
 已知（测试里会定义，你的代码直接用）：`MODEL`（关掉 thinking 的 ChatDeepSeek）、`ClauseReview`（Pydantic 模型，字段 `clause_id`、`verdict`、`risk_level`）、两个工具 `lookup_playbook(topic)` 和 `get_clause(clause_id)`。
 

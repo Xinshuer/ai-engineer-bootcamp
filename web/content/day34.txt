@@ -448,6 +448,9 @@ print("after resume:", pending_interrupt(path, "demo-1"))
 type: predict
 title: 复习：两个 thread、改判
 level: 1
+cards: d33:改状态：update_state 和时间旅行; d33:看状态：get_state 和历史
+--- context
+复习昨天的检查点：律所里常常同时有好几份合同停在导出前等律师看，每份合同各占一个 thread。
 --- prompt
 复习第 33 天。写出输出。两个 thread 都停在 export 前，只有 `a` 被改判。注意最后一行历史里每个检查点的来源。
 --- code
@@ -489,6 +492,9 @@ print([s.metadata["source"] for s in app.get_state_history(a)])
 type: predict
 title: 恢复时谁又跑了一遍
 level: 2
+cards: 恢复时节点从头再跑; interrupt()：停下来问人
+--- context
+审批节点在停下等人之前，常常还想顺手做点事，比如通知法务「有几条 redline 等你批」。律师可能几小时后才回来点批准，这中间程序一直停着。
 --- prompt
 写出输出。`approve` 在 `interrupt()` 前后各打印一行。想清楚：恢复时从哪一行开始跑？`prepare` 会再跑吗？
 --- code
@@ -531,6 +537,9 @@ print("final", final)
 type: code
 title: 审批节点
 level: 2
+cards: interrupt()：停下来问人; 读 graph.py
+--- context
+这是真实 `graph.py` 审批环节的简化版：有 redline 时，先把待批的条款编号交给律师看，等他批准或拒绝，再决定导出什么。`start` 和 `finish` 可以想成两次请求：一次开始审查，一次送回律师的决定。
 --- prompt
 图已经搭好：有 redline 时先去 `approve` 再 `export`，没有就直接 `export`。写三处：
 
@@ -642,6 +651,9 @@ expect("没有 redline：不中断，直接导出完", _clean, [None, []])
 type: fix
 title: 修 bug：法务收到两封通知
 level: 2
+cards: 恢复时节点从头再跑
+--- context
+审批要等人，可人不会一直盯着屏幕，所以停下前要通知法务。通知重复发，法务会以为有两份合同要批，久而久之就不再信这些通知了。
 --- prompt
 `approve` 在停下之前给法务发一条通知，然后等他们批准。上线后法务抱怨：每次审批都收到**两封**一样的通知。
 
@@ -725,6 +737,9 @@ expect("图里有 notify 节点", lambda: sorted(build().get_graph().nodes), ["_
 type: code
 title: 批准、拒绝、修改后批准
 level: 2
+cards: 审批的几种回答; interrupt()：停下来问人
+--- context
+律师看待批的 redline 清单时，除了全批、全拒，最常见的是「这两条同意，那条算了」。批准后要改的是真实的合同，所以律师的回答也要像模型的回答一样先校验。
 --- prompt
 写 `approve(state)` 节点。payload 是 `{"redlines": state["redlines"]}`，恢复值是一个字典：
 
@@ -816,6 +831,9 @@ expect_raises("看不懂的回答", lambda: _decide("sure"), ValueError)
 type: code
 title: 答不清楚就再问
 level: 3
+cards: 审批的几种回答; 恢复时节点从头再跑
+--- context
+律师在网页的输入框里打字回答，难免打错（比如 `yse`）。审批决定合同会不会被改，看不懂的回答不能靠猜。
 --- prompt
 律师在网页上输入 yes 或 no。人会打错字，所以 `approve` 要校验：
 
@@ -894,6 +912,9 @@ expect("答错两次（第二次连字符串都不是）", lambda: _answers("ok"
 type: choice
 title: 网页上的审批用哪种写法
 level: 2
+cards: 审批的几种回答; interrupt()：停下来问人
+--- context
+这是 Clause Check 网页版想加的功能：律师在浏览器里看清单、点按钮，服务器上的程序等他的决定再往下走。
 --- prompt
 你要给 Clause Check 加一个功能：导出前，律师在网页上看到待应用的 redline 清单，可以点「批准」「拒绝」或「删掉几条后批准」。用哪种写法最合适？
 --- options
@@ -909,6 +930,9 @@ answer: 2
 type: fix
 title: 修 bug：审批永远恢复不了
 level: 1
+cards: interrupt()：停下来问人; d33:Checkpointer 和 thread_id
+--- context
+审批一停往往就是几个小时，律师回来点批准时，流程必须能接着往下走。这一题的图能停下，却回不来。
 --- prompt
 第一次运行正常停下、交出了待批清单，可律师批准后一调用 `finish` 就报错。运行测试，读报错信息，修好它。只改一行。
 --- starter
@@ -975,6 +999,9 @@ expect("停着的时候能查到它在等", lambda: (start("t4", ["12"]), app.ge
 type: code
 title: 用 Command 分诊
 level: 2
+cards: Command：在节点里更新 + 跳转; d32:看图：draw_mermaid
+--- context
+审完一份合同，下一步去哪儿、界面上显示什么状态，都取决于同一批判定结果。练习里的 `log` 记下走过的节点，方便测试检查走对了路。
 --- prompt
 写 `triage(state)` 节点，用 `Command` 同时更新和跳转（图里 triage 后面**没有**画边）：
 
@@ -1077,6 +1104,9 @@ expect("图里画出了 triage 的三条虚线边（靠返回类型标注）", _
 type: fill
 title: 填空：Send 展开
 level: 1
+cards: Send：一条款一个分支（map-reduce）
+--- context
+一份合同几十条条款，每条的审查互不相干，排队一条条审太慢。map-reduce 就是先分头处理、再合起来汇总。难点在于条款数要读完合同才知道，没法事先为每条画一条边。
 --- prompt
 补全 map-reduce：每条款一个 `review` 分支，结果合并进 `reviews`，全部完成后 `summarise` 跑一次。
 --- template
@@ -1123,6 +1153,9 @@ expect("summarise 在全部分支之后跑一次", lambda: app.invoke({"clauses"
 type: code
 title: 并行审查整份合同
 level: 3
+cards: Send：一条款一个分支（map-reduce）; d30:with_structured_output：直接拿到对象
+--- context
+真实 `graph.py` 的 `review` 节点现在是一条接一条地审。这里改成每条条款一个分支同时审，模型给出判定和风险，最后汇总成报告开头的计数。
 --- prompt
 用 Send 并行审查每一条款，模型是 `reviewer`（已给出：DeepSeek flash，思考关闭，结构化输出 `ClauseReview`）。写三个函数：
 
@@ -1239,6 +1272,9 @@ expect("没有条款：不调模型，计数全为 0", lambda: [_run([])[0]["cou
 type: fix
 title: 修 bug：一条款没问题，三条款就崩
 level: 2
+cards: Send：一条款一个分支（map-reduce）; d32:并行分支和 superstep
+--- context
+测试合同只有一条条款，真合同有几十条。只在小例子上测过的并行代码，换成真数据才露出问题，所以测试要用多条条款。
 --- prompt
 并行审查在只有一条款的测试合同上一切正常，换成真合同就报 `InvalidUpdateError`。运行测试，读错误信息，修好它。只改一行。
 --- starter
@@ -1304,6 +1340,9 @@ expect("三条款：三个结果都在，按顺序", lambda: [(r["clause_id"], r
 type: code
 title: 子图：一条款的审查
 level: 2
+cards: 子图：把一条款的审查打包复用
+--- context
+「审一条条款」的几步（先判断它讲的是什么话题，再给判定）可以单独写、单独测，再放进整份合同的流程里复用。真实项目里 `review.py` 审一条条款的工具循环也是这样一个独立的零件，改用 LangGraph 时很适合做成子图。
 --- prompt
 把「审一条款」做成子图，再放进整份流程：
 
@@ -1413,6 +1452,9 @@ expect("父图的节点", lambda: sorted(build_contract_graph(build_clause_graph
 type: code
 title: 进度事件
 level: 2
+cards: 流式：让界面看到进度
+--- context
+审一份几十条的合同要好几分钟，界面一直空白，用户会以为程序卡死了。每审完一条就报一次「3/10」这样的进度，网页上就能显示进度条。
 --- prompt
 写两处：
 
@@ -1497,6 +1539,9 @@ expect("普通 invoke 照样能用（writer 没人听时什么也不做）", lam
 type: code
 title: 只把一个节点的 token 给用户
 level: 2
+cards: 流式：让界面看到进度
+--- context
+网页上想让模型的建议像打字机一样一段段出现，不用等全部写完。可图里有两个节点都在调模型，界面只该显示其中一个说的话。
 --- prompt
 图里有两个节点都调模型：`summarise`（思考关闭）和 `advise`（思考**开着**）。界面上只想打字机式显示某一个节点的输出。
 
@@ -1582,6 +1627,9 @@ expect_true("advise 确实有空片段要跳过", lambda: _thinking_chunks() > 3
 type: order
 title: 排代码：graph.py 的 run_graph
 level: 2
+cards: 读 graph.py; interrupt()：停下来问人
+--- context
+这是真实项目命令行加 `--graph` 时背后的流程：审到需要批准时停下，在终端里问你 y/N，再按你的回答接着跑。`decide` 就是「问人」那一步。
 --- prompt
 排出 `run_with_approval(app, inputs, thread_id, decide)`，和 `clausecheck/graph.py` 的 `run_graph` 做同样的事：运行到中断，把 payload 交给 `decide(payload)` 得到 True / False，再恢复；没有中断就直接返回结果。有两行干扰项。
 --- lines
@@ -1643,6 +1691,9 @@ expect("没有 redline：不问人", _clean, [["report.json"], []])
 type: code
 title: 另一个进程看待批内容
 level: 2
+cards: 读 graph.py; d33:看状态：get_state 和历史
+--- context
+律师第二天打开系统，想先看看待批的是哪几条，还没决定批不批。这时只能「看」，不能不小心让流程继续跑下去。真实 `graph.py` 里的 `pending_interrupt` 就负责这个。
 --- prompt
 仿照 `graph.py` 的 `pending_interrupt`，写 `pending_interrupt(app, thread_id)`：
 
@@ -1693,6 +1744,9 @@ expect("只看不恢复：看两次还在", lambda: [pending_interrupt(APP, "wai
 type: testwrite
 title: 写测试：待批的 redline
 level: 2
+cards: 读 graph.py
+--- context
+律师批准以后，代码会把改写一条条替换进导出的合同副本。清单里混进一条没法执行的，律师批了也落不了地；漏掉一条能执行的，律师就根本看不到它。
 --- prompt
 被测函数 `pending_redlines(reviews)` 模仿 `graph.py` 里 `approve` 节点算 `pending` 的那段：只有 verdict 是 `"redline"`，**并且**有 redline 草稿、草稿在原文里定位到了（`located` 为 True），才交给人批准；保持原顺序。
 
@@ -1778,6 +1832,9 @@ def test_keeps_contract_order():
 type: choice
 title: 读 graph.py
 level: 2
+cards: 读 graph.py; 恢复时节点从头再跑; d33:SqliteSaver：进程退出也不丢
+--- context
+面试时很可能被问「你的审批流程是怎么实现的」。先确认自己对 `graph.py` 的理解没有偏差。
 --- prompt
 关于 `clausecheck/graph.py`，下面哪个说法是对的？
 --- options
@@ -1794,6 +1851,9 @@ type: scratch
 title: 闭卷：并行审查 + 汇总
 exam: yes
 level: 3
+cards: Send：一条款一个分支（map-reduce）; d30:with_structured_output：直接拿到对象
+--- context
+闭卷写一遍并行版的整份合同审查：报告开头要有各判定的数量，还要列出高风险条款让人先看。
 --- prompt
 写 `review_contract(clauses)`，用 LangGraph 的 `Send` 并行审查：
 
@@ -1874,6 +1934,9 @@ type: scratch
 title: 闭卷：通知一次、可以修改的审批
 exam: yes
 level: 3
+cards: 恢复时节点从头再跑; 审批的几种回答; interrupt()：停下来问人
+--- context
+这是一个完整的审批环节：通知法务，停下等律师决定，再按决定导出。它决定合同最终被改成什么样，所以要经得起「恢复时重跑」和「律师乱填」。
 --- prompt
 写 `approval_flow(redlines, answer, notify)`：
 
@@ -1941,6 +2004,9 @@ type: scratch
 title: 闭卷：带进度的分诊
 exam: yes
 level: 3
+cards: 流式：让界面看到进度; Command：在节点里更新 + 跳转
+--- context
+网页一边显示逐条审查的进度，一边显示整份合同最后被分到哪里：送法务批准，还是没问题直接结束。
 --- prompt
 写 `stream_triage(clauses)`：
 

@@ -243,6 +243,9 @@ main();
 type: choice
 title: await 做了什么
 level: 1
+cards: async / await：等网络的时候不卡住
+--- context
+用 TypeScript 调模型接口时，发请求、读回答都要等网络返回。这个「等」怎么写、写漏了会怎样，是今天最重要的一课。
 --- prompt
 在 async 函数里写 `const data = res.json();`（忘了 await），`data` 是什么？
 --- options
@@ -258,6 +261,9 @@ answer: 2
 type: predict
 title: 异步的执行顺序
 level: 2
+cards: async / await：等网络的时候不卡住
+--- context
+用 TypeScript 写审查程序时，日志打印的先后常常和代码的书写顺序不一样，排查问题时很容易看糊涂。先用一个最小的例子把先后弄清楚。
 --- prompt
 写出输出。关键：`.then` 里的回调要等当前这一段同步代码全部跑完才执行。
 --- code
@@ -273,6 +279,9 @@ console.log("D");
 type: code
 title: 组装请求体（TS 版）
 level: 1
+cards: fetch：TypeScript 里的 requests.post; d5:函数和箭头函数
+--- context
+和第 4 天的 Python 版一样，每次请模型审一条条款，都要组一个请求体（发给接口的全部内容）。这次用 TypeScript 来写。
 --- prompt
 写 `buildBody(messages, model, temperature)`：`model` 默认 `"deepseek-flash"`，`temperature` 默认 `0.3`，返回有 `model`、`messages`、`thinking`、`temperature` 四个键的对象。和第 4 天一样，`thinking` 固定是 `{ type: "disabled" }`。
 --- starter
@@ -300,6 +309,9 @@ expect("自定义温度", () => buildBody(msgs, "deepseek-flash", 0).temperature
 type: code
 title: 第一次调接口（TS 版）
 level: 2
+cards: fetch：TypeScript 里的 requests.post; async / await：等网络的时候不卡住
+--- context
+这是 TypeScript 版的「把问题发给模型，拿回回答」。很多 AI 团队用的 Mastra 框架就是 TypeScript 写的，面试时可能会让你当场写出这几行。
 --- prompt
 写 `ask(prompt)`：POST 到 `API_URL`，请求头带 `Bearer` 密钥，模型 `deepseek-flash`，一条 user 消息，返回回答文字。
 --- starter
@@ -333,6 +345,9 @@ expectAsync("用的模型", async () => { await ask("x"); return MOCK.calls[MOCK
 type: fix
 title: 修 bug：忘了 await
 level: 2
+cards: async / await：等网络的时候不卡住; d5:类型标注和类型错误
+--- context
+调用模型的函数写好了，运行前的类型检查却报了错。好在有这一关：要是没有类型检查，这类问题要等真正调接口时才会暴露。
 --- prompt
 类型检查报错了。读报错，修好它。
 --- starter
@@ -369,6 +384,9 @@ expectAsync("另一个问题", () => ask("pong"), "Mock reply: pong");
 type: code
 title: 顺便记下 token（TS 版）
 level: 2
+cards: fetch：TypeScript 里的 requests.post; async / await：等网络的时候不卡住
+--- context
+模型按 token 计费（token：模型读写文字的计量单位）。每次调用都顺手记下用量，最后才能算出审一份合同花了多少钱。第 4 天做过 Python 版。
 --- prompt
 写 `askWithUsage(prompt)`，返回 `{ text, tokens }`：回答文字和本次 `total_tokens`。返回类型已经写好。
 --- starter
@@ -401,6 +419,9 @@ expectTrueAsync("tokens 是正数", async () => (await askWithUsage("cost?")).to
 type: code
 title: 状态码不对就 throw
 level: 2
+cards: try / catch / throw; fetch：TypeScript 里的 requests.post
+--- context
+接口出错时，把状态码和服务器的原话一起报出来，看日志就知道是密钥错了、请求写错了，还是服务器忙。调用它的代码可以接住这个错误，再决定重试还是放弃。
 --- prompt
 写 `callApi(body)`：发请求；`res.ok` 为 true 就返回解析后的数据；否则 `throw new Error(\`API error ${状态码}: ${错误信息}\`)`，错误信息在 `(await res.json()).error.message`。
 --- starter
@@ -438,6 +459,9 @@ expectAsync("错误信息格式", async () => {
 type: code
 title: 失败就重试（TS 版）
 level: 3
+cards: d4:状态码和重试; fetch：TypeScript 里的 requests.post; try / catch / throw
+--- context
+审一份合同要连着调几十次接口，偶尔碰上「请求太频繁」或服务器临时故障，等一下再试往往就好了。第 4 天定下的重试规则，这次用 TypeScript 实现。
 --- prompt
 写 `askWithRetry(prompt, maxAttempts = 3)`：200 返回文字；429 / 500 / 503 重试；其他状态码直接 throw；次数用完 throw。规则和第 4 天一样。
 --- starter
@@ -490,6 +514,9 @@ expectAsync("401 不重试", async () => {
 type: code
 title: 用 Zod 解析模型输出
 level: 2
+cards: Zod：TypeScript 的 Pydantic; try / catch / throw; z.infer：一份定义，两处使用
+--- context
+模型回来的判定要先检查再用。Zod 在 TypeScript 里做的，就是 Pydantic 在 Python 里做的事，Mastra 定义工具参数用的也是它。出错原因要留下来，之后可以发回给模型让它改。
 --- prompt
 补全 `VerdictSchema`（`clause_id` 字符串，`verdict` 为三选一），再写 `parseVerdict(raw)`：
 
@@ -542,6 +569,9 @@ expectTrue("缺字段", () => String(parseVerdict('{"verdict": "flag"}')).starts
 type: predict
 title: safeParse 的结果
 level: 2
+cards: Zod：TypeScript 的 Pydantic
+--- context
+模型的回答不一定完整，也不一定合规。先看清 Zod 检查一个缺了字段的回答和一个判定写错的回答时，分别交回什么。
 --- prompt
 写出输出。`default(0.5)` 会在缺字段时补上默认值。
 --- code
@@ -560,6 +590,9 @@ console.log(b.success, b.error?.issues[0].path);
 type: code
 title: 结构化判定（TS 版）
 level: 3
+cards: Zod：TypeScript 的 Pydantic; fetch：TypeScript 里的 requests.post; async / await：等网络的时候不卡住
+--- context
+这一题把今天前面几题连起来：发出一条条款，拿回一个检查过的判定，这是 TypeScript 版审查器的核心。在 Mastra 里写审查 Agent，做的也是同样的事。
 --- prompt
 写 `classify(clauseText)`：模型 `deepseek-flash`，请求时加 `response_format: { type: "json_object" }`，并用 `thinking: { type: "disabled" }` 关掉思考模式（判一条条款要快、要便宜）；把回答文字 `JSON.parse` 后用 `VerdictSchema.parse` 校验，返回 `Verdict`。
 --- starter
@@ -619,6 +652,9 @@ expectAsync("关掉了思考模式", async () => { await classify(TEXT); return 
 type: code
 title: 执行工具调用（TS 版）
 level: 2
+cards: 工具分发：名字到函数的表
+--- context
+模型审条款时会说「帮我查一下付款规则」，也就是给出工具名和一段参数文字。程序要按名字找到真正干活的函数去执行。第 4 天做过 Python 版。
 --- prompt
 写 `runToolCall(call, tools)`：按 `call.function.name` 在 `tools` 里找到函数，把 `arguments`（JSON 文字）解析后传进去，返回结果。找不到返回 `"UNKNOWN_TOOL: 名字"`。
 --- starter
@@ -655,6 +691,9 @@ expect("不存在", () => runToolCall(mk("delete_all", "{}"), TOOLS), "UNKNOWN_T
 type: code
 title: 通过率（TS 版）
 level: 2
+cards: async / await：等网络的时候不卡住; d4:随机性：跑一次不算数
+--- context
+同一条条款问模型几次，答案可能不一样，评估时要多问几次看比例。一次一次按顺序来，也能避免一下子发出太多请求，被服务器以「太频繁」为由拒绝。
 --- prompt
 写 `passRate(text, expected, n)`：调用 `classify(text)` 共 `n` 次（**一次一次按顺序 await**），返回判定等于 `expected` 的比例。`classify` 已经写好。
 --- starter
@@ -703,6 +742,9 @@ expectTrueAsync("摇摆的条款介于 0 和 1", async () => { const r = await p
 type: translate
 title: 翻译：ask
 level: 2
+cards: fetch：TypeScript 里的 requests.post; async / await：等网络的时候不卡住
+--- context
+同一个「问模型一句话」，Python 版你第 4 天写过。两种语言对照着记，面试时不管被要求用哪种，都能写出来。
 --- prompt
 把第 4 天的 Python `ask` 翻译成 TypeScript。注意三处差异：`method: "POST"`、`JSON.stringify`、两个 `await`。
 --- source
@@ -742,6 +784,9 @@ expectAsync("消息", async () => { await ask("m"); return MOCK.calls[MOCK.calls
 type: order
 title: 排代码：要 JSON 的调用（TS 版）
 level: 2
+cards: fetch：TypeScript 里的 requests.post; async / await：等网络的时候不卡住
+--- context
+让模型只用 JSON 回答、再把回答变成对象，这几行是 TypeScript 里调用模型的固定套路，值得熟到不用想。
 --- prompt
 排出 `askJson`：要求 JSON 格式、关掉思考模式，返回解析后的对象。对象字面量里 `method`、`headers`、`body` 三行的顺序可以互换。有一行干扰项。
 --- lines
@@ -766,6 +811,9 @@ expectAsync("主题", async () => (await askJson("Review clause 6.2: survives in
 type: choice
 title: z.infer 的作用
 level: 2
+cards: z.infer：一份定义，两处使用; Zod：TypeScript 的 Pydantic
+--- context
+读 Mastra 或别的 TypeScript 项目时，经常能在一个 Zod 定义下面看到这样一行。
 --- prompt
 `type Verdict = z.infer<typeof VerdictSchema>;` 这一行的作用是？
 --- options
@@ -781,6 +829,9 @@ Zod schema 是运行时的一个值，负责校验；`z.infer` 在编译时从�
 type: choice
 title: Python 和 Mastra 的对应
 level: 1
+cards: import / export 和 Mastra 长什么样; Zod：TypeScript 的 Pydantic
+--- context
+面试的公司用 Mastra（TypeScript），你的项目用 Python。能把两边的概念一一对上，就能说明你学会的东西可以直接搬过去。
 --- prompt
 Mastra 用 `createTool({ inputSchema: z.object({...}) })` 定义工具参数。在 Python / Clause Check 里，对应的是什么？
 --- options
@@ -796,6 +847,9 @@ answer: 2
 type: local
 title: 本机任务：用 TypeScript 调一次 DeepSeek
 level: 2
+cards: fetch：TypeScript 里的 requests.post; async / await：等网络的时候不卡住
+--- context
+前面的题都连着模拟服务器。这次在自己电脑上用 TypeScript 真的调一次模型，从空白开始自己写，看看这两天学的能不能独立用起来。
 --- prompt
 **不看这个页面**，手写一次 TypeScript 的真实调用。
 
@@ -819,13 +873,16 @@ verify: tokens?\D{0,30}\d+
 --- hints
 - 看到 `fetch is not defined`：Node 版本太旧，需要 18 以上（你的是 22，没问题）。
 - 看到 401：检查 `.env` 和 `Bearer ` 前缀。
-- 看到 400 和 `Model Not Exist`：模型名写错了，用 `deepseek-flash`。
+- 看到 400，错误里写着 `The supported API model names are ...`：模型名写错了，用 `deepseek-flash`。
 
 @@ item d6-e1
 type: scratch
 title: 闭卷：Rule schema
 exam: yes
 level: 2
+cards: Zod：TypeScript 的 Pydantic; z.infer：一份定义，两处使用; try / catch / throw
+--- context
+公司的审查规则（playbook）存在 JSON 文件里，是人手写的，也可能写错。TypeScript 版的程序读规则时同样要先检查，坏规则不能混进审查里。
 --- prompt
 用 Zod 定义 `RuleSchema`：`id` 字符串、`topic` 字符串、`severity` 为 `low` / `medium` / `high` 之一。再写 `loadRule(raw: string)`：合法返回解析后的对象，JSON 坏了或字段不合法都返回 `null`。
 --- solution
@@ -856,6 +913,9 @@ type: scratch
 title: 闭卷：要 JSON 的调用（TS）
 exam: yes
 level: 2
+cards: fetch：TypeScript 里的 requests.post; async / await：等网络的时候不卡住
+--- context
+要模型给结构化结果时，这就是 TypeScript 里最基本的一次调用：发出问题，拿回一个可以直接取字段的对象。
 --- prompt
 写 `askJson(prompt: string): Promise<any>`：调用 `https://api.deepseek.com/v1/chat/completions`（模型 `deepseek-flash`，密钥 `process.env.DEEPSEEK_API_KEY`），要求 `json_object` 格式并关掉思考模式，返回解析后的对象。
 --- solution
@@ -878,6 +938,9 @@ type: scratch
 title: 闭卷：一共多少 token（TS）
 exam: yes
 level: 2
+cards: async / await：等网络的时候不卡住; fetch：TypeScript 里的 requests.post
+--- context
+模型按 token 计费（token：模型读写文字的计量单位）。一批请求跑完，把每次的用量加起来，就知道这一批一共用了多少。
 --- prompt
 写 `countTokens(prompts: string[]): Promise<number>`：对每个 prompt 按顺序各调用一次接口（URL 和密钥同上题，模型 `deepseek-flash`，不用关思考模式），返回 `total_tokens` 之和，空数组返回 0。
 --- solution

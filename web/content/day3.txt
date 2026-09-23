@@ -198,6 +198,9 @@ print(first_id(["3.1", "8.1"]), first_id([]))
 type: predict
 title: json.loads
 level: 1
+cards: JSON：文字和字典之间的桥
+--- context
+模型回给程序的判定，是一段 JSON 格式的文字（JSON：程序之间传数据最常用的写法）。程序要先把它变成 Python 能用的东西，才能取出里面的判定。
 --- prompt
 写出输出。注意 JSON 的 `true` / `null` 变成了什么。
 --- code
@@ -214,6 +217,9 @@ print(sorted(data.keys()))
 type: predict
 title: json.dumps
 level: 1
+cards: JSON：文字和字典之间的桥
+--- context
+反过来，程序也常要把 Python 的数据写成 JSON 文字：比如把审查报告存成文件，或者把工具查到的结果发回给模型。
 --- prompt
 写出输出。注意 Python 的 `False` / `None` 变成了什么，以及引号。
 --- code
@@ -227,6 +233,9 @@ print(json.dumps(v["refs"]))
 type: code
 title: 从 JSON 里取判定
 level: 1
+cards: JSON：文字和字典之间的桥; import：用别人写好的代码
+--- context
+程序要求模型用 JSON 格式回答，这样才能准确取出判定，不用去猜一段自然语言到底是什么意思。这是处理模型回答的第一步。
 --- prompt
 模型返回了一段 JSON 文字，例如 `'{"clause_id": "8.1", "verdict": "flag"}'`。
 
@@ -252,6 +261,9 @@ expect("accept", lambda: verdict_of('{"verdict": "accept", "risk_level": "low"}'
 type: code
 title: 安全地解析
 level: 2
+cards: try / except：预料到的错误要接住; JSON：文字和字典之间的桥
+--- context
+模型有时会少写一个括号、多加一句话，JSON 就坏了。一份合同几十条条款，不能因为其中一条的回答坏了，就让整个审查停下来。
 --- prompt
 模型偶尔会返回坏掉的 JSON。写 `safe_parse(raw)`：能解析就返回字典；格式不对就返回 `None`，**不要让程序崩溃**。
 --- starter
@@ -279,6 +291,9 @@ expect("空字符串返回 None", lambda: safe_parse(""), None)
 type: fix
 title: 修 bug：接错了异常
 level: 2
+cards: try / except：预料到的错误要接住; 读懂多层的 Traceback
+--- context
+审查跑到一半，一条回答坏了，整批就停了，这是最让人头疼的事之一。这段代码本来就是为了防这个写的。
 --- prompt
 这个函数想在 JSON 坏掉时返回 `None`，但遇到坏 JSON 时还是崩了。运行，看报错的类型，修好它。
 --- starter
@@ -308,6 +323,9 @@ expect("坏 JSON", lambda: parse_or_none("{oops"), None)
 type: code
 title: 缺字段用默认值
 level: 2
+cards: try / except：预料到的错误要接住; d2:字典：用名字找值
+--- context
+模型回答的 JSON 里，不重要的字段（比如备注）有时会漏写。缺了就用默认值补上，审查照常往下走，不必为此报错。
 --- prompt
 写 `field(data, key, default)`：`data` 里有这个键就返回它的值，没有就返回 `default`。
 
@@ -333,6 +351,9 @@ expect("值是 None 也要原样返回", lambda: field({"note": None}, "note", "
 type: choice
 title: 读多层报错
 level: 2
+cards: 读懂多层的 Traceback
+--- context
+真实项目里函数层层调用：主程序调用汇总，汇总里再做计数。出错时，报错会把每一层都列出来，看起来吓人，其实有固定的读法。
 --- prompt
 下面的报错里，应该去改哪一行？
 --- code
@@ -355,6 +376,9 @@ answer: 2
 type: code
 title: 找出交叉引用
 level: 2
+cards: 正则入门：在文字里找模式; import：用别人写好的代码
+--- context
+「Subject to Section 12」的意思是这一条要受第 12 条约束，不看第 12 条就下结论容易判错。切合同时先把这些引用找出来，真实项目会把它们写进发给模型的消息里，提醒它还要看哪几条。
 --- prompt
 条款里常写「Subject to Section 12」。写 `find_refs(text)`：返回文字中所有被引用的章节号（字符串），按出现顺序。章节号可能带小数点，如 `4.2`。
 
@@ -386,6 +410,9 @@ expect("一个引用", lambda: find_refs("as set out in Section 9.1."), ["9.1"])
 type: predict
 title: re.findall 和 re.search
 level: 2
+cards: 正则入门：在文字里找模式
+--- context
+合同里的数字往往就是关键条件：付款期限几天、利息多少、引用哪一条。先看清两种找数字的写法各自交回什么。
 --- prompt
 写出输出。`\d+` 会把 `4.2` 拆成几个数字？
 --- code
@@ -401,6 +428,9 @@ print(re.search(r"\d+ weeks", text))
 type: code
 title: 第一个数字
 level: 2
+cards: 正则入门：在文字里找模式; d1:变量和类型
+--- context
+付款条款写着「Pay within 30 days」。假设公司规定付款期限至少 30 天，练习里要先把这个天数取出来，才能拿去和规定的天数比大小。
 --- prompt
 写 `first_number(text)`：返回文字中出现的第一个整数（`int` 类型）；没有数字返回 `None`。
 
@@ -430,6 +460,9 @@ expect("没有数字", lambda: first_number("no digits here"), None)
 type: code
 title: 写一个 Clause 类
 level: 2
+cards: 类：把数据和操作放在一起
+--- context
+一条条款有编号、标题、正文三样东西，总是一起出现。合同里还有只有标题、没有正文的章节标题行（比如「8 Liability」），它们不用送去审查。真实项目的 `models.py` 里就有一个 `Clause`。
 --- prompt
 写类 `Clause`：
 
@@ -467,6 +500,9 @@ expect("label", lambda: c.label(), "8.1 Cap on Liability")
 type: code
 title: 判定计数器类
 level: 3
+cards: 类：把数据和操作放在一起; d2:计数的标准写法
+--- context
+审查是一条一条进行的。假设界面上要随时显示「到目前为止各种判定各有几条」，练习里就把这个计数器做成一个对象，边审边记。
 --- prompt
 写类 `VerdictTally`：
 
@@ -514,6 +550,9 @@ expect("空的返回 None", lambda: VerdictTally().most_common(), None)
 type: choice
 title: 类型标注会被检查吗
 level: 1
+cards: 类型标注：写给人和工具看的说明
+--- context
+真实项目里几乎每个函数都写了类型标注，比如 `def summarise(reviews: list[ClauseReview], settings: Settings) -> dict`。读懂它之前，先弄清它到底起什么作用。
 --- prompt
 `def risk_score(risk: str) -> int:` 这样定义后，调用 `risk_score(123)` 会怎样？
 --- options
@@ -529,6 +568,9 @@ Python 的类型标注在运行时不做检查，函数照常执行（可能在�
 type: order
 title: 排代码：安全取判定
 level: 2
+cards: try / except：预料到的错误要接住; JSON：文字和字典之间的桥
+--- context
+每审一条条款，程序都要从模型的回答里取出判定。模型的回答不一定可靠，这一步要能扛住各种坏掉的回答，整份报告才出得来。
 --- prompt
 排出 `load_verdict(raw)`：JSON 坏了返回 `None`，否则返回其中的 `verdict`（没有这个字段也返回 `None`）。有一行干扰项。
 --- lines
@@ -552,6 +594,9 @@ expect("缺字段", lambda: load_verdict("{}"), None)
 type: code
 title: 手写一个校验器
 level: 3
+cards: d2:字典：用名字找值; d1:if / elif / else
+--- context
+JSON 能解析，不代表内容对：模型可能漏了编号，或者自己发明一个判定，比如 `maybe`。发现问题后，程序可以把问题告诉模型，让它重答一次。
 --- prompt
 模型返回的字典不一定可靠。写 `validate_verdict(data)`，返回问题列表（字符串），没有问题返回 `[]`：
 
@@ -591,6 +636,9 @@ expect("缺编号且判定不合法", lambda: validate_verdict({"verdict": "mayb
 type: code
 title: 主动报错
 level: 2
+cards: raise：主动报错; d1:字符串
+--- context
+风险等级决定条款在报告里排第几、要不要先给人看。收到一个不认识的值时，要是悄悄当成 `low`，高风险条款就会混进「不用看」的那一堆里。
 --- prompt
 写 `parse_risk(text)`：去掉首尾空白并转小写；结果是 `low` / `medium` / `high` 之一就返回它；否则 `raise ValueError`（信息写 `"unknown risk: 原始输入"`）。
 --- starter
@@ -620,6 +668,9 @@ type: scratch
 title: 闭卷：取所有规则编号
 exam: yes
 level: 2
+cards: JSON：文字和字典之间的桥; d2:列表推导式：一行写完筛选和变换
+--- context
+公司的审查规则（playbook）存在一个 JSON 文件里，每条规则有编号（如 `PB-01`）和主题。程序启动时先读这个文件；模型的判定里也会写上它依据的是哪几条规则。
 --- prompt
 写 `rule_ids(raw)`：`raw` 是这样的 JSON 文字：
 
@@ -641,6 +692,9 @@ type: scratch
 title: 闭卷：解析结果
 exam: yes
 level: 2
+cards: try / except：预料到的错误要接住; JSON：文字和字典之间的桥
+--- context
+处理模型回答的函数，要让调用它的代码一眼看出成功还是失败，失败了再决定是重问模型，还是记一笔错误。
 --- prompt
 写 `parse_result(raw)`：
 
@@ -663,6 +717,9 @@ type: scratch
 title: 闭卷：Rule 类
 exam: yes
 level: 2
+cards: 类：把数据和操作放在一起
+--- context
+playbook 里的每条规则都有编号、主题和严重程度（severity）。严重程度高的规则一旦被违反，往往意味着一条高风险条款。
 --- prompt
 写类 `Rule`：创建时接收 `rule_id`、`topic`、`severity` 并保存为同名属性；方法 `is_high()` 在 `severity` 为 `"high"` 时返回 `True`；方法 `summary()` 返回 `"PB-01 (payment, high)"` 这样的字符串。
 --- solution
