@@ -8,6 +8,7 @@ import os as _cc_os
 import random as _cc_random
 import re as _cc_re
 import sys as _cc_sys
+import threading as _cc_threading
 import types as _cc_types
 
 _CC_RULES = [
@@ -22,6 +23,10 @@ _CC_TOPICS = [
     ("liabil", "liability_cap"), ("renew", "auto_renewal"), ("data", "data_processing"),
     ("fee", "payment"), ("pay", "payment"), ("confiden", "confidentiality"), ("terminat", "termination"),
 ]
+# Current DeepSeek model names (api-docs.deepseek.com, 2026-09): deepseek-flash (DeepSeek-V4.1-Flash),
+# deepseek-v4-pro, and the legacy deepseek-v4-flash that is still routed to Flash. deepseek-chat and
+# deepseek-reasoner were discontinued on 2026-07-24, so they get "Model Not Exist" like any unknown name.
+_CC_MODELS = ("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash")
 _CC_STATUS_TEXT = {429: "Rate limit reached, please retry later", 500: "Internal server error", 503: "Service unavailable"}
 
 # Mock embeddings: a deterministic bag of words hashed (FNV-1a) into 256 dimensions, with a few
@@ -63,6 +68,7 @@ def _cc_embed(text):
 
 class _CCMock:
     def __init__(self):
+        self._lock = _cc_threading.Lock()
         self.reset()
 
     def reset(self, seed=7):
@@ -70,6 +76,7 @@ class _CCMock:
         self.queue = []
         self.calls = []
         self.prompts = []
+        self.sleeps = []  # retry waits recorded by the LangChain runtime (py_langchain.py)
 
     def embed(self, text):
         return _cc_embed(text)
@@ -101,6 +108,12 @@ class _CCMock:
                 "rationale": "Mock review: nothing unusual found."}
 
     def handle(self, url, headers, body):
+        # on a normal machine LangGraph runs parallel branches in threads: one request at a time,
+        # so the prefix cache and the fail_next queue are never updated by two threads at once
+        with self._lock:
+            return self._handle(url, headers, body)
+
+    def _handle(self, url, headers, body):
         # keep a snapshot, like a real server: later changes to the learner's lists don't rewrite history
         try:
             snapshot = _cc_json.loads(_cc_json.dumps(body))
@@ -121,8 +134,19 @@ class _CCMock:
             return self._embeddings(body)
         if not isinstance(body, dict) or not isinstance(body.get("model"), str) or not isinstance(body.get("messages"), list) or not body["messages"]:
             return 400, {"error": {"message": "Invalid request: the body needs 'model' (a string) and 'messages' (a non-empty list)", "type": "invalid_request_error"}}
-        if body["model"] not in ("deepseek-chat", "deepseek-reasoner"):
+        if body["model"] not in _CC_MODELS:
             return 400, {"error": {"message": f"Model Not Exist: {body['model']}", "type": "invalid_request_error"}}
+        # thinking mode (DeepSeek V4): on unless the body says {"thinking": {"type": "disabled"}}
+        thinking = body.get("thinking")
+        if thinking is not None and (not isinstance(thinking, dict) or thinking.get("type") not in ("enabled", "disabled")):
+            return 400, {"error": {"message": "Invalid request: 'thinking' must be {\"type\": \"enabled\"} or {\"type\": \"disabled\"}", "type": "invalid_request_error"}}
+        think = not (isinstance(thinking, dict) and thinking.get("type") == "disabled")
+        # thinking mode + tools: every earlier assistant message must carry its reasoning_content
+        # ("If your code does not correctly pass back reasoning_content, the API will return a 400 error.")
+        if think and body.get("tools"):
+            for i, m in enumerate(body["messages"]):
+                if isinstance(m, dict) and m.get("role") == "assistant" and not isinstance(m.get("reasoning_content"), str):
+                    return 400, {"error": {"message": f"Invalid request: thinking mode with tools needs the reasoning_content of every earlier assistant message passed back (message at index {i} has none). Pass it back, or send \"thinking\": {{\"type\": \"disabled\"}}", "type": "invalid_request_error"}}
         messages = body["messages"]
         for i, m in enumerate(messages):
             if not isinstance(m, dict) or m.get("role") not in ("system", "user", "assistant", "tool"):
@@ -163,21 +187,35 @@ class _CCMock:
         tools = body.get("tools") or []
         tool_msgs = [m for m in messages if m["role"] == "tool"]
         fmt = (body.get("response_format") or {}).get("type")
+        if fmt not in (None, "text", "json_object"):
+            return 400, {"error": {"message": f"Invalid request: response_format type {fmt!r} is not supported (use 'json_object', or tools)", "type": "invalid_request_error"}}
+        choice = body.get("tool_choice")
+        forced = (choice.get("function") or {}).get("name") if isinstance(choice, dict) else None
+        required = choice in ("required", "any")
         finish = "stop"
-        if tools and (not tool_msgs or "[loop]" in user_text):
-            # which tool: the first one whose name appears in the question, else the first one.
-            # arguments: filled from the question for the parameters it knows (topic, clause_id, query).
+        if tools and choice != "none" and (forced or required or not tool_msgs or "[loop]" in user_text):
+            # tool_choice like the real API: "none" never calls a tool, "required" always does, a named
+            # function is always that function. Which tool otherwise: the first one whose name appears in
+            # the question, else the first one; with "required" after a tool result, the LAST tool (in
+            # LangChain's create_agent(response_format=...) that is the answer schema).
+            # arguments: filled from the question for the parameters it knows (topic, clause_id, query);
+            # with a forced or required tool (structured output) every property is filled.
             # "[bad-args]" sends broken JSON; "[loop]" keeps calling tools forever.
             low = user_text.lower()
             fns = [t.get("function") or {} for t in tools]
-            fn = next((f for f in fns if f.get("name") and f["name"] in user_text), fns[0])
+            fn = next((f for f in fns if forced and f.get("name") == forced), None) \
+                or (fns[-1] if required and tool_msgs else None) \
+                or next((f for f in fns if f.get("name") and f["name"] in user_text), fns[0])
             name = fn.get("name", "tool")
             props = (fn.get("parameters") or {}).get("properties")
             topic = next((t for kw, t in _CC_TOPICS if kw in low), "other")
             cid = _cc_re.search(r"clause\s+(\d+(?:\.\d+)*)", user_text, _cc_re.I)
             known = {"topic": topic, "clause_id": cid.group(1) if cid else "unknown",
                      "query": _cc_re.sub(r"\[[a-z-]+\]", "", user_text).strip()[:80]}
-            args = {"topic": topic} if not props else {k: v for k, v in known.items() if k in props}
+            if forced or required:
+                args = self._fill(fn.get("parameters") or {}, dict(known, **self._judge(user_text)))
+            else:
+                args = {"topic": topic} if not props else {k: v for k, v in known.items() if k in props}
             arguments = '{"topic": ' if "[bad-args]" in user_text else _cc_json.dumps(args)
             message = {"role": "assistant", "content": "", "tool_calls": [
                 {"id": f"call_{len(tool_msgs) + 1}", "type": "function", "function": {"name": name, "arguments": arguments}}]}
@@ -193,12 +231,41 @@ class _CCMock:
                 content = "Mock reply: " + user_text[:60]
             message = {"role": "assistant", "content": content}
         completion_tokens = len(message.get("content") or "") // 4 + 5
+        reasoning_tokens = 0
+        if think:
+            # the chain of thought comes back next to the answer and is billed as output
+            message["reasoning_content"] = f"Mock reasoning: {len(messages)} message(s) read; deciding how to answer."
+            reasoning_tokens = len(message["reasoning_content"]) // 4 + 40
+            completion_tokens += reasoning_tokens
         usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                  "total_tokens": prompt_tokens + completion_tokens,
                  "prompt_cache_hit_tokens": cache_hit, "prompt_cache_miss_tokens": prompt_tokens - cache_hit}
+        if think:  # not a required field in the API reference: only sent here when there is reasoning
+            usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
         return 200, {"id": f"mock-{len(self.calls)}", "object": "chat.completion", "model": body["model"],
                      "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}
 
+
+    def _fill(self, schema, known, defs=None):
+        # structured output: like a model, fill every property of the forced tool's schema, using
+        # what the review found for the names it knows and a plain value of the right type otherwise
+        defs = defs if defs is not None else schema.get("$defs") or {}
+        out = {}
+        for k, p in (schema.get("properties") or {}).items():
+            if "$ref" in p:
+                p = defs.get(p["$ref"].split("/")[-1], {})
+            enum = p.get("enum") or ([p["const"]] if "const" in p else None)
+            v = known.get(k)
+            if isinstance(v, str) and p.get("type", "string") == "string" and (not enum or v in enum):
+                out[k] = v
+            elif enum:
+                out[k] = enum[0]
+            elif p.get("type") == "object" and p.get("properties"):
+                out[k] = self._fill(p, known, defs)
+            else:
+                out[k] = {"string": f"mock {k}", "integer": 0, "number": 0, "boolean": False,
+                          "array": [], "object": {}}.get(p.get("type"))
+        return out
 
     def _embeddings(self, body):
         bad = (400, {"error": {"message": "Invalid request: the body needs 'model' (a string) and 'input' (a string or a non-empty list of strings)", "type": "invalid_request_error"}})
@@ -208,6 +275,17 @@ class _CCMock:
             return 400, {"error": {"message": f"Model Not Exist: {body['model']} (use an embedding model, e.g. text-embedding-3-small)", "type": "invalid_request_error"}}
         inp = body.get("input")
         texts = [inp] if isinstance(inp, str) else inp
+        # like the real API, token ids are accepted too (LangChain's OpenAIEmbeddings sends them):
+        # decoded back to text with tiktoken (Python only; the TypeScript mirror takes strings)
+        if isinstance(texts, list) and texts and all(isinstance(t, int) for t in texts):
+            texts = [texts]
+        if isinstance(texts, list) and texts and all(isinstance(t, list) and t and all(isinstance(x, int) for x in t) for t in texts):
+            try:
+                import tiktoken
+                enc = tiktoken.get_encoding("cl100k_base")
+                texts = [enc.decode(t) for t in texts]
+            except Exception:  # noqa: BLE001
+                return 400, {"error": {"message": "Invalid request: token-id input needs tiktoken; send strings", "type": "invalid_request_error"}}
         if not isinstance(texts, list) or not texts or not all(isinstance(t, str) for t in texts):
             return bad
         tokens = sum(len(t) // 4 + 1 for t in texts)

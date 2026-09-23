@@ -55,7 +55,7 @@ title: fetch：TypeScript 里的 requests.post
 const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
   method: "POST",
   headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
-  body: JSON.stringify({ model: "deepseek-chat", messages }),
+  body: JSON.stringify({ model: "deepseek-flash", messages }),
 });
 res.status;             // 状态码
 res.ok;                 // 200–299 为 true
@@ -65,17 +65,28 @@ const data = await res.json();
 和 Python 的三个不同：要写 `method: "POST"`；请求体要自己 `JSON.stringify`；`res.json()` 要 await。
 
 `process.env.DEEPSEEK_API_KEY` 读环境变量，和 `os.getenv` 一样。本页连的是模拟服务器，本机连的就是真的。
+
+思考模式和第 4 天一样：默认开着，思考过程在 `message.reasoning_content`，思考 token 按输出计费。审查条款的请求加 `thinking: { type: "disabled" }` 关掉它（更快、更便宜、`temperature` 才起作用）。
 --- code
 async function main() {
   const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: "Say hello" }] }),
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: "Say hello" }] }),
   });
   console.log(res.status, res.ok);
   const data = await res.json();
   console.log(data.choices[0].message.content);
-  console.log(data.usage.total_tokens);
+  console.log(data.usage.total_tokens, "reasoning:", data.usage.completion_tokens_details.reasoning_tokens);
+
+  const off = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: "Say hello" }], thinking: { type: "disabled" } }),
+  });
+  const offData = await off.json();
+  // 关掉思考：没有 reasoning_content，token 少了一大截（关掉时 completion_tokens_details 不一定返回，别直接读它）
+  console.log(offData.usage.total_tokens);
 }
 main();
 
@@ -263,7 +274,7 @@ type: code
 title: 组装请求体（TS 版）
 level: 1
 --- prompt
-写 `buildBody(messages, model, temperature)`：`model` 默认 `"deepseek-chat"`，`temperature` 默认 `0.3`，返回有这三个键的对象。
+写 `buildBody(messages, model, temperature)`：`model` 默认 `"deepseek-flash"`，`temperature` 默认 `0.3`，返回有 `model`、`messages`、`thinking`、`temperature` 四个键的对象。和第 4 天一样，`thinking` 固定是 `{ type: "disabled" }`。
 --- starter
 type Message = { role: "system" | "user" | "assistant"; content: string };
 
@@ -273,22 +284,24 @@ function buildBody(messages: Message[]) {
 --- solution
 type Message = { role: "system" | "user" | "assistant"; content: string };
 
-function buildBody(messages: Message[], model = "deepseek-chat", temperature = 0.3) {
-  return { model, messages, temperature };
+function buildBody(messages: Message[], model = "deepseek-flash", temperature = 0.3) {
+  return { model, messages, thinking: { type: "disabled" }, temperature };
 }
 --- tests
 const msgs: Message[] = [{ role: "user", content: "hi" }];
-expect("默认值", () => buildBody(msgs), { model: "deepseek-chat", messages: msgs, temperature: 0.3 });
-expect("自定义", () => buildBody(msgs, "deepseek-reasoner", 0).model, "deepseek-reasoner");
+expect("默认值", () => buildBody(msgs), { model: "deepseek-flash", messages: msgs, thinking: { type: "disabled" }, temperature: 0.3 });
+expect("换成更大的模型", () => buildBody(msgs, "deepseek-v4-pro", 0).model, "deepseek-v4-pro");
+expect("自定义温度", () => buildBody(msgs, "deepseek-flash", 0).temperature, 0);
 --- hints
 - `{ model, messages, temperature }` 是 `{ model: model, ... }` 的简写。
+- `thinking` 不是参数，直接写成 `thinking: { type: "disabled" }`。
 
 @@ item d6-04
 type: code
 title: 第一次调接口（TS 版）
 level: 2
 --- prompt
-写 `ask(prompt)`：POST 到 `API_URL`，请求头带 `Bearer` 密钥，模型 `deepseek-chat`，一条 user 消息，返回回答文字。
+写 `ask(prompt)`：POST 到 `API_URL`，请求头带 `Bearer` 密钥，模型 `deepseek-flash`，一条 user 消息，返回回答文字。
 --- starter
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const API_KEY = process.env.DEEPSEEK_API_KEY;
@@ -304,14 +317,14 @@ async function ask(prompt: string): Promise<string> {
   const res = await fetch(API_URL, {
     method: "POST",
     headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] }),
   });
   const data = await res.json();
   return data.choices[0].message.content;
 }
 --- tests
 expectAsync("回答", () => ask("hello"), "Mock reply: hello");
-expectAsync("用的模型", async () => { await ask("x"); return MOCK.calls[MOCK.calls.length - 1].body.model; }, "deepseek-chat");
+expectAsync("用的模型", async () => { await ask("x"); return MOCK.calls[MOCK.calls.length - 1].body.model; }, "deepseek-flash");
 --- hints
 - `fetch(API_URL, { method: "POST", headers: {...}, body: JSON.stringify({...}) })`，前面加 await。
 - `const data = await res.json();` 然后取 `data.choices[0].message.content`。
@@ -329,7 +342,7 @@ async function ask(prompt: string): Promise<string> {
   const res = await fetch(API_URL, {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] }),
   });
   const data = res.json();
   return data.choices[0].message.content;
@@ -341,7 +354,7 @@ async function ask(prompt: string): Promise<string> {
   const res = await fetch(API_URL, {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] }),
   });
   const data = await res.json();
   return data.choices[0].message.content;
@@ -373,7 +386,7 @@ async function askWithUsage(prompt: string): Promise<{ text: string; tokens: num
   const res = await fetch(API_URL, {
     method: "POST",
     headers: HEADERS,
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] }),
   });
   const data = await res.json();
   return { text: data.choices[0].message.content, tokens: data.usage.total_tokens };
@@ -411,7 +424,7 @@ async function callApi(body: object): Promise<any> {
   return data;
 }
 --- tests
-const GOOD = { model: "deepseek-chat", messages: [{ role: "user", content: "hi" }] };
+const GOOD = { model: "deepseek-flash", messages: [{ role: "user", content: "hi" }] };
 expectAsync("成功", async () => (await callApi(GOOD)).choices[0].message.content, "Mock reply: hi");
 expectRejects("模型名写错", () => callApi({ model: "gpt-9", messages: [{ role: "user", content: "x" }] }));
 expectAsync("错误信息格式", async () => {
@@ -433,7 +446,7 @@ const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
 const RETRYABLE = [429, 500, 503];
 
 async function askWithRetry(prompt: string, maxAttempts = 3): Promise<string> {
-  const body = JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] });
+  const body = JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] });
   return "";
 }
 --- solution
@@ -442,7 +455,7 @@ const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
 const RETRYABLE = [429, 500, 503];
 
 async function askWithRetry(prompt: string, maxAttempts = 3): Promise<string> {
-  const body = JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] });
+  const body = JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] });
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body });
     if (res.status === 200) {
@@ -548,7 +561,7 @@ type: code
 title: 结构化判定（TS 版）
 level: 3
 --- prompt
-写 `classify(clauseText)`：请求时加 `response_format: { type: "json_object" }`，把回答文字 `JSON.parse` 后用 `VerdictSchema.parse` 校验，返回 `Verdict`。
+写 `classify(clauseText)`：模型 `deepseek-flash`，请求时加 `response_format: { type: "json_object" }`，并用 `thinking: { type: "disabled" }` 关掉思考模式（判一条条款要快、要便宜）；把回答文字 `JSON.parse` 后用 `VerdictSchema.parse` 校验，返回 `Verdict`。
 --- starter
 import { z } from "zod";
 
@@ -583,9 +596,10 @@ async function classify(clauseText: string): Promise<Verdict> {
     method: "POST",
     headers: HEADERS,
     body: JSON.stringify({
-      model: "deepseek-chat",
+      model: "deepseek-flash",
       messages: [{ role: "user", content: clauseText }],
       response_format: { type: "json_object" },
+      thinking: { type: "disabled" },
     }),
   });
   const data = await res.json();
@@ -596,8 +610,9 @@ const TEXT = "Review clause 8.1: Customer's liability shall be unlimited.";
 expectAsync("unlimited → redline", async () => (await classify(TEXT)).verdict, "redline");
 expectAsync("编号", async () => (await classify(TEXT)).clause_id, "8.1");
 expectAsync("带了 response_format", async () => { await classify(TEXT); return MOCK.calls[MOCK.calls.length - 1].body.response_format; }, { type: "json_object" });
+expectAsync("关掉了思考模式", async () => { await classify(TEXT); return MOCK.calls[MOCK.calls.length - 1].body.thinking; }, { type: "disabled" });
 --- hints
-- 请求体里多一个键：`response_format: { type: "json_object" }`。
+- 请求体里比第 4 题多两个键：`response_format: { type: "json_object" }` 和 `thinking: { type: "disabled" }`。
 - 回答文字 → `JSON.parse(...)` → `VerdictSchema.parse(...)`。
 
 @@ item d6-12
@@ -647,7 +662,7 @@ const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
 
 async function classify(text: string): Promise<{ verdict: string }> {
-  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }) });
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }) });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content);
 }
@@ -660,7 +675,7 @@ const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
 
 async function classify(text: string): Promise<{ verdict: string }> {
-  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }) });
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }) });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content);
 }
@@ -698,7 +713,7 @@ API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 def ask(prompt):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
     data = requests.post(API_URL, headers=headers, json=body).json()
     return data["choices"][0]["message"]["content"]
 --- starter
@@ -712,7 +727,7 @@ const API_URL = "https://api.deepseek.com/v1/chat/completions";
 
 async function ask(prompt: string): Promise<string> {
   const headers = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
-  const body = { model: "deepseek-chat", messages: [{ role: "user", content: prompt }] };
+  const body = { model: "deepseek-flash", messages: [{ role: "user", content: prompt }] };
   const res = await fetch(API_URL, { method: "POST", headers, body: JSON.stringify(body) });
   const data = await res.json();
   return data.choices[0].message.content;
@@ -728,13 +743,13 @@ type: order
 title: 排代码：要 JSON 的调用（TS 版）
 level: 2
 --- prompt
-排出 `askJson`。对象字面量里 `method`、`headers`、`body` 三行的顺序可以互换。有一行干扰项。
+排出 `askJson`：要求 JSON 格式、关掉思考模式，返回解析后的对象。对象字面量里 `method`、`headers`、`body` 三行的顺序可以互换。有一行干扰项。
 --- lines
 async function askJson(prompt: string): Promise<any> {
   const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" } }),
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }),
   });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content);
@@ -786,7 +801,7 @@ level: 2
 
 1. 在 `G:\Contract Clause Reviewer\learn` 下新建 `my_first_call.ts`
 2. 第一行写 `process.loadEnvFile();`（Node 自带，读取当前目录的 `.env`）
-3. 手写一个 async 的 `main()`：fetch DeepSeek，打印回答和 `total_tokens`，最后调用 `main()`
+3. 手写一个 async 的 `main()`：fetch DeepSeek（模型 `deepseek-flash`），打印回答和 `total_tokens`，最后调用 `main()`
 4. 在项目根目录运行（这样 `.env` 能被找到）：
 
 ```
@@ -797,11 +812,14 @@ npx tsx learn/my_first_call.ts
 5. 把输出粘贴到下面
 
 第一次运行 `npx tsx` 会询问是否安装，输入 y。
+
+可选：和第 4 天一样，先打印 `usage.completion_tokens_details.reasoning_tokens` 看思考用了多少 token；再加上 `thinking: { type: "disabled" }` 跑一次，对比两次的 `completion_tokens`（关掉思考后 `completion_tokens_details` 不一定返回，别直接读它）。
 placeholder: 粘贴终端输出，应该包含回答和 total_tokens
 verify: tokens?\D{0,30}\d+
 --- hints
 - 看到 `fetch is not defined`：Node 版本太旧，需要 18 以上（你的是 22，没问题）。
 - 看到 401：检查 `.env` 和 `Bearer ` 前缀。
+- 看到 400 和 `Model Not Exist`：模型名写错了，用 `deepseek-flash`。
 
 @@ item d6-e1
 type: scratch
@@ -839,13 +857,13 @@ title: 闭卷：要 JSON 的调用（TS）
 exam: yes
 level: 2
 --- prompt
-写 `askJson(prompt: string): Promise<any>`：调用 `https://api.deepseek.com/v1/chat/completions`（模型 `deepseek-chat`，密钥 `process.env.DEEPSEEK_API_KEY`），要求 `json_object` 格式，返回解析后的对象。
+写 `askJson(prompt: string): Promise<any>`：调用 `https://api.deepseek.com/v1/chat/completions`（模型 `deepseek-flash`，密钥 `process.env.DEEPSEEK_API_KEY`），要求 `json_object` 格式并关掉思考模式，返回解析后的对象。
 --- solution
 async function askJson(prompt: string): Promise<any> {
   const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" } }),
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }),
   });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content);
@@ -853,6 +871,7 @@ async function askJson(prompt: string): Promise<any> {
 --- tests
 expectAsync("判定", async () => (await askJson("Review clause 10.1: processed in any country")).verdict, "redline");
 expectAsync("主题", async () => (await askJson("Review clause 10.1: processed in any country")).topic, "data_processing");
+expectAsync("关掉了思考模式", async () => { await askJson("Review clause 10.1: processed in any country"); return MOCK.calls[MOCK.calls.length - 1].body.thinking; }, { type: "disabled" });
 
 @@ item d6-e3
 type: scratch
@@ -860,7 +879,7 @@ title: 闭卷：一共多少 token（TS）
 exam: yes
 level: 2
 --- prompt
-写 `countTokens(prompts: string[]): Promise<number>`：对每个 prompt 按顺序各调用一次接口，返回 `total_tokens` 之和，空数组返回 0。
+写 `countTokens(prompts: string[]): Promise<number>`：对每个 prompt 按顺序各调用一次接口（URL 和密钥同上题，模型 `deepseek-flash`，不用关思考模式），返回 `total_tokens` 之和，空数组返回 0。
 --- solution
 async function countTokens(prompts: string[]): Promise<number> {
   let total = 0;
@@ -868,7 +887,7 @@ async function countTokens(prompts: string[]): Promise<number> {
     const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: p }] }),
+      body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: p }] }),
     });
     const data = await res.json();
     total += data.usage.total_tokens;

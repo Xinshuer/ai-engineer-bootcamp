@@ -1,0 +1,1656 @@
+@@ day 32
+title: 状态图基础：StateGraph、节点、边、reducer、并行、流式
+lang: py
+langchain: yes
+hours: 4–5 小时
+--- goal
+用 LangGraph 重写第 19 天的图执行器：`StateGraph`、节点、固定边和条件边、`START` / `END`、`compile`、`invoke`。弄懂它怎么跑（superstep：同一步里的节点一起跑）、reducer（几个节点写同一个键时怎么合并）、并行分支和汇合，分清哪些错误会报出来、哪些会**悄悄**发生；最后用 `MessagesState` 搭一个聊天节点。对应项目里的 `clausecheck/graph.py`。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每张都改一处再运行
+- 练习区全部通过
+- 闭卷 3 题
+- 打开 `clausecheck/graph.py`，说出 `State` 的每个键由哪个节点写，以及这张图为什么不需要 reducer
+
+@@ concept
+title: 从你的执行器到 StateGraph
+--- body
+第 19 天你写的执行器，每一块在 LangGraph 里都有对应：
+
+- `nodes["review"] = review` → `g.add_node("review", review)`
+- `start = "load"` → `g.add_edge(START, "load")`
+- `edges["load"] = "review"` → `g.add_edge("load", "review")`
+- `edges["summarise"] = route` → `g.add_conditional_edges("summarise", route)`（下下张卡片）
+- `"END"` → `END`
+- `run_graph(...)` → `app = g.compile()`，然后 `app.invoke(输入)` 返回**最终状态**（一个 dict）
+- `max_steps=20` → 调用时传 `{"recursion_limit": 20}`（第 31 天：不传就是 10007）
+
+规矩也一样：节点拿到整个 state，只返回**它改了的键**（一个小字典），合并交给框架。`compile()` 会先检查结构（边指向不存在的节点、没有起点……），返回的 `app` 是一个 Runnable，所以也有 `stream`、`batch`（第 29 天）。
+
+State 用 `TypedDict`（第 19 天学过），`total=False` 表示每个键一开始都可以没有。
+
+值不值得：下面这种直线流程，普通函数一个接一个调用就够了（`pipeline.py` 就是这样）。LangGraph 真正值钱的是检查点、中断等人、并行和流式，`graph.py` 顶部的 docstring 写的就是这个理由。
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    clauses: list[str]
+    redlines: list[str]
+    summary: str
+
+def load(state: State) -> dict:
+    return {"clauses": state["text"].split("\n")}
+
+def review(state: State) -> dict:
+    return {"redlines": [c.split()[0] for c in state["clauses"] if "unlimited" in c]}
+
+def summarise(state: State) -> dict:
+    return {"summary": f"{len(state['clauses'])} clauses, {len(state['redlines'])} redline(s)"}
+
+g = StateGraph(State)
+g.add_node("load", load)
+g.add_node("review", review)
+g.add_node("summarise", summarise)
+g.add_edge(START, "load")
+g.add_edge("load", "review")
+g.add_edge("review", "summarise")
+g.add_edge("summarise", END)
+app = g.compile()
+
+final = app.invoke({"text": "3.1 Fees are payable in 30 days.\n8.3 Liability shall be unlimited."})
+print(final["summary"], final["redlines"])
+print(sorted(final))
+print(type(app).__name__)
+
+@@ concept
+title: State 和 reducer
+--- body
+每个键默认是**覆盖**：两个节点先后写 `verdict`，后写的赢，和 `{**state, **update}` 一样。
+
+想「累加」，就给这个键配一个 **reducer**：
+
+```python
+class State(TypedDict):
+    verdict: str                                  # 覆盖
+    notes: Annotated[list[str], operator.add]     # 追加
+```
+
+合并时 LangGraph 调用 `operator.add(旧值, 新值)`，对列表就是拼接。reducer 可以是任何「两个参数、返回合并结果」的函数，比如保留更高的风险等级（练习里写）。`invoke` 的输入也要经过 reducer。
+
+为什么重要：节点可以并行（后面的卡片），同一步里好几个节点写同一个键时，只有 reducer 知道怎么合。
+
+经典错误：有 reducer 的键，节点却返回**整个**列表 `{"notes": state["notes"] + ["x"]}`。旧内容会被拼第二遍。节点只返回**新增**的那部分。
+--- code
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict):
+    verdict: str
+    notes: Annotated[list[str], operator.add]
+
+def legal(state):
+    return {"verdict": "flag", "notes": ["legal: cap is 12 months"]}
+
+def cost(state):
+    return {"verdict": "accept", "notes": ["cost: within budget"]}
+
+def wrong(state):
+    return {"notes": state["notes"] + ["wrong: returned the whole list"]}
+
+g = StateGraph(State)
+g.add_node("legal", legal)
+g.add_node("cost", cost)
+g.add_node("wrong", wrong)
+g.add_edge(START, "legal")
+g.add_edge("legal", "cost")
+g.add_edge("cost", "wrong")
+g.add_edge("wrong", END)
+out = g.compile().invoke({"verdict": "", "notes": ["input"]})
+print("verdict:", out["verdict"])
+for note in out["notes"]:
+    print(" -", note)
+
+@@ concept
+title: 条件边
+--- body
+`g.add_conditional_edges("summarise", route)`：`summarise` 跑完后调用 `route(state)`，它返回下一个节点的名字，或者 `END`（直接结束）。和第 19 天的路由函数一模一样。
+
+给路由函数写返回类型 `-> Literal["approve", "export"]`（`graph.py` 的 `route` 就是这样写的）：
+
+- LangGraph 从这个标注知道条件边可能去哪些节点，画图才画得对
+- 返回的名字不在里面（比如拼错成 `"Approve"`）时，直接抛 `KeyError: 'Approve'`，马上发现
+- 不写标注也能跑，但拼错的名字**不报错**：图记一条警告就停了（后面的卡片专门讲）
+
+也可以用第三个参数说明去向：列表 `["approve", "export"]`，或者映射 `{"yes": "approve", "no": "export"}`（路由返回 yes / no）。效果一样：画图知道去向，拼错也抛 `KeyError`。
+--- code
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] > 0 else "export"
+
+g = StateGraph(State)
+g.add_node("summarise", summarise)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "summarise")
+g.add_conditional_edges("summarise", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+app = g.compile()
+
+print(app.invoke({"redlines": 2})["path"])
+print(app.invoke({"redlines": 0})["path"])
+
+@@ concept
+title: 并行分支和 superstep
+--- body
+LangGraph 按**步（superstep）**跑：每一步把所有该跑的节点一起跑，跑完再统一合并它们的更新，然后决定下一步。一个节点有两条出边，两个目标就在同一步里并行（普通电脑上是多线程；本页的浏览器里一个接一个跑，结果一样）。
+
+- **汇合**：`g.add_edge(["legal_check", "cost_estimate"], "summarise")`（起点写成列表）表示两边**都完成**后才跑 `summarise`，只跑一次。只写两条单独的边时，两条分支一长一短，`summarise` 会在不同的步里被触发**两次**（下面的例子）
+- 同一步里两个节点写同一个**没有 reducer** 的键：`InvalidUpdateError: At key 'verdict': Can receive only one value per step. Use an Annotated key to handle multiple values.` 解决办法就是给它配 reducer
+- 合并的顺序是固定的（这一版按节点名排），但不是你加边的顺序，也不是谁先跑完。别依赖它：要稳定的顺序就自己排序
+- 不要在并行节点里 `print`：真机上线程先后不定，输出的顺序每次可能不同
+--- code
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    findings: Annotated[list[str], operator.add]
+    runs: Annotated[list[str], operator.add]
+
+def legal_check(state):
+    return {"findings": ["legal: liability is unlimited"]}
+
+def cost_check(state):
+    return {"findings": ["cost: fees can rise any time"]}
+
+def cost_estimate(state):
+    return {"findings": ["cost: +12% per year"]}
+
+def summarise(state):
+    return {"runs": [f"summarise saw {len(state['findings'])} finding(s)"]}
+
+def build(join):
+    g = StateGraph(State)
+    for name, fn in [("legal_check", legal_check), ("cost_check", cost_check), ("cost_estimate", cost_estimate), ("summarise", summarise)]:
+        g.add_node(name, fn)
+    g.add_edge(START, "legal_check")
+    g.add_edge(START, "cost_check")
+    g.add_edge("cost_check", "cost_estimate")
+    if join:
+        g.add_edge(["legal_check", "cost_estimate"], "summarise")
+    else:
+        g.add_edge("legal_check", "summarise")
+        g.add_edge("cost_estimate", "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+
+print("two edges:", build(join=False).invoke({})["runs"])
+out = build(join=True).invoke({})
+print("joined:   ", out["runs"])
+print(sorted(out["findings"]))
+
+@@ concept
+title: 报错的错误和悄悄的错误
+--- body
+LangGraph 会**报出来**的（好事，马上知道）：
+
+- 边指向不存在的节点：`compile()` 时 `ValueError: Found edge ending at unknown node ...`
+- 没有从 `START` 出发的边：`ValueError: Graph must have an entrypoint ...`
+- 同名节点加两次：`ValueError: Node ... already present.`
+- 节点返回的不是字典：`InvalidUpdateError: Expected dict, got ...`
+- 节点读一个没人写过的键：普通的 `KeyError`
+
+**悄悄**发生的（最危险，测试要专门抓）：
+
+- 节点返回了 State 里没有的键（`verdikt`）：直接丢掉
+- 路由函数（没有 `Literal` 标注）返回了不存在的节点名：只记一条警告（下面输出里那行 `Task ... wrote to unknown channel ...`），图就停了
+- 节点没有出边：图在那里结束
+- 节点忘了 `return`（返回 `None`）：当成「什么都没改」
+
+怎么抓：测试断言**最终状态**和**走过的节点**；路由函数写 `Literal`；调试时看 stream（下一张卡片）。
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class S(TypedDict, total=False):
+    verdict: str
+
+def run(label, node, route=None):
+    try:
+        g = StateGraph(S)
+        g.add_node("review", node)
+        g.add_node("export", lambda s: {})
+        g.add_edge(START, "review")
+        if route:
+            g.add_conditional_edges("review", route)
+        else:
+            g.add_edge("review", "export")
+        g.add_edge("export", END)
+        print(f"{label:<16} ->", g.compile().invoke({"verdict": "pending"}))
+    except Exception as e:
+        print(f"{label:<16} -> {type(e).__name__}: {str(e).splitlines()[0]}")
+
+run("returns a str", lambda s: "flag")
+run("reads missing", lambda s: {"verdict": s["risk"]})
+run("typo in key", lambda s: {"verdikt": "flag"})
+run("forgot return", lambda s: None)
+run("route typo", lambda s: {"verdict": "flag"}, route=lambda s: "exprot")
+
+@@ concept
+title: stream：看每一步做了什么
+--- body
+`invoke` 只给最终状态。想知道「每一步哪个节点改了什么」，用 `stream`：
+
+- `stream_mode="updates"`：每跑完一个节点给一次 `{节点名: 它的更新}`。一个节点什么都没写进状态（返回 `None`，或者键名写错被丢掉）时，这里是 `None`
+- `stream_mode="values"`：每一步之后给一次**完整状态**，第一次是输入本身（某一步什么都没写进状态时，这一步不给）
+- 两种都要：`stream_mode=["updates", "values"]`，每次给一个 `(模式, 数据)` 元组
+
+调试「悄悄的错误」时看 updates 一眼就明白：该出现的节点没出现（路由拼错），或者某个节点的更新是 `None`（键名写错）。第 34 天用它给前端推进度。并行分支的 updates 在真机上的顺序可能每次不同，别依赖它。
+--- code
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    exported: bool
+
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["verdict"] == "redline" else "export"
+
+def approve(state):
+    return {"verdikt": "approved"}   # 故意拼错：看 updates 里这一步变成了什么
+
+def export(state):
+    return {"exported": True}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+app = g.compile()
+
+for update in app.stream({"text": "Liability shall be unlimited."}, stream_mode="updates"):
+    print(update)
+print("--- values")
+for state in app.stream({"text": "Fees are due in 30 days."}, stream_mode="values"):
+    print(state)
+
+@@ concept
+title: MessagesState 和 add_messages
+--- body
+聊天历史是最常见的状态。`MessagesState` 是一个现成的 State，只有一个键 `messages`，reducer 是 `add_messages`：
+
+- 节点返回 `{"messages": [新消息]}`，**接到**历史后面
+- `("user", "hi")`、`{"role": "user", "content": "hi"}` 会自动变成 `HumanMessage`，并分配一个 id
+- 同一个 id 的新消息**替换**旧的；`RemoveMessage(id=...)` **删除**那一条（用来裁剪历史）
+- 要更多键就继承它：`class State(MessagesState): clause_id: str`
+
+经典错误：自己写 `messages: list`（没有 reducer）。节点返回的一条新消息会把整个历史**覆盖**掉，模型下一轮就「失忆」了。
+
+system prompt 通常不存进状态，而是在节点里调模型时临时放在最前面（`create_agent` 也是这样做的）。节点里的 `ChatDeepSeek` 照样关掉 thinking：这里没有工具，开着也不会 400，但简单问答用不着长思考，思考 token 按输出计费；节点一旦给模型绑了工具，就必须关（第 31 天）。
+--- code
+from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, RemoveMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.graph.message import add_messages
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def chat(state: MessagesState):
+    reply = model.invoke([SystemMessage("You answer questions about a SaaS contract.")] + state["messages"])
+    return {"messages": [reply]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+app = g.compile()
+
+out = app.invoke({"messages": [("user", "Is clause 8.1 standard?")]})
+out = app.invoke({"messages": out["messages"] + [("user", "And clause 9.2?")]})
+print([type(m).__name__ for m in out["messages"]])
+print([m["role"] for m in MOCK.calls[-1]["body"]["messages"]])
+
+history = [HumanMessage("Review clause 8.1", id="m1"), AIMessage("accept", id="m2")]
+history = add_messages(history, [AIMessage("flag: see Section 12", id="m2")])
+print([m.content for m in history])
+print([m.content for m in add_messages(history, [RemoveMessage(id="m1")])])
+
+@@ concept
+title: 看图：draw_mermaid
+--- body
+`app.get_graph().draw_mermaid()` 输出 Mermaid 文字，贴到 GitHub、Notion 或 mermaid.live 就能看成图。读法：
+
+- `a --> b;` 固定边；`a -.-> b;` 条件边（虚线）
+- `__start__`、`__end__` 就是 `START`、`END`
+
+条件边能去哪儿，是从路由函数的 `Literal` 标注（或第三个参数）读出来的。**没有标注时它不知道**：下面第二行里 summarise 直接连到 `__end__`，连 `approve --> export` 这些边也不见了（两个节点还在，成了孤岛），画出来的图是错的（图照样能跑）。这又是一个写 `Literal` 的理由。
+
+对照 `graph.py` 顶部 docstring 里手画的图：`load -> review -> summarise -> (redlines?) -> approve -> export`，另一条是 summarise 直接到 export。给 PR 或面试讲架构时，把 Mermaid 贴出来比口头描述清楚得多。
+--- code
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+
+def build(route):
+    g = StateGraph(State)
+    for name in ["load", "review", "summarise", "approve", "export"]:
+        g.add_node(name, lambda s: {})
+    g.add_edge(START, "load")
+    g.add_edge("load", "review")
+    g.add_edge("review", "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+
+def with_literal(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] else "export"
+
+def without(state):
+    return "approve" if state["redlines"] else "export"
+
+for route in [with_literal, without]:
+    edges = [line.strip() for line in build(route).get_graph().draw_mermaid().splitlines() if "->" in line]
+    print(route.__name__, edges)
+
+@@ item d32-01
+type: predict
+title: 复习：create_agent 是一张图
+level: 1
+--- prompt
+复习第 31 天。写出输出。模拟服务器第一次会让模型调工具，拿到工具结果后回答 `"Based on the playbook: "` 加上工具结果的前 80 个字符。
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-07: at least 60 days' notice."
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+agent = create_agent(model, tools=[lookup_playbook])
+print(list(agent.get_graph().nodes))
+result = agent.invoke({"messages": [("user", "Can the provider terminate on ten days' notice?")]})
+print([type(m).__name__ for m in result["messages"]])
+print(result["messages"][-1].content)
+print(len(MOCK.calls), "model calls")
+--- explain
+`create_agent` 返回的就是一张编译好的 LangGraph 图：`model` 节点调模型，`tools` 节点执行工具，条件边看最后一条 AIMessage 有没有 `tool_calls` 决定去 `tools` 还是结束。今天你学的就是怎么自己搭这样的图。
+
+@@ item d32-02
+type: choice
+title: 复习：没设上限的 agent
+level: 1
+--- prompt
+复习第 31 天。一个 `create_agent` 做的 agent，调用时**没有**传 `recursion_limit`。某次模型卡住了，每一轮都要求再调一次工具。在本课用的 LangGraph 1.2 上会发生什么？
+--- options
+- 跑 25 步后抛 `GraphRecursionError`
+- 一直跑到默认上限 10007 步才抛 `GraphRecursionError`，中间调了约 5000 次模型
+- 第二次调同一个工具时 LangGraph 自动停下
+- `create_agent` 默认只允许 6 步
+answer: 2
+--- explain
+这一版的默认上限是 10007，老版本和很多教程里写的是 25。每两步（model + tools）就是一次付费的模型调用，所以不设上限几乎等于没有上限。生产代码里永远显式传 `{"recursion_limit": N}`，并在外面接住 `GraphRecursionError`（第 31 天的 `ask_safely`）。
+
+@@ item d32-03
+type: code
+title: 第一张图
+level: 1
+--- prompt
+三个节点函数已经写好。写 `build_app()`：用 `StateGraph(State)` 把它们连成 `START → load → review → summarise → END`，返回 `compile()` 之后的 app。
+
+例：`build_app().invoke({"text": "3.1 Fees are payable in 30 days.\n8.3 Liability shall be unlimited."})["summary"]` → `"2 clauses, 1 redline(s)"`
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    clauses: list[str]
+    redlines: list[str]
+    summary: str
+
+def load(state: State) -> dict:
+    return {"clauses": [line for line in state["text"].split("\n") if line.strip()]}
+
+def review(state: State) -> dict:
+    return {"redlines": [c.split()[0] for c in state["clauses"] if "unlimited" in c or "any country" in c]}
+
+def summarise(state: State) -> dict:
+    return {"summary": f"{len(state['clauses'])} clauses, {len(state['redlines'])} redline(s)"}
+
+def build_app():
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    clauses: list[str]
+    redlines: list[str]
+    summary: str
+
+def load(state: State) -> dict:
+    return {"clauses": [line for line in state["text"].split("\n") if line.strip()]}
+
+def review(state: State) -> dict:
+    return {"redlines": [c.split()[0] for c in state["clauses"] if "unlimited" in c or "any country" in c]}
+
+def summarise(state: State) -> dict:
+    return {"summary": f"{len(state['clauses'])} clauses, {len(state['redlines'])} redline(s)"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("load", load)
+    g.add_node("review", review)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "load")
+    g.add_edge("load", "review")
+    g.add_edge("review", "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- tests
+TEXT = "3.1 Fees are payable in 30 days.\n8.3 Liability shall be unlimited.\n\n10.1 Data may be processed in any country."
+expect("最终状态", lambda: build_app().invoke({"text": TEXT}), {"text": TEXT, "clauses": ["3.1 Fees are payable in 30 days.", "8.3 Liability shall be unlimited.", "10.1 Data may be processed in any country."], "redlines": ["8.3", "10.1"], "summary": "3 clauses, 2 redline(s)"})
+expect("没有 redline", lambda: build_app().invoke({"text": "3.1 Fees are payable in 30 days."})["summary"], "1 clauses, 0 redline(s)")
+expect("节点", lambda: list(build_app().get_graph().nodes), ["__start__", "load", "review", "summarise", "__end__"])
+--- hints
+- `g = StateGraph(State)`，然后三次 `g.add_node("名字", 函数)`。
+- 起点和终点也是边：`g.add_edge(START, "load")`、`g.add_edge("summarise", END)`。
+- 最后 `return g.compile()`，别忘了 compile。
+
+@@ item d32-04
+type: predict
+title: 覆盖还是追加
+level: 2
+--- prompt
+写出输出。`verdict` 没有 reducer，`notes` 有 `operator.add`。注意 `third` 返回的是什么，还有输入 `invoke(...)` 本身也经过 reducer。
+--- code
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict):
+    verdict: str
+    notes: Annotated[list[str], operator.add]
+
+def first(state):
+    return {"verdict": "flag", "notes": ["first"]}
+
+def second(state):
+    return {"verdict": "redline", "notes": ["second"]}
+
+def third(state):
+    return {"notes": state["notes"] + ["third"]}
+
+g = StateGraph(State)
+g.add_node("first", first)
+g.add_node("second", second)
+g.add_node("third", third)
+g.add_edge(START, "first")
+g.add_edge("first", "second")
+g.add_edge("second", "third")
+g.add_edge("third", END)
+out = g.compile().invoke({"verdict": "accept", "notes": ["input"]})
+print(out["verdict"])
+print(out["notes"])
+print(len(out["notes"]))
+--- explain
+`verdict` 每次被覆盖，最后是 `second` 写的 redline（`third` 没写它）。`notes` 每次都是「旧列表 + 新列表」。`third` 返回了整个列表再加一项，reducer 又把它拼到旧列表后面，于是 input、first、second 出现了两遍。有 reducer 的键，节点只返回新增的部分：`{"notes": ["third"]}`。
+
+@@ item d32-05
+type: choice
+title: 两个分支写同一个键
+level: 2
+--- prompt
+State 里 `reviews: list[dict]`（**没有** reducer）。`legal_check` 和 `cost_check` 都从 `START` 出发（并行），各自返回 `{"reviews": [...]}`。`invoke` 时会怎样？
+--- options
+- 两个列表自动拼在一起
+- 后跑完的那个覆盖先跑完的
+- 抛 `InvalidUpdateError: At key 'reviews': Can receive only one value per step. ...`，要改成 `Annotated[list[dict], operator.add]`
+- 只保留加边时写在前面的那个分支的结果
+answer: 3
+--- explain
+同一步里有两个值要写进同一个普通键，LangGraph 不替你猜，直接报错，而且错误信息就告诉你办法：用 Annotated 配一个 reducer。顺序先后覆盖的规则只在**不同的步**里成立（上一题的 `verdict`）。这正是第 18 天「并行时结果怎么合并」的问题，框架把它变成了类型声明。
+
+@@ item d32-06
+type: code
+title: 自定义 reducer：取最高风险
+level: 2
+--- prompt
+三个检查节点从 `START` 并行出发，各自返回一个 `risk`（`"low"` / `"medium"` / `"high"`）。最终状态里的 `risk` 应该是**最高**的那个。
+
+1. 写 reducer `max_risk(old, new)`：返回两者中风险更高的。顺序 low < medium < high。这一版 LangGraph 第一次调用它时，`old` 是空字符串 `""`（键的类型是 `str`，它先用 `str()` 做初始值），把它当成比 low 还低
+2. 把 `State` 里的 `risk: str` 改成 `risk: Annotated[str, max_risk]`
+
+例：`max_risk("medium", "low")` → `"medium"`；`max_risk("", "low")` → `"low"`
+--- starter
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+ORDER = {"low": 0, "medium": 1, "high": 2}
+
+def max_risk(old, new):
+    return new
+
+class State(TypedDict, total=False):
+    text: str
+    risk: str
+
+def liability_check(state):
+    return {"risk": "high" if "unlimited" in state["text"] else "low"}
+
+def data_check(state):
+    return {"risk": "medium" if "any country" in state["text"] else "low"}
+
+def payment_check(state):
+    return {"risk": "medium" if "without notice" in state["text"] else "low"}
+
+def build_app():
+    g = StateGraph(State)
+    for name, fn in [("liability_check", liability_check), ("data_check", data_check), ("payment_check", payment_check)]:
+        g.add_node(name, fn)
+        g.add_edge(START, name)
+        g.add_edge(name, END)
+    return g.compile()
+--- solution
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+ORDER = {"low": 0, "medium": 1, "high": 2}
+
+def max_risk(old, new):
+    if ORDER.get(new, -1) > ORDER.get(old, -1):
+        return new
+    return old
+
+class State(TypedDict, total=False):
+    text: str
+    risk: Annotated[str, max_risk]
+
+def liability_check(state):
+    return {"risk": "high" if "unlimited" in state["text"] else "low"}
+
+def data_check(state):
+    return {"risk": "medium" if "any country" in state["text"] else "low"}
+
+def payment_check(state):
+    return {"risk": "medium" if "without notice" in state["text"] else "low"}
+
+def build_app():
+    g = StateGraph(State)
+    for name, fn in [("liability_check", liability_check), ("data_check", data_check), ("payment_check", payment_check)]:
+        g.add_node(name, fn)
+        g.add_edge(START, name)
+        g.add_edge(name, END)
+    return g.compile()
+--- tests
+expect("reducer：保留更高的", lambda: [max_risk("medium", "low"), max_risk("low", "high"), max_risk("high", "medium")], ["medium", "high", "high"])
+expect("reducer：第一次 old 是空字符串", lambda: max_risk("", "low"), "low")
+expect("三个并行检查：取最高", lambda: build_app().invoke({"text": "Customer Data may be processed in any country; liability is unlimited."})["risk"], "high")
+expect("只有 medium", lambda: build_app().invoke({"text": "Provider may suspend the Service without notice."})["risk"], "medium")
+expect("全是 low", lambda: build_app().invoke({"text": "Fees are payable in 30 days."})["risk"], "low")
+--- hints
+- 用 `ORDER.get(x, -1)` 取等级，空字符串（或任何不认识的值）拿到 -1，自然比 low 低。
+- `max_risk` 比较两边的等级，返回大的那个；一样大就返回 old。
+- 不配 reducer 时，三个并行节点同一步写 `risk` 会报 `InvalidUpdateError`：`risk: Annotated[str, max_risk]`。
+
+@@ item d32-07
+type: code
+title: 条件边：批准还是导出
+level: 2
+--- prompt
+写路由函数和图：
+
+- `route(state)`：`state["redlines"] > 0` 返回 `"approve"`，否则 `"export"`。写上返回类型 `-> Literal["approve", "export"]`
+- `build_app()`：`START → summarise`，`summarise` 之后走 `route`，`approve → export → END`。节点函数已经写好，每个节点往 `path` 里记下自己的名字
+
+例：`build_app().invoke({"redlines": 2})["path"]` → `["summarise", "approve", "export"]`
+--- starter
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state):
+    pass
+
+def build_app():
+    pass
+--- solution
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] > 0 else "export"
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("summarise", summarise)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+expect("有 redline：先批准", lambda: build_app().invoke({"redlines": 2})["path"], ["summarise", "approve", "export"])
+expect("没有 redline：直接导出", lambda: build_app().invoke({"redlines": 0})["path"], ["summarise", "export"])
+expect("路由函数本身", lambda: [route({"redlines": 1}), route({"redlines": 0})], ["approve", "export"])
+expect("图上画出了两条条件边（要有 Literal 标注）", lambda: sorted(line.strip() for line in build_app().get_graph().draw_mermaid().splitlines() if "-.->" in line), ["summarise -.-> approve;", "summarise -.-> export;"])
+--- hints
+- 路由函数只返回名字，不改状态：`return "approve" if state["redlines"] > 0 else "export"`。
+- 条件边：`g.add_conditional_edges("summarise", route)`，注意传的是函数本身 `route`，不是 `route(state)`。
+- 返回类型写成 `-> Literal["approve", "export"]`，图才知道条件边能去哪儿。
+
+@@ item d32-08
+type: fix
+title: 修 bug：图悄悄停了
+level: 2
+--- prompt
+有 redline 时，这张图应该走 `summarise → approve → export`。可测试显示它在 `summarise` 之后就结束了，没有任何异常，只有一条不起眼的警告（真实服务的日志里很容易被淹没）。
+
+运行测试，找到原因并修好。修完后再做一件事，让这类拼写错误以后**直接报错**，而不是悄悄停下（测试会检查）。
+--- starter
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state):
+    return "Approve" if state["redlines"] > 0 else "export"
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("summarise", summarise)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- solution
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] > 0 else "export"
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("summarise", summarise)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+expect("有 redline：走完三步", lambda: build_app().invoke({"redlines": 1})["path"], ["summarise", "approve", "export"])
+expect("没有 redline", lambda: build_app().invoke({"redlines": 0})["path"], ["summarise", "export"])
+def _typo_now_raises():
+    global route
+    original = route
+    def typo(state):
+        return "Approve"
+    typo.__annotations__ = dict(original.__annotations__)
+    route = typo
+    try:
+        build_app().invoke({"redlines": 1})
+        return "silent stop"
+    except KeyError:
+        return "KeyError"
+    finally:
+        route = original
+expect("以后再拼错会直接 KeyError", _typo_now_raises, "KeyError")
+--- hints
+- 用 `stream_mode="updates"` 跑一次，或者读警告：路由返回的名字和节点名对得上吗？大小写也算。
+- 节点叫 `"approve"`，路由返回的却是 `"Approve"`。
+- 让拼错直接报错：给 `route` 写返回类型 `-> Literal["approve", "export"]`（卡片「条件边」），或者给 `add_conditional_edges` 传第三个参数 `["approve", "export"]`。
+
+@@ item d32-09
+type: testwrite
+title: 写测试：审查后的路由
+level: 2
+--- prompt
+被测函数 `route_after_review(state)` 决定审查之后去哪儿，按顺序判断：
+
+1. `state["failed"]` 为 True（有条款没审完）且 `state["retries"] < 2` → `"review"`（再审一遍）
+2. 还是 failed，但已经重试 2 次 → `"human"`
+3. `state["redlines"] > 0` → `"approve"`
+4. 否则 → `END`（从 `langgraph.graph` import，值是 `"__end__"`）
+
+写测试函数（`def test_...():` 里用 `assert`），在正确的函数上全部通过，并抓住藏起来的有 bug 的版本。路由函数是纯函数，不用搭图就能测，这是测图最便宜的一层。
+--- impl
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["failed"] and state["retries"] < 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    if state["redlines"] > 0:
+        return "approve"
+    return END
+--- mutants
+===== 边界：已经重试了 2 次时
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["failed"] and state["retries"] <= 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    if state["redlines"] > 0:
+        return "approve"
+    return END
+===== 没有 redline 时
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["failed"] and state["retries"] < 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    if state["redlines"] >= 0:
+        return "approve"
+    return END
+===== 结束要返回 END，不是 "export"
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["failed"] and state["retries"] < 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    if state["redlines"] > 0:
+        return "approve"
+    return "export"
+===== failed 了但还有 redline：先处理失败
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["redlines"] > 0:
+        return "approve"
+    if state["failed"] and state["retries"] < 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    return END
+--- starter
+def test_redlines_go_to_approve():
+    assert route_after_review({"failed": False, "retries": 0, "redlines": 2}) == "approve"
+--- solution
+from langgraph.graph import END
+
+def test_redlines_go_to_approve():
+    assert route_after_review({"failed": False, "retries": 0, "redlines": 2}) == "approve"
+
+def test_failed_retries_first():
+    assert route_after_review({"failed": True, "retries": 1, "redlines": 0}) == "review"
+
+def test_two_retries_go_to_human():
+    assert route_after_review({"failed": True, "retries": 2, "redlines": 0}) == "human"
+
+def test_nothing_to_do_ends():
+    assert route_after_review({"failed": False, "retries": 0, "redlines": 0}) == END
+
+def test_failure_beats_redlines():
+    assert route_after_review({"failed": True, "retries": 0, "redlines": 3}) == "review"
+--- hints
+- 每个分支至少一个测试，再加边界：`retries` 刚好等于 2。
+- 没有 redline、也没失败时，期望值是 `END`（`from langgraph.graph import END`）。
+- 同时失败又有 redline 时应该先重审：redline 数可能不完整。
+
+@@ item d32-10
+type: code
+title: 并行检查再汇合
+level: 3
+--- prompt
+写 `build_app()`，让图这样走：
+
+- `START` 同时到 `legal_check` 和 `cost_check`（并行）
+- `cost_check → cost_estimate`（成本这边多一步）
+- 两边**都**完成后跑 `summarise`，而且**只跑一次**
+- `summarise → END`
+
+节点函数已经写好：检查节点往 `findings` 里加发现，`summarise` 写 `summary` 并往 `runs` 里记一笔。`findings` 和 `runs` 都是 `Annotated[list[str], operator.add]`。
+--- starter
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    findings: Annotated[list[str], operator.add]
+    runs: Annotated[list[str], operator.add]
+    summary: str
+
+def legal_check(state):
+    return {"findings": ["legal: unlimited liability"] if "unlimited" in state["text"] else []}
+
+def cost_check(state):
+    return {"findings": ["cost: price can change any time"] if "at any time" in state["text"] else []}
+
+def cost_estimate(state):
+    return {"findings": ["cost: budget impact unknown"] if "at any time" in state["text"] else []}
+
+def summarise(state):
+    found = sorted(state["findings"])
+    return {"summary": f"{len(found)} finding(s): " + "; ".join(found), "runs": ["summarise"]}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("legal_check", legal_check)
+    g.add_node("cost_check", cost_check)
+    g.add_node("cost_estimate", cost_estimate)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "legal_check")
+    g.add_edge("legal_check", "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- solution
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    findings: Annotated[list[str], operator.add]
+    runs: Annotated[list[str], operator.add]
+    summary: str
+
+def legal_check(state):
+    return {"findings": ["legal: unlimited liability"] if "unlimited" in state["text"] else []}
+
+def cost_check(state):
+    return {"findings": ["cost: price can change any time"] if "at any time" in state["text"] else []}
+
+def cost_estimate(state):
+    return {"findings": ["cost: budget impact unknown"] if "at any time" in state["text"] else []}
+
+def summarise(state):
+    found = sorted(state["findings"])
+    return {"summary": f"{len(found)} finding(s): " + "; ".join(found), "runs": ["summarise"]}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("legal_check", legal_check)
+    g.add_node("cost_check", cost_check)
+    g.add_node("cost_estimate", cost_estimate)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "legal_check")
+    g.add_edge(START, "cost_check")
+    g.add_edge("cost_check", "cost_estimate")
+    g.add_edge(["legal_check", "cost_estimate"], "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- tests
+TEXT = "Liability is unlimited. Provider may raise prices at any time."
+expect("三条发现都在总结里", lambda: build_app().invoke({"text": TEXT})["summary"], "3 finding(s): cost: budget impact unknown; cost: price can change any time; legal: unlimited liability")
+expect("summarise 只跑一次", lambda: build_app().invoke({"text": TEXT})["runs"], ["summarise"])
+expect("没有发现", lambda: build_app().invoke({"text": "Fees are payable in 30 days."})["summary"], "0 finding(s): ")
+expect("四个节点都跑了，各跑一次", lambda: sorted(name for update in build_app().stream({"text": TEXT}, stream_mode="updates") for name in update), ["cost_check", "cost_estimate", "legal_check", "summarise"])
+--- hints
+- 两条从 `START` 出发的边就是并行：`g.add_edge(START, "legal_check")`、`g.add_edge(START, "cost_check")`。
+- 汇合要等两边都完成：起点写成列表 `g.add_edge(["legal_check", "cost_estimate"], "summarise")`。
+- 如果写成两条单独的边，`legal_check` 那边一步就到，`summarise` 会先跑一次、等 `cost_estimate` 完成后再跑一次。
+
+@@ item d32-11
+type: fix
+title: 修 bug：InvalidUpdateError
+level: 2
+--- prompt
+两个检查节点并行跑，然后汇合到 `summarise`。运行测试，读错误信息（它把解决办法也写出来了），只改 State 里的一行。
+--- starter
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    findings: list[str]
+    summary: str
+
+def legal_check(state):
+    return {"findings": ["legal: unlimited liability"] if "unlimited" in state["text"] else []}
+
+def data_check(state):
+    return {"findings": ["data: stored in any country"] if "any country" in state["text"] else []}
+
+def summarise(state):
+    return {"summary": f"{len(state['findings'])} finding(s)"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("legal_check", legal_check)
+    g.add_node("data_check", data_check)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "legal_check")
+    g.add_edge(START, "data_check")
+    g.add_edge(["legal_check", "data_check"], "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- solution
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    findings: Annotated[list[str], operator.add]
+    summary: str
+
+def legal_check(state):
+    return {"findings": ["legal: unlimited liability"] if "unlimited" in state["text"] else []}
+
+def data_check(state):
+    return {"findings": ["data: stored in any country"] if "any country" in state["text"] else []}
+
+def summarise(state):
+    return {"summary": f"{len(state['findings'])} finding(s)"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("legal_check", legal_check)
+    g.add_node("data_check", data_check)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "legal_check")
+    g.add_edge(START, "data_check")
+    g.add_edge(["legal_check", "data_check"], "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- tests
+TEXT = "Liability is unlimited and Customer Data may be stored in any country."
+expect("两条发现", lambda: sorted(build_app().invoke({"text": TEXT})["findings"]), ["data: stored in any country", "legal: unlimited liability"])
+expect("总结", lambda: build_app().invoke({"text": TEXT})["summary"], "2 finding(s)")
+expect("只有一条", lambda: build_app().invoke({"text": "Liability is unlimited."})["findings"], ["legal: unlimited liability"])
+--- hints
+- 错误信息：`At key 'findings': Can receive only one value per step. Use an Annotated key to handle multiple values.`
+- 两个并行节点在同一步写 `findings`，要告诉 LangGraph 怎么合并两个列表。
+- `findings: Annotated[list[str], operator.add]`（`operator` 和 `Annotated` 已经 import 了）。
+
+@@ item d32-12
+type: predict
+title: stream 的 updates
+level: 2
+--- prompt
+写出输出。每跑完一个节点，`stream_mode="updates"` 给一个 `{节点名: 它返回的更新}`；`stream_mode="values"` 每一步之后给一次完整状态（第一次是输入）。
+--- code
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    exported: bool
+
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["verdict"] == "redline" else "export"
+
+def approve(state):
+    return {"verdict": "redline (approved)"}
+
+def export(state):
+    return {"exported": True}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+app = g.compile()
+
+for update in app.stream({"text": "Liability shall be unlimited."}, stream_mode="updates"):
+    print(update)
+print("---")
+for update in app.stream({"text": "Fees are due in 30 days."}, stream_mode="updates"):
+    print(update)
+print(len(list(app.stream({"text": "Fees are due in 30 days."}, stream_mode="values"))))
+--- explain
+updates 按执行顺序列出每个节点返回了什么，走哪条路一目了然：第二个输入没有 redline，`approve` 根本没出现。values 模式给了 3 次完整状态：输入一次，`review` 之后一次，`export` 之后一次。调试时先看 updates，比在每个节点里加 print 省事，也不会在并行时乱序。
+
+@@ item d32-13
+type: fix
+title: 修 bug：审查结果没写进去
+level: 2
+--- prompt
+导出的结果总是 `8.3: pending`，好像 review 节点从来没跑过。可是没有任何报错。
+
+先用下面的办法自己看一眼（在代码最后临时加上，看完删掉）：
+
+```python
+for update in build_app().stream({"clause_id": "8.3", "text": "Liability shall be unlimited.", "verdict": "pending"}, stream_mode="updates"):
+    print(update)
+```
+
+`review` 那一步的更新是什么？找到原因，修好它。
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clause_id: str
+    text: str
+    verdict: str
+    exported: str
+
+def review(state):
+    verdict = "redline" if "unlimited" in state["text"] else "accept"
+    return {"verdikt": verdict}
+
+def export(state):
+    return {"exported": f"{state['clause_id']}: {state['verdict']}"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clause_id: str
+    text: str
+    verdict: str
+    exported: str
+
+def review(state):
+    verdict = "redline" if "unlimited" in state["text"] else "accept"
+    return {"verdict": verdict}
+
+def export(state):
+    return {"exported": f"{state['clause_id']}: {state['verdict']}"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+START_STATE = {"clause_id": "8.3", "text": "Liability shall be unlimited.", "verdict": "pending"}
+expect("redline 写进去了", lambda: build_app().invoke(START_STATE)["exported"], "8.3: redline")
+expect("accept 也写进去了", lambda: build_app().invoke({"clause_id": "3.1", "text": "Fees are due in 30 days.", "verdict": "pending"})["exported"], "3.1: accept")
+expect("review 节点本身（不用搭图也能测）", lambda: review({"text": "Liability shall be unlimited."}), {"verdict": "redline"})
+--- hints
+- stream 里 `review` 那一步显示 `None`：它返回的键，State 里没有，被丢掉了。
+- 对照 `State` 的键名，一个字母一个字母地看。
+- 最后一个测试说明了防这种 bug 的最便宜的办法：直接测节点函数的返回值。
+
+@@ item d32-14
+type: code
+title: 调试小工具：走过的路
+level: 2
+--- prompt
+写 `trace(app, inputs)`：用 `app.stream(inputs, stream_mode="updates")` 跑一遍图，返回一个列表，每跑完一个节点加一项 `(节点名, 它更新的键，排好序的列表)`。节点什么都没写进状态（更新是 `None`）时，键列表是 `[]`。
+
+例：`trace(APP, {"text": "Liability shall be unlimited."})` → `[("review", ["verdict"]), ("approve", ["approved"]), ("export", ["exported"])]`
+
+有了它，测试就能断言「图走了哪条路」，路由拼错、键名写错这类悄悄的 bug 都藏不住。
+--- starter
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    approved: bool
+    exported: bool
+
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["verdict"] == "redline" else "export"
+
+def approve(state):
+    return {"approved": True}
+
+def export(state):
+    return {"exported": True}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+APP = g.compile()
+
+def trace(app, inputs):
+    return []
+--- solution
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    approved: bool
+    exported: bool
+
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["verdict"] == "redline" else "export"
+
+def approve(state):
+    return {"approved": True}
+
+def export(state):
+    return {"exported": True}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+APP = g.compile()
+
+def trace(app, inputs):
+    steps = []
+    for update in app.stream(inputs, stream_mode="updates"):
+        for node, changes in update.items():
+            steps.append((node, sorted(changes or {})))
+    return steps
+--- tests
+expect("有 redline 的路", lambda: trace(APP, {"text": "Liability shall be unlimited."}), [("review", ["verdict"]), ("approve", ["approved"]), ("export", ["exported"])])
+expect("没有 redline 的路", lambda: trace(APP, {"text": "Fees are due in 30 days."}), [("review", ["verdict"]), ("export", ["exported"])])
+class _S(TypedDict, total=False):
+    verdict: str
+    n: int
+_g = StateGraph(_S)
+_g.add_node("review", lambda s: {"verdikt": "flag", "n": 1})
+_g.add_node("noop", lambda s: None)
+_g.add_node("both", lambda s: {"verdict": "flag", "n": 2})
+_g.add_edge(START, "review")
+_g.add_edge("review", "noop")
+_g.add_edge("noop", "both")
+_g.add_edge("both", END)
+expect("写错的键不见了，None 变成 []，键排好序", lambda: trace(_g.compile(), {"verdict": "pending"}), [("review", ["n"]), ("noop", []), ("both", ["n", "verdict"])])
+--- hints
+- `for update in app.stream(inputs, stream_mode="updates"):`，每个 update 是 `{节点名: 更新}`。
+- 用 `for node, changes in update.items():` 拆开。
+- `changes` 可能是 `None`：`sorted(changes or {})` 对字典排序得到的是键的列表。
+
+@@ item d32-15
+type: order
+title: 排代码：搭一张带路由的图
+level: 2
+--- prompt
+排出完整程序：定义 State 和节点，搭图（`START → review`，`review` 之后按路由去 `approve` 或 `END`，`approve → END`），编译后跑一次，结果存进 `OUT`。有两行干扰项。
+--- lines
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    approved: bool
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+def route(state) -> Literal["approve", "__end__"]:
+    return "approve" if state["verdict"] == "redline" else END
+def approve(state):
+    return {"approved": True}
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", END)
+app = g.compile()
+OUT = app.invoke({"text": "Customer's liability shall be unlimited."})
+--- distractors
+g.add_conditional_edges("review", route(State))
+OUT = g.invoke({"text": "Customer's liability shall be unlimited."})
+--- tests
+expect("最终状态", lambda: OUT, {"text": "Customer's liability shall be unlimited.", "verdict": "redline", "approved": True})
+expect("没有 redline 时直接结束", lambda: app.invoke({"text": "Fees are due in 30 days."}), {"text": "Fees are due in 30 days.", "verdict": "accept"})
+--- hints
+- 先 import，再定义 State 和三个函数，最后才能搭图（`add_node` 要用到函数）。
+- `add_conditional_edges` 传的是路由函数本身；`invoke` 是编译后的 `app` 才有的。
+- `END` 的值就是 `"__end__"`，所以 `Literal` 里写 `"__end__"`。
+
+@@ item d32-16
+type: fill
+title: 填空：reducer 和条件边
+level: 1
+--- prompt
+补全：`path` 要**追加**每个节点的名字；`summarise` 之后用 `route` 决定去 `approve` 还是直接结束；最后编译。
+--- template
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], [[operator.add]]]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def route(state) -> Literal["approve", "__end__"]:
+    return "approve" if state["redlines"] > 0 else [[END]]
+
+g = StateGraph(State)
+g.add_node("summarise", summarise)
+g.add_node("approve", approve)
+g.add_edge(START, "summarise")
+g.[[add_conditional_edges]]("summarise", route)
+g.add_edge("approve", END)
+app = g.[[compile]]()
+--- tests
+expect("有 redline", lambda: app.invoke({"redlines": 1})["path"], ["summarise", "approve"])
+expect("没有 redline：直接结束", lambda: app.invoke({"redlines": 0})["path"], ["summarise"])
+--- hints
+- 追加列表用的函数在 `operator` 模块里，就是 `+` 的函数版。
+- 「直接结束」返回的是从 `langgraph.graph` import 的那个常量。
+- 按条件走的边是 `add_conditional_edges`；最后 `compile()`。
+
+@@ item d32-17
+type: code
+title: 聊天节点：MessagesState
+level: 2
+--- prompt
+搭一个一个节点的聊天图：
+
+- `chat(state)`：用 `MODEL` 回答。发给模型的是 `[SystemMessage(SYSTEM)] + state["messages"]`，返回 `{"messages": [回复]}`。system prompt **不要**存进状态
+- `APP`：`StateGraph(MessagesState)`，`START → chat → END`，编译好
+- `ask(history, question)`：把 `("user", question)` 接到 `history`（消息列表）后面，调用 `APP`，返回新的完整消息列表
+
+例：
+```python
+h = ask([], "Is clause 8.1 standard?")
+h = ask(h, "And clause 9.2?")
+[type(m).__name__ for m in h]   # ["HumanMessage", "AIMessage", "HumanMessage", "AIMessage"]
+```
+--- starter
+from langchain_core.messages import SystemMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You answer questions about a SaaS contract."
+
+def chat(state: MessagesState):
+    pass
+
+APP = None
+
+def ask(history, question):
+    pass
+--- solution
+from langchain_core.messages import SystemMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You answer questions about a SaaS contract."
+
+def chat(state: MessagesState):
+    reply = MODEL.invoke([SystemMessage(SYSTEM)] + state["messages"])
+    return {"messages": [reply]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+APP = g.compile()
+
+def ask(history, question):
+    out = APP.invoke({"messages": history + [("user", question)]})
+    return out["messages"]
+--- tests
+def _two_turns():
+    h = ask([], "Is clause 8.1 standard?")
+    h = ask(h, "And clause 9.2?")
+    return [(type(m).__name__, m.content) for m in h]
+expect("两轮对话", _two_turns, [("HumanMessage", "Is clause 8.1 standard?"), ("AIMessage", "Mock reply: Is clause 8.1 standard?"), ("HumanMessage", "And clause 9.2?"), ("AIMessage", "Mock reply: And clause 9.2?")])
+def _sent():
+    h = ask([], "Is clause 8.1 standard?")
+    ask(h, "And clause 9.2?")
+    body = MOCK.calls[-1]["body"]
+    return [[m["role"] for m in body["messages"]], body["messages"][0]["content"], body["thinking"]]
+expect("第二轮：system + 完整历史，thinking 关闭", _sent, [["system", "user", "assistant", "user"], SYSTEM, {"type": "disabled"}])
+expect("system prompt 没有存进状态", lambda: [type(m).__name__ for m in ask([], "Hi")], ["HumanMessage", "AIMessage"])
+--- hints
+- `chat`：`reply = MODEL.invoke([SystemMessage(SYSTEM)] + state["messages"])`，然后 `return {"messages": [reply]}`，reducer 会把它接到后面。
+- 搭图写在函数外面，替换掉 `APP = None`。
+- `ask`：`APP.invoke({"messages": history + [("user", question)]})["messages"]`。
+
+@@ item d32-18
+type: code
+title: 裁剪历史：RemoveMessage
+level: 3
+--- prompt
+聊天越长，每次发给模型的 token 越多。加一个 `trim` 节点，放在 `chat` 前面：
+
+- `trim(state)`：只保留最后 `KEEP` 条消息，更早的每一条都返回一个 `RemoveMessage(id=那条消息的 id)`：`{"messages": [RemoveMessage(...), ...]}`。消息不超过 `KEEP` 条时返回 `{"messages": []}`
+- `APP`：`START → trim → chat → END`
+
+`chat` 节点已经写好。`add_messages` 会给每条消息分配 id，所以 `m.id` 一定有值。
+--- starter
+from langchain_core.messages import RemoveMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+KEEP = 3
+
+def chat(state: MessagesState):
+    return {"messages": [MODEL.invoke(state["messages"])]}
+
+def trim(state: MessagesState):
+    return {"messages": []}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+APP = g.compile()
+--- solution
+from langchain_core.messages import RemoveMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+KEEP = 3
+
+def chat(state: MessagesState):
+    return {"messages": [MODEL.invoke(state["messages"])]}
+
+def trim(state: MessagesState):
+    old = state["messages"][:-KEEP]
+    return {"messages": [RemoveMessage(id=m.id) for m in old]}
+
+g = StateGraph(MessagesState)
+g.add_node("trim", trim)
+g.add_node("chat", chat)
+g.add_edge(START, "trim")
+g.add_edge("trim", "chat")
+g.add_edge("chat", END)
+APP = g.compile()
+--- tests
+from langchain_core.messages import HumanMessage, AIMessage
+LONG = [HumanMessage("q1"), AIMessage("a1"), HumanMessage("q2"), AIMessage("a2"), HumanMessage("q3")]
+expect("模型只收到最后 3 条", lambda: (APP.invoke({"messages": LONG}), [m["content"] for m in MOCK.calls[-1]["body"]["messages"]])[1], ["q2", "a2", "q3"])
+expect("最终状态：3 条 + 回复", lambda: [m.content for m in APP.invoke({"messages": LONG})["messages"]], ["q2", "a2", "q3", "Mock reply: q3"])
+expect("刚好 3 条：一条都不删", lambda: [m.content for m in APP.invoke({"messages": LONG[2:]})["messages"]], ["q2", "a2", "q3", "Mock reply: q3"])
+expect("trim 节点本身：少于 KEEP 条", lambda: trim({"messages": [HumanMessage("only", id="x")]}), {"messages": []})
+--- hints
+- 要删的是除了最后 `KEEP` 条之外的：`state["messages"][:-KEEP]`。消息少于 KEEP 条时这个切片是空列表，正好什么都不删。
+- 每条要删的消息：`RemoveMessage(id=m.id)`。
+- 图：`g.add_node("trim", trim)`，边改成 `START → trim → chat`。
+
+@@ item d32-e1
+type: scratch
+title: 闭卷：审查流程图
+exam: yes
+level: 3
+--- prompt
+用 LangGraph（`from langgraph.graph import StateGraph, START, END`）写 `build_review_graph()`，返回编译好的图。State 的键：`text: str`、`clauses: list[str]`、`redlines: list[str]`、`summary: str`、`approved: bool`、`exported: str`。
+
+节点：
+
+- `load`：`clauses` = `text` 按 `"\n"` 切开、去掉空行
+- `review`：`redlines` = 包含 `"unlimited"` 或 `"any country"` 的条款的第一个词（条款号），按顺序
+- `summarise`：`summary` = `f"{条款数} clauses, {redline 数} redline(s)"`
+- `approve`：`approved` = True
+- `export`：`exported` = `"with redlines"`（`approved` 为 True 时）否则 `"report only"`
+
+边：`START → load → review → summarise`；`summarise` 之后有 redline 去 `approve`，没有去 `export`（条件边，路由函数写 `Literal` 返回类型）；`approve → export → END`。
+--- solution
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    clauses: list[str]
+    redlines: list[str]
+    summary: str
+    approved: bool
+    exported: str
+
+def load(state):
+    return {"clauses": [line for line in state["text"].split("\n") if line.strip()]}
+
+def review(state):
+    return {"redlines": [c.split()[0] for c in state["clauses"] if "unlimited" in c or "any country" in c]}
+
+def summarise(state):
+    return {"summary": f"{len(state['clauses'])} clauses, {len(state['redlines'])} redline(s)"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] else "export"
+
+def approve(state):
+    return {"approved": True}
+
+def export(state):
+    return {"exported": "with redlines" if state.get("approved") else "report only"}
+
+def build_review_graph():
+    g = StateGraph(State)
+    for name, fn in [("load", load), ("review", review), ("summarise", summarise), ("approve", approve), ("export", export)]:
+        g.add_node(name, fn)
+    g.add_edge(START, "load")
+    g.add_edge("load", "review")
+    g.add_edge("review", "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+TEXT = "3.1 Fees are payable in 30 days.\n\n8.3 Liability shall be unlimited.\n10.1 Data may be processed in any country."
+expect("有 redline", lambda: build_review_graph().invoke({"text": TEXT}), {"text": TEXT, "clauses": ["3.1 Fees are payable in 30 days.", "8.3 Liability shall be unlimited.", "10.1 Data may be processed in any country."], "redlines": ["8.3", "10.1"], "summary": "3 clauses, 2 redline(s)", "approved": True, "exported": "with redlines"})
+expect("没有 redline：不经过 approve", lambda: build_review_graph().invoke({"text": "3.1 Fees are payable in 30 days."}), {"text": "3.1 Fees are payable in 30 days.", "clauses": ["3.1 Fees are payable in 30 days."], "redlines": [], "summary": "1 clauses, 0 redline(s)", "exported": "report only"})
+expect("图上有两条条件边", lambda: sorted(l.strip() for l in build_review_graph().get_graph().draw_mermaid().splitlines() if "-.->" in l), ["summarise -.-> approve;", "summarise -.-> export;"])
+
+@@ item d32-e2
+type: scratch
+title: 闭卷：并行检查与汇合
+exam: yes
+level: 3
+--- prompt
+写 `build_checks()`，返回编译好的 LangGraph 图（`import operator`、`from typing import Annotated, TypedDict`、`from langgraph.graph import StateGraph, START, END`）：
+
+State 的键：`text: str`；`risk`：配一个自定义 reducer，保留更高的风险（low < medium < high；第一次调用时旧值是空字符串 `""`，当成最低）；`findings`：列表，用 `operator.add` 追加；`decision: str`。
+
+- 三个检查节点从 `START` 并行出发：`liability`（text 含 `"unlimited"` → risk high，findings 加 `"liability"`；否则 risk low、不加）、`data`（含 `"any country"` → medium、加 `"data"`）、`payment`（含 `"without notice"` → medium、加 `"payment"`）
+- 三个都完成后跑 `decide`，**只跑一次**：`decision` = `"redline"`（risk 是 high）、`"flag"`（medium）、`"accept"`（low）
+- `decide → END`
+--- solution
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+ORDER = {"low": 0, "medium": 1, "high": 2}
+
+def max_risk(old, new):
+    return new if ORDER.get(new, -1) > ORDER.get(old, -1) else old
+
+class State(TypedDict, total=False):
+    text: str
+    risk: Annotated[str, max_risk]
+    findings: Annotated[list[str], operator.add]
+    decision: str
+
+def check(keyword, level, name):
+    def node(state):
+        if keyword in state["text"]:
+            return {"risk": level, "findings": [name]}
+        return {"risk": "low", "findings": []}
+    return node
+
+def decide(state):
+    return {"decision": {"high": "redline", "medium": "flag"}.get(state["risk"], "accept")}
+
+def build_checks():
+    g = StateGraph(State)
+    names = []
+    for name, keyword, level in [("liability", "unlimited", "high"), ("data", "any country", "medium"), ("payment", "without notice", "medium")]:
+        g.add_node(name, check(keyword, level, name))
+        g.add_edge(START, name)
+        names.append(name)
+    g.add_node("decide", decide)
+    g.add_edge(names, "decide")
+    g.add_edge("decide", END)
+    return g.compile()
+--- tests
+expect("high 胜出", lambda: (lambda o: [o["risk"], sorted(o["findings"]), o["decision"]])(build_checks().invoke({"text": "Liability is unlimited; data may go to any country."})), ["high", ["data", "liability"], "redline"])
+expect("medium", lambda: build_checks().invoke({"text": "Provider may suspend the Service without notice."})["decision"], "flag")
+expect("全部正常", lambda: (lambda o: [o["risk"], o["findings"], o["decision"]])(build_checks().invoke({"text": "Fees are payable in 30 days."})), ["low", [], "accept"])
+
+@@ item d32-e3
+type: scratch
+title: 闭卷：带裁剪的聊天图
+exam: yes
+level: 3
+--- prompt
+写 `build_chat(model, keep)`，返回编译好的 LangGraph 图，State 用 `MessagesState`（`from langgraph.graph import StateGraph, START, END, MessagesState`）：
+
+- `trim` 节点：只保留最后 `keep` 条消息，更早的每一条都用 `RemoveMessage(id=m.id)` 删掉（`from langchain_core.messages import RemoveMessage`）
+- `chat` 节点：调用 `model.invoke(...)`，发给模型的是 `[SystemMessage("You review SaaS contracts.")] + 当前的 messages`（`from langchain_core.messages import SystemMessage`），把回复追加进 messages。system 消息**不**存进状态
+- 边：`START → trim → chat → END`
+--- solution
+from langchain_core.messages import RemoveMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+def build_chat(model, keep):
+    def trim(state: MessagesState):
+        return {"messages": [RemoveMessage(id=m.id) for m in state["messages"][:-keep]]}
+
+    def chat(state: MessagesState):
+        reply = model.invoke([SystemMessage("You review SaaS contracts.")] + state["messages"])
+        return {"messages": [reply]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("trim", trim)
+    g.add_node("chat", chat)
+    g.add_edge(START, "trim")
+    g.add_edge("trim", "chat")
+    g.add_edge("chat", END)
+    return g.compile()
+--- tests
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_deepseek import ChatDeepSeek
+_m = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+_h = [HumanMessage("Review clause 3.1"), AIMessage("accept"), HumanMessage("Review clause 8.3"), AIMessage("redline"), HumanMessage("Why 8.3?")]
+def _sent():
+    build_chat(_m, 2).invoke({"messages": _h})
+    return [(m["role"], m["content"]) for m in MOCK.calls[-1]["body"]["messages"]]
+expect("模型收到 system + 最后 2 条", _sent, [("system", "You review SaaS contracts."), ("assistant", "redline"), ("user", "Why 8.3?")])
+expect("状态里：最后 2 条 + 回复，没有 system", lambda: [m.content for m in build_chat(_m, 2).invoke({"messages": _h})["messages"]], ["redline", "Why 8.3?", "Mock reply: Why 8.3?"])
+expect("消息不多时一条不删", lambda: len(build_chat(_m, 10).invoke({"messages": _h})["messages"]), 6)

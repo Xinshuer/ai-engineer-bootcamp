@@ -1,0 +1,1299 @@
+@@ day 26
+title: 云基础：GCP 和 AWS、存储、身份、密钥
+lang: py
+hours: 5 小时
+--- goal
+认识 GCP 和 AWS 的核心服务，并能把两家一一对应起来；用 Python 在两朵云上读写对象存储（boto3 的 S3、google-cloud-storage 的 GCS），会分页列出文件；分清哪些云错误该重试、哪些不该；把安全默认值变成习惯：最小权限、密钥不进代码、用密钥管理服务、合同数据放在欧盟区域。对应 Clause Check 上云以后「合同放在桶里、密钥放在 Secret Manager、worker 只拿它需要的权限」。
+
+本页的云 SDK 是模拟的：不需要云账号，也不花钱。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过（本机任务选做）
+- 闭卷挑战 3 题
+- 不看资料，在纸上写出 GCP ↔ AWS 的 8 组对应服务，再说出 Clause Check 的合同该放在哪两个区域
+
+@@ concept
+title: 云是什么：租来的电脑，按用量付钱
+--- body
+云就是**别人的电脑，通过 API 租给你用**：你不买服务器，而是调用 `put_object`、`deploy` 这样的接口，按用量付钱（存了多少 GB、运行了多少秒、调用了多少次）。
+
+三个到处都会见到的词：
+
+- **项目 / 账号**：GCP 叫 project（比如 `clausecheck-dev`），AWS 叫 account。账单和权限都挂在它上面；开发和生产通常分成两个
+- **区域（region）**：机房所在的地方，比如 GCP 的 `europe-north1`（芬兰）、AWS 的 `eu-north-1`（斯德哥尔摩）。建资源时就要选定区域，数据存放和处理的地方由它决定，合规（比如「数据不出欧盟」）要看它
+- **可用区（zone）**：一个区域里几个互相独立的机房，一个出事，其他的还在
+
+两家的服务几乎一一对应（运行下面的代码）。你将来做的项目可能用任何一家，面试时能说出「GCS 就是 GCP 的 S3」这样的对应关系很加分。名字会变，读资料时留意：旧资料里常见的 AWS App Runner 从 2026 年 4 月底起不再接受新客户，AWS 建议迁到 ECS；GCP 的 Vertex AI 在 2026 年 4 月改名为 Gemini Enterprise Agent Platform（API 没变，文档和面试里还常叫它 Vertex AI）。
+--- code
+SERVICES = [
+    ("run containers / functions", "Cloud Run", "ECS (Fargate) / Lambda"),
+    ("object storage (files)", "Cloud Storage (GCS)", "S3"),
+    ("data warehouse", "BigQuery", "Redshift / Athena"),
+    ("messages and queues", "Pub/Sub", "SNS / SQS"),
+    ("secrets", "Secret Manager", "Secrets Manager"),
+    ("managed LLMs", "Vertex AI (Gemini)", "Bedrock"),
+    ("logs and monitoring", "Cloud Logging", "CloudWatch"),
+    ("who may do what", "IAM", "IAM"),
+]
+print(f"{'what':<28}{'GCP':<22}AWS")
+for what, gcp, aws in SERVICES:
+    print(f"{what:<28}{gcp:<22}{aws}")
+
+REGIONS = {"GCP": "europe-north1 (Finland)", "AWS": "eu-north-1 (Stockholm)"}
+print()
+for cloud, region in REGIONS.items():
+    print(f"Clause Check contracts on {cloud}: {region}")
+
+@@ concept
+title: 对象存储：桶、键和字节
+cloud: yes
+--- body
+合同 PDF、审查报告这类**文件**放在对象存储里：AWS 的 S3、GCP 的 Cloud Storage（GCS）。
+
+- **桶（bucket）**：一个大容器，名字全球唯一，比如 `clausecheck-contracts`
+- **键（key）**：对象的完整名字，比如 `contracts/1/103/original.pdf`。**没有真的文件夹**：`/` 只是名字里的一个字符，「列出一个文件夹」其实是「列出以这个前缀开头的键」
+- 对象 = 字节 + 元数据：`ContentType`（`application/json`、`application/pdf`）和你自己加的键值对（Metadata；S3 会把它的键名**转成小写**）
+- 读出来的是**字节**：S3 是 `resp["Body"].read()`，要 `.decode("utf-8")` 才是文字
+- 列出时一次最多返回 1000 个键，更多的要**分页**；一个都没匹配时，S3 的响应里连 `Contents` 键都没有
+- 打开版本控制（versioning）后，覆盖和删除都会留下旧版本，删错了能找回
+
+本页的 boto3 / google-cloud 是模拟的：调用写法和返回结构与真 SDK 一致（只实现了课程用到的部分）；真项目里 `pip install boto3 google-cloud-storage` 后配置凭证即可。两个桶 `clausecheck-contracts`、`clausecheck-reports` 已经建好。
+--- code
+import json
+import boto3
+from google.cloud import storage
+
+report = {"contract_id": 103, "counts": {"redline": 2, "flag": 1}}
+
+# AWS S3：一个 client，方法名就是 API 的名字，参数全部用关键字传
+s3 = boto3.client("s3", region_name="eu-north-1")
+s3.put_object(Bucket="clausecheck-reports", Key="reports/103.json",
+              Body=json.dumps(report).encode("utf-8"),
+              ContentType="application/json", Metadata={"Contract-Id": "103"})
+resp = s3.get_object(Bucket="clausecheck-reports", Key="reports/103.json")
+print(resp["ContentType"], resp["Metadata"])
+print(json.loads(resp["Body"].read().decode("utf-8")))
+
+# GCP Cloud Storage：client → bucket → blob（一个对象）
+gcs = storage.Client()
+blob = gcs.bucket("clausecheck-reports").blob("reports/103.json")
+blob.upload_from_string(json.dumps(report), content_type="application/json")
+print(blob.content_type, json.loads(blob.download_as_text()))
+
+# 「文件夹」只是前缀
+page = s3.list_objects_v2(Bucket="clausecheck-reports", Prefix="reports/")
+print([o["Key"] for o in page["Contents"]], page["IsTruncated"])
+print([b.name for b in gcs.list_blobs("clausecheck-reports", prefix="reports/")])
+empty = s3.list_objects_v2(Bucket="clausecheck-reports", Prefix="archive/")
+print("Contents" in empty, empty.get("Contents", []))
+
+@@ concept
+title: 身份和凭证：谁在调用
+cloud: yes
+--- body
+每个 API 调用都要回答「你是谁」。云上有两种身份：
+
+- **人**：你自己的账号，本机开发时用
+- **机器**：GCP 的**服务账号**（service account）、AWS 的 **IAM 角色**（role）。Cloud Run 服务、Lambda 函数运行时自带这个身份，代码里不用写任何密钥
+
+SDK 按固定顺序自动找凭证（凭证链），所以同一份代码在本机和线上都不用改：
+
+- AWS：环境变量（`AWS_ACCESS_KEY_ID` 等）→ 本机的 `~/.aws/` 配置（`aws configure` 或 `aws configure sso` 写的）→ 运行环境提供的角色
+- GCP：**Application Default Credentials（ADC）**：`GOOGLE_APPLICATION_CREDENTIALS` 指向的文件 → 本机 `gcloud auth application-default login` 登录过的账号 → 运行环境附带的服务账号
+
+**永远不要**把访问密钥、服务账号的 JSON 密钥文件写进代码或提交到 git。
+
+一个细节：`boto3.client(...)` 不检查凭证，**第一次真正调用**时才签名，才报 `NoCredentialsError`；它不是 `ClientError`，`except ClientError` 接不住。Google 的 client 在创建时就找凭证。
+--- code
+import boto3
+import google.auth.exceptions
+from botocore.exceptions import ClientError, NoCredentialsError
+from google.cloud import storage
+
+# CLOUD 只有本页的模拟才有：假装这台电脑上没有任何凭证
+CLOUD.aws_credentials = False
+CLOUD.gcp_adc = False
+
+s3 = boto3.client("s3", region_name="eu-north-1")
+print("boto3 client created, no credentials checked yet")
+try:
+    s3.list_objects_v2(Bucket="clausecheck-contracts")
+except ClientError as e:
+    print("ClientError:", e)
+except NoCredentialsError as e:
+    print(type(e).__name__, "-", e)
+    print("is it a ClientError?", isinstance(e, ClientError))
+
+try:
+    storage.Client()
+except google.auth.exceptions.DefaultCredentialsError as e:
+    print(type(e).__name__, "-", str(e).split(".")[0])
+
+@@ concept
+title: IAM：只给需要的权限
+--- body
+IAM 决定「这个身份能对哪个资源做什么」。原则是**最小权限**：只给完成工作所需的那几个动作，只作用在需要的资源上。
+
+Clause Check 的审查 worker 只需要：读 `clausecheck-contracts` 里的合同，往 `clausecheck-reports` 里写报告，读 DeepSeek 的密钥。它不需要删除合同，也不需要碰别的桶。
+
+- AWS：给 worker 的角色挂一份策略（policy）。`Action` 写具体动作（`s3:GetObject`），`Resource` 写具体的 ARN（`arn:aws:s3:::clausecheck-contracts/*`）
+- GCP：在**桶上**给服务账号授予角色，比如 contracts 桶给 `roles/storage.objectViewer`，reports 桶给 `roles/storage.objectCreator`，密钥给 `roles/secretmanager.secretAccessor`。注意 `objectCreator` 只能新建、**不能覆盖**已有的对象；报告要重写的话，得换成权限更大的 `roles/storage.objectUser`（它还能删除）
+
+看到 **403 / AccessDenied / PermissionDenied**：多半不是代码写错了，是身份缺权限。排查三问：这次调用用的是哪个身份（`aws sts get-caller-identity`）？缺的是哪个动作（错误信息里通常写着）？权限加在了哪个资源上？
+
+一个坑：S3 读一个**不存在**的键时，如果身份没有 `s3:ListBucket` 权限，得到的是 403 AccessDenied，而不是 404 NoSuchKey。
+
+下面是一个**极简**的策略检查器，帮你看懂策略的形状。真正的 IAM 还有 Deny（明确拒绝永远优先）、条件、多份策略合并。
+--- code
+from fnmatch import fnmatch
+
+WORKER_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::clausecheck-contracts/*"]},
+        {"Effect": "Allow", "Action": ["s3:PutObject"], "Resource": ["arn:aws:s3:::clausecheck-reports/*"]},
+        {"Effect": "Allow", "Action": ["secretsmanager:GetSecretValue"],
+         "Resource": ["arn:aws:secretsmanager:eu-north-1:123456789012:secret:clausecheck/deepseek-*"]},
+    ],
+}
+
+def allowed(policy, action, resource):
+    for st in policy["Statement"]:
+        if st["Effect"] == "Allow" and action in st["Action"] and any(fnmatch(resource, r) for r in st["Resource"]):
+            return True
+    return False
+
+checks = [
+    ("s3:GetObject", "arn:aws:s3:::clausecheck-contracts/contracts/1/103/original.pdf"),
+    ("s3:PutObject", "arn:aws:s3:::clausecheck-reports/reports/103.json"),
+    ("s3:DeleteObject", "arn:aws:s3:::clausecheck-contracts/contracts/1/103/original.pdf"),
+    ("s3:GetObject", "arn:aws:s3:::clausecheck-billing/invoices/2026-09.csv"),
+]
+for action, resource in checks:
+    verdict = "ALLOW" if allowed(WORKER_POLICY, action, resource) else "DENY "
+    print(verdict, action.ljust(16), resource.split(":::")[1])
+
+@@ concept
+title: 密钥管理：不进代码、不进镜像
+cloud: yes
+--- body
+本机开发时，密钥放在 `.env` 里（第 10 天）。上线以后不这样做：代码仓库、容器镜像、日志里都不能出现密钥。
+
+线上用**密钥管理服务**：GCP 的 Secret Manager、AWS 的 Secrets Manager。密钥加密保存，谁能读由 IAM 控制，读取可以记进审计日志（AWS 是 CloudTrail；GCP 要先打开 Secret Manager 的「数据访问」审计日志，默认是关的），还能**轮换**（换一把新的，旧的作废）。
+
+- GCP：名字是 `projects/项目/secrets/名字/versions/latest`；读出来的 `payload.data` 是**字节**，要 `.decode("utf-8")`
+- AWS：`get_secret_value(SecretId=...)["SecretString"]` 是**字符串**；存的是键值对时它是一段 JSON，要 `json.loads`
+- 进程启动后读一次，**缓存**起来，别每个请求都读：每次读取都有延迟，也按调用次数计费。代价是轮换以后要重启（或让缓存过期）才用上新密钥
+- 另一种常见做法：Cloud Run 可以把 Secret Manager 里的密钥直接注入成环境变量，代码照旧 `os.getenv`
+
+打印密钥时只露出前几个字符，日志里一个完整的密钥都不要有。
+--- code
+import json
+import boto3
+from google.cloud import secretmanager
+
+gsm = secretmanager.SecretManagerServiceClient()
+name = "projects/clausecheck-dev/secrets/deepseek-api-key/versions/latest"
+resp = gsm.access_secret_version(name=name)
+print(type(resp.payload.data).__name__, resp.payload.data.decode("utf-8")[:6] + "...")
+
+asm = boto3.client("secretsmanager", region_name="eu-north-1")
+secret = asm.get_secret_value(SecretId="clausecheck/deepseek")
+print(type(secret["SecretString"]).__name__, secret["SecretString"][:14] + "...")
+print(json.loads(secret["SecretString"])["api_key"][:6] + "...")
+
+@@ concept
+title: 错误和重试：只重试暂时的错误
+cloud: yes
+--- body
+云 API 的错误分两类，处理方式完全不同：
+
+- **暂时的**：限流（429、`ThrottlingException`、S3 的 `SlowDown`）和服务端 5xx（`ServiceUnavailable`）。等一会儿再试，通常就好了
+- **永久的**：404 不存在、403 没权限、400 参数错。重试一百次结果也一样，应该马上报错
+
+好消息：SDK 自己会重试暂时的错误。boto3 默认（legacy 模式）一共试 5 次，standard 模式 3 次，可以用 `Config(retries={"mode": "standard", "total_max_attempts": 3})` 设置；google-cloud-storage 也会重试读取。所以一个限流错误到了你的代码里，意思是「SDK 已经试过好几次了」。
+
+自己写重试时（SDK 不重试的调用，或者整个步骤要重来）：只重试暂时的错误，**指数退避**（0.5 秒、1 秒、2 秒……），再乘一个**随机抖动**（jitter，让很多客户端不在同一瞬间一起重试），并设上限。被重试的操作最好是**幂等**的：同一个键再写一次同样的内容，结果不变。
+
+两家的错误长得不一样：boto3 几乎全是 `ClientError`，看 `e.response["Error"]["Code"]`；Google 按状态码分成不同的异常类（`NotFound`、`TooManyRequests`），看类或者 `e.code`。不要去匹配错误信息的文字，它随时会变。
+--- code
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from google.cloud import storage
+from google.api_core.exceptions import NotFound
+
+s3 = boto3.client("s3", region_name="eu-north-1")
+CLOUD.fail_next("s3", "throttle", 2)            # 模拟：接下来两次请求被限流
+resp = s3.list_objects_v2(Bucket="clausecheck-reports")
+print("succeeded; the SDK retried", resp["ResponseMetadata"]["RetryAttempts"], "times behind the scenes")
+
+no_retry = boto3.client("s3", region_name="eu-north-1", config=Config(retries={"total_max_attempts": 1}))
+CLOUD.fail_next("s3", "throttle", 1)
+try:
+    no_retry.list_objects_v2(Bucket="clausecheck-reports")
+except ClientError as e:
+    print(e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"], "-> transient, retry later")
+
+try:
+    s3.get_object(Bucket="clausecheck-reports", Key="reports/999.json")
+except ClientError as e:
+    print(e.response["Error"]["Code"], "-> permanent, do not retry")
+
+gcs = storage.Client()
+try:
+    gcs.bucket("clausecheck-reports").blob("reports/999.json").download_as_text()
+except NotFound as e:
+    print(type(e).__name__, e.code, "-> permanent, do not retry")
+
+@@ concept
+title: 数据驻留：合同留在欧盟
+cloud: yes
+--- body
+合同里有姓名、邮箱、签字人，这些都是**个人数据**。欧盟的 **GDPR** 用大白话说：处理个人数据要有正当理由，只收需要的，保护好；把它传到欧盟以外，要有额外的法律保障。所以客户常在合同里写明「数据只能在欧盟存放和处理」。项目 playbook 的 **PB-03**（Data location and DPA）审的就是这种条款，Clause Check 自己当然也要做到：
+
+- 桶、数据库、日志、备份都建在欧盟区域：AWS `eu-north-1`（斯德哥尔摩）、GCP `europe-north1`（芬兰）
+- 把合同文字发给大模型也是「处理」：模型的推理位置同样要在欧盟（明天的 Bedrock 和 Vertex AI）
+- 两家云默认都做**静态加密**（encryption at rest），但加密不改变数据在哪个国家
+
+建桶时写明区域：S3 在 `us-east-1` 以外建桶，必须带 `CreateBucketConfiguration={"LocationConstraint": 区域}`，否则报 `IllegalLocationConstraintException`；GCS 的 `create_bucket` 不写 `location` 时，默认是 `US`（美国的多区域）。
+--- code
+import boto3
+from botocore.exceptions import ClientError
+from google.cloud import storage
+
+s3 = boto3.client("s3", region_name="eu-north-1")
+try:
+    s3.create_bucket(Bucket="clausecheck-contracts-se")
+except ClientError as e:
+    print(e.response["Error"]["Code"])
+s3.create_bucket(Bucket="clausecheck-contracts-se",
+                 CreateBucketConfiguration={"LocationConstraint": "eu-north-1"})
+print("S3 bucket created in", s3.meta.region_name)
+
+gcs = storage.Client()
+print(gcs.create_bucket("clausecheck-contracts-fi", location="europe-north1").location)
+print(gcs.create_bucket("clausecheck-tmp").location, "<- no location given")
+
+@@ concept
+title: 成本和命令行
+--- body
+云的账单主要来自：计算（运行了多少秒）、存储（每 GB 每月）、**出站流量**（egress：数据从云里下载到外面，按 GB 收费，是意外账单的常见来源）和 API 调用次数。对 Clause Check 来说，存合同几乎不花钱，大头是模型的 token（运行下面的估算）。
+
+- **存储类别**：常用的放 Standard；很少读的旧合同可以用生命周期规则自动转到便宜的冷存储（S3 Glacier、GCS Coldline / Archive），但取回要另外收费
+- **预算和告警**：两家都能设月度预算，花到 50%、90% 时发邮件提醒。开账号的第一天就设。注意预算**只提醒，不会自动停掉服务**；真要封顶，还得靠最大实例数这类上限（明天讲）
+- 价格经常变，代码里的单价只是示例，用来看数量级，以官方价格页为准
+
+命令行在文档和面试里随处可见，读得懂就行：
+
+```
+gcloud auth list                          # 现在用的是哪个账号
+gcloud auth application-default login     # 本机登录 ADC
+gcloud storage cp report.json gs://clausecheck-reports/reports/
+aws sts get-caller-identity               # 我现在是谁（排查 403 的第一步）
+aws s3 cp report.json s3://clausecheck-reports/reports/
+aws s3 ls s3://clausecheck-reports/reports/
+```
+--- code
+# 示例单价（美元），只用来看数量级，以官方价格页为准
+STORAGE_PER_GB_MONTH = 0.02
+EGRESS_PER_GB = 0.1
+TOKENS_PER_CONTRACT = 150_000
+USD_PER_MILLION_TOKENS = 0.5
+
+def monthly_cost(contracts, mb_per_contract=2, downloads_per_contract=3):
+    gb = contracts * mb_per_contract / 1024
+    storage = gb * STORAGE_PER_GB_MONTH
+    egress = gb * downloads_per_contract * EGRESS_PER_GB
+    llm = contracts * TOKENS_PER_CONTRACT / 1_000_000 * USD_PER_MILLION_TOKENS
+    return {"storage": round(storage, 4), "egress": round(egress, 4), "llm": round(llm, 2)}
+
+for n in (100, 1000):
+    print(n, "contracts/month:", monthly_cost(n))
+
+@@ item d26-01
+type: choice
+title: 复习：错误在哪一步抛出
+level: 1
+--- prompt
+复习第 25 天。下面的代码想在查询出错时打印 `query failed`，可是表名 `clausecheck.review` 少写了一个 s（`client` 是 `bigquery.Client()`）。运行时会发生什么？
+--- code
+from google.api_core.exceptions import GoogleAPICallError
+
+try:
+    job = client.query("SELECT verdict FROM clausecheck.review")
+except GoogleAPICallError:
+    print("query failed")
+rows = list(job.result())
+--- options
+- 打印 `query failed`
+- 不会打印：`client.query()` 只是提交了一个查询作业，表不存在的错误要等 `job.result()` 时才抛出，而那一行不在 `try` 里，程序带着 `NotFound` 崩掉
+- 不报错，`rows` 是空列表
+- `client.query()` 马上抛出 Python 的 `SyntaxError`
+answer: 2
+--- explain
+`client.query()` 立刻返回一个作业对象；SQL 写错、表不存在、超过字节上限，都在 `job.result()` 时才抛出，所以 `try` 要包住 `result()`（或者用一步完成的 `client.query_and_wait()`）。今天还会遇到同样的事：boto3 的 client 建好时不检查凭证，第一次调用才报错；GCS 的 `list_blobs` 开始遍历时才真正发请求、才报错。「错误从哪一步冒出来」决定了 `try` 该放在哪里。
+
+@@ item d26-02
+type: code
+title: 合同的键名
+level: 2
+--- prompt
+合同在桶里的名字（键）要**可预测**：按客户分前缀，列出一个客户的全部合同、给某个客户单独授权，都只要看前缀。写 `contract_key(customer_id, contract_id, filename)`，返回 `contracts/<customer_id>/<contract_id>/<清理后的文件名>`。
+
+文件名是用户上传的，不能直接用（里面的 `/` 会变成假的「文件夹」）。清理规则：
+
+- 转小写
+- 连续的一串「不是 a–z、0–9、`.`」的字符，换成**一个** `-`
+- 去掉首尾的 `-`
+- 清理后是空字符串：`raise ValueError("empty filename")`
+
+例：`contract_key(2, 103, "Hospital Software License v2.PDF")` → `"contracts/2/103/hospital-software-license-v2.pdf"`
+--- starter
+import re
+
+def contract_key(customer_id, contract_id, filename):
+    return f"contracts/{customer_id}/{contract_id}/{filename}"
+--- solution
+import re
+
+def contract_key(customer_id, contract_id, filename):
+    name = re.sub(r"[^a-z0-9.]+", "-", filename.lower()).strip("-")
+    if not name:
+        raise ValueError("empty filename")
+    return f"contracts/{customer_id}/{contract_id}/{name}"
+--- tests
+expect("题目里的例子", lambda: contract_key(2, 103, "Hospital Software License v2.PDF"), "contracts/2/103/hospital-software-license-v2.pdf")
+expect("括号、破折号、空格连在一起只换一个 -", lambda: contract_key(1, 101, "Contract (final) — Nordlys AB.pdf"), "contracts/1/101/contract-final-nordlys-ab.pdf")
+expect("/ 不能变成文件夹", lambda: contract_key(1, 101, "../reports/x.json"), "contracts/1/101/..-reports-x.json")
+expect("首尾的 - 去掉", lambda: contract_key(4, 108, "  NDA!  .txt"), "contracts/4/108/nda-.txt")
+expect_raises("清理后是空的", lambda: contract_key(1, 101, "???"), ValueError)
+--- hints
+- `re.sub(模式, "-", 文字)` 把匹配到的部分都换成 `-`。「不是这些字符」写成 `[^a-z0-9.]`，后面加 `+` 表示「连续的一串」。
+- 先 `.lower()` 再替换，最后 `.strip("-")` 去掉首尾的 `-`。
+
+@@ item d26-03
+type: predict
+title: S3 读回来是什么
+level: 1
+cloud: yes
+--- prompt
+写出输出。注意三件事：`Body` 读出来是什么类型；元数据的键名大小写；`ContentType` 从哪里来。
+--- code
+import json
+import boto3
+
+s3 = boto3.client("s3", region_name="eu-north-1")
+s3.put_object(
+    Bucket="clausecheck-reports",
+    Key="reports/103.json",
+    Body=json.dumps({"contract_id": 103, "redlines": 2}),
+    ContentType="application/json",
+    Metadata={"Contract-Id": "103", "Prompt-Version": "v2"},
+)
+resp = s3.get_object(Bucket="clausecheck-reports", Key="reports/103.json")
+body = resp["Body"].read()
+print(type(body).__name__, len(body))
+print(resp["ContentType"])
+print(resp["Metadata"])
+print(resp["Metadata"].get("Contract-Id"))
+print(json.loads(body)["redlines"] + 1)
+--- explain
+`Body` 是一个流，`.read()` 读出来是 **bytes**（只能读一次）；`json.loads` 也接受 bytes，但要打印、做字符串处理时先 `.decode("utf-8")`。S3 把元数据的键名存成了小写，所以 `.get("Contract-Id")` 是 `None`：代码里永远用小写去读。`ContentType` 是上传时你告诉 S3 的，不写的话是 `binary/octet-stream`，浏览器就不知道怎么打开它。
+
+@@ item d26-04
+type: code
+title: 上传合同
+level: 2
+cloud: yes
+--- prompt
+写 `upload_contract(s3, bucket, key, text, contract_id, prompt_version)`：把合同文字上传到 S3，返回 S3 给的 `ETag`。
+
+- `Body` 用 UTF-8 编码后的字节 `text.encode("utf-8")`（直接传 str 时 boto3 也会按 UTF-8 编码；显式写出来，读代码的人一眼就知道存的是什么）
+- `ContentType="text/plain; charset=utf-8"`
+- `Metadata={"contract-id": ..., "prompt-version": ...}`：键直接用小写，**值必须是字符串**（真 boto3 遇到整数会报 `ParamValidationError`）
+- 只在这个键**还不存在**时写入：传 `IfNoneMatch="*"`。已经存在时 S3 返回错误码 `PreconditionFailed`（412），这时不覆盖，返回 `None`；其他错误照常抛出
+
+`s3` 是传进来的 client（依赖注入：测试传模拟的，线上传真的）。boto3 的参数全部用关键字传。
+--- starter
+from botocore.exceptions import ClientError
+
+def upload_contract(s3, bucket, key, text, contract_id, prompt_version):
+    resp = s3.put_object(Bucket=bucket, Key=key, Body=text)
+    return resp["ETag"]
+--- solution
+from botocore.exceptions import ClientError
+
+def upload_contract(s3, bucket, key, text, contract_id, prompt_version):
+    try:
+        resp = s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=text.encode("utf-8"),
+            ContentType="text/plain; charset=utf-8",
+            Metadata={"contract-id": str(contract_id), "prompt-version": prompt_version},
+            IfNoneMatch="*",
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "PreconditionFailed":
+            return None
+        raise
+    return resp["ETag"]
+--- tests
+import boto3
+from botocore.exceptions import ClientError
+S3 = boto3.client("s3", region_name="eu-north-1")
+KEY = "contracts/2/103/hospital-software-license.txt"
+TEXT = "8.1 Cap on Liability\nLiability is unlimited. Signed in Malmö."
+def _stored():
+    return CLOUD.s3["clausecheck-contracts"][KEY]
+expect_true("返回 ETag", lambda: upload_contract(S3, "clausecheck-contracts", KEY, TEXT, 103, "v2").startswith('"'))
+expect("存的是 UTF-8 字节", lambda: _stored()["Body"], TEXT.encode("utf-8"))
+expect("ContentType", lambda: _stored()["ContentType"], "text/plain; charset=utf-8")
+expect("元数据：值都是字符串", lambda: _stored()["Metadata"], {"contract-id": "103", "prompt-version": "v2"})
+expect("已经存在：不覆盖，返回 None", lambda: (upload_contract(S3, "clausecheck-contracts", KEY, "other text", 103, "v3"), _stored()["Body"] == TEXT.encode("utf-8")), (None, True))
+expect_raises("桶不存在：错误照常抛出", lambda: upload_contract(S3, "no-such-bucket", KEY, TEXT, 103, "v2"), ClientError)
+--- hints
+- 字符串变字节：`text.encode("utf-8")`；元数据的值用 `str(contract_id)`。
+- 把 `put_object` 放进 `try`；`except ClientError as e:` 里看 `e.response["Error"]["Code"] == "PreconditionFailed"`，是就 `return None`，否则单独一行 `raise`。
+- `IfNoneMatch="*"` 的意思是「这个键上什么都没有时才写」。有了它，同一份合同被重复上传（比如请求超时后客户端重试）也不会覆盖掉原来的。
+
+@@ item d26-05
+type: fix
+title: 修 bug：错误被吞掉了
+level: 2
+cloud: yes
+--- prompt
+同事写的 `read_report_or_none` 在桶名拼错时也安安静静地返回 `None`，前端于是一直显示「报告生成中」，大家排查了一下午。
+
+运行测试，修好它：只有「键不存在」（错误码 `NoSuchKey`）返回 `None`，其他错误（桶不存在、没权限、限流重试用完了……）原样抛出。只吞掉你预料到、也知道怎么处理的那一种错误。
+
+（线上要让 S3 回答 `NoSuchKey`，这个身份还得有 `s3:ListBucket` 权限；没有的话，不存在的键也是 403 `AccessDenied`，见第 4 张卡片。）
+--- starter
+import json
+from botocore.exceptions import ClientError
+
+def read_report_or_none(s3, bucket, key):
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError:
+        return None
+    return json.loads(resp["Body"].read().decode("utf-8"))
+--- solution
+import json
+from botocore.exceptions import ClientError
+
+def read_report_or_none(s3, bucket, key):
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+    return json.loads(resp["Body"].read().decode("utf-8"))
+--- tests
+import json
+import boto3
+from botocore.exceptions import ClientError
+S3 = boto3.client("s3", region_name="eu-north-1")
+S3.put_object(Bucket="clausecheck-reports", Key="reports/103.json", Body=json.dumps({"contract_id": 103, "verdict": "redline"}), ContentType="application/json")
+expect("读出报告", lambda: read_report_or_none(S3, "clausecheck-reports", "reports/103.json"), {"contract_id": 103, "verdict": "redline"})
+expect("还没生成：None", lambda: read_report_or_none(S3, "clausecheck-reports", "reports/999.json"), None)
+expect_raises("桶名拼错（少了 s）：要报错，不能当成「还没生成」", lambda: read_report_or_none(S3, "clausecheck-report", "reports/103.json"), ClientError)
+def _throttled():
+    CLOUD.fail_next("s3", "throttle", 5)   # 连续 5 次限流：SDK 自己的重试也用完了
+    return read_report_or_none(S3, "clausecheck-reports", "reports/103.json")
+expect_raises("限流重试用完：要报错", _throttled, ClientError)
+--- hints
+- `except ClientError as e:` 之后，错误码在 `e.response["Error"]["Code"]`。
+- 是 `"NoSuchKey"` 才 `return None`；否则单独写一行 `raise`，把原来的错误继续往外抛。
+
+@@ item d26-06
+type: code
+title: 分页列出所有键
+level: 2
+cloud: yes
+--- prompt
+一个客户可能有几千份合同，而 `list_objects_v2` 一次最多返回 1000 个键。写 `list_all_keys(s3, bucket, prefix, page_size=1000)`，返回**所有**以 `prefix` 开头的键（列表，保持 S3 返回的顺序）：
+
+- 每次调用都传 `MaxKeys=page_size`（测试会用很小的 `page_size` 逼出分页）
+- 响应里 `IsTruncated` 为 `True` 表示还有下一页：把这一页的 `NextContinuationToken` 作为下一次调用的 `ContinuationToken`
+- 一个都没匹配时，响应里**连 `Contents` 键都没有**，要返回 `[]` 而不是报 `KeyError`
+- 第一次调用不要传 `ContinuationToken=None`：真 boto3 会报 `ParamValidationError`（参数要么不传，要么是字符串）
+
+例：7 个键、`page_size=3` → 调用 3 次，拿到全部 7 个。
+--- starter
+def list_all_keys(s3, bucket, prefix, page_size=1000):
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=page_size)
+    return [obj["Key"] for obj in resp["Contents"]]
+--- solution
+def list_all_keys(s3, bucket, prefix, page_size=1000):
+    keys = []
+    kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": page_size}
+    while True:
+        resp = s3.list_objects_v2(**kwargs)
+        keys += [obj["Key"] for obj in resp.get("Contents", [])]
+        if not resp.get("IsTruncated"):
+            return keys
+        kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+--- tests
+import boto3
+from botocore.exceptions import ParamValidationError
+class StrictS3:
+    """Like real botocore: a parameter is either left out or has the right type; None is rejected."""
+    def __init__(self, s3):
+        self._s3 = s3
+    def list_objects_v2(self, **kwargs):
+        for k, v in kwargs.items():
+            if v is None:
+                raise ParamValidationError(report=f"Invalid type for parameter {k}, value: None, type: <class 'NoneType'>, valid types: <class 'str'>")
+        return self._s3.list_objects_v2(**kwargs)
+    def __getattr__(self, name):
+        return getattr(self._s3, name)
+S3 = StrictS3(boto3.client("s3", region_name="eu-north-1"))
+for i in range(1, 8):
+    S3.put_object(Bucket="clausecheck-contracts", Key=f"contracts/2/{100 + i}/original.txt", Body=b"x")
+S3.put_object(Bucket="clausecheck-contracts", Key="contracts/3/201/original.txt", Body=b"x")
+SEVEN = [f"contracts/2/{100 + i}/original.txt" for i in range(1, 8)]
+def _with_calls(fn):
+    count = lambda: len([c for c in CLOUD.calls if c[0] == "s3.list_objects_v2"])
+    before = count()
+    out = fn()
+    return out, count() - before
+expect("一页就够（第一次调用不传 ContinuationToken）", lambda: list_all_keys(S3, "clausecheck-contracts", "contracts/3/"), ["contracts/3/201/original.txt"])
+expect("7 个键、每页 3 个：调用 3 次，一个不少", lambda: _with_calls(lambda: list_all_keys(S3, "clausecheck-contracts", "contracts/2/", page_size=3)), (SEVEN, 3))
+expect("每页 7 个：调用 1 次", lambda: _with_calls(lambda: list_all_keys(S3, "clausecheck-contracts", "contracts/2/", page_size=7)), (SEVEN, 1))
+expect("没有匹配：[]", lambda: list_all_keys(S3, "clausecheck-contracts", "contracts/6/"), [])
+--- hints
+- 先把参数放进一个字典：`kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": page_size}`，每次调用 `s3.list_objects_v2(**kwargs)`（`**` 把字典展开成关键字参数）。
+- 键在 `resp.get("Contents", [])` 里，每个元素是一个字典，取 `obj["Key"]`。
+- 用 `while True:`：`if not resp.get("IsTruncated"): return keys`；否则 `kwargs["ContinuationToken"] = resp["NextContinuationToken"]`，再来一轮。
+
+@@ item d26-07
+type: predict
+title: GCS 对象的属性
+level: 2
+cloud: yes
+--- prompt
+写出输出。关键问题：`bucket.blob(...)` 和 `client.bucket(...)` 会不会发请求？对象的大小什么时候才知道？
+--- code
+from google.cloud import storage
+
+client = storage.Client()
+bucket = client.bucket("clausecheck-reports")
+blob = bucket.blob("reports/103.json")
+print(blob.size, blob.content_type)
+blob.upload_from_string('{"verdict": "flag"}', content_type="application/json")
+print(blob.size, blob.content_type)
+fresh = bucket.blob("reports/103.json")
+print(fresh.size, fresh.exists())
+loaded = bucket.get_blob("reports/103.json")
+print(loaded.size, loaded.content_type)
+print(bucket.get_blob("reports/999.json"))
+print(client.bucket("no-such-bucket").name)
+--- explain
+`client.bucket(...)` 和 `bucket.blob(...)` 只是在本地造一个对象，**不发请求**：所以一开始属性都是 `None`，名字拼错的桶也不会报错，要等第一次真正读写时才 `NotFound`。上传之后，同一个 `blob` 上就有了大小和类型；另外造的 `fresh` 还是什么都不知道。想知道大小和类型，用 `bucket.get_blob(name)`（不存在时返回 `None`）或 `blob.reload()`；`exists()` 发一个请求，只回答在不在。
+
+@@ item d26-08
+type: code
+title: GCS 存取报告
+level: 2
+cloud: yes
+--- prompt
+在 GCS 上存取审查报告。写两个函数：
+
+- `save_report(client, bucket_name, contract_id, report)`：把字典 `report` 写成 JSON，存到 `reports/<contract_id>.json`，`content_type="application/json"`；JSON 用 `ensure_ascii=False`，让 `Malmö` 原样保存；返回对象名
+- `load_report(client, bucket_name, contract_id)`：读出并解析成字典；对象不存在时返回 `None`（捕获 `google.api_core.exceptions.NotFound`）
+
+`client` 是 `storage.Client()`。
+--- starter
+import json
+from google.api_core.exceptions import NotFound
+
+def save_report(client, bucket_name, contract_id, report):
+    pass
+
+def load_report(client, bucket_name, contract_id):
+    pass
+--- solution
+import json
+from google.api_core.exceptions import NotFound
+
+def save_report(client, bucket_name, contract_id, report):
+    name = f"reports/{contract_id}.json"
+    blob = client.bucket(bucket_name).blob(name)
+    blob.upload_from_string(json.dumps(report, ensure_ascii=False), content_type="application/json")
+    return name
+
+def load_report(client, bucket_name, contract_id):
+    blob = client.bucket(bucket_name).blob(f"reports/{contract_id}.json")
+    try:
+        return json.loads(blob.download_as_text())
+    except NotFound:
+        return None
+--- tests
+from google.cloud import storage
+C = storage.Client()
+R = {"contract_id": 103, "customer": "Nordlys AB, Malmö", "counts": {"redline": 2}}
+def _stored():
+    return CLOUD.gcs["clausecheck-reports"]["reports/103.json"]
+expect("返回对象名", lambda: save_report(C, "clausecheck-reports", 103, R), "reports/103.json")
+expect("存成 application/json", lambda: _stored()["content_type"], "application/json")
+expect("ö 原样保存（ensure_ascii=False）", lambda: "Malmö" in _stored()["data"].decode("utf-8"), True)
+expect("读回来和原来一样", lambda: load_report(C, "clausecheck-reports", 103), R)
+expect("不存在：None", lambda: load_report(C, "clausecheck-reports", 999), None)
+--- hints
+- 对象：`client.bucket(bucket_name).blob(name)`；写：`blob.upload_from_string(文字, content_type="application/json")`；读：`blob.download_as_text()`。
+- 读的时候 `try: return json.loads(...)`，`except NotFound: return None`。
+
+@@ item d26-09
+type: fix
+title: 修 bug：只能遍历一次
+level: 2
+cloud: yes
+--- prompt
+`storage_summary` 要返回一个前缀下的对象个数、总字节数和名字列表，可是一运行就报 `ValueError: Iterator has already started`。
+
+`list_blobs` 返回的不是列表，而是一个**懒加载、只能遍历一次**的迭代器：它一边遍历一边按页去请求（所以桶不存在的 `NotFound` 也要等开始遍历时才出现）。运行，读报错，修好它。
+--- starter
+from google.cloud import storage
+
+def storage_summary(client, bucket_name, prefix):
+    blobs = client.list_blobs(bucket_name, prefix=prefix)
+    total = sum(b.size for b in blobs)
+    names = [b.name for b in blobs]
+    return {"count": len(names), "bytes": total, "names": names}
+--- solution
+from google.cloud import storage
+
+def storage_summary(client, bucket_name, prefix):
+    blobs = list(client.list_blobs(bucket_name, prefix=prefix))
+    total = sum(b.size for b in blobs)
+    names = [b.name for b in blobs]
+    return {"count": len(names), "bytes": total, "names": names}
+--- tests
+from google.cloud import storage
+C = storage.Client()
+for cid, text in [(101, "a" * 10), (102, "b" * 25), (103, "c" * 5)]:
+    C.bucket("clausecheck-reports").blob(f"reports/{cid}.json").upload_from_string(text)
+C.bucket("clausecheck-reports").blob("drafts/104.json").upload_from_string("x")
+expect("三个报告", lambda: storage_summary(C, "clausecheck-reports", "reports/"), {"count": 3, "bytes": 40, "names": ["reports/101.json", "reports/102.json", "reports/103.json"]})
+expect("没有匹配", lambda: storage_summary(C, "clausecheck-reports", "archive/"), {"count": 0, "bytes": 0, "names": []})
+--- hints
+- 报错发生在第二次遍历 `blobs` 时：迭代器已经被 `sum(...)` 用完了。
+- 用 `list(...)` 把结果一次装进列表：`blobs = list(client.list_blobs(bucket_name, prefix=prefix))`，之后想遍历几次都行。
+
+@@ item d26-10
+type: choice
+title: worker 该有什么权限
+level: 2
+--- prompt
+Clause Check 的审查 worker 运行在 AWS 上。它要做两件事：读 `clausecheck-contracts` 里的合同，把报告写进 `clausecheck-reports`。给它的角色挂哪份策略最合适？
+--- options
+- `{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}`：省事，以后加功能也不用改
+- 两条：`s3:GetObject` 作用于 `arn:aws:s3:::clausecheck-contracts/*`；`s3:PutObject` 作用于 `arn:aws:s3:::clausecheck-reports/*`
+- `s3:GetObject`、`s3:PutObject`、`s3:DeleteObject` 作用于两个桶里的所有对象，以防以后要清理
+- 不挂策略，把一个管理员的访问密钥放进 worker 的环境变量
+answer: 2
+--- explain
+最小权限：只给需要的动作，只作用在需要的资源上。这样即使 worker 被一段恶意合同文字诱导（第 12 天的提示注入），或者代码出了 bug，它也删不了合同、读不到别的桶。`s3:*` 加 `*` 等于把整个账号的 S3 交了出去；「以防以后要用」是多给权限最常见的借口；管理员密钥放进环境变量，既不是最小权限，又会随着镜像、日志泄露。GCP 上对应的做法：在 contracts 桶上给服务账号 `roles/storage.objectViewer`，在 reports 桶上给 `roles/storage.objectCreator`（它不能覆盖已有的报告；重审时要覆盖，就给 `roles/storage.objectUser`）。
+
+@@ item d26-11
+type: code
+title: 读密钥并缓存
+level: 2
+cloud: yes
+--- prompt
+写 `get_secret(client, secret_id)`：从 GCP Secret Manager 读密钥的**最新版本**，返回字符串。
+
+- 名字：`projects/clausecheck-dev/secrets/<secret_id>/versions/latest`
+- 调用 `client.access_secret_version(name=名字)`；结果的 `payload.data` 是**字节**，要 `.decode("utf-8")`
+- **缓存**：同一个 `secret_id` 只真正读一次，之后直接从模块级的字典 `_CACHE` 里返回（测试会数 API 调用了几次）
+- 读取失败（比如 `NotFound`）时不往缓存里放任何东西，让错误抛出去
+--- starter
+from google.cloud import secretmanager
+
+PROJECT = "clausecheck-dev"
+_CACHE = {}
+
+def get_secret(client, secret_id):
+    name = f"projects/{PROJECT}/secrets/{secret_id}/versions/latest"
+    return client.access_secret_version(name=name).payload.data
+--- solution
+from google.cloud import secretmanager
+
+PROJECT = "clausecheck-dev"
+_CACHE = {}
+
+def get_secret(client, secret_id):
+    if secret_id in _CACHE:
+        return _CACHE[secret_id]
+    name = f"projects/{PROJECT}/secrets/{secret_id}/versions/latest"
+    value = client.access_secret_version(name=name).payload.data.decode("utf-8")
+    _CACHE[secret_id] = value
+    return value
+--- tests
+from google.cloud import secretmanager
+from google.api_core.exceptions import NotFound
+SM = secretmanager.SecretManagerServiceClient()
+def _reads():
+    return [c[1] for c in CLOUD.calls if c[0] == "secretmanager.access_secret_version"]
+expect("读出字符串", lambda: get_secret(SM, "deepseek-api-key"), "sk-mock-0000")
+expect("第二次不再调用 API", lambda: (get_secret(SM, "deepseek-api-key"), len(_reads())), ("sk-mock-0000", 1))
+expect("读的是 latest 版本", lambda: _reads()[0], "projects/clausecheck-dev/secrets/deepseek-api-key/versions/latest")
+expect_raises("不存在的密钥：NotFound", lambda: get_secret(SM, "langfuse-secret-key"), NotFound)
+expect("失败的不进缓存", lambda: "langfuse-secret-key" in _CACHE, False)
+--- hints
+- 先查缓存：`if secret_id in _CACHE: return _CACHE[secret_id]`。
+- `payload.data` 是 bytes，要 `.decode("utf-8")`；读成功之后再 `_CACHE[secret_id] = value`，这样失败的调用自然不会进缓存。
+
+@@ item d26-12
+type: code
+title: 本机用 .env，线上用密钥服务
+level: 2
+cloud: yes
+--- prompt
+Clause Check 在本机用 `.env` 里的 `DEEPSEEK_API_KEY`，在 AWS 上从 Secrets Manager 读。写 `load_api_key(sm, env)`：
+
+- `env`（一个字典，就像 `os.environ`）里有**非空**的 `DEEPSEEK_API_KEY`：直接返回它，**不调用** Secrets Manager
+- 否则读密钥 `clausecheck/deepseek`：`sm.get_secret_value(SecretId=...)`。`SecretString` 是一段 JSON 字符串，比如 `'{"api_key": "sk-..."}'`，返回其中的 `api_key`
+- 密钥不存在（错误码 `ResourceNotFoundException`）：`raise RuntimeError("no DeepSeek key: set DEEPSEEK_API_KEY or create secret clausecheck/deepseek")`
+- 其他错误原样抛出（包括 `NoCredentialsError`，它根本不是 `ClientError`）
+--- starter
+import json
+from botocore.exceptions import ClientError
+
+SECRET_ID = "clausecheck/deepseek"
+
+def load_api_key(sm, env):
+    pass
+--- solution
+import json
+from botocore.exceptions import ClientError
+
+SECRET_ID = "clausecheck/deepseek"
+
+def load_api_key(sm, env):
+    if env.get("DEEPSEEK_API_KEY"):
+        return env["DEEPSEEK_API_KEY"]
+    try:
+        resp = sm.get_secret_value(SecretId=SECRET_ID)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            raise RuntimeError("no DeepSeek key: set DEEPSEEK_API_KEY or create secret clausecheck/deepseek")
+        raise
+    return json.loads(resp["SecretString"])["api_key"]
+--- tests
+import boto3
+SMC = boto3.client("secretsmanager", region_name="eu-north-1")
+def _sm_calls():
+    return len([c for c in CLOUD.calls if c[0] == "secretsmanager.get_secret_value"])
+expect("本机：用环境变量，不调用 API", lambda: (load_api_key(SMC, {"DEEPSEEK_API_KEY": "sk-local-1234"}), _sm_calls()), ("sk-local-1234", 0))
+expect("线上：从 Secrets Manager 读 JSON", lambda: load_api_key(SMC, {}), "sk-mock-0000")
+expect("环境变量是空字符串也算没有", lambda: load_api_key(SMC, {"DEEPSEEK_API_KEY": ""}), "sk-mock-0000")
+def _missing():
+    del CLOUD.aws_secrets["clausecheck/deepseek"]
+    try:
+        load_api_key(SMC, {})
+    except RuntimeError as e:
+        return str(e)
+    finally:
+        CLOUD.aws_secrets["clausecheck/deepseek"] = '{"api_key": "sk-mock-0000"}'
+    return "没有报错"
+expect("密钥不存在：说清楚该怎么办", _missing, "no DeepSeek key: set DEEPSEEK_API_KEY or create secret clausecheck/deepseek")
+def _no_credentials():
+    CLOUD.aws_credentials = False
+    try:
+        load_api_key(SMC, {})
+    except Exception as e:
+        return type(e).__name__
+    finally:
+        CLOUD.aws_credentials = True
+    return "没有报错"
+expect("没有凭证：原样抛出 NoCredentialsError", _no_credentials, "NoCredentialsError")
+--- hints
+- 第一步：`if env.get("DEEPSEEK_API_KEY"): return env["DEEPSEEK_API_KEY"]`（空字符串是「假」，正好也跳过）。
+- `SecretString` 是字符串：`json.loads(resp["SecretString"])["api_key"]`。
+- 只在 `e.response["Error"]["Code"] == "ResourceNotFoundException"` 时换成 RuntimeError，其余情况单独一行 `raise`。
+
+@@ item d26-13
+type: testwrite
+title: 为 is_retryable 写测试
+level: 3
+cloud: yes
+--- prompt
+重试只该重试「暂时的」错误。下面的 `is_retryable(error)` 判断一个异常值不值得重试：
+
+- boto3 的 `ClientError`：看错误码，在 `RETRYABLE_AWS_CODES` 里才重试
+- Google 的异常：`TooManyRequests`（429）、`ServiceUnavailable`（503）、`InternalServerError`（500）才重试
+- 其他一律不重试（`NotFound`、`ValueError` 这类）
+
+为它写测试。造一个 boto3 错误：`ClientError({"Error": {"Code": "SlowDown", "Message": "..."}}, "PutObject")`（第二个参数是操作名）；造一个 Google 错误：`NotFound("gone")`。起始代码里已经有一个造 boto3 错误的小函数。你的测试要在正确版本上全部通过，并且能抓住每一个埋了 bug 的版本。
+--- impl
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+--- mutants
+===== 范围：所有 ClientError 都被当成可以重试（NoSuchKey 呢？）
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return True
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+===== Google：只认 429，漏了 503
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, TooManyRequests)
+===== 错误码：S3 的限流码叫 SlowDown
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+===== 兜底：不认识的错误一律重试（Google 的 NotFound 呢？）
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return True
+--- starter
+import pytest
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import NotFound, TooManyRequests, ServiceUnavailable
+
+def aws_error(code):
+    return ClientError({"Error": {"Code": code, "Message": "test"}}, "GetObject")
+
+def test_bedrock_throttling_is_retryable():
+    assert is_retryable(aws_error("ThrottlingException")) is True
+--- solution
+import pytest
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import NotFound, TooManyRequests, ServiceUnavailable
+
+def aws_error(code):
+    return ClientError({"Error": {"Code": code, "Message": "test"}}, "GetObject")
+
+def test_bedrock_throttling_is_retryable():
+    assert is_retryable(aws_error("ThrottlingException")) is True
+
+def test_s3_slowdown_is_retryable():
+    assert is_retryable(aws_error("SlowDown")) is True
+
+def test_missing_key_is_not_retryable():
+    assert is_retryable(aws_error("NoSuchKey")) is False
+
+def test_access_denied_is_not_retryable():
+    assert is_retryable(aws_error("AccessDenied")) is False
+
+def test_google_429_and_503_are_retryable():
+    assert is_retryable(TooManyRequests("rate limit")) is True
+    assert is_retryable(ServiceUnavailable("down")) is True
+
+def test_google_not_found_is_not_retryable():
+    assert is_retryable(NotFound("gone")) is False
+
+def test_plain_bug_is_not_retryable():
+    assert is_retryable(ValueError("bad json")) is False
+--- hints
+- 每类情况一个 `test_`：AWS 该重试的码（`ThrottlingException`、`SlowDown`）、AWS 不该重试的码（`NoSuchKey`、`AccessDenied`）、Google 该重试的类、Google 不该重试的类、普通的 Python 异常。
+- 「该重试」和「不该重试」两边都要测：只测该重试的那一边，抓不住「全都重试」的版本。
+- Google 的异常直接用类名加一句话来造：`ServiceUnavailable("down")`、`NotFound("gone")`。
+
+@@ item d26-14
+type: code
+title: 指数退避
+level: 3
+cloud: yes
+--- prompt
+写 `with_backoff(fn, sleep, attempts=4, base=0.5)`：调用 `fn()`，遇到**可以重试**的错误就等一会儿再试。
+
+- `is_retryable(error)` 已经写好（就是上一题的被测函数）
+- 第 1 次失败后等 `base` 秒，第 2 次后等 `base * 2`，第 3 次后 `base * 4`……（指数退避）。等待用传进来的 `sleep(秒数)`：测试传一个只记录、不真睡的假函数
+- 最多调用 `fn` 共 `attempts` 次；最后一次还失败，就把**这个错误**抛出去（不再 sleep）
+- 不可重试的错误：马上抛出，不 sleep
+- 成功就返回 `fn()` 的结果
+
+这里先不加随机抖动，方便测试（闭卷题会加）。测试用的 S3 client 设置了 `total_max_attempts=1`：SDK 自己不重试，每个错误都直接交给你。
+--- starter
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+
+def with_backoff(fn, sleep, attempts=4, base=0.5):
+    return fn()
+--- solution
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+
+def with_backoff(fn, sleep, attempts=4, base=0.5):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if not is_retryable(e) or attempt == attempts - 1:
+                raise
+            sleep(base * 2 ** attempt)
+--- tests
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+S3 = boto3.client("s3", region_name="eu-north-1", config=Config(retries={"total_max_attempts": 1}))
+S3.put_object(Bucket="clausecheck-reports", Key="reports/103.json", Body=b"{}")
+def run(fails, key="reports/103.json", **kw):
+    CLOUD.queue.clear()
+    CLOUD.fail_next("s3", "throttle", fails)
+    delays = []
+    try:
+        resp = with_backoff(lambda: S3.get_object(Bucket="clausecheck-reports", Key=key), delays.append, **kw)
+        return resp["Body"].read(), delays
+    except ClientError as e:
+        return e.response["Error"]["Code"], delays
+expect("一次就成功：不等待", lambda: run(0), (b"{}", []))
+expect("限流两次后成功：等 0.5、1.0", lambda: run(2), (b"{}", [0.5, 1.0]))
+expect("一直限流：调用 4 次后放弃，只等 3 次", lambda: run(4), ("SlowDown", [0.5, 1.0, 2.0]))
+expect("NoSuchKey：马上放弃，不等", lambda: run(0, key="reports/999.json"), ("NoSuchKey", []))
+expect("attempts 和 base 可以改", lambda: run(9, attempts=2, base=1), ("SlowDown", [1]))
+--- hints
+- 骨架：`for attempt in range(attempts):`，里面 `try: return fn()`。
+- `except Exception as e:`：`if not is_retryable(e) or attempt == attempts - 1: raise`（单独一个 `raise` 抛出原来的错误）；否则 `sleep(base * 2 ** attempt)`。
+
+@@ item d26-15
+type: choice
+title: 瑞典客户的合同放哪
+level: 1
+--- prompt
+斯德哥尔摩的律所 Nordlys AB 要用 Clause Check。他们的合同里有员工和客户的姓名、联系方式，他们和我们签的合同里写着「Customer Data is stored and processed within the EU/EEA」。合同存放的桶、审查用的大模型，区域怎么选？
+--- options
+- `us-east-1` / `us-central1`：最便宜、新功能最先上线，反正数据是加密的
+- 桶放在欧盟区域（AWS `eu-north-1` 斯德哥尔摩，或 GCP `europe-north1` 芬兰），模型调用也选欧盟区域或欧盟范围的端点；日志和备份同样留在欧盟
+- 桶放在欧盟就够了；模型不保存数据，在哪里推理无所谓
+- 选离开发者最近的区域，调试最快
+answer: 2
+--- explain
+数据驻留看的是数据**存放和处理**的地方：桶、数据库、日志、备份，还有把合同文字发给模型推理，都算「处理」。静态加密是两家默认就有的，但加密不改变数据在哪个国家、受哪里的法律管。这正是 playbook PB-03 审查客户合同时要求的东西，Clause Check 自己也要做到。明天会看到：Vertex AI 可以指定区域，Bedrock 有只在欧盟区域之间路由的推理配置（ID 以 `eu.` 开头）。
+
+@@ item d26-16
+type: fill
+title: 填空：分页器
+level: 2
+cloud: yes
+--- prompt
+boto3 的**分页器**（paginator）替你处理 `ContinuationToken`：`for page in paginator.paginate(...)` 每次给你一页响应。用它统计一个前缀下所有对象的个数和总字节数。`PageSize` 设成 2，是为了在测试的小数据上也能分出好几页。填空。
+--- template
+def prefix_size(s3, bucket, prefix):
+    paginator = s3.[[get_paginator]]("list_objects_v2")
+    total = 0
+    count = 0
+    for page in paginator.[[paginate]](Bucket=bucket, Prefix=prefix, PaginationConfig={"PageSize": 2}):
+        for obj in page.[[get]]("Contents", []):
+            total += obj["[[Size]]"]
+            count += 1
+    return {"objects": count, "bytes": total}
+--- tests
+import boto3
+S3 = boto3.client("s3", region_name="eu-north-1")
+for i, n in enumerate([100, 250, 50, 600, 1]):
+    S3.put_object(Bucket="clausecheck-contracts", Key=f"contracts/1/{101 + i}/original.pdf", Body=b"x" * n)
+def _pages(fn):
+    count = lambda: len([c for c in CLOUD.calls if c[0] == "s3.list_objects_v2"])
+    before = count()
+    out = fn()
+    return out, count() - before
+expect("5 个对象，分 3 页取回", lambda: _pages(lambda: prefix_size(S3, "clausecheck-contracts", "contracts/1/")), ({"objects": 5, "bytes": 1001}, 3))
+expect("没有匹配", lambda: prefix_size(S3, "clausecheck-contracts", "contracts/9/"), {"objects": 0, "bytes": 0})
+--- hints
+- 分页器从 client 上拿：`s3.get_paginator("list_objects_v2")`；`paginate(...)` 的参数和 `list_objects_v2` 一样。
+- 空页没有 `Contents` 键，所以用字典的 `get` 给默认值 `[]`；每个对象的字节数在 `obj["Size"]`。
+
+@@ item d26-17
+type: order
+title: 排代码：存进去再读回来
+level: 2
+cloud: yes
+--- prompt
+排出 `save_and_check(report)`：把报告存进 S3，再读回来，返回读回来的字典（用来确认存进去的内容没问题）。有两行干扰项。
+--- lines
+import json
+import boto3
+s3 = boto3.client("s3", region_name="eu-north-1")
+def save_and_check(report):
+    body = json.dumps(report).encode("utf-8")
+    s3.put_object(Bucket="clausecheck-reports", Key="reports/latest.json", Body=body, ContentType="application/json")
+    resp = s3.get_object(Bucket="clausecheck-reports", Key="reports/latest.json")
+    back = json.loads(resp["Body"].read().decode("utf-8"))
+    return back
+--- distractors
+    s3.put_object("clausecheck-reports", "reports/latest.json", body)
+    back = json.loads(resp["Body"].decode("utf-8"))
+--- tests
+R = {"contract_id": 103, "counts": {"redline": 2, "flag": 1}}
+expect("读回来一样", lambda: save_and_check(R), R)
+expect("存成 application/json", lambda: CLOUD.s3["clausecheck-reports"]["reports/latest.json"]["ContentType"], "application/json")
+--- hints
+- 顺序：导入 → 建 client → def → 编码 → 写 → 读 → 解析 → 返回。
+- 一个干扰项用了位置参数（boto3 只接受关键字参数，会报 `TypeError`），另一个忘了先 `.read()`（`Body` 是个流，不是字节）。
+
+@@ item d26-18
+type: code
+title: 预签名下载链接
+level: 3
+cloud: yes
+--- prompt
+律师要下载一份报告，但我们不想把桶公开，也不想给律师开 AWS 账号。常见做法是**预签名 URL**：用 worker 自己的凭证在本地签出一个带有效期的链接，拿到链接的人在有效期内可以下载这一个对象。（上传也可以这么做：给浏览器一个 `put_object` 的预签名 URL，合同就直接传进桶里，不经过你的服务器。）
+
+写 `share_link(s3, bucket, key, minutes)`：
+
+- `minutes` 小于 1，或者超过 7 天（`7 * 24 * 60` 分钟，SDK 签名的上限）：`raise ValueError("minutes must be between 1 and 10080")`
+- 生成链接时 SDK **不会**检查对象存不存在（它根本不发请求），所以先 `head_object`：不存在时 `raise FileNotFoundError(key)`。注意 HEAD 响应没有正文，错误码就是字符串 `"404"`，不是 `NoSuchKey`；其他错误原样抛出
+- 返回 `s3.generate_presigned_url("get_object", Params={"Bucket": ..., "Key": ...}, ExpiresIn=秒数)`
+
+预签名 URL 就像一把临时钥匙：谁拿到都能用。所以有效期尽量短，也不要把它写进日志。另外，链接带着签名者的凭证：在 Lambda、ECS 这类用角色**临时凭证**的地方签出的链接，凭证过期时也会一起失效（通常只有几个小时），写了 7 天也到不了 7 天。
+--- starter
+from botocore.exceptions import ClientError
+
+def share_link(s3, bucket, key, minutes):
+    return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key})
+--- solution
+from botocore.exceptions import ClientError
+
+MAX_MINUTES = 7 * 24 * 60
+
+def share_link(s3, bucket, key, minutes):
+    if minutes < 1 or minutes > MAX_MINUTES:
+        raise ValueError(f"minutes must be between 1 and {MAX_MINUTES}")
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            raise FileNotFoundError(key)
+        raise
+    return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=minutes * 60)
+--- tests
+import boto3
+S3 = boto3.client("s3", region_name="eu-north-1")
+S3.put_object(Bucket="clausecheck-reports", Key="reports/103.json", Body=b"{}")
+link = lambda minutes, key="reports/103.json": share_link(S3, "clausecheck-reports", key, minutes)
+expect_true("15 分钟：X-Amz-Expires=900", lambda: "X-Amz-Expires=900" in link(15))
+expect_true("链接指向这个对象", lambda: link(15).startswith("https://clausecheck-reports.s3.eu-north-1.amazonaws.com/reports/103.json?"))
+expect_raises("对象不存在：FileNotFoundError", lambda: link(15, "reports/999.json"), FileNotFoundError)
+expect_true("刚好 7 天可以", lambda: "X-Amz-Expires=604800" in link(7 * 24 * 60))
+expect_raises("超过 7 天：ValueError", lambda: link(7 * 24 * 60 + 1), ValueError)
+expect_raises("0 分钟：ValueError", lambda: link(0), ValueError)
+--- hints
+- 三步：检查 `minutes` → `head_object` 确认对象存在 → 生成链接。`ExpiresIn` 的单位是**秒**：`minutes * 60`。
+- `try: s3.head_object(Bucket=bucket, Key=key)`；`except ClientError as e:` 里，`e.response["Error"]["Code"] == "404"` 就 `raise FileNotFoundError(key)`，否则 `raise`。
+
+@@ item d26-19
+type: local
+title: 本机任务（选做）：装上真的 SDK
+level: 1
+--- prompt
+在你的电脑上装上真的 SDK，顺便亲眼看看「凭证在第一次调用时才检查」。不需要云账号，也不花钱。在 PowerShell 里逐行运行：
+
+```
+python -m pip install boto3 google-cloud-storage
+python -m pip show boto3 google-cloud-storage
+python -c "import boto3; s3 = boto3.client('s3', region_name='eu-north-1'); print('client ok'); s3.list_objects_v2(Bucket='clausecheck-contracts')"
+```
+
+第三条会先打印 `client ok`，然后报错，最后一行是 `botocore.exceptions.NoCredentialsError: Unable to locate credentials`：你的电脑上没有 AWS 凭证，SDK 沿着凭证链找了一圈没找到。（如果你以前配置过 AWS 账号，看到的可能是 AccessDenied 之类的错误，说明请求真的发出去了，也没关系。）
+
+然后看 `pip show boto3` 输出里的 `Requires:` 那一行：boto3 依赖了哪几个包？今天的 `ClientError` 就来自其中一个。
+
+把终端输出（从 `pip show` 开始）粘贴到下面。
+placeholder: 粘贴终端输出：应该能看到 Name: boto3、Name: google-cloud-storage 和 client ok
+verify: ^(?=[\s\S]*Name: boto3)(?=[\s\S]*Name: google-cloud-storage)(?=[\s\S]*client ok)
+--- hints
+- 用 `python -m pip` 而不是直接 `pip`：保证包装进的是你运行 `python` 时用的那个 Python。
+- 第三条命令的报错是预期结果，不用修。`Requires:` 里的 `botocore` 就是 `ClientError`、`Config` 所在的包。
+
+@@ item d26-e1
+type: scratch
+title: 闭卷：归档一个客户的合同
+exam: yes
+level: 3
+cloud: yes
+--- prompt
+写 `archive_contracts(s3, customer_id, page_size=1000)`：把一个客户的所有合同从桶 `clausecheck-contracts` 挪到归档桶 `clausecheck-archive`（测试里已经建好）。
+
+- 要挪的是键以 `contracts/<customer_id>/` 开头的所有对象（注意：`contracts/1/` 不包括 `contracts/12/`）
+- 列出时每次调用 `list_objects_v2` 都传 `MaxKeys=page_size`，并处理分页（`IsTruncated` / `NextContinuationToken` → `ContinuationToken`；第一次调用不传 `ContinuationToken`，传 `None` 会报 `ParamValidationError`）；没有匹配时响应里没有 `Contents`
+- **先列出全部键，再逐个挪**：`get_object` 读出字节和 `ContentType`，用同一个键、同样的 `ContentType` `put_object` 到归档桶，然后 `delete_object` 删掉原来的
+- 返回挪走的键的列表（按列出的顺序）
+
+boto3 的参数全部用关键字传。（真项目里会用 `copy_object` 在 S3 内部复制，不用先下载再上传；本页的模拟没有它，这里用 get + put。）
+--- solution
+def archive_contracts(s3, customer_id, page_size=1000):
+    src, dst = "clausecheck-contracts", "clausecheck-archive"
+    kwargs = {"Bucket": src, "Prefix": f"contracts/{customer_id}/", "MaxKeys": page_size}
+    keys = []
+    while True:
+        resp = s3.list_objects_v2(**kwargs)
+        keys += [obj["Key"] for obj in resp.get("Contents", [])]
+        if not resp.get("IsTruncated"):
+            break
+        kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+    for key in keys:
+        obj = s3.get_object(Bucket=src, Key=key)
+        s3.put_object(Bucket=dst, Key=key, Body=obj["Body"].read(), ContentType=obj["ContentType"])
+        s3.delete_object(Bucket=src, Key=key)
+    return keys
+--- tests
+import boto3
+from botocore.exceptions import ParamValidationError
+class StrictS3:
+    """Like real botocore: a parameter is either left out or has the right type; None is rejected."""
+    def __init__(self, s3):
+        self._s3 = s3
+    def list_objects_v2(self, **kwargs):
+        for k, v in kwargs.items():
+            if v is None:
+                raise ParamValidationError(report=f"Invalid type for parameter {k}, value: None, type: <class 'NoneType'>, valid types: <class 'str'>")
+        return self._s3.list_objects_v2(**kwargs)
+    def __getattr__(self, name):
+        return getattr(self._s3, name)
+S3 = StrictS3(boto3.client("s3", region_name="eu-north-1"))
+S3.create_bucket(Bucket="clausecheck-archive", CreateBucketConfiguration={"LocationConstraint": "eu-north-1"})
+for cid in (101, 102, 110, 111, 112):
+    S3.put_object(Bucket="clausecheck-contracts", Key=f"contracts/1/{cid}/original.pdf", Body=f"pdf {cid}".encode(), ContentType="application/pdf")
+S3.put_object(Bucket="clausecheck-contracts", Key="contracts/12/120/original.txt", Body=b"another customer", ContentType="text/plain")
+MOVED = [f"contracts/1/{c}/original.pdf" for c in (101, 102, 110, 111, 112)]
+expect("挪走 5 份（每页 2 个）", lambda: archive_contracts(S3, 1, page_size=2), MOVED)
+expect("归档桶里有，内容和类型都在", lambda: (CLOUD.s3["clausecheck-archive"]["contracts/1/110/original.pdf"]["Body"], CLOUD.s3["clausecheck-archive"]["contracts/1/110/original.pdf"]["ContentType"]), (b"pdf 110", "application/pdf"))
+expect("原桶只剩客户 12 的合同", lambda: sorted(CLOUD.s3["clausecheck-contracts"]), ["contracts/12/120/original.txt"])
+expect("没有合同的客户：[]", lambda: archive_contracts(S3, 6), [])
+
+@@ item d26-e2
+type: scratch
+title: 闭卷：给报告加批注
+exam: yes
+level: 3
+cloud: yes
+--- prompt
+律师可以给审查报告加批注。写 `add_note(client, contract_id, note)`（`client` 是 `storage.Client()`）：
+
+- 报告在 GCS 桶 `clausecheck-reports` 的 `reports/<contract_id>.json`
+- 读出报告（`download_as_text` + `json.loads`）；对象不存在（`google.api_core.exceptions.NotFound`）时，从 `{"contract_id": contract_id, "notes": []}` 开始
+- 报告里没有 `"notes"` 键时，当成空列表
+- 把 `note` 加到 `notes` 末尾；**同一条 note 已经在里面就不再加**（这样请求被重试时，不会出现两条一样的批注）
+- 写回同一个对象：`json.dumps(report, ensure_ascii=False)`，`content_type="application/json"`
+- 返回写回去的报告字典
+--- solution
+import json
+from google.api_core.exceptions import NotFound
+
+def add_note(client, contract_id, note):
+    blob = client.bucket("clausecheck-reports").blob(f"reports/{contract_id}.json")
+    try:
+        report = json.loads(blob.download_as_text())
+    except NotFound:
+        report = {"contract_id": contract_id, "notes": []}
+    notes = report.setdefault("notes", [])
+    if note not in notes:
+        notes.append(note)
+    blob.upload_from_string(json.dumps(report, ensure_ascii=False), content_type="application/json")
+    return report
+--- tests
+import json
+from google.cloud import storage
+C = storage.Client()
+C.bucket("clausecheck-reports").blob("reports/103.json").upload_from_string(json.dumps({"contract_id": 103, "counts": {"redline": 2}}), content_type="application/json")
+expect("已有报告：加上 notes", lambda: add_note(C, 103, "8.1: ask for a mutual cap"), {"contract_id": 103, "counts": {"redline": 2}, "notes": ["8.1: ask for a mutual cap"]})
+expect("重试同一条：不重复", lambda: add_note(C, 103, "8.1: ask for a mutual cap")["notes"], ["8.1: ask for a mutual cap"])
+expect("写回去了，类型是 JSON", lambda: (json.loads(CLOUD.gcs["clausecheck-reports"]["reports/103.json"]["data"])["notes"], CLOUD.gcs["clausecheck-reports"]["reports/103.json"]["content_type"]), (["8.1: ask for a mutual cap"], "application/json"))
+expect("还没有报告：新建，ö 原样保存", lambda: (add_note(C, 104, "Kontakt: Åsa i Malmö"), "Malmö" in CLOUD.gcs["clausecheck-reports"]["reports/104.json"]["data"].decode("utf-8")), ({"contract_id": 104, "notes": ["Kontakt: Åsa i Malmö"]}, True))
+
+@@ item d26-e3
+type: scratch
+title: 闭卷：带抖动的重试
+exam: yes
+level: 3
+cloud: yes
+--- prompt
+写 `call_with_retry(fn, sleep, rand, attempts=5, base=0.2, cap=2.0)`：
+
+- 调用 `fn()`，成功就返回结果
+- 失败时先判断能不能重试：`botocore.exceptions.ClientError` 且错误码在 `{"ThrottlingException", "SlowDown", "ServiceUnavailable"}` 里；或者是 `google.api_core.exceptions` 的 `TooManyRequests`、`ServiceUnavailable`。不能重试的错误马上抛出
+- 第 `i` 次失败后（`i` 从 0 开始数）等待 `min(cap, base * 2 ** i) * rand()` 秒（指数退避 + 上限 + 随机抖动）。`sleep(秒数)` 和 `rand()`（返回 0 到 1 之间的数）都是传进来的
+- 一共最多调用 `fn` `attempts` 次；最后一次失败时把那个错误抛出去，不再等待
+--- solution
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable
+
+AWS_RETRYABLE = {"ThrottlingException", "SlowDown", "ServiceUnavailable"}
+
+def _retryable(e):
+    if isinstance(e, ClientError):
+        return e.response["Error"]["Code"] in AWS_RETRYABLE
+    return isinstance(e, (TooManyRequests, ServiceUnavailable))
+
+def call_with_retry(fn, sleep, rand, attempts=5, base=0.2, cap=2.0):
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if not _retryable(e) or i == attempts - 1:
+                raise
+            sleep(min(cap, base * 2 ** i) * rand())
+--- tests
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, NotFound
+def aws(code):
+    return ClientError({"Error": {"Code": code, "Message": "test"}}, "Converse")
+def run(errors, **kw):
+    queue = list(errors)
+    calls = []
+    def fn():
+        calls.append(1)
+        if queue:
+            raise queue.pop(0)
+        return "ok"
+    delays = []
+    try:
+        out = call_with_retry(fn, delays.append, lambda: 0.5, **kw)
+    except Exception as e:
+        out = type(e).__name__
+    return out, len(calls), delays
+expect("三次暂时错误后成功", lambda: run([aws("ThrottlingException"), TooManyRequests("x"), aws("SlowDown")]), ("ok", 4, [0.1, 0.2, 0.4]))
+expect("上限 cap 起作用", lambda: run([aws("SlowDown")] * 9, attempts=6, base=1, cap=2.0), ("ClientError", 6, [0.5, 1.0, 1.0, 1.0, 1.0]))
+expect("次数用完：抛出最后的错误", lambda: run([aws("ThrottlingException")] * 9, attempts=3)[:2], ("ClientError", 3))
+expect("NotFound 不重试", lambda: run([NotFound("gone")]), ("NotFound", 1, []))

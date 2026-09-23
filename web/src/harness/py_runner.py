@@ -166,6 +166,21 @@ def _make_asserts(results):
     return {"expect": expect, "expect_true": expect_true, "expect_raises": expect_raises, "expect_output": expect_output}
 
 
+def _cc_load_module(name, source):
+    """Load a harness file (py_sql.py, py_cloud.py) as its own module, so its names stay apart
+    from the learner's code."""
+    import types
+    mod = types.ModuleType(name)
+    mod.__file__ = name + ".py"
+    sys.modules[name] = mod
+    exec(compile(source, name + ".py", "exec"), mod.__dict__)
+    return mod
+
+
+def _cc_run_sql(user_sql, spec_json="{}", setup_sql=""):
+    return sys.modules["_ccsql"].run_sql(user_sql, spec_json, setup_sql)
+
+
 def run(user_code, test_code="", setup_code=""):
     out = io.StringIO()
     res = {"stdout": "", "error": None, "error_line": None, "tests": []}

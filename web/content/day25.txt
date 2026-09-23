@@ -1,0 +1,1020 @@
+@@ day 25
+title: BigQuery：数据仓库、成本、Python 客户端
+lang: sql
+dataset: clausecheck
+langs: SQL + Python
+hours: 5 小时
+--- goal
+知道数据仓库是什么、BigQuery 怎么收费（按扫描的字节：只选需要的列、分区、dry run、上限）；能用 BigQuery 的 SQL 写 LLM 可观测性看板上的问题：每月每客户的成本、缓存命中率、各 prompt 版本的 redline 率、延迟分位数；会用 Python 客户端安全地查询（参数、dry run、字节上限）和写入（流式写入的错误列表）。
+
+对应项目：`clausecheck/pipeline.py` 汇总的 token、延迟、错误和 `models.py` 的 `ReviewTrace`，上线以后每条审查一行，写进 BigQuery 的一张表；第 13 天手算的通过率和 p95，在仓库里就是一条 SQL。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每张都改一处再运行
+- 练习区全部通过（本机任务是选做）
+- 闭卷 3 题
+- 用自己的话说出：为什么 `SELECT * ... LIMIT 10` 在 BigQuery 里不省钱，怎样才省钱
+
+@@ concept
+title: 数据仓库和 BigQuery
+bq: yes
+--- body
+本页的 BigQuery 是模拟的：SQL 跑在浏览器里的 SQLite 上，模拟了几个 BigQuery 写法；Python 客户端的调用写法和返回结构与真 SDK（google-cloud-bigquery）一致（只实现了课程用到的部分）。真项目里 `pip install google-cloud-bigquery` 后配置凭证即可。
+
+昨天的 SQLite / Postgres 是**业务数据库**（OLTP）：每次读写几行，要快、要有事务。Clause Check 上线后每条审查产生一行追踪数据，积累下来就是上亿行，负责人想看的是一张**看板**：每个客户每月花了多少钱、prompt 缓存命中率、延迟 p95、每个 prompt 版本的 redline 率和失败率。这种「扫一大片历史」的问题，是**数据仓库**（OLAP）的活。
+
+BigQuery 是 Google Cloud 的数据仓库：
+
+- **无服务器**：不用管机器，写 SQL 就行，按用量付费
+- **列式存储**：每一列单独存，只读查询用到的列，所以扫几亿行也快
+- 名字有三段：`项目.数据集.表`，比如 `clausecheck-dev.clausecheck.reviews`（本页的项目叫 clausecheck-dev，数据集叫 clausecheck）。写进 SQL 时，带项目的全名用反引号括起来，就像下面例子里的 FROM
+- 它是给分析用的，不是应用的后台库：不适合频繁改单行
+- 数据集建的时候要选**位置**（比如 `EU` 多区域，或 `europe-north1` 芬兰），建好以后改不了。追踪数据里可能有客户信息，按 GDPR 的习惯默认放在欧盟
+
+AWS 对照：
+
+- BigQuery ↔ Amazon Redshift（数据仓库）
+- BigQuery 外部表（查 Cloud Storage 里的文件）↔ Amazon Athena（用 SQL 直接查 S3 里的文件）
+--- code
+SELECT model, COUNT(*) AS reviews, ROUND(SUM(cost_usd), 4) AS cost_usd
+FROM `clausecheck-dev.clausecheck.reviews`
+GROUP BY model
+ORDER BY reviews DESC
+
+@@ concept
+title: 怎么收费：扫多少列、多少分区
+lang: py
+--- body
+按需（on-demand）计费时，BigQuery 按查询**扫描的字节**收钱。官方价格页写的是每 TiB 6.25 美元、每月前 1 TiB 免费（价格会变，以官方价格页为准）。另一种是按容量（editions：按用了多少计算槽 slot、多少小时付费），用量大的团队常用，今天只讲按需。因为是列式存储：
+
+- 扫描量 = 查询里**用到的每一列**的全部大小（SELECT、WHERE、JOIN、GROUP BY 里出现的都算），和返回几行无关。`SELECT *` 读所有列，最贵
+- `LIMIT 10` **不会**少扫；在没分区、没聚簇的表上，`WHERE` 也不会
+- 每个用到的表至少按 10 MB 算；报错的查询、命中缓存的查询不收钱。只想看看数据长什么样，用控制台里表的「预览」（免费）
+- **分区表**：`PARTITION BY DATE(created_at)` 把表按天切块。WHERE 直接拿分区列和常量比较（`created_at >= TIMESTAMP('2026-09-01')`）时，只读那几天的分区。建表时在 `OPTIONS (require_partition_filter = TRUE)` 里打开这个开关，不带这种过滤的查询直接报错
+- **聚簇**：`CLUSTER BY customer_id` 把同一客户的数据存在一起，按它过滤时能跳过很多块。省下多少要跑完才知道，所以聚簇表的 dry run 估算是个上限
+
+分区和聚簇本页模拟不了，下面按一张假想的「一年 2 亿行」的表算算账。
+--- code
+TIB = 2 ** 40
+PRICE_PER_TIB = 6.25                 # 示例价格，以官方价格页为准
+ROWS = 200_000_000                   # 假想：上线一年，每条审查一行
+BYTES_PER_ROW = {                    # 每列平均每行几个字节：数字和时间 8 个，文字约 2 + 长度
+    "id": 8, "contract_id": 8, "clause_id": 6, "heading": 22, "topic": 15, "verdict": 8,
+    "risk": 6, "model": 16, "prompt_version": 4, "prompt_tokens": 8, "completion_tokens": 8,
+    "cache_hit_tokens": 8, "latency_ms": 8, "cost_usd": 8, "error": 2, "created_at": 8,
+    "rationale": 400,                # 模型写的理由：最占地方的一列
+}
+
+def usd(columns, share_of_rows=1.0):
+    scanned = ROWS * share_of_rows * sum(BYTES_PER_ROW[c] for c in columns)
+    return scanned / TIB * PRICE_PER_TIB
+
+runs_per_month = 12 * 24 * 30        # 看板每 5 分钟刷新一次
+print(f"SELECT * ... LIMIT 10          ${usd(BYTES_PER_ROW):.3f} per run")
+print(f"SELECT created_at, cost_usd    ${usd(['created_at', 'cost_usd']):.4f} per run")
+print(f"  + 30 of 365 day partitions   ${usd(['created_at', 'cost_usd'], 30 / 365):.5f} per run")
+print(f"dashboard with SELECT *        ${usd(BYTES_PER_ROW) * runs_per_month:,.0f} per month")
+print(f"dashboard, 2 cols, partitions  ${usd(['created_at', 'cost_usd'], 30 / 365) * runs_per_month:,.2f} per month")
+
+@@ concept
+title: GoogleSQL 方言：表名、除法、COUNTIF
+bq: yes
+--- body
+BigQuery 的 SQL 叫 GoogleSQL。前两天学的 SELECT、JOIN、CTE、窗口函数都照样能用。和 SQLite 不一样、今天常用的几处（本页模拟了它们，题目标着 BigQuery 写法时可以用）：
+
+- 表名要带数据集：`clausecheck.reviews`；或者连项目一起写全名，用反引号（键盘左上角 Esc 下面那个键）括起来，像下面例子里的 FROM。只写 `reviews` 会报 missing dataset
+- `/` 永远得到小数：`7 / 2 = 3.5`（SQLite 和 Postgres 里整数相除得 3）。要整数除法用 `DIV(7, 2)`
+- `SAFE_DIVIDE(a, b)`：b 是 0 时得到 NULL，而不是报错。算比率（命中率、通过率）就用它
+- `COUNTIF(条件)`：数满足条件的行，相当于 `SUM(CASE WHEN 条件 THEN 1 ELSE 0 END)`（一行都没有时 COUNTIF 得 0，SUM 得 NULL）
+- `IF(条件, a, b)`：短一点的 CASE WHEN
+- 类型名不一样：`CAST(x AS STRING)`、`INT64`、`FLOAT64`、`BOOL`
+
+下面比较两个模型：大模型 v4-pro 平均输出的 token 是 flash 的三倍多，也慢得多。
+--- code
+SELECT
+  model,
+  COUNT(*) AS reviews,
+  COUNTIF(verdict = 'flag') AS flags,
+  ROUND(SAFE_DIVIDE(SUM(completion_tokens), COUNT(*)), 1) AS avg_output_tokens,
+  IF(AVG(latency_ms) > 5000, 'slow', 'ok') AS speed,
+  7 / 2 AS float_div,
+  DIV(7, 2) AS int_div
+FROM `clausecheck-dev.clausecheck.reviews`
+GROUP BY model
+
+@@ concept
+title: 时间：DATE_TRUNC 和 TIMESTAMP_DIFF
+bq: yes
+--- body
+BigQuery 里最常用的时间类型是 `DATE`（日期）和 `TIMESTAMP`（时刻，UTC）；另外还有不带时区的 `DATETIME` 和 `TIME`。本页的时间列存成文字，但下面这些函数按 BigQuery 的规则模拟了：
+
+- `DATE(created_at)`：时刻 → 日期
+- `DATE_TRUNC(日期, MONTH)`：截到月初（还有 WEEK、QUARTER、YEAR）。**值在前、单位在后**，单位是不带引号的关键字，和 Postgres 的 `date_trunc('month', ts)` 正好反过来。写成 `'MONTH'` 会报错
+- 截断不改变类型：TIMESTAMP 截到月还是 TIMESTAMP（`2026-09-01 00:00:00`），所以「按月」通常写 `DATE_TRUNC(DATE(created_at), MONTH)`，得到 `2026-09-01`
+- `WEEK` 从星期日算起（要从星期一算，真 BigQuery 里写 `ISOWEEK` 或 `WEEK(MONDAY)`，本页没有模拟）
+- `TIMESTAMP_DIFF(晚, 早, SECOND)`：两个时刻差几个整秒（单位最大到 DAY；按 DAY 数的是满 24 小时的个数）。按日历算差几天、几个月，用 `DATE_DIFF(DATE(a), DATE(b), DAY)`（或 `MONTH`）
+
+本页的小限制：列的别名别起成单独的时间单位词，比如 `month`、`week`、`day`、`hour`、`year`（模拟器可能把它当成单位，结果悄悄算错），用 `month_start` 这种名字。真 BigQuery 没有这个问题。
+
+下面看两次评测各跑了多久：v1 和 v2 都在 3 分半钟左右跑完 24 次。
+--- code
+SELECT
+  prompt_version,
+  DATE(MIN(created_at)) AS run_date,
+  DATE_TRUNC(DATE(MIN(created_at)), WEEK) AS week_start,
+  TIMESTAMP_DIFF(MAX(created_at), MIN(created_at), SECOND) AS run_seconds,
+  COUNT(*) AS runs
+FROM clausecheck.evals
+GROUP BY prompt_version
+ORDER BY prompt_version
+
+@@ concept
+title: 本页跑不了的 BigQuery 写法
+bq: yes
+--- body
+这几样在真 BigQuery 里天天用，本页模拟不了。要认得它们，面试时会写：
+
+- `QUALIFY`：像 HAVING，但过滤的是窗口函数的结果。「每个条款最新的一条审查」一句就够：
+
+```sql
+SELECT contract_id, clause_id, verdict
+FROM clausecheck.reviews
+WHERE error IS NULL
+QUALIFY ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id ORDER BY created_at DESC) = 1
+```
+
+  本页的写法：把 ROW_NUMBER 放进 CTE，外面 `WHERE rn = 1`（第 23 天）
+- `APPROX_QUANTILES(latency_ms, 100)[OFFSET(95)]`：近似的 p95。本页用窗口函数按 nearest-rank 算（第 13 天的算法），就是下面的例子
+- `ARRAY_AGG(x)` 把一组值收成数组，`UNNEST(数组)` 把数组展开成多行（像昨天的 json_each），`STRUCT(a, b)` 把几个字段打包成一个
+- `SELECT * EXCEPT (rationale)`：除了某几列都要（没选的列不扫，也就不收钱）
+- 在仓库里做 AI：BigQuery ML 能在 SQL 里调用模型生成 embedding，`VECTOR_SEARCH` 在表里做向量相似度搜索（用法以官方文档为准）
+
+例子里：`rn` 是排序后的名次，`n` 是这一组的行数。名次 ≥ 0.95 × n 的行里最小的延迟，正好是第 ceil(0.95 × n) 个，也就是 nearest-rank 的 p95。
+--- code
+WITH ranked AS (
+  SELECT
+    model,
+    latency_ms,
+    ROW_NUMBER() OVER (PARTITION BY model ORDER BY latency_ms) AS rn,
+    COUNT(*) OVER (PARTITION BY model) AS n
+  FROM clausecheck.reviews
+)
+SELECT
+  model,
+  MAX(n) AS n,
+  MIN(IF(rn >= 0.95 * n, latency_ms, NULL)) AS p95_ms
+FROM ranked
+GROUP BY model
+ORDER BY model
+
+@@ concept
+title: Python 客户端：查询、参数、行
+lang: py
+cloud: yes
+dataset: clausecheck
+--- body
+Python 里用 `google-cloud-bigquery`：
+
+```python
+from google.cloud import bigquery
+client = bigquery.Client()                    # 项目和凭证来自环境（第 26 天细讲）
+config = bigquery.QueryJobConfig(
+    query_parameters=[bigquery.ScalarQueryParameter("cid", "INT64", 103)],
+    labels={"feature": "dashboard"},
+)
+job = client.query(sql, job_config=config)    # 提交一个查询任务
+rows = list(job.result())                     # 等它跑完，拿到所有行
+```
+
+- SQL 里写 `@cid`，值用 `ScalarQueryParameter(名字, 类型, 值)` 传，类型写 `"STRING"`、`"INT64"`、`"FLOAT64"`、`"BOOL"`、`"DATE"`、`"TIMESTAMP"`。和昨天的 `?` 一个道理：**永远不要用 f-string 拼值**。表名、列名同样不能用参数
+- 行可以用 `row["verdict"]`、`row.verdict`、`row[0]` 取值，`dict(row.items())` 变成字典。INT64 → int，FLOAT64 → float，TIMESTAMP → 带时区（UTC）的 `datetime`
+- `job.result()` 只能遍历**一次**，要用两次就先 `list(...)`
+- SQL 写错、表不存在：错误在 `job.result()` 时才抛出，不是在 `client.query()` 时
+- `labels` 给查询贴标签，账单里就能按功能分摊成本
+- 真 SDK 里 `job.result().to_dataframe()` 能直接变成 pandas 表（本页没有 pandas）
+--- code
+from google.cloud import bigquery
+
+client = bigquery.Client()
+sql = """
+SELECT id, clause_id, verdict, created_at
+FROM clausecheck.reviews
+WHERE contract_id = @cid AND risk = @risk
+ORDER BY id
+"""
+config = bigquery.QueryJobConfig(query_parameters=[
+    bigquery.ScalarQueryParameter("cid", "INT64", 103),
+    bigquery.ScalarQueryParameter("risk", "STRING", "high"),
+])
+job = client.query(sql, job_config=config)
+rows = list(job.result())
+for row in rows:
+    print(row["id"], row.clause_id, row[2], row.created_at.isoformat())
+print(dict(rows[0].items()))
+
+bad = client.query("SELECT verdict FROM reviews")      # 忘了写数据集
+print("client.query() did not raise")
+try:
+    bad.result()
+except Exception as e:
+    print(type(e).__name__, e)
+
+@@ concept
+title: dry run、字节上限和缓存
+lang: py
+cloud: yes
+dataset: clausecheck
+--- body
+花钱之前先算：
+
+- **dry run**（空跑）：`QueryJobConfig(dry_run=True)`。BigQuery 只检查 SQL、估算扫描量，不真跑，**不收钱**。读 `job.total_bytes_processed`。SQL 有错时 `client.query()` 当场就报错。官方的 Python 示例写的是 `QueryJobConfig(dry_run=True, use_query_cache=False)`：估算时不看缓存
+- **字节上限**：`QueryJobConfig(maximum_bytes_billed=字节数)`。预计计费字节超过上限，查询直接失败，不收钱。因为每个表至少按 10 MB（10485760 字节）计费，上限低于它时，任何读表的查询都会失败
+- 超限的错误原因（reason）是 `bytesBilledLimitExceeded`。用 `client.query()` + `result()` 时，SDK 的错误对照表里没有这个原因，就报成 500 `InternalServerError`，**不是** `BadRequest`；换一种调用方式，类型可能又不一样。所以要接住它们共同的父类 `GoogleAPICallError`，再看 `e.errors[0]["reason"]`
+- **缓存**：一模一样的查询（连空格都一样）24 小时内再跑一次，只要表没变过，结果直接来自缓存（`job.cache_hit` 是 True），计费 0 字节。表刚被流式写入过、用了 `CURRENT_TIMESTAMP()` 这类每次都变的函数时，不走缓存
+
+下面：三条查询的扫描量（注意 LIMIT 那条）；一个过低的上限；同一条查询跑两次。
+--- code
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPICallError
+
+client = bigquery.Client()
+for sql in [
+    "SELECT * FROM clausecheck.reviews",
+    "SELECT verdict, cost_usd FROM clausecheck.reviews",
+    "SELECT verdict, cost_usd FROM clausecheck.reviews LIMIT 1",
+]:
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
+    print(f"{job.total_bytes_processed:>5} bytes  {sql}")
+
+limited = bigquery.QueryJobConfig(maximum_bytes_billed=5_000_000)
+try:
+    client.query("SELECT verdict FROM clausecheck.reviews", job_config=limited).result()
+except GoogleAPICallError as e:
+    print(type(e).__name__, e.errors[0]["reason"])
+
+first = client.query("SELECT COUNT(*) AS n FROM clausecheck.evals")
+first.result()
+again = client.query("SELECT COUNT(*) AS n FROM clausecheck.evals")
+print("cache hit:", first.cache_hit, again.cache_hit, "| billed:", first.total_bytes_billed, again.total_bytes_billed)
+
+@@ concept
+title: 写入：流式和批量
+lang: py
+cloud: yes
+dataset: clausecheck
+--- body
+追踪数据怎么进 BigQuery？两种方式：
+
+- **流式写入** `client.insert_rows_json(表名, 行的列表)`：写进去几秒内就能查到，按写入量收费（官方价格页：每 200 MiB 0.01 美元，每行至少按 1 KB 算；以官方为准）。适合 worker 每审完一条就写一行。它用的是老的 insertAll（REST）接口，写起来最简单；新项目 Google 推荐走 gRPC 的 Storage Write API，更便宜
+- **批量加载**：先把一批数据写成文件放进 Cloud Storage，再用 load job 导入。加载本身不收费，适合大批量、不着急的数据
+
+行的数据有问题时，`insert_rows_json` **不抛异常，而是返回错误列表**，一定要检查：成功是 `[]`；失败时每项是 `{"index": 第几行, "errors": [...]}`。（表不存在、没权限这类整个请求的错误，才会抛异常。）默认**一行坏，整批都不写**：坏行的 reason 是 `invalid`，其他行是 `stopped`，可以原样重发。`skip_invalid_rows=True` 让好行直接写进去。
+
+BigQuery 不会替你挡住重复行：表上可以声明主键，但不强制执行（只给查询优化用）。同一行发两次，通常就存成两行（`row_ids` 参数只能尽力去重）。所以看板查询常要自己去重，比如用 QUALIFY 取每组最新的一条。注意：本页的模拟把 `id` 当成主键，同一个 id 发两次只留一行，这一点和真 BigQuery 不一样。
+--- code
+from google.cloud import bigquery
+
+client = bigquery.Client()
+TABLE = "clausecheck-dev.clausecheck.reviews"
+row = {
+    "id": 1066, "contract_id": 110, "clause_id": "9.1", "heading": "Warranties", "topic": "warranty",
+    "verdict": "accept", "risk": "low", "rule_ids": '["PB-00"]', "model": "deepseek-flash",
+    "prompt_version": "v2", "prompt_tokens": 2104, "completion_tokens": 151, "cache_hit_tokens": 1650,
+    "latency_ms": 2210, "cost_usd": 0.000327, "created_at": "2026-09-23 10:00:00",
+}
+bad = dict(row, id=1067, prompt_tokens="many")
+
+errors = client.insert_rows_json(TABLE, [row, bad])
+for e in errors:
+    print(e["index"], e["errors"][0]["reason"], e["errors"][0]["message"])
+print(client.insert_rows_json(TABLE, [row]))
+n = list(client.query("SELECT COUNT(*) AS n FROM clausecheck.reviews").result())[0]["n"]
+print("rows now:", n)
+
+@@ item d25-01
+type: sql
+title: 复习：每个模型最慢的两条
+level: 2
+ordered: yes
+--- prompt
+复习第 23 天的窗口函数（这题用普通 SQLite 写法，表名不用带数据集）：找出每个模型延迟最高的**两条**审查。返回四列：`model`、`id`、`clause_id`、`latency_ms`，按 model 排序，同一个模型里按 latency_ms 从高到低。用 `ROW_NUMBER()`。
+--- solution
+WITH ranked AS (
+  SELECT model, id, clause_id, latency_ms,
+         ROW_NUMBER() OVER (PARTITION BY model ORDER BY latency_ms DESC) AS rn
+  FROM reviews
+)
+SELECT model, id, clause_id, latency_ms
+FROM ranked
+WHERE rn <= 2
+ORDER BY model, latency_ms DESC;
+--- hints
+- 在 CTE 里给每一行编号：`ROW_NUMBER() OVER (PARTITION BY model ORDER BY latency_ms DESC) AS rn`。
+- 外面的查询只留 `rn <= 2` 的行。窗口函数的结果不能直接写在同一层的 WHERE 里，所以要套一层 CTE。
+- 最后 `ORDER BY model, latency_ms DESC`。
+
+@@ item d25-02
+type: sql
+title: 修 bug：搬到 BigQuery 报错
+level: 1
+bq: yes
+ordered: yes
+--- prompt
+这条查询统计「已完成（status = 'reviewed'）的合同」里每种判定有几条成功的审查。它在 SQLite 里好好的，搬到 BigQuery 就报错。运行，读报错，修好它。结果两列：`verdict`、`n`，按 n 从多到少。
+--- starter
+SELECT r.verdict, COUNT(*) AS n
+FROM reviews AS r
+JOIN contracts AS c ON c.id = r.contract_id
+WHERE c.status = 'reviewed' AND r.error IS NULL
+GROUP BY r.verdict
+ORDER BY n DESC, r.verdict;
+--- solution
+SELECT r.verdict, COUNT(*) AS n
+FROM clausecheck.reviews AS r
+JOIN clausecheck.contracts AS c ON c.id = r.contract_id
+WHERE c.status = 'reviewed' AND r.error IS NULL
+GROUP BY r.verdict
+ORDER BY n DESC, r.verdict;
+--- hints
+- 报错说 `Table name "reviews" missing dataset`：BigQuery 不知道 reviews 在哪个数据集里。
+- 两张表都要带上数据集：`clausecheck.reviews`、`clausecheck.contracts`（或者带项目的反引号写法）。别名 `r`、`c` 不用改。
+
+@@ item d25-03
+type: sql
+title: 各版本的 redline 率
+level: 1
+bq: yes
+ordered: yes
+--- prompt
+看板第一个问题：每个 prompt 版本的 redline 率。只算成功的审查（`error IS NULL`）。返回四列：
+
+- `prompt_version`
+- `reviews`：成功的审查条数
+- `redlines`：其中 redline 的条数
+- `redline_rate`：redlines ÷ reviews，`ROUND(..., 3)`
+
+按 prompt_version 排序。用 `COUNTIF` 和 `SAFE_DIVIDE`。
+--- solution
+SELECT
+  prompt_version,
+  COUNT(*) AS reviews,
+  COUNTIF(verdict = 'redline') AS redlines,
+  ROUND(SAFE_DIVIDE(COUNTIF(verdict = 'redline'), COUNT(*)), 3) AS redline_rate
+FROM clausecheck.reviews
+WHERE error IS NULL
+GROUP BY prompt_version
+ORDER BY prompt_version;
+--- hints
+- 失败的行先用 WHERE 去掉，再 `GROUP BY prompt_version`。
+- `COUNTIF(verdict = 'redline')` 数 redline；比率：`ROUND(SAFE_DIVIDE(COUNTIF(verdict = 'redline'), COUNT(*)), 3)`。
+
+@@ item d25-04
+type: sql
+title: 每份合同的缓存命中率
+level: 2
+bq: yes
+ordered: yes
+--- prompt
+缓存命中率 = 命中缓存的输入 token ÷ 全部输入 token（第 12、13 天）。算每份合同的命中率，返回三列：`contract_id`、`reviews`（审查条数）、`cache_hit_ratio`（`SUM(cache_hit_tokens)` ÷ `SUM(prompt_tokens)`，`ROUND(..., 3)`），按命中率从低到高。
+
+看结果：命中率最低的是只有 2 条审查的 110。为什么条数少的合同命中率低？（看一眼每份合同第一条审查的 `cache_hit_tokens`。）
+--- solution
+SELECT
+  contract_id,
+  COUNT(*) AS reviews,
+  ROUND(SAFE_DIVIDE(SUM(cache_hit_tokens), SUM(prompt_tokens)), 3) AS cache_hit_ratio
+FROM clausecheck.reviews
+GROUP BY contract_id
+ORDER BY cache_hit_ratio;
+--- hints
+- 先求和再相除：`SAFE_DIVIDE(SUM(cache_hit_tokens), SUM(prompt_tokens))`。不要先算每行的比率再 AVG，那样短请求和长请求权重一样，结果不对。
+- 在 SQLite 和 Postgres 里 `SUM(a) / SUM(b)` 是整数除法，会得到 0；BigQuery 的 `/` 本来就得到小数。用 SAFE_DIVIDE 还多一层保险：分母是 0 时得到 NULL，整条查询不会报错。
+- 每份合同的第一条请求缓存是冷的（cache_hit_tokens 是 0），后面的请求才命中共同的前缀。条数越少，这条冷请求占比越大。
+
+@@ item d25-05
+type: sql
+title: 每月每客户的花费
+level: 2
+bq: yes
+ordered: yes
+--- prompt
+给客户开账单：每个月、每个客户的审查花费。按**审查时间**算月份，失败的审查也花了钱，也要算。返回四列：
+
+- `month_start`：`DATE_TRUNC(DATE(r.created_at), MONTH)`
+- `customer`：客户名
+- `reviews`：审查条数
+- `cost_usd`：`ROUND(SUM(cost_usd), 4)`
+
+按 month_start 从早到晚，同一个月里按 cost_usd 从高到低。没有审查的客户不用出现。
+--- solution
+SELECT
+  DATE_TRUNC(DATE(r.created_at), MONTH) AS month_start,
+  cu.name AS customer,
+  COUNT(*) AS reviews,
+  ROUND(SUM(r.cost_usd), 4) AS cost_usd
+FROM clausecheck.reviews AS r
+JOIN clausecheck.contracts AS c ON c.id = r.contract_id
+JOIN clausecheck.customers AS cu ON cu.id = c.customer_id
+GROUP BY month_start, customer
+ORDER BY month_start, cost_usd DESC;
+--- hints
+- 审查要经过合同才能找到客户：reviews → contracts → customers，三张表都带数据集。
+- GROUP BY 可以直接用别名：`GROUP BY month_start, customer`。
+- 注意单位不带引号：`DATE_TRUNC(DATE(r.created_at), MONTH)`。
+
+@@ item d25-06
+type: sql
+title: 多久开审，有没有重审
+level: 2
+bq: yes
+ordered: yes
+--- prompt
+两个运营问题：合同上传以后多久开始审？后来有没有被重审？每份合同返回三列：
+
+- `contract_id`
+- `seconds_to_first`：从上传（`uploaded_at`）到第一条审查的秒数，用 `TIMESTAMP_DIFF`
+- `days_to_last`：从上传日期到最后一条审查的日期相差几天，用 `DATE_DIFF(DATE(...), DATE(...), DAY)`
+
+按 days_to_last 从大到小，一样的按 contract_id 从小到大。
+--- solution
+SELECT
+  c.id AS contract_id,
+  TIMESTAMP_DIFF(MIN(r.created_at), c.uploaded_at, SECOND) AS seconds_to_first,
+  DATE_DIFF(DATE(MAX(r.created_at)), DATE(c.uploaded_at), DAY) AS days_to_last
+FROM clausecheck.contracts AS c
+JOIN clausecheck.reviews AS r ON r.contract_id = c.id
+GROUP BY c.id, c.uploaded_at
+ORDER BY days_to_last DESC, contract_id;
+--- hints
+- 按合同分组：`GROUP BY c.id, c.uploaded_at`（uploaded_at 要用在 SELECT 的计算里，所以也放进 GROUP BY）。
+- 第一条审查是 `MIN(r.created_at)`，最后一条是 `MAX(r.created_at)`。参数顺序是「晚的在前、早的在后」：`TIMESTAMP_DIFF(MIN(r.created_at), c.uploaded_at, SECOND)`。
+- 结果最上面两份是 103 和 109：正是那两次重审（第 23 天「每组最新一条」用过的数据）。
+
+@@ item d25-07
+type: sql
+title: 延迟 p50 和 p95
+level: 3
+bq: yes
+ordered: yes
+--- prompt
+延迟不能只看平均（第 13 天）。按 prompt_version 算延迟的 p50 和 p95，用 nearest-rank：排序后的第 ceil(p × n) 个。返回五列：`prompt_version`、`n`（条数）、`p50_ms`、`p95_ms`、`avg_ms`（`ROUND(AVG(latency_ms))`），按 prompt_version 排序。
+
+真 BigQuery 里会写 `APPROX_QUANTILES(latency_ms, 100)[OFFSET(95)]`；本页用知识卡片里的窗口函数写法。看结果：v1 的 p95 为什么比 v2 高那么多？
+--- solution
+WITH ranked AS (
+  SELECT
+    prompt_version,
+    latency_ms,
+    ROW_NUMBER() OVER (PARTITION BY prompt_version ORDER BY latency_ms) AS rn,
+    COUNT(*) OVER (PARTITION BY prompt_version) AS n
+  FROM clausecheck.reviews
+)
+SELECT
+  prompt_version,
+  MAX(n) AS n,
+  MIN(IF(rn >= 0.5 * n, latency_ms, NULL)) AS p50_ms,
+  MIN(IF(rn >= 0.95 * n, latency_ms, NULL)) AS p95_ms,
+  ROUND(AVG(latency_ms)) AS avg_ms
+FROM ranked
+GROUP BY prompt_version
+ORDER BY prompt_version;
+--- hints
+- 照着知识卡片「本页跑不了的 BigQuery 写法」里的例子，把 `PARTITION BY model` 换成 `PARTITION BY prompt_version`。
+- p50 和 p95 是同一个套路：`MIN(IF(rn >= 0.5 * n, latency_ms, NULL))`，把 0.5 换成 0.95 就是 p95。
+- v1 的 29 条里有 2 条用了 deepseek-v4-pro（8 秒以上），它们就是最慢的两条，p95 正好取到其中一条；平均值只高了 0.5 秒，p95 却高了一倍多。
+
+@@ item d25-08
+type: fill
+title: 填空：每周失败率
+level: 2
+bq: yes
+ordered: yes
+--- prompt
+补全这条看板查询：按周（从星期日算起）统计审查条数、失败条数和失败率（`error` 不是 NULL 就是失败），按周从早到晚。
+--- template
+SELECT
+  DATE_TRUNC(DATE(created_at), [[WEEK]]) AS week_start,
+  COUNT(*) AS reviews,
+  [[COUNTIF]](error IS NOT NULL) AS failed,
+  ROUND([[SAFE_DIVIDE]](COUNTIF(error IS NOT NULL), COUNT(*)), 3) AS failure_rate
+FROM [[clausecheck.reviews]]
+GROUP BY week_start
+ORDER BY week_start;
+--- hints
+- 截到「周」的单位关键字是 `WEEK`，不带引号。
+- 数满足条件的行用 `COUNTIF`；安全的除法用 `SAFE_DIVIDE`；表名要带数据集。
+
+@@ item d25-09
+type: choice
+title: LIMIT 省钱吗
+level: 1
+--- prompt
+同事想看看 `clausecheck.reviews`（假设整张表 2 TiB）长什么样，在 BigQuery 里写了 `SELECT * FROM clausecheck.reviews LIMIT 10`。按需计费时，这条查询大约按多少数据收费？
+--- options
+- 10 行的数据，几 KB
+- 整张表的所有列，约 2 TiB：LIMIT 只是少返回几行，列式存储照样把用到的列全部读一遍
+- 0：带 LIMIT 的查询免费
+- 只按第一列算
+answer: 2
+--- explain
+按官方价格页的示例单价（每 TiB 6.25 美元，以官方价格页为准），这一下就是 12.5 美元，看板每 5 分钟跑一次就是一大笔钱。想看数据长什么样，用控制台里表的「预览」，免费；真要查，只选需要的列，先 dry run 看扫描量，再设 `maximum_bytes_billed` 当安全带。面试常问这一题。
+
+@@ item d25-10
+type: choice
+title: 哪条扫得最少
+level: 2
+--- prompt
+`clausecheck.reviews` 按 `DATE(created_at)` 分区、按 `customer_id` 聚簇，存了一整年的数据。下面哪条查询扫描的数据**最少**？
+--- options
+- `SELECT customer_id, cost_usd FROM clausecheck.reviews LIMIT 100`
+- `SELECT * FROM clausecheck.reviews WHERE created_at >= TIMESTAMP('2026-09-01')`
+- `SELECT customer_id, cost_usd FROM clausecheck.reviews WHERE created_at >= TIMESTAMP('2026-09-01')`
+- `SELECT customer_id, cost_usd FROM clausecheck.reviews WHERE cost_usd > 0.0005`
+answer: 3
+--- explain
+第 3 条拿分区列 `created_at` 和常量比较，只读 9 月以后的分区，而且只读 3 列（WHERE 里的 created_at 也算）。第 2 条分区一样，但 `SELECT *` 读所有列。第 1 条 LIMIT 不减少扫描，读一整年。第 4 条按普通列过滤，分区剪不掉，也读一整年。建表时加 `require_partition_filter = TRUE`，第 1、4 条这种查询会直接报错，不会悄悄扫全表。
+
+@@ item d25-11
+type: predict
+title: 行、类型和只能遍历一次
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+--- prompt
+写出输出。注意：NULL 到 Python 里是什么？TIMESTAMP 列回来是什么类型（`.day` 能用吗）？`job.result()` 能遍历两次吗？
+--- code
+from google.cloud import bigquery
+
+client = bigquery.Client()
+job = client.query("SELECT id, verdict, risk, created_at FROM clausecheck.reviews WHERE contract_id = 109 ORDER BY id")
+rows = job.result()
+print(rows.total_rows)
+for row in rows:
+    print(row["id"], row.verdict, row[2], row.created_at.day)
+try:
+    for row in rows:
+        print("again", row.id)
+except ValueError as e:
+    print("ValueError:", e.args[0])
+--- explain
+失败的 1061 那条，verdict 和 risk 是 NULL，到 Python 里是 `None`。TIMESTAMP 列回来是带 UTC 时区的 `datetime`，所以 `.day` 能用。`result()` 返回的迭代器只能走一遍，第二次循环报 `ValueError: Iterator has already started`。要用两次就先 `rows = list(job.result())`。
+
+@@ item d25-12
+type: code
+title: 客户报告：用参数
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+--- prompt
+写 `run_report(client, customer_id)`：用起始代码里的 `SQL` 查出这个客户每份合同的汇总，返回字典列表（`dict(row.items())`），按 contract_id 排序；没有合同的客户返回 `[]`。
+
+SQL 里的 `@customer_id` 要用 `bigquery.ScalarQueryParameter("customer_id", "INT64", customer_id)` 传进去，放在 `QueryJobConfig(query_parameters=[...])` 里。
+
+例：`run_report(client, 4)` → `[{"contract_id": 107, "title": "Reseller Agreement", "reviews": 8, "redlines": 2, "cost_usd": 0.006198}, {"contract_id": 108, ...}]`
+--- starter
+from google.cloud import bigquery
+
+SQL = """
+SELECT c.id AS contract_id, c.title, COUNT(r.id) AS reviews,
+       COUNTIF(r.verdict = 'redline') AS redlines,
+       ROUND(SUM(r.cost_usd), 6) AS cost_usd
+FROM clausecheck.contracts AS c
+JOIN clausecheck.reviews AS r ON r.contract_id = c.id
+WHERE c.customer_id = @customer_id
+GROUP BY c.id, c.title
+ORDER BY c.id
+"""
+
+def run_report(client, customer_id):
+    pass
+--- solution
+from google.cloud import bigquery
+
+SQL = """
+SELECT c.id AS contract_id, c.title, COUNT(r.id) AS reviews,
+       COUNTIF(r.verdict = 'redline') AS redlines,
+       ROUND(SUM(r.cost_usd), 6) AS cost_usd
+FROM clausecheck.contracts AS c
+JOIN clausecheck.reviews AS r ON r.contract_id = c.id
+WHERE c.customer_id = @customer_id
+GROUP BY c.id, c.title
+ORDER BY c.id
+"""
+
+def run_report(client, customer_id):
+    config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("customer_id", "INT64", customer_id)],
+    )
+    rows = client.query(SQL, job_config=config).result()
+    return [dict(row.items()) for row in rows]
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+def _brief(customer_id):
+    return [(r["contract_id"], r["title"], r["reviews"], r["redlines"], round(r["cost_usd"], 6)) for r in run_report(client, customer_id)]
+expect("客户 4 的两份合同", lambda: _brief(4), [(107, "Reseller Agreement", 8, 2, 0.006198), (108, "Mutual NDA", 4, 1, 0.00238)])
+expect("每项是字典，键就是列名", lambda: sorted(run_report(client, 2)[0]), ["contract_id", "cost_usd", "redlines", "reviews", "title"])
+expect("客户 2", lambda: [r["contract_id"] for r in run_report(client, 2)], [103, 104])
+expect("没有合同的客户", lambda: run_report(client, 6), [])
+def _sent_sql():
+    run_report(client, 3)
+    return "@customer_id" in CLOUD.calls[-1][1]
+expect("SQL 原样发出去，值走参数（没有把 3 拼进 SQL）", _sent_sql, True)
+--- hints
+- `config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("customer_id", "INT64", customer_id)])`。
+- `rows = client.query(SQL, job_config=config).result()`，然后 `[dict(row.items()) for row in rows]`。
+
+@@ item d25-13
+type: fix
+title: 修 bug：f-string 拼进 SQL
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+--- prompt
+`reviews_by_topic(client, topic)` 返回某个主题的审查 id（按 id 排序）。它把 topic 直接拼进了 SQL：值里有撇号就报错，还能被注入。运行测试，然后改成 `@topic` 参数（类型 `"STRING"`）。昨天在 SQLite 里修过一模一样的 bug，这次换成 BigQuery 的写法。
+--- starter
+from google.cloud import bigquery
+
+def reviews_by_topic(client, topic):
+    sql = f"SELECT id FROM clausecheck.reviews WHERE topic = '{topic}' ORDER BY id"
+    return [row["id"] for row in client.query(sql).result()]
+--- solution
+from google.cloud import bigquery
+
+def reviews_by_topic(client, topic):
+    sql = "SELECT id FROM clausecheck.reviews WHERE topic = @topic ORDER BY id"
+    config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("topic", "STRING", topic)],
+    )
+    return [row["id"] for row in client.query(sql, job_config=config).result()]
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+expect("普通主题", lambda: reviews_by_topic(client, "termination"), [1010, 1027, 1033, 1043, 1053])
+expect("注入只是一个查不到的怪主题", lambda: reviews_by_topic(client, "x' OR 'a'='a"), [])
+expect("带撇号的值不会弄坏 SQL", lambda: reviews_by_topic(client, "o'clock"), [])
+def _value_in_sql():
+    reviews_by_topic(client, "warranty")
+    return "warranty" in CLOUD.calls[-1][1]
+expect("值没有被拼进 SQL 文本", _value_in_sql, False)
+--- hints
+- SQL 里写 `WHERE topic = @topic`，不要引号，也不要 f-string。
+- 值放进 `bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("topic", "STRING", topic)])`，再 `client.query(sql, job_config=config)`。
+
+@@ item d25-14
+type: code
+title: 先估算，不真跑
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+--- prompt
+写 `estimate_cost(client, sql, usd_per_tib=6.25)`：用 **dry run** 估算这条查询的扫描量和费用，返回 `{"bytes": 扫描字节数, "usd": 美元}`，其中 `usd = bytes / 2**40 * usd_per_tib`（不四舍五入；6.25 只是示例单价，以官方价格页为准）。
+
+- 绝不能真的运行这条查询：估算一条 DELETE 的费用时，数据不能被删掉
+- SQL 有错时让错误抛出去（dry run 在 `client.query()` 时就会报 `BadRequest`）
+
+真实账单还有「每表至少 10 MB」的规则，这里先不管。
+--- starter
+from google.cloud import bigquery
+
+def estimate_cost(client, sql, usd_per_tib=6.25):
+    job = client.query(sql)
+    job.result()
+    n = job.total_bytes_processed
+    return {"bytes": n, "usd": n / 2**40 * usd_per_tib}
+--- solution
+from google.cloud import bigquery
+
+def estimate_cost(client, sql, usd_per_tib=6.25):
+    config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+    job = client.query(sql, job_config=config)
+    n = job.total_bytes_processed
+    return {"bytes": n, "usd": n / 2**40 * usd_per_tib}
+--- tests
+from google.cloud import bigquery
+from google.api_core.exceptions import BadRequest
+client = bigquery.Client()
+STAR = "SELECT * FROM clausecheck.reviews"
+TWO = "SELECT verdict, cost_usd FROM clausecheck.reviews"
+expect("SELECT * 的字节数", lambda: estimate_cost(client, STAR)["bytes"], 9508)
+expect("只选两列，少扫很多", lambda: estimate_cost(client, TWO)["bytes"], 1008)
+expect("同一条 SQL 估两次，结果一样（真跑的话第二次命中缓存，得到 0）", lambda: [estimate_cost(client, TWO)["bytes"] for _ in range(2)], [1008, 1008])
+expect("费用 = bytes / 2**40 * 单价", lambda: estimate_cost(client, STAR, usd_per_tib=5.0)["usd"], 9508 / 2**40 * 5.0)
+def _delete_is_safe():
+    estimate_cost(client, "DELETE FROM clausecheck.reviews WHERE error IS NOT NULL")
+    return list(client.query("SELECT COUNT(*) AS n FROM clausecheck.reviews").result())[0]["n"]
+expect("估算 DELETE 不会真的删数据", _delete_is_safe, 65)
+expect_raises("SQL 写错：dry run 当场报 BadRequest", lambda: estimate_cost(client, "SELEC verdict FROM clausecheck.reviews"), BadRequest)
+--- hints
+- 起始代码真的跑了查询：看「估算 DELETE」那个测试，数据真的被删了。
+- `config = bigquery.QueryJobConfig(dry_run=True)`（官方示例还加了 `use_query_cache=False`），`job = client.query(sql, job_config=config)`；dry run 不用调用 `result()`（它只会返回 0 行），直接读 `job.total_bytes_processed`。
+
+@@ item d25-15
+type: code
+title: 字节上限当安全带
+level: 3
+lang: py
+cloud: yes
+dataset: clausecheck
+--- prompt
+写 `safe_query(client, sql, max_bytes)`：
+
+- 用 `QueryJobConfig(maximum_bytes_billed=max_bytes)` 运行查询，返回行的字典列表（`dict(row.items())`）
+- 超出上限（错误的 `errors[0]["reason"]` 是 `"bytesBilledLimitExceeded"`）：不崩，返回 `None`
+- 其他错误（SQL 写错、表不存在）照常抛出
+
+超限的错误从 `result()` 抛出来时是 500 `InternalServerError`，不是 `BadRequest`（知识卡片讲过原因）：要 `except GoogleAPICallError as e:`，再看原因。记住每个用到的表至少按 10 MB（`10 * 1024 * 1024` 字节）计费。
+--- starter
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPICallError
+
+def safe_query(client, sql, max_bytes):
+    config = bigquery.QueryJobConfig(maximum_bytes_billed=max_bytes)
+    job = client.query(sql, job_config=config)
+    return [dict(row.items()) for row in job.result()]
+--- solution
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPICallError
+
+def safe_query(client, sql, max_bytes):
+    config = bigquery.QueryJobConfig(maximum_bytes_billed=max_bytes)
+    job = client.query(sql, job_config=config)
+    try:
+        rows = job.result()
+    except GoogleAPICallError as e:
+        if e.errors and e.errors[0].get("reason") == "bytesBilledLimitExceeded":
+            return None
+        raise
+    return [dict(row.items()) for row in rows]
+--- tests
+from google.cloud import bigquery
+from google.api_core.exceptions import BadRequest, NotFound
+client = bigquery.Client()
+MB = 1024 * 1024
+ONE = "SELECT verdict, COUNT(*) AS n FROM clausecheck.reviews WHERE error IS NULL GROUP BY verdict ORDER BY verdict"
+TWO = "SELECT r.id, c.title FROM clausecheck.reviews AS r JOIN clausecheck.contracts AS c ON c.id = r.contract_id WHERE r.id = 1001"
+expect("上限太低：返回 None，不崩", lambda: safe_query(client, ONE, 5_000_000), None)
+expect("一张表，上限 10 MB：够了", lambda: safe_query(client, ONE, 10 * MB), [{"verdict": "accept", "n": 37}, {"verdict": "flag", "n": 14}, {"verdict": "redline", "n": 12}])
+expect("两张表至少 20 MB：10 MB 不够", lambda: safe_query(client, TWO, 10 * MB), None)
+expect("两张表，上限 20 MB", lambda: safe_query(client, TWO, 20 * MB), [{"id": 1001, "title": "CloudNotes SaaS Agreement"}])
+expect_raises("表名写错：NotFound 照常抛出", lambda: safe_query(client, "SELECT id FROM clausecheck.review", 20 * MB), NotFound)
+expect_raises("SQL 写错：BadRequest 照常抛出", lambda: safe_query(client, "SELEC id FROM clausecheck.reviews", 20 * MB), BadRequest)
+--- hints
+- 错误是 `job.result()` 抛出来的，所以 try 包住 `result()`。
+- `except GoogleAPICallError as e:` 里看 `e.errors[0].get("reason")`：是 `"bytesBilledLimitExceeded"` 就 `return None`，否则 `raise` 原样抛出。
+- 只写 `except BadRequest` 接不住超限（它是 500）；只写 `except GoogleAPICallError: return None` 又把真正的 bug 吞掉了；只接 `InternalServerError` 也不对，服务器真出故障的 500 也会被当成「超限」。按 reason 判断才准确。
+
+@@ item d25-16
+type: code
+title: 流式写入：检查错误列表
+level: 3
+lang: py
+cloud: yes
+dataset: clausecheck
+--- prompt
+写 `stream_reviews(client, rows)`，把审查行流式写进 `TABLE`，返回 `{"inserted": 写进去的行数, "bad": [坏行的下标，从小到大]}`：
+
+1. `rows` 为空：直接返回 `{"inserted": 0, "bad": []}`，**不调用** API
+2. `errors = client.insert_rows_json(TABLE, rows)`；`errors == []` 说明全部写入
+3. 否则：errors 里 reason 是 `"invalid"` 的是坏行，记下下标；其余的行（reason 是 `"stopped"`，被连累的好行）原样重发一次
+4. 重发还有错误：`raise RuntimeError`
+
+例：4 行里第 1、3 行是坏的 → 返回 `{"inserted": 2, "bad": [1, 3]}`，库里多了第 0、2 行。
+--- starter
+from google.cloud import bigquery
+
+TABLE = "clausecheck-dev.clausecheck.reviews"
+
+def stream_reviews(client, rows):
+    client.insert_rows_json(TABLE, rows)
+    return {"inserted": len(rows), "bad": []}
+--- solution
+from google.cloud import bigquery
+
+TABLE = "clausecheck-dev.clausecheck.reviews"
+
+def stream_reviews(client, rows):
+    if not rows:
+        return {"inserted": 0, "bad": []}
+    errors = client.insert_rows_json(TABLE, rows)
+    if not errors:
+        return {"inserted": len(rows), "bad": []}
+    bad = sorted(e["index"] for e in errors if any(x["reason"] == "invalid" for x in e["errors"]))
+    retry = [row for i, row in enumerate(rows) if i not in bad]
+    if retry:
+        again = client.insert_rows_json(TABLE, retry)
+        if again:
+            raise RuntimeError(f"retry failed: {again}")
+    return {"inserted": len(retry), "bad": bad}
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+def _row(i, **changes):
+    row = {"id": i, "contract_id": 110, "clause_id": "9.1", "heading": "Warranties", "topic": "warranty",
+           "verdict": "accept", "risk": "low", "rule_ids": '["PB-00"]', "model": "deepseek-flash",
+           "prompt_version": "v2", "prompt_tokens": 2104, "completion_tokens": 151, "cache_hit_tokens": 1650,
+           "latency_ms": 2210, "cost_usd": 0.000327, "created_at": "2026-09-23 10:00:00"}
+    row.update(changes)
+    return row
+def _all_good():
+    result = stream_reviews(client, [_row(3001), _row(3002)])
+    ids = [r["id"] for r in client.query("SELECT id FROM clausecheck.reviews WHERE id BETWEEN 3000 AND 3099 ORDER BY id").result()]
+    return result, ids
+expect("全是好行", _all_good, ({"inserted": 2, "bad": []}, [3001, 3002]))
+def _mixed():
+    result = stream_reviews(client, [_row(3101), _row(3102, prompt_tokens="many"), _row(3103), _row(3104, created_at=None)])
+    ids = [r["id"] for r in client.query("SELECT id FROM clausecheck.reviews WHERE id BETWEEN 3100 AND 3199 ORDER BY id").result()]
+    return result, ids
+expect("坏行记下标，好行重发后写进去", _mixed, ({"inserted": 2, "bad": [1, 3]}, [3101, 3103]))
+def _empty():
+    before = len(CLOUD.calls)
+    result = stream_reviews(client, [])
+    return result, len(CLOUD.calls) - before
+expect("空列表：不调用 API", _empty, ({"inserted": 0, "bad": []}, 0))
+--- hints
+- 起始代码没看返回值：`insert_rows_json` 出错时**不抛异常**，只返回错误列表。
+- 坏行：`[e["index"] for e in errors if any(x["reason"] == "invalid" for x in e["errors"])]`；要重发的是其余的行：`[row for i, row in enumerate(rows) if i not in bad]`。
+- 另一种写法也可以：第一次就传 `skip_invalid_rows=True`，好行直接写进去，返回的错误里只剩坏行。
+
+@@ item d25-17
+type: order
+title: 排代码：按风险计数
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+--- prompt
+排出 `risk_counts(client, contract_id)`：返回这份合同每个风险等级的审查条数，形如 `{"low": 8, "medium": 2, "high": 2}`；失败的审查（risk 是 NULL）不算。contract_id 用参数传。有两行干扰项。
+--- lines
+from google.cloud import bigquery
+def risk_counts(client, contract_id):
+    sql = "SELECT risk, COUNT(*) AS n FROM clausecheck.reviews WHERE contract_id = @cid AND risk IS NOT NULL GROUP BY risk"
+    param = bigquery.ScalarQueryParameter("cid", "INT64", contract_id)
+    config = bigquery.QueryJobConfig(query_parameters=[param])
+    job = client.query(sql, job_config=config)
+    rows = job.result()
+    return {row["risk"]: row["n"] for row in rows}
+--- distractors
+    sql = f"SELECT risk, COUNT(*) AS n FROM clausecheck.reviews WHERE contract_id = {contract_id} AND risk IS NOT NULL GROUP BY risk"
+    config = bigquery.QueryJobConfig(query_parameters=param)
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+expect("合同 101", lambda: risk_counts(client, 101), {"low": 8, "medium": 2, "high": 2})
+expect("失败的审查不算", lambda: risk_counts(client, 106), {"low": 1, "high": 1})
+def _uses_param():
+    risk_counts(client, 110)
+    return "@cid" in CLOUD.calls[-1][1]
+expect("SQL 里用的是参数", _uses_param, True)
+--- hints
+- 顺序：写 SQL → 做参数 → 放进 config → 提交查询 → 取结果 → 变成字典。
+- `query_parameters` 要的是**列表**：`[param]`。
+
+@@ item d25-18
+type: local
+title: 本机任务（选做）：BigQuery 沙盒
+level: 2
+lang: py
+--- prompt
+BigQuery 有一个免费的**沙盒**：用 Google 账号就能开，不用信用卡、不用建结算账号。按官方「BigQuery sandbox」页面的说明：和免费额度一样每月 1 TiB 查询，存储一共 10 GiB（删了数据也不退回额度），表 60 天后自动过期，不支持流式写入和改数据的 DML（规则会变，以官方页面为准）。打不开 Google 服务的话，跳过这一题。
+
+**第 1 步**：用浏览器打开 `console.cloud.google.com/bigquery`，用 Google 账号登录，接受服务条款，按提示创建一个项目（组织选「No organization」即可）。不要点「升级」，也不要添加结算信息。
+
+**第 2 步**：在查询编辑器里粘贴下面的查询（公开数据集：莎士比亚作品的词频表），**先不要运行**：
+
+```sql
+SELECT word, SUM(word_count) AS n
+FROM `bigquery-public-data.samples.shakespeare`
+GROUP BY word
+ORDER BY n DESC
+LIMIT 10
+```
+
+**第 3 步**：看编辑器旁边的提示（一个绿色对勾，英文界面写着 This query will process … when run）：这就是 dry run 估出来的扫描量，记下来。
+
+**第 4 步**：把整条查询临时换成下面这句，再看估算变成多少（LIMIT 省不省？），然后换回第 2 步的查询：
+
+```sql
+SELECT * FROM `bigquery-public-data.samples.shakespeare` LIMIT 10
+```
+
+**第 5 步**：点运行。在结果旁边的「作业信息 / Job information」里找到处理的字节数和计费的字节数（Bytes processed / Bytes billed）。
+
+**第 6 步**：把两次估算的数字和作业信息里那两行粘贴到下面。计费的字节为什么比处理的多？（提示：今天的「每表至少 10 MB」）
+placeholder: 粘贴两次估算的扫描量，以及作业信息里的 Bytes processed / Bytes billed
+verify: (process|处理|bytes|字节|MB|KB)
+--- hints
+- 找不到估算：SQL 写对了它才会出现，写错时那个位置显示的是红色的错误。
+- 第 4 步如果只把第一行改成 `SELECT *`，下面的 `GROUP BY word` 还在，查询就错了（`*` 里的列没有分组），所以要换掉整条查询。
+
+@@ item d25-e1
+type: sql
+title: 闭卷：每月每客户的 redline 率
+exam: yes
+level: 3
+bq: yes
+ordered: yes
+--- prompt
+用 BigQuery 写法：每个月、每个客户的 redline 率，只算成功的审查（`error IS NULL`），月份按审查时间算。返回五列：
+
+- `month_start`：审查所在月的第一天（DATE）
+- `customer`：客户名
+- `reviews`：成功的审查条数
+- `redlines`：其中 redline 的条数
+- `redline_rate`：redlines ÷ reviews，用 SAFE_DIVIDE，`ROUND(..., 3)`
+
+按 month_start 从早到晚，同一个月里按 redline_rate 从高到低，再一样的按 customer 字母顺序。表：`clausecheck.reviews`、`clausecheck.contracts`（`customer_id`）、`clausecheck.customers`（`name`）。
+--- solution
+SELECT
+  DATE_TRUNC(DATE(r.created_at), MONTH) AS month_start,
+  cu.name AS customer,
+  COUNT(*) AS reviews,
+  COUNTIF(r.verdict = 'redline') AS redlines,
+  ROUND(SAFE_DIVIDE(COUNTIF(r.verdict = 'redline'), COUNT(*)), 3) AS redline_rate
+FROM clausecheck.reviews AS r
+JOIN clausecheck.contracts AS c ON c.id = r.contract_id
+JOIN clausecheck.customers AS cu ON cu.id = c.customer_id
+WHERE r.error IS NULL
+GROUP BY month_start, customer
+ORDER BY month_start, redline_rate DESC, customer;
+
+@@ item d25-e2
+type: scratch
+title: 闭卷：先估价再查询
+exam: yes
+level: 3
+lang: py
+cloud: yes
+dataset: clausecheck
+--- prompt
+写 `guarded_query(client, sql, params, max_usd, usd_per_tib=6.25)`，用 `from google.cloud import bigquery`：
+
+- `params` 是字典 `{参数名: (类型, 值)}`，比如 `{"cid": ("INT64", 103)}`，SQL 里写 `@cid`。把它们变成 `bigquery.ScalarQueryParameter(名字, 类型, 值)` 的列表；`params` 可以是空字典
+- 先 **dry run**（同样要带上参数，否则 dry run 会因为找不到 `@cid` 而报错），费用 = `total_bytes_processed / 2**40 * usd_per_tib`
+- 费用大于 `max_usd`：`raise ValueError`，**不要**真的运行
+- 否则真正运行（带参数），返回行的字典列表（`dict(row.items())`）
+
+例：`guarded_query(client, "SELECT id, verdict FROM clausecheck.reviews WHERE contract_id = @cid AND risk = @risk ORDER BY id", {"cid": ("INT64", 101), "risk": ("STRING", "high")}, 0.01)` → `[{"id": 1005, "verdict": "redline"}, {"id": 1006, "verdict": "flag"}]`
+--- solution
+from google.cloud import bigquery
+
+def guarded_query(client, sql, params, max_usd, usd_per_tib=6.25):
+    qp = [bigquery.ScalarQueryParameter(name, type_, value) for name, (type_, value) in params.items()]
+    dry = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=qp, dry_run=True, use_query_cache=False))
+    usd = dry.total_bytes_processed / 2**40 * usd_per_tib
+    if usd > max_usd:
+        raise ValueError(f"query would cost {usd:.8f} USD, limit {max_usd}")
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=qp))
+    return [dict(row.items()) for row in job.result()]
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+SQL = "SELECT id, verdict FROM clausecheck.reviews WHERE contract_id = @cid AND risk = @risk ORDER BY id"
+expect("便宜的查询：带参数，返回行", lambda: guarded_query(client, SQL, {"cid": ("INT64", 101), "risk": ("STRING", "high")}, 0.01), [{"id": 1005, "verdict": "redline"}, {"id": 1006, "verdict": "flag"}])
+def _too_expensive():
+    before = len(CLOUD.calls)
+    try:
+        guarded_query(client, "SELECT * FROM clausecheck.reviews", {}, 0.0)
+    except ValueError:
+        return len(CLOUD.calls) - before
+    return "没有抛出 ValueError"
+expect("太贵：ValueError，只做了 dry run（1 次调用）", _too_expensive, 1)
+def _delete_not_run():
+    try:
+        guarded_query(client, "DELETE FROM clausecheck.reviews WHERE contract_id = @cid", {"cid": ("INT64", 110)}, 0.0)
+    except ValueError:
+        pass
+    return list(client.query("SELECT COUNT(*) AS n FROM clausecheck.reviews").result())[0]["n"]
+expect("先估价后运行：太贵的 DELETE 没有执行", _delete_not_run, 65)
+
+@@ item d25-e3
+type: sql
+title: 闭卷：评测通过率
+exam: yes
+level: 3
+bq: yes
+ordered: yes
+--- prompt
+用 BigQuery 写法，从 `clausecheck.evals` 算每种期望判定（`expected`）在每个 prompt 版本下的通过率。`passed` 列是 1（通过）或 0。返回五列：
+
+- `expected`
+- `prompt_version`
+- `runs`：跑了几次
+- `passed_runs`：通过了几次
+- `pass_rate`：passed_runs ÷ runs，用 SAFE_DIVIDE，`ROUND(..., 3)`
+
+按 expected、再按 prompt_version 排序。看结果：v2 修好了哪一类用例，又让哪一类变差了一点？
+--- solution
+SELECT
+  expected,
+  prompt_version,
+  COUNT(*) AS runs,
+  COUNTIF(passed = 1) AS passed_runs,
+  ROUND(SAFE_DIVIDE(COUNTIF(passed = 1), COUNT(*)), 3) AS pass_rate
+FROM clausecheck.evals
+GROUP BY expected, prompt_version
+ORDER BY expected, prompt_version;

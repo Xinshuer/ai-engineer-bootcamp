@@ -831,7 +831,7 @@ level: 2
 def review(clause_id, *, strict=False, **extra):
     return clause_id, strict, extra
 
-opts = {"strict": True, "model": "deepseek-chat"}
+opts = {"strict": True, "model": "deepseek-flash"}
 --- options
 - `review("8.1")`
 - `review("8.1", strict=True)`
@@ -839,7 +839,7 @@ opts = {"strict": True, "model": "deepseek-chat"}
 - `review("8.1", **opts)`
 answer: 3
 --- explain
-单独的 `*` 后面的参数只能按名字传，第二个位置参数 `True` 没地方放，报 `takes 1 positional argument but 2 were given`。`**opts` 展开成 `strict=True, model="deepseek-chat"`：`strict` 对上了参数，`model` 被 `**extra` 收走。读 `review.py` 里的 `client.messages.create(**kwargs)` 也是这个道理：把一个字典原样展开传给 SDK。
+单独的 `*` 后面的参数只能按名字传，第二个位置参数 `True` 没地方放，报 `takes 1 positional argument but 2 were given`。`**opts` 展开成 `strict=True, model="deepseek-flash"`：`strict` 对上了参数，`model` 被 `**extra` 收走。读 `review.py` 里的 `client.messages.create(**kwargs)` 也是这个道理：把一个字典原样展开传给 SDK。
 
 @@ item d8-e1
 type: scratch

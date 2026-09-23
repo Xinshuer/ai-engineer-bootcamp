@@ -55,9 +55,14 @@ function parseContent(file) {
 const list = (s) => (s ? s.split(/^- /m).map((x) => x.trim()).filter(Boolean) : []);
 function normalize(o, day) {
   const out = { ...o, lang: o.lang || day.lang };
+  // SQL blocks use the day's dataset unless they name one; Python blocks name it explicitly
+  if (out.lang === "sql" && !out.dataset && day.dataset) out.dataset = day.dataset;
   for (const k of ["options", "hints", "checklist"]) if (o[k] !== undefined) out[k] = list(o[k]);
   if (o.answer !== undefined) out.answer = o.answer.split(",").map((x) => Number(x.trim()) - 1);
-  for (const k of ["exam", "mock"]) out[k] = o[k] === "yes";
+  for (const k of ["exam", "mock", "cloud", "ordered", "bq"]) out[k] = o[k] === "yes";
+  // LangChain / LangGraph (real libraries + the mock DeepSeek server): per block, or for every
+  // Python block of a day with `langchain: yes` on the day (a block can opt out with `langchain: no`)
+  out.langchain = out.lang === "py" && (o.langchain === "yes" || (o.langchain === undefined && day.langchain === "yes"));
   if (o.level) out.level = Number(o.level);
   if (o.type === "fill") {
     out.solution = o.template.replace(/\[\[(.*?)\]\]/g, "$1");
@@ -83,10 +88,19 @@ function normalize(o, day) {
 const DAYS = [];
 const dayNum = (f) => Number(/\d+/.exec(f)[0]);
 for (const f of fs.readdirSync(P("content")).filter((f) => /^day\d+\.txt$/.test(f)).sort((a, b) => dayNum(a) - dayNum(b))) parseContent(P("content", f));
+// datasets for SQL / database / cloud exercises: content/data/<name>.sql
+const DATASETS = {};
+if (fs.existsSync(P("content", "data")))
+  for (const f of fs.readdirSync(P("content", "data")).filter((f) => f.endsWith(".sql")))
+    DATASETS[f.replace(/\.sql$/, "")] = fs.readFileSync(P("content", "data", f), "utf8").replace(/\r\n/g, "\n");
 
 // ---------------------------------------------------------------- runtimes
 // Validation runs from node_modules + vendor/, so --day runs never touch dist/.
 const WHEELS = fs.readdirSync(P("vendor")).filter((f) => f.endsWith(".whl")).map((f) => f.replace(/\.whl$/, ".wasm"));
+// the LangChain week: vendor/lc/ (node fetch-vendor.mjs) holds the libraries and everything they import
+const LC_WHEELS = fs.existsSync(P("vendor", "lc")) ? fs.readdirSync(P("vendor", "lc")).filter((f) => f.endsWith(".whl")).map((f) => f.replace(/\.whl$/, ".wasm")) : [];
+// tiktoken's encoding file sits in its cache (the name is sha1 of the download URL), so OpenAIEmbeddings works offline
+const TIKTOKEN = { file: "cl100k_base.tiktoken.txt", cache: "/tmp/data-gym-cache/9b5ad71b2ce5302211f9c61530b329a4922fc6a4" };
 fs.mkdirSync(P("build"), { recursive: true });
 
 const libs = {};
@@ -109,6 +123,9 @@ const PY_RUNNER = fs.readFileSync(P("src", "harness", "py_runner.py"), "utf8");
 const PY_MOCK = fs.readFileSync(P("src", "harness", "py_mock.py"), "utf8");
 const TS_RUNTIME = fs.readFileSync(P("src", "harness", "ts_runtime.js"), "utf8");
 const PY_DISCOVER = fs.readFileSync(P("src", "harness", "py_discover.py"), "utf8");
+const PY_SQL = fs.readFileSync(P("src", "harness", "py_sql.py"), "utf8");
+const PY_CLOUD = fs.readFileSync(P("src", "harness", "py_cloud.py"), "utf8");
+const PY_LANGCHAIN = fs.readFileSync(P("src", "harness", "py_langchain.py"), "utf8");
 const TS_COMPILE = fs.readFileSync(P("src", "harness", "ts_compile.js"), "utf8");
 vm.runInThisContext(TS_COMPILE);
 const ZOD = fs.readFileSync(ZOD_FILE, "utf8");
@@ -120,10 +137,45 @@ const SITE = py.runPython("import site; site.getsitepackages()[0]");
 for (const f of WHEELS) py.unpackArchive(new Uint8Array(fs.readFileSync(P("vendor", f.replace(/\.wasm$/, ".whl")))), "wheel", { extractDir: SITE });
 py.runPython("import importlib; importlib.invalidate_caches(); import pydantic");
 py.runPython(PY_RUNNER);
+const loadModule = py.globals.get("_cc_load_module");
+loadModule("_ccsql", PY_SQL);
+loadModule("_cccloud", PY_CLOUD);
+loadModule("_cclc", PY_LANGCHAIN);
 const pyRun = py.globals.get("run");
-const runPy = (code, tests = "", mock = false) => JSON.parse(pyRun(code, tests, mock ? PY_MOCK : ""));
+const pySqlRun = py.globals.get("_cc_run_sql");
+let lcReady = false;
+function ensureLangchain() {
+  if (lcReady) return;
+  if (!LC_WHEELS.length) throw new Error("vendor/lc/ is missing: run node fetch-vendor.mjs");
+  for (const f of LC_WHEELS) py.unpackArchive(new Uint8Array(fs.readFileSync(P("vendor", "lc", f.replace(/\.wasm$/, ".whl")))), "wheel", { extractDir: SITE });
+  py.FS.mkdirTree(path.posix.dirname(TIKTOKEN.cache));
+  py.FS.writeFile(TIKTOKEN.cache, fs.readFileSync(P("vendor", "lc", "cl100k_base.tiktoken")));
+  py.runPython("import importlib; importlib.invalidate_caches(); import _cclc; _cclc.prepare()");
+  lcReady = true;
+}
+// what runs before the learner's Python code: the mock API, a dataset + fresh_db(), the mock cloud,
+// LangChain pointed at the mock (the page builds exactly the same string, see pySetup in index.html)
+const FRESH_DB = "def fresh_db():\n    import sqlite3\n    conn = sqlite3.connect(':memory:')\n    conn.executescript(DATASET_SQL)\n    return conn\n";
+const LC_PREP = "import _cclc\n_cclc.prepare()\n";
+function pySetup(o) {
+  if (o.langchain) ensureLangchain();
+  let s = o.langchain ? LC_PREP : "";
+  s += o.mock || o.langchain ? PY_MOCK + "\n" : "";
+  if (o.langchain) s += "_cclc.use_mock(MOCK)\n";
+  if (o.dataset) {
+    if (!(o.dataset in DATASETS)) throw new Error(`${o.id}: unknown dataset ${o.dataset}`);
+    s += `DATASET_SQL = ${JSON.stringify(DATASETS[o.dataset])}\n${FRESH_DB}`;
+  }
+  if (o.cloud) s += `import _cccloud\nCLOUD = _cccloud._cc_cloud_install(${o.dataset ? "DATASET_SQL" : '""'})\n`;
+  return s;
+}
+const runPy = (o, code, tests = "") => JSON.parse(pyRun(code, tests, pySetup(o)));
 // testwrite: the learner's tests are main.py; the code under test is loaded first, as setup
-const runTestwrite = (impl, testCode, mock = false) => JSON.parse(pyRun(testCode, PY_DISCOVER, (mock ? PY_MOCK + "\n" : "") + impl));
+const runTestwrite = (o, impl, testCode) => JSON.parse(pyRun(testCode, PY_DISCOVER, pySetup(o) + "\n" + impl));
+// SQL: the dataset (plus the item's own --- schema) is the setup; the reference query is the answer
+const sqlSetup = (o) => [o.dataset ? DATASETS[o.dataset] : "", o.schema || ""].join("\n");
+const sqlSpec = (o, solution) => JSON.stringify({ solution: solution ?? null, check: o.check || null, ordered: !!o.ordered, bq: !!o.bq });
+const runSql = (o, code, solution) => JSON.parse(pySqlRun(code, sqlSpec(o, solution), sqlSetup(o)));
 
 function runTs(code, tests = "") {
   const { diagnostics, js } = CCTS.compile(ts, libs, code, tests);
@@ -152,14 +204,51 @@ const bad = (id, msg) => problems.push(`${id}: ${msg}`);
 const allPass = (r) => !r.error && !(r.diagnostics || []).length && r.tests.length > 0 && r.tests.every((t) => t.passed);
 const summary = (r) => r.error || (r.diagnostics || []).map((d) => `L${d.line} ${d.message}`).join("; ") || r.tests.filter((t) => !t.passed).map((t) => `${t.label} got=${t.got} exp=${t.expected} ${t.error || ""}`).join(" | ") || "(no tests)";
 
-async function run(lang, code, tests, mock) { return lang === "py" ? runPy(code, tests, mock) : await runTs(code, tests); }
+async function run(o, code, tests) {
+  if (o.lang === "sql") return runSql(o, code, o.type === "predict" || !o.solution ? null : o.solution);
+  return o.lang === "py" ? runPy(o, code, tests) : await runTs(code, tests);
+}
+// table info for the schema panel of SQL items: one entry per dataset (+ the item's own tables)
+const TABLES = {};
+const tableInfo = py.runPython(`
+import json, sqlite3
+def _cc_table_info(setup):
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(setup)
+    out = []
+    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY rowid"):
+        cols = [{"name": c[1], "type": c[2]} for c in conn.execute(f"PRAGMA table_info({name})")]
+        cur = conn.execute(f"SELECT * FROM {name} LIMIT 3")
+        out.append({"name": name, "columns": cols, "count": conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0],
+                    "sample": [list(r) for r in cur.fetchall()]})
+    return json.dumps(out)
+_cc_table_info
+`);
+function tablesKey(o) {
+  if (o.lang !== "sql") return null;
+  const key = o.schema ? `${o.dataset || ""}+${o.id}` : o.dataset || null;
+  if (key && !TABLES[key]) TABLES[key] = JSON.parse(tableInfo(sqlSetup(o)));
+  return key;
+}
+
+// LangChain code that passes in the browser but not on a normal machine (the browser has one thread
+// and no event loop of its own), checked on every code field of the item
+function lintLangchain(o) {
+  const code = ["code", "starter", "solution", "tests", "impl", "template", "lines"].map((k) => o[k] || "").join("\n");
+  if (/SqliteSaver\s*\(\s*sqlite3\.connect\((?![^)]*check_same_thread\s*=\s*False)/.test(code) || /sqlite3\.connect\((?![^)]*check_same_thread\s*=\s*False)[^)]*\)[\s\S]*SqliteSaver\s*\(/.test(code))
+    bad(o.id, "SqliteSaver(sqlite3.connect(...)) needs check_same_thread=False: real LangGraph writes checkpoints from another thread (or use SqliteSaver.from_conn_string)");
+  if (/\basyncio\.run\(|^\s*await\s|\bainvoke\(|\bastream\(|\babatch\(/m.test(code))
+    bad(o.id, "async LangChain calls cannot run in the browser runtime (no asyncio.run); show them in concept text only");
+}
+for (const day of DAYS) for (const c of day.concepts) if (c.langchain && c.code) lintLangchain(c);
 
 const ids = new Set();
 for (const day of DAYS) {
   const validate = onlyDays === null || onlyDays.has(Number(day.id));
   for (const c of day.concepts) {
     if (!validate || !c.code) continue;
-    const r = await run(c.lang, c.code, "", c.mock);
+    const r = await run(c, c.code, "");
+    c.tables = tablesKey(c);
     checked++;
     if (SHOW) console.log(`--- ${c.id} ${c.title}\n${r.stdout || ""}${r.error || ""}${(r.diagnostics || []).map((d) => `L${d.line} ${d.message}`).join("\n")}`);
     if (c.error_demo === "yes") { if (!r.error && !(r.diagnostics || []).length) bad(c.id, "error demo did not error"); }
@@ -172,16 +261,45 @@ for (const day of DAYS) {
     if (!validate) continue;
     checked++;
     const t = it.type;
+    if (it.langchain) lintLangchain(it);
     if (t === "choice") {
       if (!it.options?.length || !it.answer?.length || it.answer.some((a) => a < 0 || a >= it.options.length)) bad(it.id, "bad options/answer");
       if (!it.explain) bad(it.id, "missing explain");
       continue;
     }
+    it.tables = tablesKey(it);
+    if (it.lang === "sql" && t === "order" && !it.tests) {
+      // judged by line order only, but the correct order must still be a working query
+      const r = runSql(it, it.solution, null);
+      if (r.error) bad(it.id, "the correct line order is not a valid query: " + r.error.split("\n").pop());
+      continue;
+    }
+    if (it.lang === "sql" && t !== "choice" && t !== "local" && !(t === "order" && !it.tests)) {
+      if (!["sql", "fill", "order"].includes(t)) { bad(it.id, `SQL items are type sql / fill / order, not ${t}`); continue; }
+      if (!it.solution) { bad(it.id, "SQL item needs --- solution"); continue; }
+      const sol = runSql(it, it.solution, it.solution);
+      if (!allPass(sol)) { bad(it.id, "SOLUTION fails: " + summary(sol)); continue; }
+      if (!sol.table.rows.length && it.allow_empty !== "yes") bad(it.id, "solution returns no rows (set allow_empty: yes if that is the point)");
+      it.expected_table = sol.expected_table;
+      if (SHOW) console.log(`--- ${it.id} ${it.title}\n${sol.stdout}`);
+      const starter = it.starter;
+      if (starter !== undefined && starter.trim() && it.skip_starter !== "yes") {
+        const st = runSql(it, starter, it.solution);
+        if (allPass(st)) bad(it.id, "STARTER already passes");
+      }
+      if (t === "sql" && it.exam && it.starter) bad(it.id, "exam items have no starter");
+      continue;
+    }
     if (t === "predict") {
-      const r = await run(it.lang, it.code, "", it.mock);
+      const r = await run(it, it.code, "");
       if (r.error || (r.diagnostics || []).length) { bad(it.id, "predict code errors: " + summary(r)); continue; }
       it.expected = r.stdout.replace(/\s+$/, "");
       if (!it.expected) bad(it.id, "predict prints nothing");
+      // the answer must not depend on the run (message ids, interrupt ids, timings, random jitter)
+      if (it.lang === "py") {
+        const again = (await run(it, it.code, "")).stdout.replace(/\s+$/, "");
+        if (again !== it.expected) bad(it.id, `predict output differs between two runs:\n  1: ${JSON.stringify(it.expected).slice(0, 300)}\n  2: ${JSON.stringify(again).slice(0, 300)}`);
+      }
       if (SHOW) console.log(`--- ${it.id} ${it.title}\n${it.expected}`);
       if (it.lang === "ts") {
         const real = realNode(r.js);
@@ -194,31 +312,31 @@ for (const day of DAYS) {
     if (t === "testwrite") {
       if (it.lang !== "py") { bad(it.id, "testwrite is Python only"); continue; }
       if (!it.impl || !it.mutants.length || !it.solution || it.starter === undefined) { bad(it.id, "testwrite needs impl, mutants, solution (reference tests) and starter"); continue; }
-      const onImpl = runTestwrite(it.impl, it.solution, it.mock);
+      const onImpl = runTestwrite(it, it.impl, it.solution);
       if (!allPass(onImpl)) bad(it.id, "reference tests fail on the correct impl: " + summary(onImpl));
       it.mutants.forEach((m, i) => {
         if (!m.note) bad(it.id, `mutant ${i + 1} has no clue after =====`);
-        const r = runTestwrite(m.code, it.solution, it.mock);
+        const r = runTestwrite(it, m.code, it.solution);
         if (r.error) bad(it.id, `mutant ${i + 1} does not even load: ${r.error.split("\n").pop()}`);
         else if (allPass(r)) bad(it.id, `reference tests miss mutant ${i + 1} (${m.note})`);
       });
-      const st = runTestwrite(it.impl, it.starter, it.mock);
-      if (allPass(st) && it.mutants.every((m) => !allPass(runTestwrite(m.code, it.starter, it.mock)))) bad(it.id, "STARTER tests already catch every mutant");
+      const st = runTestwrite(it, it.impl, it.starter);
+      if (allPass(st) && it.mutants.every((m) => !allPass(runTestwrite(it, m.code, it.starter)))) bad(it.id, "STARTER tests already catch every mutant");
       continue;
     }
     if (t === "order" && !it.tests) continue;
     if (!it.tests) { bad(it.id, "missing tests"); continue; }
-    const sol = await run(it.lang, it.solution, it.tests, it.mock);
+    const sol = await run(it, it.solution, it.tests);
     if (!allPass(sol)) bad(it.id, "SOLUTION fails: " + summary(sol));
     else if (sol.tests.length < 2 && !it.exam) bad(it.id, "fewer than 2 tests");
     if (t === "order") {
       const scrambled = [...it.lines].reverse().join("\n");
-      const r = await run(it.lang, scrambled, it.tests, it.mock);
+      const r = await run(it, scrambled, it.tests);
       if (allPass(r)) bad(it.id, "reversed order also passes");
       continue;
     }
     if (it.starter !== undefined && it.skip_starter !== "yes") {
-      const st = await run(it.lang, it.starter, it.tests, it.mock);
+      const st = await run(it, it.starter, it.tests);
       if (allPass(st)) bad(it.id, "STARTER already passes");
     } else if (t !== "scratch" && it.starter === undefined) bad(it.id, "missing starter");
   }
@@ -239,11 +357,13 @@ for (const f of ["pyodide.mjs", "pyodide.asm.mjs", "pyodide.asm.wasm", "pyodide-
   fs.copyFileSync(P("node_modules", "pyodide", f), P("dist", "pyodide", f));
 fs.copyFileSync(P("node_modules", "pyodide", "python_stdlib.zip"), P("dist", "pyodide", "python_stdlib.wasm"));
 for (const f of WHEELS) fs.copyFileSync(P("vendor", f.replace(/\.wasm$/, ".whl")), P("dist", "pyodide", "pkg", f));
+for (const f of LC_WHEELS) fs.copyFileSync(P("vendor", "lc", f.replace(/\.wasm$/, ".whl")), P("dist", "pyodide", "pkg", f));
+if (LC_WHEELS.length) fs.copyFileSync(P("vendor", "lc", "cl100k_base.tiktoken"), P("dist", "pyodide", "pkg", TIKTOKEN.file));
 fs.writeFileSync(P("dist", "zod.iife.js"), ZOD);
-const course = { builtAt: new Date().toISOString(), days: DAYS };
+const course = { builtAt: new Date().toISOString(), days: DAYS, datasets: DATASETS, tables: TABLES };
 fs.writeFileSync(P("dist", "course.js"), "window.CC_COURSE = " + JSON.stringify(course) + ";\n");
 fs.writeFileSync(P("dist", "harness.js"), [
-  "window.CC_HARNESS = " + JSON.stringify({ PY_RUNNER, PY_MOCK, PY_DISCOVER, TS_RUNTIME, WHEELS }) + ";",
+  "window.CC_HARNESS = " + JSON.stringify({ PY_RUNNER, PY_MOCK, PY_DISCOVER, PY_SQL, PY_CLOUD, PY_LANGCHAIN, TS_RUNTIME, WHEELS, LC_WHEELS, TIKTOKEN }) + ";",
   TS_COMPILE,
 ].join("\n"));
 fs.writeFileSync(P("dist", "ts-libs.json"), JSON.stringify(libs));

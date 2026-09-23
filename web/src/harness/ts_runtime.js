@@ -143,6 +143,8 @@ const __RULES = [
   ["subject to section", "flag", "high", "liability_cap"],
 ];
 const __TOPICS = [["liabil", "liability_cap"], ["renew", "auto_renewal"], ["data", "data_processing"], ["fee", "payment"], ["pay", "payment"], ["confiden", "confidentiality"], ["terminat", "termination"]];
+// current DeepSeek model names (mirror of py_mock.py _CC_MODELS; deepseek-chat / deepseek-reasoner were discontinued 2026-07-24)
+const __MODELS = ["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"];
 const __STATUS_TEXT = { 429: "Rate limit reached, please retry later", 500: "Internal server error", 503: "Service unavailable" };
 // mock embeddings: same hashed bag of words as py_mock.py (FNV-1a into 256 dims, contract synonyms folded)
 const __EMBED_DIM = 256;
@@ -196,6 +198,21 @@ const MOCK = {
     }
     return { clause_id, verdict: "accept", risk_level: "low", topic: "other", rationale: "Mock review: nothing unusual found." };
   },
+  // structured output: fill every property of the forced tool's schema (mirror of py_mock.py _fill)
+  fill(schema, known, defs) {
+    defs = defs || schema.$defs || {};
+    const out = {};
+    for (let [k, p] of Object.entries(schema.properties || {})) {
+      if (p.$ref) p = defs[p.$ref.split("/").pop()] || {};
+      const en = p.enum || ("const" in p ? [p.const] : null);
+      const v = known[k];
+      if (typeof v === "string" && (p.type || "string") === "string" && (!en || en.includes(v))) out[k] = v;
+      else if (en) out[k] = en[0];
+      else if (p.type === "object" && p.properties) out[k] = this.fill(p, known, defs);
+      else out[k] = ({ string: `mock ${k}`, integer: 0, number: 0, boolean: false, array: [], object: {} })[p.type] ?? null;
+    }
+    return out;
+  },
   handle(url, headers, body) {
     this.calls.push({ url, body });
     const err = (status, message, type) => [status, { error: { message, type } }];
@@ -208,7 +225,17 @@ const MOCK = {
     if (isEmbed) return this.embeddings(body);
     if (!body || typeof body !== "object" || typeof body.model !== "string" || !Array.isArray(body.messages) || body.messages.length === 0)
       return err(400, "Invalid request: the body needs 'model' (a string) and 'messages' (a non-empty list)", "invalid_request_error");
-    if (!["deepseek-chat", "deepseek-reasoner"].includes(body.model)) return err(400, `Model Not Exist: ${body.model}`, "invalid_request_error");
+    if (!__MODELS.includes(body.model)) return err(400, `Model Not Exist: ${body.model}`, "invalid_request_error");
+    // thinking mode (DeepSeek V4): on unless the body says { thinking: { type: "disabled" } }
+    const thinking = body.thinking;
+    if (thinking !== undefined && thinking !== null && (typeof thinking !== "object" || !["enabled", "disabled"].includes(thinking.type)))
+      return err(400, `Invalid request: 'thinking' must be {"type": "enabled"} or {"type": "disabled"}`, "invalid_request_error");
+    const think = !(thinking && thinking.type === "disabled");
+    // thinking mode + tools: every earlier assistant message must carry its reasoning_content (mirror of py_mock.py)
+    if (think && body.tools && body.tools.length) {
+      const i = body.messages.findIndex((m) => m && m.role === "assistant" && typeof m.reasoning_content !== "string");
+      if (i >= 0) return err(400, `Invalid request: thinking mode with tools needs the reasoning_content of every earlier assistant message passed back (message at index ${i} has none). Pass it back, or send "thinking": {"type": "disabled"}`, "invalid_request_error");
+    }
     const messages = body.messages;
     for (let i = 0; i < messages.length; i++) {
       const m = messages[i];
@@ -247,19 +274,26 @@ const MOCK = {
     const tools = body.tools || [];
     const toolMsgs = messages.filter((m) => m.role === "tool");
     const fmt = (body.response_format || {}).type;
+    if (![undefined, null, "text", "json_object"].includes(fmt))
+      return err(400, `Invalid request: response_format type '${fmt}' is not supported (use 'json_object', or tools)`, "invalid_request_error");
+    const choice = body.tool_choice;
+    const forced = choice && typeof choice === "object" ? (choice.function || {}).name : null;
+    const required = choice === "required" || choice === "any";
     let message, finish = "stop";
-    if (tools.length && (!toolMsgs.length || userText.includes("[loop]"))) {
+    if (tools.length && choice !== "none" && (forced || required || !toolMsgs.length || userText.includes("[loop]"))) {
       // same tool choice and argument filling as py_mock.py
       const low = userText.toLowerCase();
       const fns = tools.map((t) => t.function || {});
-      const fn = fns.find((f) => f.name && userText.includes(f.name)) || fns[0];
+      const fn = fns.find((f) => forced && f.name === forced) || (required && toolMsgs.length ? fns[fns.length - 1] : null)
+        || fns.find((f) => f.name && userText.includes(f.name)) || fns[0];
       const name = fn.name || "tool";
       const props = (fn.parameters || {}).properties;
       const hit = __TOPICS.find(([kw]) => low.includes(kw));
       const topic = hit ? hit[1] : "other";
       const cid = /clause\s+(\d+(?:\.\d+)*)/i.exec(userText);
       const known = { topic, clause_id: cid ? cid[1] : "unknown", query: userText.replace(/\[[a-z-]+\]/g, "").trim().slice(0, 80) };
-      const args = !props ? { topic } : Object.fromEntries(Object.entries(known).filter(([k]) => k in props));
+      const args = forced || required ? this.fill(fn.parameters || {}, { ...known, ...this.judge(userText) })
+        : !props ? { topic } : Object.fromEntries(Object.entries(known).filter(([k]) => k in props));
       const argText = userText.includes("[bad-args]") ? '{"topic": ' : JSON.stringify(args);
       message = { role: "assistant", content: "", tool_calls: [{ id: `call_${toolMsgs.length + 1}`, type: "function", function: { name, arguments: argText } }] };
       finish = "tool_calls";
@@ -275,11 +309,18 @@ const MOCK = {
       }
       message = { role: "assistant", content };
     }
-    const completionTokens = Math.floor((message.content || "").length / 4) + 5;
+    let completionTokens = Math.floor((message.content || "").length / 4) + 5;
+    let reasoningTokens = 0;
+    if (think) {
+      // the chain of thought comes back next to the answer and is billed as output
+      message.reasoning_content = `Mock reasoning: ${messages.length} message(s) read; deciding how to answer.`;
+      reasoningTokens = Math.floor(message.reasoning_content.length / 4) + 40;
+      completionTokens += reasoningTokens;
+    }
     return [200, {
       id: `mock-${this.calls.length}`, object: "chat.completion", model: body.model,
       choices: [{ index: 0, message, finish_reason: finish }],
-      usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, prompt_cache_hit_tokens: cacheHit, prompt_cache_miss_tokens: promptTokens - cacheHit },
+      usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, prompt_cache_hit_tokens: cacheHit, prompt_cache_miss_tokens: promptTokens - cacheHit, ...(think ? { completion_tokens_details: { reasoning_tokens: reasoningTokens } } : {}) },
     }];
   },
   embeddings(body) {

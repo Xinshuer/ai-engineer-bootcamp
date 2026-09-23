@@ -59,6 +59,8 @@ mock: yes
 - 回顾第 7 天：pass@k（k 次里至少对一次）很容易接近 100%；pass^k（k 次全对）才是无人值守要看的。`run_evals.py` 的表里就有 `pass^k` 一列
 - 本页的模拟服务器对 AS IS 免责条款故意摇摆（约 60% 判 accept）。`MOCK.reset()` 会把它的随机种子复位，所以同样的代码每次跑出同样的数，测试才能写死期望值
 
+`classify` 的请求和昨天一样带着 `"thinking": {"type": "disabled"}`：评测要把每条用例调很多次，判一条条款又用不着长推理，关掉思考模式更快、更便宜，`temperature` 也重新起作用。
+
 下面的例子里，跑 1 次是 100%，跑多了才看出它其实不稳。
 --- code
 import json
@@ -69,7 +71,8 @@ URL = "https://api.deepseek.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 
 def classify(clause_text):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}],
+            "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
     return json.loads(content)
 
@@ -231,7 +234,7 @@ title: token、缓存命中率、延迟分位数
 把每次调用的 `usage` 加起来，就是这次评测（或这份合同）的总账：
 
 - **总 token** 和**缓存命中率** `hit ÷ (hit + miss)`：命中率低，说明请求开头有东西在变（昨天学的）
-- **成本**：第 7 天的 `estimate_cost`；给客户报价时换算成「每 100 份合同多少钱」
+- **成本**：第 7 天的 `estimate_cost`；给客户报价时换算成「每 100 份合同多少钱」。开着思考模式时，推理 token 也算在 `completion_tokens` 里（其中推理占多少，看 `usage["completion_tokens_details"]["reasoning_tokens"]`），按输出价格收费
 - **延迟不要只看平均**：一次 30 秒的卡顿会被一堆 1 秒的调用平均掉。要看 **p50**（一半的调用比它快）和 **p95**（95% 的调用比它快，代表「慢的那批」有多慢）
 
 最简单的分位数算法（nearest-rank）：排好序，取第 `ceil(p ÷ 100 × n)` 个（从 1 开始数）。下面 10 个延迟里，p50 是第 5 个，p95 是第 10 个。
@@ -355,7 +358,8 @@ URL = "https://api.deepseek.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 
 def classify(clause_text):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}],
+            "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
     return json.loads(content)
 
@@ -379,7 +383,8 @@ URL = "https://api.deepseek.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 
 def classify(clause_text):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}],
+            "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
     return json.loads(content)
 
@@ -991,7 +996,7 @@ def _real():
     MOCK.reset()
     responses = []
     for clause in ["Review clause 3.1: fees.", "Review clause 8.1: unlimited.", "Review clause 4.2: renewal."]:
-        body = {"model": "deepseek-chat", "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": clause}]}
+        body = {"model": "deepseek-flash", "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": clause}]}
         responses.append(requests.post("https://api.deepseek.com/v1/chat/completions", headers={"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}, json=body).json())
     t = total_usage(responses)
     return [t["prompt_tokens"] == t["prompt_cache_hit_tokens"] + t["prompt_cache_miss_tokens"], cache_hit_ratio(t) > 0.5]
@@ -1150,20 +1155,36 @@ cd "G:\Contract Clause Reviewer"
 python evals/run_evals.py --mode mock --runs 3 --out evals/results.mock.json
 ```
 
-2. 再用 DeepSeek 分别跑两版 prompt。每遍 11 条用例 × 3 次，大约 5–8 分钟，花费几分钱：
+2. 项目是照着 DeepSeek 旧的接口写的，调真模型之前要补一处代码。DeepSeek 默认开着思考模式，它的文档写着：开着思考模式、请求里又带着 `tools` 时，之后的每次请求都要把回答里的 `reasoning_content` 原样传回去，否则返回 400。项目的工具循环没传它，所以模型一调工具，下一次请求就失败。最简单的修法是关掉思考模式：审条款本来就用不着长推理，关掉还更快、更便宜，项目设的 `temperature`（0.3）也重新生效。
+
+打开 `clausecheck/review.py`，找到 `OpenAICompatBackend` 的 `_post`。如果 `body` 里还没有 `"thinking"`，就在 `r = self.requests.post(...)` 那一行**上面**加两行，缩进和 `r =` 对齐：
 
 ```
+        if self.settings.mode == "deepseek":
+            body["thinking"] = {"type": "disabled"}
+```
+
+只在 deepseek 模式加：同一个类也用来连 LM Studio 这样的本地服务器，那边用不着它。
+
+3. 再用 DeepSeek 分别跑两版 prompt。项目 `config.py` 里默认的 DeepSeek 模型名也是旧的，DeepSeek 已经停用了它，所以第一行先用环境变量 `CLAUSECHECK_DEEPSEEK_MODEL` 指定 `deepseek-flash`（只对这个终端窗口有效；想一直用，就在 `.env` 里加一行 `CLAUSECHECK_DEEPSEEK_MODEL=deepseek-flash`）：
+
+```
+$env:CLAUSECHECK_DEEPSEEK_MODEL = "deepseek-flash"
 python evals/run_evals.py --mode deepseek --runs 3 --prompt v1 --out evals/results.deepseek.v1.json
 python evals/run_evals.py --mode deepseek --runs 3 --prompt v2 --out evals/results.deepseek.v2.json
 ```
 
+每遍 11 条用例 × 3 次，大约 5–10 分钟。按 `deepseek-flash` 现在的价格（高峰时段输入 0.30、输出 1.20 美元每百万 token，非高峰时段减半；以官方价格页为准（2026-09）），两遍加起来一般不到 0.3 美元。
+
 `--out` 让两次结果分开保存（`evals/results*.json` 不会进 git）。
 
-3. 把两遍 DeepSeek 的通过率表粘贴到下面（至少要有两行 `high-risk recall`），然后对照 `learn/05_prompt_ab.md` 回答自己三个问题：高风险召回掉了吗？must_accept 用例的误报变少了吗？有没有哪条用例变差？
+4. 把两遍 DeepSeek 的通过率表粘贴到下面（至少要有两行 `high-risk recall`），然后对照 `learn/05_prompt_ab.md` 回答自己三个问题：高风险召回掉了吗？must_accept 用例的误报变少了吗？有没有哪条用例变差？
 placeholder: 粘贴两张 DeepSeek 通过率表
 verify: high-risk recall[\s\S]*high-risk recall
 --- hints
 - 看到 401 或 `needs DEEPSEEK_API_KEY`：检查项目根目录 `.env` 里的 `DEEPSEEK_API_KEY`。
+- 每条都失败、错误里有 `HTTP 400` 和 `Model Not Exist`：模型名没设上。看输出的第一行（`mode=deepseek model=...`），应该是 `model=deepseek-flash`；换了新的终端窗口，要重新运行 `$env:` 那一行。
+- 错误里有 `HTTP 400`，但不是 `Model Not Exist`：多半是第 2 步那两行没加上，或者加在了 `r = self.requests.post(...)` 的**下面**（要在发请求之前改 `body`）。想先便宜地试一条：`python evals/run_evals.py --mode deepseek --runs 1 --only unlimited-liability`。
 - 表太长就只粘贴每遍最后的表格部分（从 `case  kind  pass rate` 那一行开始）。
 
 @@ item d13-e1

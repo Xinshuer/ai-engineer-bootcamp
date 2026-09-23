@@ -1,0 +1,1395 @@
+@@ day 27
+title: 部署与无服务器：Lambda、Cloud Run、Docker、队列、托管大模型
+lang: py
+langs: Python + TypeScript
+hours: 5 小时
+--- goal
+把 Clause Check 变成一个能部署的服务：看懂并写出 Dockerfile，知道 Cloud Run 和 Lambda 各适合什么；用 Python 和 TypeScript 写 Lambda 的 HTTP 入口；写一个「至少送达一次」也不会出错的队列 worker（成功后才删除、按 key 去重）；用 Bedrock 的 `converse` 和 Vertex AI 上的 Gemini 调托管大模型（重试、JSON、校验、记 token）；输出结构化日志；最后能按一张上线清单讲清楚一次部署。对应项目的 `clausecheck/api.py` 和 `config.py`。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过（本机任务选做）
+- 闭卷挑战 3 题
+- 对着第 8 张卡片的上线清单，用两分钟口头讲一遍「Clause Check 怎么部署到 GCP」，再讲一遍 AWS 版
+
+@@ concept
+title: 从脚本到服务：无状态、环境变量、健康检查
+--- body
+到现在为止，Clause Check 主要是一个命令行工具：在终端里运行，审完一份合同就退出。要让律所的人在网页上用，它得变成一个**服务**：一直在线，通过 HTTP 接收请求。项目里已经有了：`clausecheck/api.py` 是一个 FastAPI 应用，`GET /health` 回答「我还活着」，`POST /review` 接收上传的合同、返回报告 JSON。
+
+上云之前，服务要满足三条：
+
+- **无状态**：云会同时开好几个副本（实例），也会随时关掉一个、换一个新的。所以请求之间不能靠内存传东西：要记住的东西放进桶、数据库或队列
+- **配置来自环境变量**：`config.py` 的 `Settings` 全部用 `os.getenv` 读；它调用的 `load_dotenv` 找不到 `.env` 时什么也不做，所以同一份代码在本机读 `.env`，在云上读平台设置的环境变量。模型名也是配置：部署时设 `CLAUSECHECK_DEEPSEEK_MODEL=deepseek-flash`（`config.py` 里的默认值还是 DeepSeek 已经停用的旧名字；它的价格表也要跟着更新，见第 28 天的成本卡片）
+- **健康检查**：平台定期访问 `/health` 之类的地址，不健康的实例会被换掉
+
+下面模拟两个实例，看看「记在内存里」在云上为什么会出错。
+--- code
+class Instance:
+    """One copy of the service. The cloud may run several and replace them at any time."""
+
+    def __init__(self, name):
+        self.name = name
+        self.reviewed = []                       # in memory: gone when the instance goes away
+
+    def handle(self, contract_id, store):
+        self.reviewed.append(contract_id)
+        store.setdefault("reviewed", []).append(contract_id)   # shared: a bucket or a database
+        return f"{self.name} reviewed {contract_id}"
+
+store = {}
+a, b = Instance("instance-a"), Instance("instance-b")
+print(a.handle(101, store))
+print(b.handle(102, store))
+print(a.handle(103, store))
+print("instance-a remembers:", a.reviewed)
+print("instance-b remembers:", b.reviewed)
+a = Instance("instance-a2")                      # the platform replaced instance-a
+print("after the restart:", a.reviewed)
+print("the shared store:", store["reviewed"])
+
+@@ concept
+title: Docker：镜像、容器和层缓存
+--- body
+云平台不关心你用什么语言，它要的是一个**容器镜像**：把代码、Python 和依赖包打成一个包，在哪台机器上跑都一样（「我电脑上是好的」这个问题就没了）。
+
+- **镜像（image）**：打好的包，只读；**容器（container）**：镜像运行起来的一个实例
+- **Dockerfile**：打包的步骤清单，每一步生成一**层**（layer）。重新打包时，没变的层直接用缓存；某一层一变，**它后面的所有层都要重做**
+
+Clause Check 的 Dockerfile 大致是这样：
+
+```
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec uvicorn clausecheck.api:app --host 0.0.0.0 --port ${PORT:-8080}
+```
+
+- 先只复制 `requirements.txt` 并装依赖，**再**复制代码：平时只改代码，装依赖那一层就一直走缓存（运行下面的代码对比）
+- `--host 0.0.0.0`：uvicorn 默认只听 `127.0.0.1`，容器外面连不上。`${PORT:-8080}`：用平台给的端口，没有就 8080。`exec` 让 uvicorn 直接接收平台发来的停止信号
+- `PYTHONUNBUFFERED=1`：`print` 的日志立刻输出，不在缓冲区里等
+- `.dockerignore` 写明哪些文件不进镜像：`.env`（密钥）、`.git`、报告和缓存
+- 本机：`docker build -t clausecheck-api .`，然后 `docker run -p 8080:8080 -e PORT=8080 clausecheck-api`
+--- code
+def rebuild(steps, changed):
+    """Docker re-runs the first step whose inputs changed, and every step after it."""
+    out, dirty = [], False
+    for step, inputs in steps:
+        dirty = dirty or any(f in changed for f in inputs)
+        out.append(("REBUILD " if dirty else "cached  ") + step)
+    return out
+
+CODE = ["requirements.txt", "clausecheck/api.py", "clausecheck/review.py"]
+GOOD = [
+    ("FROM python:3.12-slim", []),
+    ("COPY requirements.txt .", ["requirements.txt"]),
+    ("RUN pip install -r requirements.txt   (~2 min)", []),
+    ("COPY . .", CODE),
+]
+BAD = [
+    ("FROM python:3.12-slim", []),
+    ("COPY . .", CODE),
+    ("RUN pip install -r requirements.txt   (~2 min)", []),
+]
+for name, steps in [("good order", GOOD), ("bad order", BAD)]:
+    print(f"{name}, you edited review.py:")
+    for line in rebuild(steps, {"clausecheck/review.py"}):
+        print("  " + line)
+
+@@ concept
+title: Cloud Run：跑你的容器，按请求扩缩
+--- body
+**Cloud Run**（GCP）运行你的容器镜像，替你管 HTTPS、机器和扩缩容。AWS 上跑容器对应的是 ECS on Fargate（旧资料里常见的 App Runner 从 2026 年 4 月底起不再接受新客户，AWS 建议迁到 ECS 的 Express Mode）；Lambda 是另一种思路（下一张卡片）。你只要遵守一条约定：**监听环境变量 `PORT` 给的端口**（默认 8080），地址用 `0.0.0.0`。
+
+- **扩缩容**：没有请求时可以缩到 0 个实例（不花钱）；请求多了自动加实例。`--max-instances` 设上限，流量暴涨时账单不会跟着暴涨
+- **并发**：一个实例同时处理多个请求（1 个 vCPU 时默认 80 个，最多可以调到 1000）。LLM 调用大部分时间在等网络，并发高很划算
+- **冷启动**：从 0 到第一个实例启动好，第一批请求要多等几秒（导入 langgraph 这类大包更慢）。`--min-instances 1` 让一个实例一直开着，代价是一直计费
+- **请求超时**：默认 5 分钟，最长可以设到 60 分钟（写这课时的数字，以官方文档为准）
+- 默认设置下，**只有在处理请求时才给 CPU**：返回响应以后还在后台干活，是靠不住的
+
+部署命令读得懂就行（`--set-secrets` 把 Secret Manager 里的密钥注入成环境变量）：
+
+```
+gcloud run deploy clausecheck-api --source . --region europe-north1 \
+  --service-account clausecheck-api@clausecheck-dev.iam.gserviceaccount.com \
+  --set-secrets DEEPSEEK_API_KEY=deepseek-api-key:latest \
+  --max-instances 5 --no-allow-unauthenticated
+```
+--- code
+import math
+import os
+
+port = int(os.environ.get("PORT", "8080"))
+print(f"uvicorn clausecheck.api:app --host 0.0.0.0 --port {port}")
+
+def instances_needed(requests_per_second, seconds_per_request, concurrency=80):
+    in_flight = requests_per_second * seconds_per_request     # requests being handled at the same moment
+    return math.ceil(in_flight / concurrency)
+
+print(instances_needed(2, 6))                    # 2 clause reviews per second, 6 s each (mostly waiting for the LLM)
+print(instances_needed(50, 6))
+print(instances_needed(50, 6, concurrency=1))    # one request per instance: many more instances
+
+@@ concept
+title: AWS Lambda：一个事件，调用一次函数
+--- body
+**Lambda** 运行的不是一个一直在线的服务，而是**一个函数**：来一个事件，调用一次。Python 的入口长这样：
+
+```python
+def lambda_handler(event, context):
+    return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps({...})}
+```
+
+- `event` 是一个字典，形状由触发它的服务决定：S3 上传、SQS 消息、API Gateway 转来的 HTTP 请求……
+- API Gateway（REST API 的 proxy 集成）给的事件里有 `httpMethod`、`path`、`headers`、`body`。**`body` 是字符串**（也可能是 `None`），要自己 `json.loads`；`isBase64Encoded` 为真时还要先 base64 解码。HTTP API 的新版事件格式字段名不同，以文档为准
+- 返回值里的 `body` **也必须是字符串**：`json.dumps(...)`，不能直接放字典
+- 超时默认 3 秒，最长 15 分钟；按调用次数和运行时长（乘以内存大小）计费；同样有冷启动
+- 经过 API Gateway 的 HTTP 请求还有自己的上限：REST API 默认最多等 **29 秒**（以官方文档为准）。所以 HTTP 入口只做快的事，慢活交给队列（下一张卡片）
+- 模块顶层的代码（import、建 client、读密钥）每个实例只运行一次，之后的调用都复用：client 和缓存放在函数外面
+
+TypeScript（Node.js 运行时）的写法是 `export const handler = async (event) => { ... }`，返回同样形状的对象。
+--- code
+import json
+
+def lambda_handler(event, context):
+    body = json.loads(event.get("body") or "{}")
+    clause_id = body.get("clause_id", "unknown")
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"clause_id": clause_id, "verdict": "flag"}),
+    }
+
+event = {
+    "httpMethod": "POST",
+    "path": "/review",
+    "headers": {"Content-Type": "application/json"},
+    "body": '{"clause_id": "8.1", "text": "Liability is unlimited."}',
+    "isBase64Encoded": False,
+}
+resp = lambda_handler(event, None)
+print(resp["statusCode"], type(resp["body"]).__name__)
+print(resp["body"])
+print(json.loads(resp["body"])["verdict"])
+
+@@ concept
+title: 事件和队列：至少送达一次
+cloud: yes
+--- body
+审一份合同要好几分钟，不能让上传请求一直等着。常见的做法是把工作**交给队列**：
+
+合同上传到桶 → 桶发出「对象已创建」**事件** → 事件变成队列里的一条**消息** → **worker** 取出消息、审查、写报告
+
+- AWS：S3 事件通知 → SQS 队列 → Lambda 或容器里的 worker
+- GCP：GCS 通知 → Pub/Sub 主题（或 Eventarc）→ Cloud Run 上的 worker
+
+队列（还有 S3 的事件通知本身）保证的是**至少一次**（at-least-once）：同一条消息可能被送来**不止一次**，SQS 的标准队列也不保证顺序。SQS 的消息被取走后先「隐身」一段时间（visibility timeout，默认 30 秒）；worker 处理成功后**删除**它（Pub/Sub 叫 ack），没删的话，时间一到它会重新出现，交给下一个 worker。这就是免费的自动重试，但也意味着：
+
+- **处理成功之后才删除**。先删后处理，worker 一崩，消息就丢了
+- worker 必须**幂等**（第 17 天）：用固定的 key（比如 `job_id`）记下做完的工作，同一条消息再来就跳过
+- 一直失败的消息不能无限重来：设最大接收次数，超过就移进**死信队列**（dead-letter queue，DLQ），等人来看
+- `receive_message` 默认是**短轮询**：马上返回，队列里明明有消息也可能拿到空的。worker 一般加 `WaitTimeSeconds=20`（**长轮询**：最多等 20 秒，有消息就立刻返回），空响应更少，也更省钱
+
+本页的 boto3 / google-cloud 是模拟的：调用写法和返回结构与真 SDK 一致（只实现了课程用到的部分）；真项目里 `pip install` 后配置凭证即可。`CLOUD.advance(秒数)` 只有模拟里才有，它让模拟的时钟往前走。
+--- code
+import json
+import boto3
+
+sqs = boto3.client("sqs", region_name="eu-north-1")
+url = sqs.create_queue(QueueName="review-jobs")["QueueUrl"]
+for cid in (103, 104):
+    sqs.send_message(QueueUrl=url, MessageBody=json.dumps({"job_id": f"review-{cid}", "contract_id": cid}))
+
+got = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=20).get("Messages", [])
+print("received:", [json.loads(m["Body"])["job_id"] for m in got])
+sqs.delete_message(QueueUrl=url, ReceiptHandle=got[0]["ReceiptHandle"])   # 103 done; the worker crashed on 104
+print("right away:", sqs.receive_message(QueueUrl=url).get("Messages", []))
+
+CLOUD.advance(31)                                # 模拟：31 秒过去，隐身时间到了
+again = sqs.receive_message(QueueUrl=url, MessageSystemAttributeNames=["ApproximateReceiveCount"]).get("Messages", [])
+for m in again:
+    print("again:", json.loads(m["Body"])["job_id"], "receive count", m["Attributes"]["ApproximateReceiveCount"])
+
+@@ concept
+title: 托管大模型：Bedrock 和 Vertex AI
+cloud: yes
+--- body
+Clause Check 现在直接调 DeepSeek。很多公司（尤其处理合同这种敏感数据时）更愿意用自己云里的**托管大模型**：AWS 的 **Bedrock**、GCP 的 **Vertex AI**（Gemini）。原因：数据留在自己的云账号和选定的区域里；谁能调哪个模型由 IAM 管，不用再保管一把单独的 API 密钥；账单、日志、监控都在一起。
+
+套路和第 4 天一样：发消息、要 JSON、校验、重试、记 token。
+
+- Bedrock 的 `converse` 是统一的对话接口，换模型只换 `modelId`。每条消息的 `content` 是**块的列表** `[{"text": ...}]`；系统提示单独放在 `system=[{"text": ...}]`，不是一条 system 消息；参数在 `inferenceConfig`（驼峰命名：`maxTokens`）。回答在 `resp["output"]["message"]["content"]`，`stopReason` 是 `"max_tokens"` 说明被截断了
+- 新模型常常要用**推理配置**（inference profile）的 ID 来调用，比如以 `eu.` 开头的 ID 只在欧盟区域之间路由；以 `global.` 开头的可能把请求发到全世界任何区域，合同数据不要用它
+- google-genai：`genai.Client(vertexai=True, project=..., location=...)`。不写 `location` 时默认是 `global`，要在欧盟处理就明确写一个欧盟区域（哪个模型在哪些区域可用，以 Vertex AI 文档为准）。它的错误是自己的 `google.genai.errors.APIError`（`e.code` 是 429、503……），而且**默认不重试**
+- 名字会变：Vertex AI 在 2026 年 4 月改名为 Gemini Enterprise Agent Platform（API 没变；新版 google-genai 的文档写 `enterprise=True`，`vertexai=True` 仍然能用）。模型 ID 也会过时：下面的 `eu.amazon.nova-lite-v1:0`、`gemini-2.5-flash` 只是示例（Google 已经公布了 gemini-2.5 系列在 2026 年的退役日期）。写代码前去 Bedrock 控制台、Google Cloud 控制台的模型列表查当前能用的名字，并把它放进配置，不要写死在代码里
+
+本页的 Bedrock 和 Gemini 是模拟的：请求里提到 JSON 时，按和模拟 DeepSeek 类似的关键词规则给出判定（比如 `unlimited` → redline / high）。
+--- code
+import json
+import boto3
+from google import genai
+from google.genai import types
+
+SYSTEM = "You review contract clauses. Reply with JSON: clause_id, verdict, risk_level."
+CLAUSE = "Review clause 8.1: Liability of the Customer is unlimited."
+
+bedrock = boto3.client("bedrock-runtime", region_name="eu-north-1")
+resp = bedrock.converse(
+    modelId="eu.amazon.nova-lite-v1:0",
+    system=[{"text": SYSTEM}],
+    messages=[{"role": "user", "content": [{"text": CLAUSE}]}],
+    inferenceConfig={"maxTokens": 300, "temperature": 0},
+)
+print(resp["stopReason"], resp["usage"])
+print(json.loads(resp["output"]["message"]["content"][0]["text"]))
+
+gemini = genai.Client(vertexai=True, project="clausecheck-dev", location="europe-north1")
+r = gemini.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=CLAUSE,
+    config=types.GenerateContentConfig(system_instruction=SYSTEM, response_mime_type="application/json", temperature=0),
+)
+print(r.usage_metadata.prompt_token_count, r.usage_metadata.candidates_token_count)
+print(json.loads(r.text))
+
+@@ concept
+title: 结构化日志和告警
+--- body
+线上没有人盯着终端。服务把日志写到**标准输出**，平台自动收集：Cloud Run 的进 Cloud Logging，Lambda 的进 CloudWatch Logs。
+
+日志要**一行一个 JSON 对象**（结构化日志），而不是随手 `print("done 8.1")`：这样才能按字段查询和统计，比如「过去一小时 ERROR 有几条」「v2 提示词的平均延迟是多少」。
+
+- 每条都带上 `severity`（INFO / WARNING / ERROR）和 `message`，再加排查要用的字段：`trace_id`、`contract_id`、`clause_id`、`tokens`、`latency_ms`
+- Cloud Logging 会认出 JSON 里的 `severity` 和 `message`，当成这条日志的级别和正文；CloudWatch Logs Insights 也能按 JSON 字段查询
+- `json.dumps(..., sort_keys=True)` 让字段顺序固定，人看着整齐，也方便比较
+- **不要**记合同全文、个人数据、密钥：日志保存得久，能看的人也多
+
+有了日志，再设**告警**：错误率、p95 延迟、每天的 token 花费超过阈值时通知人。
+--- code
+import json
+
+def log(severity, message, **fields):
+    print(json.dumps({"severity": severity, "message": message, **fields}, sort_keys=True))
+
+log("INFO", "clause reviewed", trace_id="t-7f3a", contract_id=103, clause_id="8.1", verdict="redline", tokens=2205, latency_ms=3563)
+log("ERROR", "model call failed", trace_id="t-9c1d", contract_id=109, clause_id="8.1", error="ThrottlingException")
+
+lines = [
+    '{"severity": "INFO", "latency_ms": 1296}',
+    '{"severity": "ERROR", "latency_ms": 30000}',
+    '{"severity": "INFO", "latency_ms": 3563}',
+    '{"severity": "INFO", "latency_ms": 2149}',
+]
+records = [json.loads(line) for line in lines]
+errors = sum(1 for r in records if r["severity"] == "ERROR")
+print(f"error rate {errors / len(records):.0%}, slowest {max(r['latency_ms'] for r in records)} ms")
+
+@@ concept
+title: 上线清单和回滚
+--- body
+上线前过一遍这张单子。面试时被问「你怎么部署它」，也按这个顺序讲：
+
+1. **密钥**不在代码和镜像里，来自 Secret Manager / Secrets Manager
+2. **运行身份**是专用的服务账号 / 角色，最小权限（第 26 天）
+3. **区域**在欧盟：服务、桶、日志、模型调用都是
+4. **上限**：最大实例数、每条条款的步数和 token 上限（第 17 天）、预算告警
+5. **可观测**：结构化日志，错误率和延迟的告警，追踪（Langfuse）
+6. **回滚**：Cloud Run 每次部署生成一个新的**修订版本**（revision），流量可以先分 10% 给新版本试一试，出问题就切回旧版本，不用重新构建（`gcloud run services update-traffic`）；Lambda 用版本加别名（alias）做同样的事。镜像用固定的标签，不要用 `latest`
+7. **健康检查**：`/health` 能回答
+
+两分钟讲清楚一个架构：它做什么 → 请求怎么流动（上传 → 队列 → worker → 报告）→ 数据在哪里、谁能访问 → 失败了怎么办（重试、幂等、死信队列）→ 花多少钱、上限在哪里。
+--- code
+def route(traffic):
+    return ", ".join(f"{rev}: {pct}%" for rev, pct in traffic.items())
+
+traffic = {"clausecheck-api-00012": 100}
+print("before:  ", route(traffic))
+traffic = {"clausecheck-api-00012": 90, "clausecheck-api-00013": 10}   # canary: 10% try the new revision
+print("canary:  ", route(traffic))
+
+error_rate = {"clausecheck-api-00012": 0.004, "clausecheck-api-00013": 0.09}   # from the structured logs
+if error_rate["clausecheck-api-00013"] > 2 * error_rate["clausecheck-api-00012"]:
+    traffic = {"clausecheck-api-00012": 100}   # roll back: no rebuild, just move the traffic
+    print("rollback:", route(traffic))
+
+@@ item d27-01
+type: predict
+title: 复习：同一条消息来两次
+level: 1
+--- prompt
+复习第 17 天的幂等。今天的队列会把同一条消息送来不止一次，worker 靠一个「做过了」的集合挡住重复。写出输出。
+--- code
+messages = [
+    {"job_id": "review-103", "clause": "8.1"},
+    {"job_id": "review-104", "clause": "3.1"},
+    {"job_id": "review-103", "clause": "8.1"},
+]
+done = set()
+emails = []
+for m in messages:
+    if m["job_id"] in done:
+        print("skip", m["job_id"])
+        continue
+    emails.append(m["clause"])
+    done.add(m["job_id"])
+    print("done", m["job_id"])
+print(len(emails), sorted(done))
+--- explain
+做成功之后记下 key，同一个 key 再来就跳过，所以 8.1 的邮件只发了一次。线上这个 `done` 不能放在内存里（实例会被替换，第 1 张卡片），要放进数据库、Redis 或者桶里的一个标记文件。
+
+@@ item d27-02
+type: choice
+title: 复习：SDK 替你重试了
+level: 1
+--- prompt
+复习第 26 天。worker 用默认设置建了 Bedrock 的 client：`boto3.client("bedrock-runtime", region_name="eu-north-1")`。某次调用 `converse` 时，Bedrock 连续返回了 2 次 `ThrottlingException`，第 3 次成功。你的代码会看到什么？
+--- options
+- 一个 `ClientError`，错误码是 `ThrottlingException`
+- 正常的回答：boto3 在背后重试了，`resp["ResponseMetadata"]["RetryAttempts"]` 是 `2`
+- 一个 `NoCredentialsError`
+- 正常的回答，但 `stopReason` 是 `"throttled"`
+answer: 2
+--- explain
+boto3 默认（legacy 模式）一共试 5 次，限流和 5xx 这类暂时的错误在 SDK 里就被消化了；只有连续失败到次数用完，错误才会到你的代码里，信息里带着 `(reached max retries: 4)`。想改次数，用 `Config(retries={"mode": "standard", "total_max_attempts": 3})`。注意：google-genai（Gemini）默认**不**重试，今天要自己写。
+
+@@ item d27-03
+type: code
+title: Lambda 的 HTTP 入口
+level: 2
+--- prompt
+写 AWS Lambda 的入口 `lambda_handler(event, context, review=review_clause)`，处理 API Gateway 转来的 `POST /review` 请求。请求体是 JSON：`{"clause_id": "8.1", "text": "..."}`。
+
+- `event["body"]` 是字符串，也可能是 `None`。解析失败，或者解析出来不是 JSON 对象（字典）：返回 400，正文 `{"error": "body must be a JSON object"}`
+- `text` 缺失、不是字符串、或者去掉空白后为空：返回 400，正文 `{"error": "text is required"}`
+- `clause_id` 可以不给，默认 `"unknown"`
+- 都没问题：调用 `review(clause_id, text)`（它返回一个字典），返回 200，正文就是这个字典
+
+每个响应都是 `{"statusCode": 状态码, "headers": {"Content-Type": "application/json"}, "body": json.dumps(正文)}`，`body` 必须是**字符串**。先写小函数 `respond(status, payload)` 生成响应，能省掉很多重复。
+
+`review` 用默认参数注入：Lambda 只传 `(event, context)`，于是用上默认的 `review_clause`；测试传一个假的进来。
+--- starter
+import json
+
+def review_clause(clause_id, text):
+    """The real one calls the LLM. Tests pass their own."""
+    return {"clause_id": clause_id, "verdict": "flag", "risk_level": "medium"}
+
+def respond(status, payload):
+    pass
+
+def lambda_handler(event, context, review=review_clause):
+    pass
+--- solution
+import json
+
+def review_clause(clause_id, text):
+    """The real one calls the LLM. Tests pass their own."""
+    return {"clause_id": clause_id, "verdict": "flag", "risk_level": "medium"}
+
+def respond(status, payload):
+    return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
+
+def lambda_handler(event, context, review=review_clause):
+    try:
+        data = json.loads(event.get("body") or "")
+    except json.JSONDecodeError:
+        return respond(400, {"error": "body must be a JSON object"})
+    if not isinstance(data, dict):
+        return respond(400, {"error": "body must be a JSON object"})
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return respond(400, {"error": "text is required"})
+    return respond(200, review(data.get("clause_id", "unknown"), text))
+--- tests
+import json
+def ev(body):
+    return {"httpMethod": "POST", "path": "/review", "headers": {"Content-Type": "application/json"}, "body": body, "isBase64Encoded": False}
+calls = []
+def fake_review(clause_id, text):
+    calls.append((clause_id, text))
+    return {"clause_id": clause_id, "verdict": "redline", "risk_level": "high"}
+def call(body):
+    r = lambda_handler(ev(body), None, review=fake_review)
+    return r["statusCode"], r["headers"], json.loads(r["body"])
+BAD_BODY = {"error": "body must be a JSON object"}
+expect("正常：200 + 审查结果", lambda: call('{"clause_id": "8.1", "text": "Liability is unlimited."}'), (200, {"Content-Type": "application/json"}, {"clause_id": "8.1", "verdict": "redline", "risk_level": "high"}))
+expect("body 是字符串", lambda: type(lambda_handler(ev('{"text": "x"}'), None, review=fake_review)["body"]).__name__, "str")
+expect("没有 body / 坏 JSON / JSON 数组：都是 400", lambda: [call(b)[::2] for b in (None, '{"text": ', '["x"]')], [(400, BAD_BODY)] * 3)
+expect("text 是空白或者不是字符串：400，而且不调用模型", lambda: (calls.clear(), [call(b)[::2] for b in ('{"text": "   "}', '{"text": 42}')], len(calls))[1:], ([(400, {"error": "text is required"})] * 2, 0))
+expect("Lambda 只传两个参数时，用默认的 review_clause", lambda: json.loads(lambda_handler(ev('{"text": "Fees are payable in 30 days."}'), None)["body"]), {"clause_id": "unknown", "verdict": "flag", "risk_level": "medium"})
+--- hints
+- `respond`：`return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}`。
+- 解析：`json.loads(event.get("body") or "")` 放进 `try`（`None` 变成空字符串，空字符串也是坏 JSON），`except json.JSONDecodeError:` 返回 400；再用 `isinstance(data, dict)` 排除数组和数字。
+- 校验：`if not isinstance(text, str) or not text.strip(): return respond(400, ...)`。全部通过才调用 `review(data.get("clause_id", "unknown"), text)`。
+
+@@ item d27-04
+type: code
+title: 解析 S3 上传事件
+level: 2
+--- prompt
+合同上传到 S3 以后，S3 可以发出一个事件（直接触发 Lambda，或者先进 SQS）。事件长这样（只留了用得到的字段）：
+
+```python
+{"Records": [
+    {"eventSource": "aws:s3", "eventName": "ObjectCreated:Put",
+     "s3": {"bucket": {"name": "clausecheck-contracts"},
+            "object": {"key": "contracts/2/103/hospital+software+license.pdf", "size": 48213}}},
+]}
+```
+
+写 `parse_s3_event(event)`，返回 `[(bucket, key), ...]`：
+
+- 一个事件里可能有**多条** `Records`，按顺序处理
+- 只要 `eventName` 以 `"ObjectCreated:"` 开头的（`ObjectRemoved:Delete` 这类删除事件跳过）
+- 事件里的键是 **URL 编码**过的：空格变成 `+`，`ö` 变成 `%C3%B6`，真正的 `+` 变成 `%2B`。用 `urllib.parse.unquote_plus(key)` 还原，否则拿它去 `get_object` 会得到 `NoSuchKey`
+- 没有 `Records` 键：返回 `[]`（真的会遇到：刚配置好通知时，S3 先发一条 `"Event": "s3:TestEvent"` 的测试消息，它就没有 `Records`）
+--- starter
+from urllib.parse import unquote_plus
+
+def parse_s3_event(event):
+    record = event["Records"][0]
+    return [(record["s3"]["bucket"]["name"], record["s3"]["object"]["key"])]
+--- solution
+from urllib.parse import unquote_plus
+
+def parse_s3_event(event):
+    out = []
+    for record in event.get("Records", []):
+        if not record["eventName"].startswith("ObjectCreated:"):
+            continue
+        bucket = record["s3"]["bucket"]["name"]
+        key = unquote_plus(record["s3"]["object"]["key"])
+        out.append((bucket, key))
+    return out
+--- tests
+def rec(key, name="ObjectCreated:Put"):
+    return {"eventSource": "aws:s3", "eventName": name, "s3": {"bucket": {"name": "clausecheck-contracts"}, "object": {"key": key, "size": 100}}}
+expect("一条记录", lambda: parse_s3_event({"Records": [rec("contracts/2/103/original.pdf")]}), [("clausecheck-contracts", "contracts/2/103/original.pdf")])
+expect("+ 还原成空格，%C3%B6 还原成 ö", lambda: parse_s3_event({"Records": [rec("contracts/5/109/Avtal+Malm%C3%B6+2026.pdf")]}), [("clausecheck-contracts", "contracts/5/109/Avtal Malmö 2026.pdf")])
+expect("真正的 + 在事件里是 %2B", lambda: parse_s3_event({"Records": [rec("contracts/1/101/C%2B%2B+SDK+License.pdf")]})[0][1], "contracts/1/101/C++ SDK License.pdf")
+expect("多条记录，跳过删除事件", lambda: parse_s3_event({"Records": [rec("a.pdf"), rec("b.pdf", "ObjectRemoved:Delete"), rec("c.pdf", "ObjectCreated:CompleteMultipartUpload")]}), [("clausecheck-contracts", "a.pdf"), ("clausecheck-contracts", "c.pdf")])
+expect("没有 Records", lambda: parse_s3_event({}), [])
+--- hints
+- `for record in event.get("Records", []):`，先检查 `record["eventName"].startswith("ObjectCreated:")`，不是就 `continue`。
+- 桶名在 `record["s3"]["bucket"]["name"]`，键在 `record["s3"]["object"]["key"]`；键要经过 `unquote_plus(...)`。
+
+@@ item d27-05
+type: predict
+title: 消息什么时候回来
+level: 2
+cloud: yes
+--- prompt
+写出输出。这个队列的隐身时间设成了 60 秒；`CLOUD.advance(秒数)` 让模拟的时钟往前走。想清楚：被取走但没删除的消息，什么时候会再出现？
+--- code
+import json
+import boto3
+
+sqs = boto3.client("sqs", region_name="eu-north-1")
+url = sqs.create_queue(QueueName="review-jobs", Attributes={"VisibilityTimeout": "60"})["QueueUrl"]
+for cid in (103, 104, 105):
+    sqs.send_message(QueueUrl=url, MessageBody=json.dumps({"job_id": f"review-{cid}"}))
+
+def job_ids(resp):
+    return [json.loads(m["Body"])["job_id"] for m in resp.get("Messages", [])]
+
+first = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=2)
+print(job_ids(first))
+print(job_ids(sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)))
+sqs.delete_message(QueueUrl=url, ReceiptHandle=first["Messages"][0]["ReceiptHandle"])
+CLOUD.advance(30)
+print(job_ids(sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)))
+CLOUD.advance(31)
+print(job_ids(sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)))
+--- explain
+取走的消息先隐身 60 秒，所以第二次只拿到剩下的 105；第 30 秒时三条要么被删了、要么还在隐身，什么都拿不到；过了 60 秒，没被删除的 104 和 105 重新出现（这就是自动重试），删掉的 103 不会再来。第二次取走的 105 也没人删：哪个 worker 忘了删，消息就会回来。`MaxNumberOfMessages` 默认是 1，最多 10。本页的模拟按发送顺序、一条不少地返回，方便你推算；真 SQS 的标准队列不保证顺序，短轮询时还可能少给几条。
+
+@@ item d27-06
+type: code
+title: 队列 worker
+level: 3
+cloud: yes
+--- prompt
+写 SQS worker 的一轮处理 `process_batch(sqs, queue_url, handle, seen)`：
+
+1. `receive_message` 一次，最多取 10 条（`MaxNumberOfMessages=10`）；没有消息时，响应里没有 `Messages` 键
+2. 每条消息的 `Body` 是 JSON，里面有 `job_id`
+3. `job_id` 已经在集合 `seen` 里：这是重复送达，**直接删除**，算 `skipped`
+4. 否则调用 `handle(job)`（`job` 是解析后的字典）：
+   - 成功：把 `job_id` 加进 `seen`，**然后**删除消息，算 `done`
+   - `handle` 抛出任何异常：**不删除**（隐身时间一到它会回来，相当于自动重试），算 `failed`，接着处理下一条
+5. 返回 `{"done": ..., "skipped": ..., "failed": ...}`
+
+删除用 `sqs.delete_message(QueueUrl=..., ReceiptHandle=msg["ReceiptHandle"])`。`seen` 由调用方传进来（线上它在数据库里，测试里是一个 set）。
+--- starter
+import json
+
+def process_batch(sqs, queue_url, handle, seen):
+    counts = {"done": 0, "skipped": 0, "failed": 0}
+    resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+    return counts
+--- solution
+import json
+
+def process_batch(sqs, queue_url, handle, seen):
+    counts = {"done": 0, "skipped": 0, "failed": 0}
+    resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+    for msg in resp.get("Messages", []):
+        job = json.loads(msg["Body"])
+        if job["job_id"] in seen:
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+            counts["skipped"] += 1
+            continue
+        try:
+            handle(job)
+        except Exception:
+            counts["failed"] += 1
+            continue
+        seen.add(job["job_id"])
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+        counts["done"] += 1
+    return counts
+--- tests
+import json
+import boto3
+SQS = boto3.client("sqs", region_name="eu-north-1")
+URL = SQS.create_queue(QueueName="review-jobs")["QueueUrl"]
+for job_id in ("review-103", "review-104", "review-101"):
+    SQS.send_message(QueueUrl=URL, MessageBody=json.dumps({"job_id": job_id}))
+handled = []
+flaky = {"review-104": 1}            # review-104 fails once (the LLM timed out), then works
+def handle(job):
+    if flaky.get(job["job_id"], 0) > 0:
+        flaky[job["job_id"]] -= 1
+        raise TimeoutError("LLM timed out")
+    handled.append(job["job_id"])
+SEEN = {"review-101"}               # 101 was already done earlier
+expect("第一轮：103 做完，104 失败，101 是重复", lambda: process_batch(SQS, URL, handle, SEEN), {"done": 1, "skipped": 1, "failed": 1})
+expect("只有失败的那条还留在队列里", lambda: [json.loads(m["Body"])["job_id"] for m in CLOUD.sqs[URL]["messages"]], ["review-104"])
+expect("隐身期内再来一轮：什么都拿不到", lambda: process_batch(SQS, URL, handle, SEEN), {"done": 0, "skipped": 0, "failed": 0})
+def _later():
+    CLOUD.advance(31)
+    return process_batch(SQS, URL, handle, SEEN), handled, sorted(SEEN)
+expect("31 秒后 104 回来了，这次成功", _later, ({"done": 1, "skipped": 0, "failed": 0}, ["review-103", "review-104"], ["review-101", "review-103", "review-104"]))
+--- hints
+- 消息列表：`resp.get("Messages", [])`；每条先 `job = json.loads(msg["Body"])`。
+- 顺序是关键：`handle(job)` 放进 `try`；`except Exception:` 里只计数然后 `continue`，**不删除**；成功以后才 `seen.add(...)` 和 `delete_message(...)`。
+- 重复的消息也要删除，否则它会一遍又一遍地回来。
+
+@@ item d27-07
+type: fix
+title: 修 bug：发不出去的事件
+level: 2
+cloud: yes
+--- prompt
+GCP 版的「合同上传了」事件：发一条消息到 Pub/Sub 主题 `contract-uploaded`，worker 订阅它。`publish_uploaded(publisher, topic, contract)` 应该：
+
+- 消息正文是 `contract` 字典的 JSON，**编码成字节**
+- 带两个属性（attributes）`contract_id`、`customer_id`，订阅方不解析正文也能过滤。属性值必须是**字符串**
+- 返回服务器给的消息 ID。`publish()` 立刻返回一个 future，`future.result()` 才等到结果；主题不存在之类的错误，也是 `result()` 抛出来的
+
+现在的代码有好几处 bug。运行，一个一个读报错，修到测试全过。
+--- starter
+import json
+
+def publish_uploaded(publisher, topic, contract):
+    data = json.dumps(contract)
+    future = publisher.publish(topic, data, contract_id=contract["contract_id"], customer_id=contract["customer_id"])
+    return future
+--- solution
+import json
+
+def publish_uploaded(publisher, topic, contract):
+    data = json.dumps(contract).encode("utf-8")
+    future = publisher.publish(
+        topic,
+        data,
+        contract_id=str(contract["contract_id"]),
+        customer_id=str(contract["customer_id"]),
+    )
+    return future.result()
+--- tests
+import json
+from google.cloud import pubsub_v1
+from google.api_core.exceptions import NotFound
+PUB = pubsub_v1.PublisherClient()
+TOPIC = PUB.topic_path("clausecheck-dev", "contract-uploaded")
+C = {"contract_id": 103, "customer_id": 2, "bucket": "clausecheck-contracts", "key": "contracts/2/103/original.pdf"}
+expect("返回服务器给的消息 ID（字符串）", lambda: publish_uploaded(PUB, TOPIC, C) == CLOUD.topics[TOPIC][-1]["message_id"], True)
+expect("正文是 JSON 字节", lambda: json.loads(CLOUD.topics[TOPIC][0]["data"]), C)
+expect("属性都是字符串", lambda: CLOUD.topics[TOPIC][0]["attributes"], {"contract_id": "103", "customer_id": "2"})
+expect_raises("主题不存在：NotFound 从 result() 抛出来", lambda: publish_uploaded(PUB, PUB.topic_path("clausecheck-dev", "no-such-topic"), C), NotFound)
+--- hints
+- 第一个报错：`publish` 的正文必须是 bytes：`json.dumps(contract).encode("utf-8")`。
+- 第二个报错：属性值只能是字符串：`str(contract["contract_id"])`。
+- 最后：返回 `future.result()`。这样既拿到了消息 ID，发布失败时错误也会在这里抛出来，而不是悄悄丢掉。
+
+@@ item d27-08
+type: fill
+title: 填空：Bedrock client
+level: 2
+cloud: yes
+--- prompt
+建一个 Bedrock Runtime 的 client：区域是斯德哥尔摩；重试用 standard 模式，**一共最多试 4 次**（包括第一次；standard 模式不设置时是 3 次）。再用 `converse` 问一句话。注意 `converse` 的消息格式和 DeepSeek 不一样：`content` 是块的列表。填空。
+--- template
+import boto3
+from botocore.config import Config
+
+MODEL_ID = "eu.amazon.nova-lite-v1:0"
+
+def make_client():
+    return boto3.client(
+        "bedrock-runtime",
+        region_name="[[eu-north-1]]",
+        config=Config(retries={"mode": "standard", "[[total_max_attempts]]": 4}),
+    )
+
+def ask(client, text):
+    resp = client.converse(
+        modelId=MODEL_ID,
+        messages=[{"role": "[[user]]", "content": [{"[[text]]": text}]}],
+        inferenceConfig={"maxTokens": 300, "temperature": 0},
+    )
+    return resp["output"]["message"]["content"][0]["text"]
+--- tests
+from botocore.exceptions import ClientError
+expect("区域", lambda: make_client().meta.region_name, "eu-north-1")
+expect("问一句", lambda: ask(make_client(), "Hello from Stockholm"), "Mock Bedrock reply: Hello from Stockholm")
+def _throttled(n):
+    CLOUD.queue.clear()
+    CLOUD.fail_next("bedrock-runtime", "throttle", n)
+    try:
+        return ask(make_client(), "Hello")
+    except ClientError as e:
+        return e.response["Error"]["Code"]
+expect("限流 3 次：SDK 自己重试，第 4 次成功", lambda: _throttled(3), "Mock Bedrock reply: Hello")
+expect("限流 4 次：试满 4 次，把错误交给你", lambda: _throttled(4), "ThrottlingException")
+--- hints
+- 斯德哥尔摩的区域名是 `eu-north-1`（GCP 的芬兰是 `europe-north1`，别混）。
+- 重试次数有两个键：`total_max_attempts` 数的是总次数（包括第一次），旧的 `max_attempts` 数的是重试次数（不含第一次）。题目要的是「一共 4 次」。
+- 消息：`{"role": "user", "content": [{"text": text}]}`。
+
+@@ item d27-09
+type: code
+title: 用 Bedrock 审一条条款
+level: 3
+cloud: yes
+--- prompt
+写 `review_with_bedrock(client, clause_id, text)`：
+
+- 调用 `client.converse(modelId=MODEL_ID, system=[{"text": SYSTEM}], messages=[...], inferenceConfig={"maxTokens": 300, "temperature": 0})`，只有一条 user 消息，内容是 `f"Review clause {clause_id}: {text}"`
+- 先看 `stopReason`：是 `"max_tokens"` 说明回答被截断了，JSON 不完整、不能信，`raise ValueError("truncated")`（不要等 `json.loads` 报一个看不懂的错）
+- 把 `content` 里**所有带 `"text"` 的块**拼起来再 `json.loads`（有的模型会在前面放一个推理块，它没有 `"text"`）
+- `verdict` 不在 `VERDICTS` 里：`raise ValueError(f"bad verdict: {verdict}")`（模型的输出永远要校验）
+- 返回 `{"clause_id": ..., "verdict": ..., "risk_level": ..., "tokens": resp["usage"]["totalTokens"]}`
+--- starter
+import json
+
+MODEL_ID = "eu.amazon.nova-lite-v1:0"
+SYSTEM = "You review contract clauses against a playbook. Reply with JSON only: clause_id, verdict, risk_level."
+VERDICTS = ("accept", "flag", "redline")
+
+def review_with_bedrock(client, clause_id, text):
+    pass
+--- solution
+import json
+
+MODEL_ID = "eu.amazon.nova-lite-v1:0"
+SYSTEM = "You review contract clauses against a playbook. Reply with JSON only: clause_id, verdict, risk_level."
+VERDICTS = ("accept", "flag", "redline")
+
+def review_with_bedrock(client, clause_id, text):
+    resp = client.converse(
+        modelId=MODEL_ID,
+        system=[{"text": SYSTEM}],
+        messages=[{"role": "user", "content": [{"text": f"Review clause {clause_id}: {text}"}]}],
+        inferenceConfig={"maxTokens": 300, "temperature": 0},
+    )
+    if resp["stopReason"] == "max_tokens":
+        raise ValueError("truncated")
+    blocks = resp["output"]["message"]["content"]
+    data = json.loads("".join(b["text"] for b in blocks if "text" in b))
+    if data["verdict"] not in VERDICTS:
+        raise ValueError(f"bad verdict: {data['verdict']}")
+    return {"clause_id": data["clause_id"], "verdict": data["verdict"], "risk_level": data["risk_level"],
+            "tokens": resp["usage"]["totalTokens"]}
+--- tests
+import boto3
+BR = boto3.client("bedrock-runtime", region_name="eu-north-1")
+expect("高风险条款", lambda: review_with_bedrock(BR, "8.1", "Liability of the Customer is unlimited."), {"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "tokens": 63})
+expect("普通条款", lambda: review_with_bedrock(BR, "3.1", "Fees are payable within thirty (30) days of invoice.")["verdict"], "accept")
+class FakeBedrock:
+    """Returns a prepared response, so tests can try what the real model sometimes does."""
+    def __init__(self, blocks, stop="end_turn"):
+        self.resp = {"output": {"message": {"role": "assistant", "content": blocks}}, "stopReason": stop,
+                     "usage": {"inputTokens": 40, "outputTokens": 20, "totalTokens": 60}}
+    def converse(self, **kwargs):
+        return self.resp
+GOOD = '{"clause_id": "12", "verdict": "flag", "risk_level": "medium"}'
+def _error(client):
+    try:
+        review_with_bedrock(client, "12", "x")
+    except Exception as e:
+        return type(e).__name__, str(e)
+    return "没有报错"
+expect("前面有推理块：只拼 text 块", lambda: review_with_bedrock(FakeBedrock([{"reasoningContent": {"reasoningText": {"text": "thinking"}}}, {"text": GOOD}]), "12", "x"), {"clause_id": "12", "verdict": "flag", "risk_level": "medium", "tokens": 60})
+expect("被截断：先看 stopReason，ValueError(\"truncated\")", lambda: _error(FakeBedrock([{"text": GOOD[:20]}], stop="max_tokens")), ("ValueError", "truncated"))
+expect("不认识的 verdict：ValueError", lambda: _error(FakeBedrock([{"text": GOOD.replace("flag", "approve")}])), ("ValueError", "bad verdict: approve"))
+--- hints
+- `messages=[{"role": "user", "content": [{"text": f"Review clause {clause_id}: {text}"}]}]`，系统提示放在 `system=[{"text": SYSTEM}]`。
+- 先看 `resp["stopReason"]`，再解析。拼文字：`"".join(b["text"] for b in blocks if "text" in b)`。
+- `tokens` 在 `resp["usage"]["totalTokens"]`（驼峰命名）。
+
+@@ item d27-10
+type: code
+title: Gemini：自己重试
+level: 3
+cloud: yes
+--- prompt
+同样的审查，换成 Vertex AI 上的 Gemini。google-genai **默认不重试**，限流（429）和服务端错误（503）会直接到你的代码里，所以这里自己重试。写 `review_with_gemini(client, clause_id, text, sleep, model="gemini-2.5-flash")`：
+
+- 调用 `client.models.generate_content(model=model, contents=f"Review clause {clause_id}: {text}", config=types.GenerateContentConfig(system_instruction=SYSTEM, response_mime_type="application/json", temperature=0))`，参数全部用关键字
+- 捕获 `errors.APIError`：`e.code` 是 429 或 503 时重试，最多一共调用 3 次，第 1 次失败后 `sleep(1)`，第 2 次失败后 `sleep(2)`，第 3 次还失败就抛出；其他错误码（比如 404 模型不存在）马上抛出
+- `response.text` 可能是 `None`（什么都没生成）：`raise ValueError("empty response")`
+- 解析 JSON，返回 `{"clause_id", "verdict", "risk_level", "tokens"}`，其中 `tokens` 是 `usage_metadata.prompt_token_count + usage_metadata.candidates_token_count`（只算输入和回答。gemini-2.5 这类模型默认会先「思考」，思考用的 token 另记在 `thoughts_token_count`，按输出价计费；真要算钱，看 `total_token_count`）
+
+`client` 是 `genai.Client(vertexai=True, project="clausecheck-dev", location="europe-north1")`。模型名做成参数，是因为它会过时（「托管大模型」那张卡片）。
+--- starter
+import json
+from google.genai import types, errors
+
+SYSTEM = "You review contract clauses against a playbook. Reply with JSON: clause_id, verdict, risk_level."
+
+def review_with_gemini(client, clause_id, text, sleep, model="gemini-2.5-flash"):
+    response = client.models.generate_content(model=model, contents=f"Review clause {clause_id}: {text}")
+    return json.loads(response.text)
+--- solution
+import json
+from google.genai import types, errors
+
+SYSTEM = "You review contract clauses against a playbook. Reply with JSON: clause_id, verdict, risk_level."
+
+def review_with_gemini(client, clause_id, text, sleep, model="gemini-2.5-flash"):
+    config = types.GenerateContentConfig(system_instruction=SYSTEM, response_mime_type="application/json", temperature=0)
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(model=model, contents=f"Review clause {clause_id}: {text}", config=config)
+            break
+        except errors.APIError as e:
+            if e.code not in (429, 503) or attempt == 2:
+                raise
+            sleep(attempt + 1)
+    if response.text is None:
+        raise ValueError("empty response")
+    data = json.loads(response.text)
+    usage = response.usage_metadata
+    return {"clause_id": data["clause_id"], "verdict": data["verdict"], "risk_level": data["risk_level"],
+            "tokens": usage.prompt_token_count + usage.candidates_token_count}
+--- tests
+from types import SimpleNamespace
+from google import genai
+from google.genai import errors
+G = genai.Client(vertexai=True, project="clausecheck-dev", location="europe-north1")
+R = {"clause_id": "8.1", "verdict": "redline", "risk_level": "high"}
+def run(fails=0, kind="throttle", **kw):
+    CLOUD.queue.clear()
+    CLOUD.fail_next("genai", kind, fails)
+    delays = []
+    try:
+        out = review_with_gemini(G, "8.1", "Liability of the Customer is unlimited.", delays.append, **kw)
+        out = {k: v for k, v in out.items() if k != "tokens"}
+    except errors.APIError as e:
+        out = e.code
+    return out, delays
+expect("正常", lambda: run(), (R, []))
+expect("429 两次后成功：等 1 秒、2 秒", lambda: run(2), (R, [1, 2]))
+expect("503 也重试", lambda: run(1, "unavailable"), (R, [1]))
+expect("一直 429：调用 3 次后抛出", lambda: run(5), (429, [1, 2]))
+expect("404 模型不存在：不重试", lambda: run(model="gpt-4o"), (404, []))
+class FakeGemini:
+    def __init__(self, text, prompt=10, out=5):
+        self.models = self
+        self.r = SimpleNamespace(text=text, usage_metadata=SimpleNamespace(prompt_token_count=prompt, candidates_token_count=out))
+    def generate_content(self, **kwargs):
+        return self.r
+expect("tokens = prompt + candidates", lambda: review_with_gemini(FakeGemini('{"clause_id": "3.1", "verdict": "accept", "risk_level": "low"}', 120, 30), "3.1", "x", print)["tokens"], 150)
+expect_raises("什么都没生成：ValueError", lambda: review_with_gemini(FakeGemini(None), "3.1", "x", print), ValueError)
+--- hints
+- 骨架：`for attempt in range(3):` 里 `try: response = ...; break`；`except errors.APIError as e:` 里 `if e.code not in (429, 503) or attempt == 2: raise`，否则 `sleep(attempt + 1)`。
+- 循环结束后先检查 `response.text is None`，再 `json.loads(response.text)`。
+- token 数在 `response.usage_metadata.prompt_token_count` 和 `.candidates_token_count`。
+
+@@ item d27-11
+type: code
+title: 一行一条的 JSON 日志
+level: 2
+--- prompt
+写 `log_event(message, severity="INFO", **fields)`：打印**一行** JSON（结构化日志），供 Cloud Logging / CloudWatch 收集。
+
+- JSON 里有 `severity`、`message`，再加上 `fields` 里的所有字段
+- `severity` 先 `.upper()`（传 `"error"` 也行），之后必须是 `SEVERITIES` 之一，否则 `raise ValueError(f"bad severity: {severity}")`
+- 字段名在 `SECRET_FIELDS` 里的（合同全文、密钥不能进日志），值换成 `"[redacted]"`
+- 用 `json.dumps(..., sort_keys=True, ensure_ascii=False)`：字段顺序固定，`ö` 原样输出
+- 返回 `None`
+
+例：`log_event("clause reviewed", clause_id="8.1", tokens=2205)` 打印
+
+`{"clause_id": "8.1", "message": "clause reviewed", "severity": "INFO", "tokens": 2205}`
+--- starter
+import json
+
+SEVERITIES = ("DEBUG", "INFO", "WARNING", "ERROR")
+SECRET_FIELDS = ("text", "contract_text", "api_key")
+
+def log_event(message, severity="INFO", **fields):
+    print(f"{severity}: {message} {fields}")
+--- solution
+import json
+
+SEVERITIES = ("DEBUG", "INFO", "WARNING", "ERROR")
+SECRET_FIELDS = ("text", "contract_text", "api_key")
+
+def log_event(message, severity="INFO", **fields):
+    severity = severity.upper()
+    if severity not in SEVERITIES:
+        raise ValueError(f"bad severity: {severity}")
+    record = {"severity": severity, "message": message}
+    for name, value in fields.items():
+        record[name] = "[redacted]" if name in SECRET_FIELDS else value
+    print(json.dumps(record, sort_keys=True, ensure_ascii=False))
+--- tests
+expect_output("题目里的例子", lambda: log_event("clause reviewed", clause_id="8.1", tokens=2205), '{"clause_id": "8.1", "message": "clause reviewed", "severity": "INFO", "tokens": 2205}')
+expect_output("小写的 error 也行", lambda: log_event("model call failed", severity="error", contract_id=109), '{"contract_id": 109, "message": "model call failed", "severity": "ERROR"}')
+expect_output("合同全文和密钥被遮住，ö 原样输出", lambda: log_event("request", text="Liability is unlimited.", api_key="sk-live-9f2c", customer="Malmö AB"), '{"api_key": "[redacted]", "customer": "Malmö AB", "message": "request", "severity": "INFO", "text": "[redacted]"}')
+expect_raises("不认识的级别", lambda: log_event("x", severity="FATAL"), ValueError)
+--- hints
+- 先处理级别：`severity = severity.upper()`，再检查 `in SEVERITIES`。
+- `record = {"severity": severity, "message": message}`，然后 `for name, value in fields.items():` 一个个放进去，名字在 `SECRET_FIELDS` 里就放 `"[redacted]"`。
+- 最后 `print(json.dumps(record, sort_keys=True, ensure_ascii=False))`。
+
+@@ item d27-12
+type: choice
+title: 长任务放在哪里
+level: 2
+--- prompt
+审一份 40 页的合同：大约 65 条条款，每条调一次模型（3–10 秒），一份合同一共要 5–10 分钟。现在的做法是：一个 HTTP 请求里审完整份合同再返回。部署到云上时，哪个设计最稳妥？
+--- options
+- 放进 Lambda，一次调用审一整份合同：Lambda 能跑 15 分钟，够了
+- 放进 Cloud Run，把请求超时调到 60 分钟，前端一直等着
+- 上传后往队列里发一条消息；worker（Cloud Run 或 Lambda 都行）每次处理一份合同或几条条款，把进度和结果写进数据库或桶；前端去查进度
+- Cloud Run 收到请求先返回 202，再在同一个实例的后台线程里慢慢审
+answer: 3
+--- explain
+能跑多久只是一方面：一个请求挂 10 分钟，中途网络断了、实例被替换、模型限流，整份都要重来，用户还得一直开着页面。拆进队列以后，每一步都短、能重试（没删的消息会回来）、能并行，一直失败的进死信队列等人看。第一个离 15 分钟的上限太近，合同一长就超时，而且 HTTP 请求经过 API Gateway 时默认 29 秒就断了，根本等不到结果；第二个能跑但很脆弱；第四个在 Cloud Run 的默认设置下，返回响应之后实例几乎不给 CPU，实例也随时可能被回收，后台线程里的工作会悄悄丢掉。
+
+@@ item d27-13
+type: order
+title: 排 Dockerfile
+level: 2
+lang: docker
+--- prompt
+排出 Clause Check API 的 Dockerfile（这题按行的顺序判分）。要求：
+
+- 从官方的 `python:3.12-slim` 镜像开始；工作目录是 `/app`，要在复制任何文件之前设置
+- 只改了代码时，不要重新安装依赖（想想层缓存：先复制什么、先装什么）
+- 容器启动时运行 uvicorn，监听 `0.0.0.0` 和平台给的 `$PORT`（没有时用 8080）；启动命令按习惯写在最后一行
+
+有两行干扰项。
+--- lines
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec uvicorn clausecheck.api:app --host 0.0.0.0 --port ${PORT:-8080}
+--- distractors
+COPY .env .
+CMD uvicorn clausecheck.api:app --port 8000
+--- hints
+- 顺序：基础镜像 → 工作目录 → 依赖清单 → 装依赖 → 其余代码 → 启动命令。
+- `.env` 里是你本机的密钥，永远不进镜像（线上的密钥来自 Secret Manager）。`--port 8000` 把端口写死了，而且 uvicorn 默认只听 `127.0.0.1`，容器外面连不上。
+
+@@ item d27-14
+type: choice
+title: 哪些不进镜像
+level: 2
+--- prompt
+`.dockerignore` 决定 `COPY . .` 时哪些文件**不会**进镜像。Clause Check 的项目根目录里有下面这些，哪些应该写进 `.dockerignore`？（多选）
+--- options
+- `.env`
+- `clausecheck/`
+- `.git/`
+- `*.report.json`、`work/`、`__pycache__/`
+- `requirements.txt`
+answer: 1,3,4
+--- explain
+`.env` 里是本机的密钥：镜像会被推到镜像仓库，被很多人和机器拉取，密钥进了镜像就等于泄露了（在后面的步骤里删掉也没用，前面那一层里还在）。`.git/` 又大，又带着全部历史，可能包括以前误提交过的东西。报告、临时文件、缓存会让镜像变大，还可能带着客户数据。`clausecheck/` 是代码本身，`requirements.txt` 是装依赖要用的，这两个必须进镜像。写法和 `.gitignore` 一样，一行一个模式。
+
+@@ item d27-15
+type: code
+title: TS：有类型的 Lambda
+level: 2
+lang: ts
+--- prompt
+用 TypeScript 写同一个 Lambda（Node.js 运行时）。类型已经在起始代码里写好了：真实项目里用 `@types/aws-lambda` 包里的 `APIGatewayProxyEvent` / `APIGatewayProxyResult`，这里自己定义一个简化版。
+
+写 `export const handler = async (event: ApiEvent): Promise<ApiResult> => { ... }`：
+
+- `event.httpMethod` 不是 `"POST"`：405，正文 `{ error: "method not allowed" }`
+- `event.body` 是 `null`，或者 `JSON.parse` 失败：400，正文 `{ error: "body must be JSON" }`
+- 用 `ReviewRequest.safeParse(...)` 校验，失败：400，正文 `{ error: "invalid request" }`
+- 成功：200，正文 `{ clause_id, verdict: reviewClause(text) }`；`clause_id` 没给时是 `"unknown"`（schema 里的默认值，用 `r.data.clause_id` 就拿到了）
+
+所有响应都用写好的 `respond(statusCode, payload)`。
+--- starter
+import { z } from "zod";
+
+type ApiEvent = { httpMethod: string; path: string; headers: Record<string, string>; body: string | null; isBase64Encoded: boolean };
+type ApiResult = { statusCode: number; headers: Record<string, string>; body: string };
+
+const ReviewRequest = z.object({
+  clause_id: z.string().default("unknown"),
+  text: z.string().min(1),
+});
+
+function reviewClause(text: string): "accept" | "flag" | "redline" {
+  return /unlimited/i.test(text) ? "redline" : "accept";
+}
+
+function respond(statusCode: number, payload: unknown): ApiResult {
+  return { statusCode, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+}
+
+export const handler = async (event: ApiEvent): Promise<ApiResult> => {
+  return respond(200, {});
+};
+--- solution
+import { z } from "zod";
+
+type ApiEvent = { httpMethod: string; path: string; headers: Record<string, string>; body: string | null; isBase64Encoded: boolean };
+type ApiResult = { statusCode: number; headers: Record<string, string>; body: string };
+
+const ReviewRequest = z.object({
+  clause_id: z.string().default("unknown"),
+  text: z.string().min(1),
+});
+
+function reviewClause(text: string): "accept" | "flag" | "redline" {
+  return /unlimited/i.test(text) ? "redline" : "accept";
+}
+
+function respond(statusCode: number, payload: unknown): ApiResult {
+  return { statusCode, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+}
+
+export const handler = async (event: ApiEvent): Promise<ApiResult> => {
+  if (event.httpMethod !== "POST") {
+    return respond(405, { error: "method not allowed" });
+  }
+  if (event.body === null) {
+    return respond(400, { error: "body must be JSON" });
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(event.body);
+  } catch {
+    return respond(400, { error: "body must be JSON" });
+  }
+  const r = ReviewRequest.safeParse(raw);
+  if (!r.success) {
+    return respond(400, { error: "invalid request" });
+  }
+  return respond(200, { clause_id: r.data.clause_id, verdict: reviewClause(r.data.text) });
+};
+--- tests
+const ev = (body: string | null, method = "POST"): ApiEvent => ({ httpMethod: method, path: "/review", headers: { "Content-Type": "application/json" }, body, isBase64Encoded: false });
+const call = async (e: ApiEvent) => {
+  const r = await handler(e);
+  return [r.statusCode, r.headers["Content-Type"], JSON.parse(r.body)];
+};
+expectAsync("正常", () => call(ev('{"clause_id": "8.1", "text": "Liability is unlimited."}')), [200, "application/json", { clause_id: "8.1", verdict: "redline" }]);
+expectAsync("clause_id 用默认值", () => call(ev('{"text": "Fees are payable in 30 days."}')), [200, "application/json", { clause_id: "unknown", verdict: "accept" }]);
+expectAsync("GET：405", () => call(ev(null, "GET")), [405, "application/json", { error: "method not allowed" }]);
+expectAsync("没有 body、坏 JSON：400", async () => [(await call(ev(null)))[2], (await call(ev('{"text": ')))[2]], [{ error: "body must be JSON" }, { error: "body must be JSON" }]);
+expectAsync("text 是空字符串：400", () => call(ev('{"text": ""}')), [400, "application/json", { error: "invalid request" }]);
+--- hints
+- 按顺序提前返回：先看 `event.httpMethod`，再看 `event.body === null`，再 `try { raw = JSON.parse(event.body); } catch { ... }`（`raw` 声明成 `let raw: unknown;`）。
+- `const r = ReviewRequest.safeParse(raw);`，`if (!r.success)` 返回 400；之后 TypeScript 知道 `r.data` 有 `clause_id` 和 `text`。
+
+@@ item d27-16
+type: translate
+title: 翻译：解析 S3 事件
+level: 2
+lang: ts
+--- prompt
+把今天的 `parse_s3_event` 翻译成 TypeScript 的 `parseS3Event(event)`，返回 `[bucket, key]` 元组的数组。
+
+Python 的 `unquote_plus(key)` 在 JavaScript 里要两步：先把 `+` 换回空格，再 `decodeURIComponent`：`decodeURIComponent(key.replace(/\+/g, " "))`。顺序不能反：先解码的话，`%2B` 变出来的真正的 `+` 也会被换成空格。`event.get("Records", [])` 在 TS 里是 `event.Records ?? []`。
+--- source
+from urllib.parse import unquote_plus
+
+def parse_s3_event(event):
+    out = []
+    for record in event.get("Records", []):
+        if not record["eventName"].startswith("ObjectCreated:"):
+            continue
+        bucket = record["s3"]["bucket"]["name"]
+        key = unquote_plus(record["s3"]["object"]["key"])
+        out.append((bucket, key))
+    return out
+--- starter
+type S3Record = { eventName: string; s3: { bucket: { name: string }; object: { key: string; size: number } } };
+type S3Event = { Records?: S3Record[] };
+
+function parseS3Event(event: S3Event): [string, string][] {
+  return [];
+}
+--- solution
+type S3Record = { eventName: string; s3: { bucket: { name: string }; object: { key: string; size: number } } };
+type S3Event = { Records?: S3Record[] };
+
+function parseS3Event(event: S3Event): [string, string][] {
+  const out: [string, string][] = [];
+  for (const record of event.Records ?? []) {
+    if (!record.eventName.startsWith("ObjectCreated:")) continue;
+    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+    out.push([record.s3.bucket.name, key]);
+  }
+  return out;
+}
+--- tests
+const rec = (key: string, eventName = "ObjectCreated:Put"): S3Record => ({ eventName, s3: { bucket: { name: "clausecheck-contracts" }, object: { key, size: 100 } } });
+expect("一条记录", () => parseS3Event({ Records: [rec("contracts/2/103/original.pdf")] }), [["clausecheck-contracts", "contracts/2/103/original.pdf"]]);
+expect("+ 和 %C3%B6", () => parseS3Event({ Records: [rec("contracts/5/109/Avtal+Malm%C3%B6+2026.pdf")] }), [["clausecheck-contracts", "contracts/5/109/Avtal Malmö 2026.pdf"]]);
+expect("真正的 + 是 %2B", () => parseS3Event({ Records: [rec("contracts/1/101/C%2B%2B+SDK+License.pdf")] })[0][1], "contracts/1/101/C++ SDK License.pdf");
+expect("跳过删除事件", () => parseS3Event({ Records: [rec("a.pdf", "ObjectRemoved:Delete"), rec("b.pdf")] }), [["clausecheck-contracts", "b.pdf"]]);
+expect("没有 Records", () => parseS3Event({}), []);
+--- hints
+- `for (const record of event.Records ?? [])`，不是 `ObjectCreated:` 开头就 `continue`。
+- 结果数组要标注类型：`const out: [string, string][] = [];`，然后 `out.push([record.s3.bucket.name, key])`。
+
+@@ item d27-17
+type: code
+title: 上线前的自动检查
+level: 2
+--- prompt
+把上线清单的一部分变成代码：部署前在 CI 里跑一遍，发现问题就拦下来。写 `check_deploy(config)`，按下面的顺序检查，返回问题列表（字符串）；没有问题返回 `[]`：
+
+1. `config["region"]` 不在 `EU_REGIONS` 里：`"region <区域> is not an EU region"`。注意是白名单，不是看前缀：`europe-west2` 和 `eu-west-2` 都在伦敦，英国不在欧盟
+2. `config["service_account"]` 是 `"default"`，或者以 `"-compute@developer.gserviceaccount.com"` 结尾（GCP 的默认计算服务账号，权限往往很大）：`"use a dedicated service account"`
+3. `config.get("max_instances")` 不是正整数（没有这个键、`None`、`0`）：`"set max_instances"`
+4. `config["env"]` 里，值以 `"sk-"` 开头的每个变量，按变量名的字母顺序：`"<变量名> looks like a secret, use a secret manager"`
+5. `config["image"]` 以 `":latest"` 结尾：`"pin the image tag"`（`latest` 会变，回滚时不知道回到哪个版本）
+--- starter
+EU_REGIONS = {
+    "europe-north1", "europe-west1", "europe-west3", "europe-west4",   # GCP: Finland, Belgium, Frankfurt, Netherlands
+    "eu-north-1", "eu-central-1", "eu-west-1", "eu-west-3",           # AWS: Stockholm, Frankfurt, Ireland, Paris
+}
+
+def check_deploy(config):
+    problems = []
+    return problems
+--- solution
+EU_REGIONS = {
+    "europe-north1", "europe-west1", "europe-west3", "europe-west4",   # GCP: Finland, Belgium, Frankfurt, Netherlands
+    "eu-north-1", "eu-central-1", "eu-west-1", "eu-west-3",           # AWS: Stockholm, Frankfurt, Ireland, Paris
+}
+
+def check_deploy(config):
+    problems = []
+    if config["region"] not in EU_REGIONS:
+        problems.append(f"region {config['region']} is not an EU region")
+    account = config["service_account"]
+    if account == "default" or account.endswith("-compute@developer.gserviceaccount.com"):
+        problems.append("use a dedicated service account")
+    max_instances = config.get("max_instances")
+    if not isinstance(max_instances, int) or max_instances < 1:
+        problems.append("set max_instances")
+    for name in sorted(config["env"]):
+        if config["env"][name].startswith("sk-"):
+            problems.append(f"{name} looks like a secret, use a secret manager")
+    if config["image"].endswith(":latest"):
+        problems.append("pin the image tag")
+    return problems
+--- tests
+GOOD = {
+    "region": "europe-north1",
+    "service_account": "clausecheck-api@clausecheck-dev.iam.gserviceaccount.com",
+    "max_instances": 5,
+    "env": {"CLAUSECHECK_MODE": "deepseek", "CLAUSECHECK_DEEPSEEK_MODEL": "deepseek-flash", "CLAUSECHECK_PROMPT_VERSION": "v2"},
+    "image": "europe-north1-docker.pkg.dev/clausecheck-dev/app/clausecheck-api:2026-09-23.1",
+}
+BAD = {
+    "region": "us-central1",
+    "service_account": "123456789012-compute@developer.gserviceaccount.com",
+    "max_instances": 0,
+    "env": {"LANGFUSE_SECRET_KEY": "sk-lf-1a2b", "DEEPSEEK_API_KEY": "sk-live-9f2c", "CLAUSECHECK_MODE": "deepseek"},
+    "image": "europe-north1-docker.pkg.dev/clausecheck-dev/app/clausecheck-api:latest",
+}
+expect("没问题", lambda: check_deploy(GOOD), [])
+expect("全是问题（按顺序）", lambda: check_deploy(BAD), ["region us-central1 is not an EU region", "use a dedicated service account", "set max_instances", "DEEPSEEK_API_KEY looks like a secret, use a secret manager", "LANGFUSE_SECRET_KEY looks like a secret, use a secret manager", "pin the image tag"])
+expect("伦敦不在欧盟", lambda: check_deploy({**GOOD, "region": "europe-west2"}), ["region europe-west2 is not an EU region"])
+expect("AWS 的斯德哥尔摩可以；没有 max_instances 这个键", lambda: check_deploy({k: v for k, v in {**GOOD, "region": "eu-north-1"}.items() if k != "max_instances"}), ["set max_instances"])
+--- hints
+- 一条规则一个 `if`，按题目的顺序 `problems.append(...)`。
+- `config.get("max_instances")` 没有这个键时是 `None`；`not isinstance(x, int) or x < 1` 同时挡住 `None` 和 `0`。
+- 环境变量要按名字排序：`for name in sorted(config["env"]):`。
+
+@@ item d27-18
+type: local
+title: 本机任务（选做）：打一个镜像
+level: 2
+--- prompt
+如果你装了 Docker Desktop，把 Clause Check 真的打成镜像。没装也没关系：读一遍步骤，然后在下面写出 Dockerfile 每一行的作用（要包含 `FROM` 和 `CMD` 两行）。
+
+在项目根目录 `G:\Contract Clause Reviewer` 新建 `Dockerfile`：
+
+```
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec uvicorn clausecheck.api:app --host 0.0.0.0 --port ${PORT:-8080}
+```
+
+再新建 `.dockerignore`（`learn` 里有网站的 node_modules，很大）：
+
+```
+.env
+.git
+__pycache__
+.pytest_cache
+*.report.json
+work
+learn
+node_modules
+```
+
+然后在 PowerShell 里运行（第一次要下载基础镜像和依赖，可能要好几分钟）：
+
+```
+cd "G:\Contract Clause Reviewer"
+docker build -t clausecheck-api .
+docker run --rm -p 8080:8080 -e PORT=8080 -e CLAUSECHECK_MODE=mock clausecheck-api
+```
+
+另开一个 PowerShell 窗口：`curl.exe http://localhost:8080/health`，应该看到 `{"ok":true,"mode":"mock",...}`。注意我们没有把 `.env` 放进镜像，所以用 `-e` 传了一个不需要密钥的设置。回到第一个窗口按 Ctrl+C 停止容器。
+
+把 `curl.exe` 的输出（或者你写的 Dockerfile 逐行说明）粘贴到下面。
+placeholder: 粘贴 /health 的输出，或者 Dockerfile 每一行的作用
+verify: "ok"\s*:\s*true|FROM python[\s\S]*CMD
+--- hints
+- `docker` 命令找不到：Docker Desktop 没装或者没启动。装它需要管理员权限和一些磁盘空间，不装也可以完成这题的第二种做法。
+- `curl.exe` 连不上：看第一个窗口有没有打印 `Uvicorn running on http://0.0.0.0:8080`；`docker run` 里的 `-p 8080:8080` 把本机的 8080 端口接到了容器的 8080 端口。
+- 镜像很大（依赖里有 streamlit、langgraph、pytest）：真实项目里给服务单独准备一份只含运行所需的依赖清单。
+
+@@ item d27-e1
+type: scratch
+title: 闭卷：Lambda 入口
+exam: yes
+level: 3
+--- prompt
+写 AWS Lambda 的入口 `lambda_handler(event, context, review=review_clause)`，处理 API Gateway（REST API proxy）转来的请求。文件里先定义：
+
+```python
+def review_clause(clause_id, text):
+    return {"clause_id": clause_id, "verdict": "accept"}
+```
+
+规则（按顺序检查）：
+
+- `event["path"]` 不是 `"/review"`：404，正文 `{"error": "not found"}`；`event["httpMethod"]` 不是 `"POST"`：405，正文 `{"error": "method not allowed"}`
+- `event.get("isBase64Encoded")` 为真时，`body` 是 base64 编码的：先 `base64.b64decode(body).decode("utf-8")`
+- `body` 是 `None`、不是合法 JSON、或者不是 JSON 对象：400，正文 `{"error": "body must be a JSON object"}`
+- `text` 必须是去掉空白后非空的字符串，`clause_id` 如果给了必须是字符串（不给就是 `"unknown"`）：否则 400，正文 `{"error": "invalid request"}`
+- 调用 `review(clause_id, text)`；它抛出任何异常：502，正文 `{"error": "review failed"}`（不要把异常信息返回给调用方）
+- 成功：200，正文是 `review` 的返回值
+
+每个响应都是 `{"statusCode": 状态码, "headers": {"Content-Type": "application/json"}, "body": json.dumps(正文)}`。
+--- solution
+import base64
+import json
+
+def review_clause(clause_id, text):
+    return {"clause_id": clause_id, "verdict": "accept"}
+
+def respond(status, payload):
+    return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
+
+def lambda_handler(event, context, review=review_clause):
+    if event.get("path") != "/review":
+        return respond(404, {"error": "not found"})
+    if event.get("httpMethod") != "POST":
+        return respond(405, {"error": "method not allowed"})
+    body = event.get("body")
+    if body is not None and event.get("isBase64Encoded"):
+        body = base64.b64decode(body).decode("utf-8")
+    try:
+        data = json.loads(body or "")
+    except json.JSONDecodeError:
+        return respond(400, {"error": "body must be a JSON object"})
+    if not isinstance(data, dict):
+        return respond(400, {"error": "body must be a JSON object"})
+    text = data.get("text")
+    clause_id = data.get("clause_id", "unknown")
+    if not isinstance(text, str) or not text.strip() or not isinstance(clause_id, str):
+        return respond(400, {"error": "invalid request"})
+    try:
+        result = review(clause_id, text)
+    except Exception:
+        return respond(502, {"error": "review failed"})
+    return respond(200, result)
+--- tests
+import base64
+import json
+def ev(body, method="POST", path="/review", b64=False):
+    return {"httpMethod": method, "path": path, "headers": {}, "body": body, "isBase64Encoded": b64}
+def call(event, review=None):
+    r = lambda_handler(event, None) if review is None else lambda_handler(event, None, review=review)
+    return r["statusCode"], json.loads(r["body"]), r["headers"]["Content-Type"]
+BODY = '{"clause_id": "8.1", "text": "Liability is unlimited."}'
+expect("正常，以及 base64 的 body", lambda: [call(ev(BODY)), call(ev(base64.b64encode(BODY.encode()).decode(), b64=True))], [(200, {"clause_id": "8.1", "verdict": "accept"}, "application/json")] * 2)
+expect("路径和方法", lambda: [call(ev(BODY, path="/admin"))[:2], call(ev(BODY, method="GET"))[:2]], [(404, {"error": "not found"}), (405, {"error": "method not allowed"})])
+expect("坏请求", lambda: [call(ev(b))[:2] for b in (None, "{oops", "[1]", '{"text": "  "}', '{"text": "x", "clause_id": 8.1}')], [(400, {"error": "body must be a JSON object"})] * 3 + [(400, {"error": "invalid request"})] * 2)
+def _boom(clause_id, text):
+    raise TimeoutError("secret internal detail")
+expect("review 出错：502，不泄露细节", lambda: call(ev(BODY), review=_boom)[:2], (502, {"error": "review failed"}))
+
+@@ item d27-e2
+type: scratch
+title: 闭卷：幂等的队列 worker
+exam: yes
+level: 3
+cloud: yes
+--- prompt
+写 `drain(sqs, queue_url, handle, done, dead)`：反复处理一个 SQS 队列，直到某一轮一条消息都没取到为止（最多 10 轮）。
+
+- 每一轮：`sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=20, MessageSystemAttributeNames=["ApproximateReceiveCount"])`（长轮询：真 SQS 用短轮询时，空响应不代表队列空了）；没有消息时响应里没有 `Messages` 键
+- 每条消息的 `Body` 是 JSON，里面有 `job_id`。按顺序处理：
+  1. `job_id` 在集合 `done` 里：重复送达，删除消息，不处理
+  2. 消息的 `msg["Attributes"]["ApproximateReceiveCount"]`（注意是**字符串**）转成整数后大于 3：这是一条反复失败的「毒消息」，把 `Body` 原文 append 到列表 `dead`（模拟死信队列），删除消息，不处理
+  3. 否则调用 `handle(job)`：成功就 `done.add(job_id)` 并删除消息；抛出任何异常就**不删除**（它过一会儿会回来）
+- 删除用 `sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])`
+- 返回这次调用里处理成功的 `job_id` 列表（按处理顺序）
+--- solution
+import json
+
+def drain(sqs, queue_url, handle, done, dead):
+    finished = []
+    for _ in range(10):
+        resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=20,
+                                   MessageSystemAttributeNames=["ApproximateReceiveCount"])
+        messages = resp.get("Messages", [])
+        if not messages:
+            break
+        for msg in messages:
+            job = json.loads(msg["Body"])
+            receipt = msg["ReceiptHandle"]
+            if job["job_id"] in done:
+                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+                continue
+            if int(msg["Attributes"]["ApproximateReceiveCount"]) > 3:
+                dead.append(msg["Body"])
+                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+                continue
+            try:
+                handle(job)
+            except Exception:
+                continue
+            done.add(job["job_id"])
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+            finished.append(job["job_id"])
+    return finished
+--- tests
+import json
+import boto3
+SQS = boto3.client("sqs", region_name="eu-north-1")
+URL = SQS.create_queue(QueueName="review-jobs")["QueueUrl"]
+for job_id in ("review-201", "review-202", "review-201", "review-203"):
+    SQS.send_message(QueueUrl=URL, MessageBody=json.dumps({"job_id": job_id}))
+def handle(job):
+    if job["job_id"] == "review-202":
+        raise ValueError("this contract always breaks the parser")
+DONE, DEAD = set(), []
+expect("第一轮：201、203 成功，重复的 201 被跳过", lambda: drain(SQS, URL, handle, DONE, DEAD), ["review-201", "review-203"])
+def _three_more():
+    out = []
+    for _ in range(3):
+        CLOUD.advance(31)
+        out.append((drain(SQS, URL, handle, DONE, DEAD), len(DEAD)))
+    return out, DEAD, len(CLOUD.sqs[URL]["messages"])
+expect("202 第 2、3 次还在重试，第 4 次送来时才进死信，队列清空", _three_more, ([([], 0), ([], 0), ([], 1)], ['{"job_id": "review-202"}'], 0))
+expect("done 里是成功的两个", lambda: sorted(DONE), ["review-201", "review-203"])
+
+@@ item d27-e3
+type: scratch
+title: 闭卷：Bedrock + 重试 + 兜底
+exam: yes
+level: 3
+cloud: yes
+--- prompt
+写 `review_clause_bedrock(client, clause_id, text, sleep)`。`client` 是 `bedrock-runtime` 的 client，已经设置成 SDK **不重试**（`total_max_attempts=1`），所以限流错误会直接到你这里。
+
+- 调用 `client.converse(...)`：`modelId="eu.amazon.nova-lite-v1:0"`；`system=[{"text": "Reply with JSON only: clause_id, verdict, risk_level."}]`；一条 user 消息，内容是 `f"Review clause {clause_id}: {text}"`；`inferenceConfig={"maxTokens": 200, "temperature": 0}`
+- `botocore.exceptions.ClientError` 的错误码是 `ThrottlingException` 或 `ServiceUnavailableException` 时重试：最多一共调用 4 次，第 `i` 次失败后（`i` 从 0 开始）`sleep(2 ** i)`；第 4 次还失败就把错误抛出去。其他错误马上抛出
+- 拿到回答以后：`stopReason` 是 `"max_tokens"`（被截断了，就算文字碰巧能解析也不信）、`content[0]["text"]` 不是合法 JSON、或者 `verdict` 不在 `("accept", "flag", "redline")` 里，都**不要报错**，而是返回兜底结果 `{"clause_id": clause_id, "verdict": "flag", "risk_level": "medium", "fallback": True}`（拿不准就交给人看，这是 Clause Check 的原则）
+- 否则返回 `{"clause_id": clause_id, "verdict": ..., "risk_level": ..., "fallback": False}`
+--- solution
+import json
+from botocore.exceptions import ClientError
+
+RETRY_CODES = ("ThrottlingException", "ServiceUnavailableException")
+VERDICTS = ("accept", "flag", "redline")
+
+def review_clause_bedrock(client, clause_id, text, sleep):
+    for i in range(4):
+        try:
+            resp = client.converse(
+                modelId="eu.amazon.nova-lite-v1:0",
+                system=[{"text": "Reply with JSON only: clause_id, verdict, risk_level."}],
+                messages=[{"role": "user", "content": [{"text": f"Review clause {clause_id}: {text}"}]}],
+                inferenceConfig={"maxTokens": 200, "temperature": 0},
+            )
+            break
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in RETRY_CODES or i == 3:
+                raise
+            sleep(2 ** i)
+    fallback = {"clause_id": clause_id, "verdict": "flag", "risk_level": "medium", "fallback": True}
+    if resp["stopReason"] == "max_tokens":
+        return fallback
+    try:
+        data = json.loads(resp["output"]["message"]["content"][0]["text"])
+    except json.JSONDecodeError:
+        return fallback
+    if data.get("verdict") not in VERDICTS:
+        return fallback
+    return {"clause_id": clause_id, "verdict": data["verdict"], "risk_level": data.get("risk_level"), "fallback": False}
+--- tests
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+BR = boto3.client("bedrock-runtime", region_name="eu-north-1", config=Config(retries={"total_max_attempts": 1}))
+def run(fails=0, kind="throttle"):
+    CLOUD.queue.clear()
+    CLOUD.fail_next("bedrock-runtime", kind, fails)
+    delays = []
+    try:
+        out = review_clause_bedrock(BR, "8.1", "Liability of the Customer is unlimited.", delays.append)
+    except ClientError as e:
+        out = e.response["Error"]["Code"]
+    return out, delays
+RED = {"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "fallback": False}
+expect("限流 2 次、503 一次后成功", lambda: (run(2), run(1, "unavailable")), ((RED, [1, 2]), (RED, [1])))
+expect("一直限流：调用 4 次后抛出", lambda: run(9), ("ThrottlingException", [1, 2, 4]))
+class Fake:
+    def __init__(self, text, stop="end_turn"):
+        self.resp = {"output": {"message": {"role": "assistant", "content": [{"text": text}]}}, "stopReason": stop, "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}}
+    def converse(self, **kwargs):
+        return self.resp
+FLAG = {"clause_id": "12", "verdict": "flag", "risk_level": "medium", "fallback": True}
+expect("截断（哪怕文字能解析）、坏 JSON、奇怪的 verdict：都兜底成 flag", lambda: [review_clause_bedrock(Fake(t, s), "12", "x", print) for t, s in (('{"verdict": "accept"}', "max_tokens"), ("Sure! Here you go", "end_turn"), ('{"verdict": "approve"}', "end_turn"))], [FLAG] * 3)

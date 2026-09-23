@@ -308,6 +308,8 @@ title: 复习：async 调用 + 计数
 level: 2
 --- prompt
 复习第 5、6 天。写 `countTopics(texts)`：对每段文字**按顺序** await 一次 `askJson(text)`（已写好），取回答里的 `topic` 字段计数，返回 `{ 主题: 次数 }`。空数组返回 `{}`。
+
+`askJson` 里的 `thinking: { type: "disabled" }` 关掉了 DeepSeek 默认开着的思考模式：给条款归类用不着长推理，关掉更快、更省钱（思考的 token 按输出计费）。
 --- starter
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
@@ -316,7 +318,12 @@ async function askJson(text: string): Promise<any> {
   const res = await fetch(API_URL, {
     method: "POST",
     headers: HEADERS,
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }),
+    body: JSON.stringify({
+      model: "deepseek-flash",
+      messages: [{ role: "user", content: text }],
+      response_format: { type: "json_object" },
+      thinking: { type: "disabled" },
+    }),
   });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content);
@@ -333,7 +340,12 @@ async function askJson(text: string): Promise<any> {
   const res = await fetch(API_URL, {
     method: "POST",
     headers: HEADERS,
-    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }),
+    body: JSON.stringify({
+      model: "deepseek-flash",
+      messages: [{ role: "user", content: text }],
+      response_format: { type: "json_object" },
+      thinking: { type: "disabled" },
+    }),
   });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content);

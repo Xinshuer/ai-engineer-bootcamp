@@ -1,0 +1,1587 @@
+@@ day 31
+title: RAG 与智能体：Document、切分、向量库、检索链、create_agent
+lang: py
+langchain: yes
+hours: 4–5 小时
+--- goal
+用 LangChain 的零件重搭第 11、19 天手写的 RAG：带 metadata 的 `Document`、切分器、向量库、retriever，做一条能说出出处的检索链；再用 `create_agent` 让模型自己决定什么时候去查，并看清它其实就是一张 LangGraph 图（明天你自己画图）。对应项目里的 `split.py`（一条条款一块）和 `review.py`（有上限的工具循环）。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每张都改一处再运行
+- 练习区全部通过
+- 闭卷 3 题
+- 能用自己的话回答面试题：「固定的 RAG 链、create_agent、自己写 LangGraph，各在什么时候用？」
+
+@@ concept
+title: Document：带出处的片段
+--- body
+第 11 天你把片段写成字典 `{"id": "c1", "text": "..."}`。LangChain 的检索零件（切分器、向量库、retriever）进出的都是 `Document`：
+
+- `page_content`：片段文字，喂给 embedding 和 prompt 的就是它
+- `metadata`：任意字典，放**出处**：`clause_id`、`heading`、`source` 文件名、`topic`……检索回来它原样跟着，引用和过滤全靠它
+
+合同有编号，最好的切法还是 `split.py` 的「一条条款一块」：正则找标题行，两个标题行之间就是正文。下面的正则和 `split.py` 的 `CLAUSE_HEAD` 是同一个思路。
+
+经典错误：只存文字、不存 metadata。检索到了，却说不出「这是第几条」，第 19 天的引用就做不成了。
+--- code
+import re
+from langchain_core.documents import Document
+
+CONTRACT = """3.1 Invoicing
+Fees are invoiced annually and are payable within thirty (30) days of the invoice date.
+8.1 Cap on Liability
+Each party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim.
+11.1 Termination by Provider
+Provider may terminate this Agreement for convenience upon ten (10) days' written notice."""
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$", re.M)
+heads = list(HEAD.finditer(CONTRACT))
+docs = []
+for i, h in enumerate(heads):
+    end = heads[i + 1].start() if i + 1 < len(heads) else len(CONTRACT)
+    body = CONTRACT[h.end():end].strip()
+    docs.append(Document(page_content=body, metadata={"clause_id": h.group(1), "heading": h.group(2), "source": "sample_contract.txt"}))
+
+for d in docs:
+    print(d.metadata["clause_id"], "|", d.metadata["heading"], "|", d.page_content[:40])
+print(repr(docs[0]))
+
+@@ concept
+title: 切分器：按长度，还是按结构
+--- body
+`RecursiveCharacterTextSplitter` 是 LangChain 最常用的切分器，第 11 天 `chunk_fixed` 的加强版：
+
+- `chunk_size`：每块最多多少字符；`chunk_overlap`：相邻两块重叠多少字符
+- `separators`：按顺序尝试的分隔符，默认 `["\n\n", "\n", " ", ""]`。先按空行切，还太长再按换行、再按空格……最后把小段**合并**回接近 `chunk_size` 的块
+- `add_start_index=True`：每块的 metadata 记下它在原文里的起始位置
+- `create_documents(texts, metadatas=[...])` 直接产出 Document，metadata 会复制到每一块
+
+它只管长度，不懂条款：下面 8.1 的标题和正文被分开了，正文还被从中间切断。所以有编号的合同按条款切（上一张卡片）；没有结构的长文字（邮件、会议纪要）才用它。
+
+参数检查：`chunk_overlap` 比 `chunk_size` 大会直接 `ValueError`；两者**相等**却不报错，每块只往前挪一小步（大约一个词），切出一堆几乎重复的块。第 11 天你的 `chunk_fixed` 更严：`overlap >= size` 就报错。
+--- code
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+text = ("8.1 Cap on Liability\nEach party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim.\n\n"
+        "8.2 Indirect Damages\nNeither party is liable for indirect or consequential damages.")
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=80, chunk_overlap=20, add_start_index=True)
+for d in splitter.create_documents([text], metadatas=[{"source": "msa.txt"}]):
+    print(d.metadata["start_index"], repr(d.page_content))
+
+same = RecursiveCharacterTextSplitter(chunk_size=80, chunk_overlap=80)
+print(len(same.split_text(text)), "chunks when chunk_overlap == chunk_size")
+
+@@ concept
+title: 向量库：向量算一次，查很多次
+--- body
+第 11 天你亲手做过：把片段送进 embeddings 接口算出向量存起来（`embed_texts`），提问时把问题也变成向量，用余弦相似度取 top-k。LangChain 把这几步装进两个对象：
+
+- `OpenAIEmbeddings(model="text-embedding-3-small")`：调 OpenAI 格式的 `/v1/embeddings`。DeepSeek 没有 embeddings 接口，本页是一个同格式的模拟服务（词袋加同义词，所以问 cancel 能找到 terminate）
+- `InMemoryVectorStore(embeddings)`：放在内存里的向量库。`add_documents(docs)` 一次请求算出所有向量；`similarity_search(q, k=2)` 返回最像的 k 个 Document；`similarity_search_with_score` 连余弦分数一起返回；`filter=lambda doc: ...` 先按 metadata 筛，再排名
+
+`add_documents` 返回的 id 是随机 uuid，条款号在 metadata 里。换成真的向量库（pgvector、Chroma……），这几个方法名基本不变，这是框架的好处。
+
+注意下面问「取消合同」时的第二名 8.3：分数很低，和问题其实无关。本页的 embedding 是模拟的（词袋 + 哈希，很粗糙），这种误命中比真模型多；但真模型也一样，向量检索**永远**返回 k 条，哪怕后面几条不相关。所以 k 不要设太大，能用 metadata 过滤就过滤。
+
+看一眼请求体：`input` 是一串数字。`OpenAIEmbeddings` 默认先用 tiktoken 把文字变成 token id 再发。源码注释说，很多非 OpenAI 的服务（举了 OpenRouter、Ollama、vLLM）要设 `check_embedding_ctx_length=False`，直接发文字。
+--- code
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+CLAUSES = [
+    ("3.1", "payment", "Fees are invoiced annually and are payable within thirty (30) days of the invoice date."),
+    ("8.1", "liability_cap", "Each party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim."),
+    ("8.3", "liability_cap", "Customer's liability for breach of Section 6 shall be unlimited."),
+    ("11.1", "termination", "Provider may terminate this Agreement for convenience upon ten (10) days' written notice."),
+]
+docs = [Document(page_content=text, metadata={"clause_id": cid, "topic": topic}) for cid, topic, text in CLAUSES]
+
+store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+ids = store.add_documents(docs)
+print(len(ids), "documents,", len(MOCK.calls), "embeddings request")
+
+for doc, score in store.similarity_search_with_score("Can the provider cancel the contract?", k=2):
+    print(doc.metadata["clause_id"], round(score, 2))
+
+only_caps = store.similarity_search("liability", k=2, filter=lambda d: d.metadata["topic"] == "liability_cap")
+print("filtered:", [d.metadata["clause_id"] for d in only_caps])
+body = MOCK.calls[-1]["body"]
+print(body["model"], "| input for 'liability':", body["input"])
+
+@@ concept
+title: Retriever 和 RAG 链
+--- body
+`store.as_retriever(search_kwargs={"k": 2})` 把向量库包成一个 **Runnable**：`retriever.invoke("问题")` 返回 Document 列表。所以它能和 prompt、model 一起放进 `|` 管道（第 29 天的 LCEL）。最常见的 RAG 链：
+
+```python
+chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt | model | StrOutputParser()
+)
+```
+
+- 开头的字典收到同一个问题，分两路：`context` 走「检索 → 拼成文字」，`question` 原样传过去，合成 `{"context": ..., "question": ...}` 交给 prompt
+- `format_docs` 是你自己写的普通函数：每段前面标上 `[条款号]`，就是第 19 天带编号的片段
+
+这条链的出口只有一个字符串，**出处丢了**。要同时返回 `sources`，最清楚的是普通 Python：先 `docs = retriever.invoke(q)` 一次，同一批 docs 既拼 prompt、又取条款号。
+
+经典错误：写成 `as_retriever(k=2)`。这个参数被**悄悄忽略**，不报错也不警告，取回的还是默认的 4 条。
+--- code
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+
+docs = [
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+]
+store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+store.add_documents(docs)
+retriever = store.as_retriever(search_kwargs={"k": 2})
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the sources. Cite clause ids like [3.1]."),
+    ("user", "Question: {question}\n\nSources:\n{context}"),
+])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = {"context": retriever | format_docs, "question": RunnablePassthrough()} | prompt | model | StrOutputParser()
+
+print(chain.invoke("When is the invoice due?"))
+print("--- what the model received:")
+print(MOCK.calls[-1]["body"]["messages"][1]["content"])
+
+@@ concept
+title: create_agent：现成的工具循环
+--- body
+第 17 天（TypeScript）和昨天（LangChain 消息）你都手写过有上限的 Agent 循环：调模型 → 有 `tool_calls` 就执行、把结果作为 tool 消息加回去 → 再调模型 → 没有 `tool_calls` 就结束。LangChain 1.x 里是一行：
+
+```python
+agent = create_agent(model, tools=[lookup_playbook], system_prompt="...")
+result = agent.invoke({"messages": [("user", "...")]})
+```
+
+- 输入输出都是 `{"messages": [...]}`。`system_prompt` 每次调模型时放在最前面，但不在返回的 messages 里
+- 读轨迹：`HumanMessage → AIMessage(tool_calls) → ToolMessage → AIMessage`（最终回答）
+- 返回的是一张**编译好的 LangGraph 图**：节点 `model` 和 `tools`，`get_graph().draw_mermaid()` 能画出来（实线是固定边，虚线是条件边）。明天你自己搭这样的图
+- 步数上限：`agent.invoke(..., {"recursion_limit": 10})`，超了抛 `GraphRecursionError`。这一版的默认上限是 10007（很多旧教程说 25），不设约等于没有上限
+
+为什么 agent 的模型一定要关掉 thinking（`extra_body={"thinking": {"type": "disabled"}}`）：DeepSeek 文档写明，思考模式下只要请求带着 tools，之前每条 assistant 消息的 `reasoning_content` 都必须原样传回去，否则返回 400；而 LangChain 的 ChatDeepSeek 把消息转成请求时会丢掉它。所以开着 thinking，agent 第二次调模型就是 400（本页的模拟服务器也按这条规则回 400）。另外，一次任务要调好几次模型，每次的思考都按输出 token 计费，还更慢。
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+RULES = {"liability_cap": "PB-01: cap at 12 months of fees; never unlimited."}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return RULES.get(topic, "no rule for this topic")
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+agent = create_agent(model, tools=[lookup_playbook], system_prompt="Check the playbook before you answer.")
+result = agent.invoke({"messages": [("user", "Clause 8.1 caps liability at 12 months of fees. Is that ok?")]})
+
+for m in result["messages"]:
+    print(f"{type(m).__name__:<13}", m.content[:50] or m.tool_calls[0]["name"])
+print(type(agent).__name__, list(agent.get_graph().nodes))
+first = MOCK.calls[0]["body"]
+print([m["role"] for m in first["messages"]], first["thinking"])
+print([line.strip() for line in agent.get_graph().draw_mermaid().splitlines() if "->" in line])
+
+try:   # 同样的 agent，只是没关 thinking
+    create_agent(ChatDeepSeek(model="deepseek-flash"), tools=[lookup_playbook]).invoke({"messages": [("user", "Is clause 8.1 ok?")]})
+except Exception as e:
+    print("thinking on:", type(e).__name__, e.status_code)
+
+@@ concept
+title: response_format：结构化的最终答案
+--- body
+Agent 最后说的是自由文字，程序不好用。`response_format` 让它最后交一个 Pydantic 对象，放在结果的 `structured_response` 里。
+
+对 DeepSeek 要写成 `ToolStrategy(ClauseReview)`：
+
+- 它把 `ClauseReview` 当成**又一个工具**加进 tools，并设 `tool_choice: "required"`（每一轮都必须调工具）。模型查完 playbook，再「调用」ClauseReview，参数就是答案；LangChain 校验后放进 `structured_response`。轨迹里多一对 AIMessage + ToolMessage（`Returning structured response: ...`）
+- 参数校验不通过时，它默认把错误写进 ToolMessage 发回去，让模型重交（和第 17 天「错误是写给模型看的」一样）。模型一直交不对就一直重试，所以这里同样要设 `recursion_limit`
+- 只写 `response_format=ClauseReview` 时，LangChain 按模型的 profile 数据自动选策略：这一版（langchain 1.4 + langchain-deepseek 1.1）的 profile 说 deepseek-flash 支持结构化输出，它就选 ProviderStrategy，发 `response_format: {"type": "json_schema", ...}`。可 DeepSeek 文档里的 JSON Output 只有 `json_object` 一种，本页的模拟服务器对 json_schema 回 400
+
+框架的「自动」有时会猜错，而且会随版本变。出问题时先看 `MOCK.calls[-1]["body"]` 到底发了什么，真实项目里就是看请求日志或 trace。
+--- code
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+agent = create_agent(model, tools=[lookup_playbook], response_format=ToolStrategy(ClauseReview))
+result = agent.invoke({"messages": [("user", "Review clause 8.3: Customer's liability shall be unlimited.")]})
+
+print(repr(result["structured_response"]))
+print([type(m).__name__ for m in result["messages"]])
+print(result["messages"][-1].content)
+body = MOCK.calls[-1]["body"]
+print([t["function"]["name"] for t in body["tools"]], body["tool_choice"])
+
+@@ concept
+title: middleware：在调用前后插一手
+--- body
+1.x 的 `create_agent` 用 **middleware** 定制循环：挂在「调模型前后」「调工具前后」的钩子。几个现成的：
+
+- `HumanInTheLoopMiddleware(interrupt_on={"send_redline": True})`：模型要调 `send_redline` 时，图先停下（interrupt），等人 approve / edit / reject / respond。它要配 `checkpointer`（停下时的状态存在那里），每次调用带同一个 `thread_id`，用 `Command(resume={"decisions": [{"type": "approve"}]})` 继续。第 17 天的审批关卡，第 34 天细讲 interrupt
+- `ModelCallLimitMiddleware(run_limit=5)`、`ToolCallLimitMiddleware(...)`：调用次数上限
+- `ModelRetryMiddleware`、`ModelFallbackMiddleware`、`SummarizationMiddleware`、`PIIMiddleware`：重试、换备用模型、压缩长历史、遮挡个人信息
+
+每加一层，出问题时就多一层要查。先想：普通代码能不能做？要用时看源码里的构造参数，旧教程的写法常常已经变了。
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+SENT = []
+
+@tool
+def send_redline(clause_id: str) -> str:
+    """Email the proposed redline for one clause to the counterparty."""
+    SENT.append(clause_id)
+    return f"redline for {clause_id} sent"
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+agent = create_agent(model, tools=[send_redline], checkpointer=InMemorySaver(),
+                     middleware=[HumanInTheLoopMiddleware(interrupt_on={"send_redline": True})])
+cfg = {"configurable": {"thread_id": "review-42"}}
+
+result = agent.invoke({"messages": [("user", "Send the redline for clause 8.3")]}, cfg)
+request = result["__interrupt__"][0].value["action_requests"][0]
+print("paused:", request["name"], request["args"], "| sent so far:", SENT)
+
+result = agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), cfg)
+print("after approve:", SENT, "|", result["messages"][-1].content)
+
+@@ concept
+title: 什么时候用哪一种
+--- body
+面试常问：固定链、create_agent、自己写 LangGraph，怎么选？
+
+- **固定链**（`prompt | model | parser`，或上面的 RAG 链）：步骤事先知道。最便宜、最可预测、最好测。审一条条款前「一定要按主题取 playbook 规则」，就写死在代码里
+- **create_agent**：要不要查、查什么、查几次由内容决定（8.1 写着 subject to Section 12，要自己去读第 12 条）。代价：调用次数更多，每次路径可能不同，要设上限、看轨迹
+- **自己写 LangGraph**：流程本身有分支、并行、暂停等人、从检查点恢复
+
+Clause Check 自己的选择：`review.py` 的有界工具循环是手写的（≤ 6 步），外层 `pipeline.py` 是普通 Python，只有审批流程用了 LangGraph（README 写了原因：第一个真正需要框架的需求是「停下来等人批，几小时后从另一个进程继续」）。
+
+一句话答法：「能写死就写死；模型真的需要自己决定时才用 agent；流程要暂停、恢复、并行时才上图框架。」下面同一个问题，固定链调 1 次模型，agent 调 2 次。
+--- code
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+RULES = {"payment": "PB-04: net 30 is fine."}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return RULES.get(topic, "no rule for this topic")
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+question = "Clause 3.1: fees are payable within 30 days. Is that ok?"
+
+MOCK.reset()
+prompt = ChatPromptTemplate.from_messages([("system", "Playbook rule: {rule}"), ("user", "{question}")])
+(prompt | model | StrOutputParser()).invoke({"rule": RULES["payment"], "question": question})
+print("fixed chain:", len(MOCK.calls), "model call(s)")
+
+MOCK.reset()
+create_agent(model, tools=[lookup_playbook]).invoke({"messages": [("user", question)]})
+print("agent:      ", len(MOCK.calls), "model call(s)")
+
+@@ item d31-01
+type: code
+title: 复习：结构化输出
+level: 1
+--- prompt
+复习第 30 天。写 `review(text)`：
+
+- 用 `MODEL.with_structured_output(ClauseReview)` 审 `text`，返回 `ClauseReview` 对象
+- 模型给的参数是坏的 JSON 时，结果是 `None`（不抛异常，第 30 天的坑）。这时返回 `ClauseReview(clause_id="unknown", verdict="flag", risk_level="medium")`：拿不准就交给人
+
+例：`review("Review clause 8.3: Customer's liability shall be unlimited.").verdict` → `"redline"`
+--- starter
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_deepseek import ChatDeepSeek
+
+class ClauseReview(BaseModel):
+    """Review of one contract clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def review(text):
+    pass
+--- solution
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_deepseek import ChatDeepSeek
+
+class ClauseReview(BaseModel):
+    """Review of one contract clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def review(text):
+    result = MODEL.with_structured_output(ClauseReview).invoke(text)
+    if result is None:
+        return ClauseReview(clause_id="unknown", verdict="flag", risk_level="medium")
+    return result
+--- tests
+expect("无限责任 → redline", lambda: review("Review clause 8.3: Customer's liability shall be unlimited.").verdict, "redline")
+expect("返回 ClauseReview 对象", lambda: type(review("Review clause 3.1: Fees are payable within 30 days.")).__name__, "ClauseReview")
+expect("参数坏了 → 交给人", lambda: review("[bad-args] Review clause 9.1").model_dump(), {"clause_id": "unknown", "verdict": "flag", "risk_level": "medium"})
+expect("请求里强制调用 ClauseReview", lambda: (review("Review clause 3.1"), MOCK.calls[-1]["body"]["tool_choice"])[1], {"type": "function", "function": {"name": "ClauseReview"}})
+--- hints
+- `MODEL.with_structured_output(ClauseReview)` 返回一个新的 Runnable，`.invoke(text)` 得到对象或 `None`。
+- 用 `if result is None:` 判断，别写 `if not result:`（习惯要好：只处理你想处理的那种情况）。
+
+@@ item d31-02
+type: predict
+title: 复习：tool_calls 和 ToolMessage
+level: 1
+--- prompt
+复习第 30 天。写出输出。模拟服务器看到问题里有 fee，会让模型用 `topic="payment"` 调第一个工具；模拟服务器给的调用 id 依次是 `call_1`、`call_2`……
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return {"payment": "PB-04: net 30 is fine."}.get(topic, "no rule")
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+ai = model.bind_tools([lookup_playbook]).invoke("Clause 3.1: fees are payable in 30 days. Check the playbook.")
+print(repr(ai.content))
+call = ai.tool_calls[0]
+print(call["name"], call["args"], call["id"])
+msg = lookup_playbook.invoke(call)
+print(type(msg).__name__, "|", msg.content, "|", msg.tool_call_id)
+--- explain
+模型要调工具时 `content` 是空字符串，要做的事在 `tool_calls` 里：`name`、`args`（已经是字典）、`id`。把整个 call 交给 `tool.invoke`，得到的是 `ToolMessage`，`tool_call_id` 自动填成同一个 id，下一轮模型才能对上号。今天的 `create_agent` 每一轮做的就是这件事。
+
+@@ item d31-03
+type: predict
+title: 切分器怎么切
+level: 2
+--- prompt
+写出输出。回想卡片：先按 `"\n\n"` 切；某段超过 `chunk_size` 再按 `"\n"` 切；最后把相邻小段合并，只要合并后（算上中间的分隔符）不超过 `chunk_size`。`start_index` 从 0 数。
+--- code
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+text = "3.1 Invoicing\nFees are payable within thirty days.\n\n3.2 Late Payment\nInterest accrues at 3% per month."
+splitter = RecursiveCharacterTextSplitter(chunk_size=40, chunk_overlap=0, add_start_index=True)
+docs = splitter.create_documents([text])
+print(len(docs))
+for d in docs:
+    print(d.metadata["start_index"], repr(d.page_content))
+--- explain
+按空行切出两段，每段 50 个字符，都超过 40，于是再按换行切。标题 13 个字符、正文 36 个，合起来（加上换行）50 个，超过 40，不能合并，所以标题和正文各成一块，这正是「按长度切」对合同不友好的地方。第二段从位置 52 开始（前面 50 个字符加两个换行）。
+
+@@ item d31-04
+type: code
+title: 合同变成 Document
+level: 2
+--- prompt
+写 `split_contract(text, source)`，像 `split.py` 一样，一条条款一个 `Document`：
+
+- 标题行用写好的 `HEAD` 正则找：组 1 是条款号，组 2 是标题
+- 正文：这个标题行结束（`h.end()`）到下一个标题行开始（`.start()`）之间的文字，`.strip()`；最后一条到文字末尾
+- `metadata = {"clause_id": 条款号, "heading": 标题, "source": source}`
+- 一个标题都没找到：`raise ValueError("no numbered clauses")`（和 `load_contract` 一样：不猜）
+
+例：`split_contract(CONTRACT, "msa.txt")[1].metadata` → `{"clause_id": "8.1", "heading": "Cap on Liability", "source": "msa.txt"}`
+--- starter
+import re
+from langchain_core.documents import Document
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$", re.M)
+
+CONTRACT = """3.1 Invoicing
+Fees are invoiced annually and are payable within thirty (30) days of the invoice date.
+8.1 Cap on Liability
+Each party's aggregate liability shall not exceed the Fees paid
+in the twelve (12) months before the claim.
+11.1 Termination by Provider
+Provider may terminate this Agreement upon ten (10) days' notice."""
+
+def split_contract(text, source):
+    return []
+--- solution
+import re
+from langchain_core.documents import Document
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$", re.M)
+
+CONTRACT = """3.1 Invoicing
+Fees are invoiced annually and are payable within thirty (30) days of the invoice date.
+8.1 Cap on Liability
+Each party's aggregate liability shall not exceed the Fees paid
+in the twelve (12) months before the claim.
+11.1 Termination by Provider
+Provider may terminate this Agreement upon ten (10) days' notice."""
+
+def split_contract(text, source):
+    heads = list(HEAD.finditer(text))
+    if not heads:
+        raise ValueError("no numbered clauses")
+    docs = []
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        body = text[h.end():end].strip()
+        docs.append(Document(page_content=body, metadata={"clause_id": h.group(1), "heading": h.group(2), "source": source}))
+    return docs
+--- tests
+expect("三条条款", lambda: [d.metadata["clause_id"] for d in split_contract(CONTRACT, "msa.txt")], ["3.1", "8.1", "11.1"])
+expect("metadata", lambda: split_contract(CONTRACT, "msa.txt")[1].metadata, {"clause_id": "8.1", "heading": "Cap on Liability", "source": "msa.txt"})
+expect("正文不含标题，多行正文保留", lambda: split_contract(CONTRACT, "msa.txt")[1].page_content, "Each party's aggregate liability shall not exceed the Fees paid\nin the twelve (12) months before the claim.")
+expect("最后一条到文字末尾", lambda: split_contract(CONTRACT, "msa.txt")[-1].page_content, "Provider may terminate this Agreement upon ten (10) days' notice.")
+expect("返回的是 Document", lambda: type(split_contract(CONTRACT, "x")[0]).__name__, "Document")
+expect_raises("没有编号：不猜", lambda: split_contract("This agreement has no numbered clauses.", "x"), ValueError)
+--- hints
+- `heads = list(HEAD.finditer(text))`，先判断空列表就 raise。
+- 用 `enumerate` 拿到下标 i：下一个标题是 `heads[i + 1]`；最后一个的结尾是 `len(text)`。
+- `Document(page_content=body, metadata={...})`，`h.group(1)` 是条款号、`h.group(2)` 是标题。
+
+@@ item d31-05
+type: fix
+title: 修 bug：取回的条数不对
+level: 2
+--- prompt
+同事写的 `make_retriever(docs, k=2)` 应该每次取回 k 条，可 prompt 里总是塞了 4 条，token 白白翻倍。代码不报错、没有警告。运行测试，找到原因，改一行。
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+DOCS = [
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="This Agreement renews automatically for successive periods of twenty-four (24) months.", metadata={"clause_id": "4.2"}),
+    Document(page_content="Customer's liability for breach of Section 6 shall be unlimited.", metadata={"clause_id": "8.3"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+]
+
+def make_retriever(docs, k=2):
+    store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+    store.add_documents(docs)
+    return store.as_retriever(k=k)
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+DOCS = [
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="This Agreement renews automatically for successive periods of twenty-four (24) months.", metadata={"clause_id": "4.2"}),
+    Document(page_content="Customer's liability for breach of Section 6 shall be unlimited.", metadata={"clause_id": "8.3"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+]
+
+def make_retriever(docs, k=2):
+    store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+    store.add_documents(docs)
+    return store.as_retriever(search_kwargs={"k": k})
+--- tests
+expect("默认取回 2 条", lambda: len(make_retriever(DOCS).invoke("When is the invoice due?")), 2)
+expect("k=1 只取 1 条，而且是最相关的", lambda: [d.metadata["clause_id"] for d in make_retriever(DOCS, k=1).invoke("When is the invoice due?")], ["3.1"])
+expect("k=3", lambda: len(make_retriever(DOCS, k=3).invoke("Can the provider cancel the contract?")), 3)
+--- hints
+- 看卡片「Retriever 和 RAG 链」最后一段。`as_retriever` 不认识的参数不会报错。
+- 检索的参数要放进 `search_kwargs` 这个字典，它会原样传给 `similarity_search`。
+- `store.as_retriever(search_kwargs={"k": k})`。
+
+@@ item d31-06
+type: code
+title: 建库并检索条款号
+level: 2
+--- prompt
+写两个函数：
+
+- `build_store(docs)`：建一个 `InMemoryVectorStore`（embedding 用 `OpenAIEmbeddings(model="text-embedding-3-small")`），把 docs 放进去，返回这个 store。要求**一次** `add_documents` 放进全部文档（一次 embeddings 请求），不要一条一条加
+- `search_ids(store, query, k=2, topic=None)`：返回最相关的 k 个文档的 `clause_id` 列表。`topic` 不是 `None` 时，只在 `metadata["topic"]` 等于它的文档里找（用 `filter`）
+
+例：`search_ids(store, "Is liability unlimited?", k=2, topic="liability_cap")` → `["8.3", "8.1"]`
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+CLAUSES = [
+    ("3.1", "payment", "Fees are invoiced annually and are payable within thirty (30) days of the invoice date."),
+    ("4.2", "auto_renewal", "This Agreement renews automatically for successive periods of twenty-four (24) months."),
+    ("8.1", "liability_cap", "Each party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim."),
+    ("8.3", "liability_cap", "Customer's liability for breach of Section 6 shall be unlimited."),
+    ("10.1", "data_processing", "Customer Data may be stored and processed in any country."),
+    ("11.1", "termination", "Provider may terminate this Agreement for convenience upon ten (10) days' written notice."),
+]
+DOCS = [Document(page_content=text, metadata={"clause_id": cid, "topic": topic}) for cid, topic, text in CLAUSES]
+
+def build_store(docs):
+    pass
+
+def search_ids(store, query, k=2, topic=None):
+    pass
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+CLAUSES = [
+    ("3.1", "payment", "Fees are invoiced annually and are payable within thirty (30) days of the invoice date."),
+    ("4.2", "auto_renewal", "This Agreement renews automatically for successive periods of twenty-four (24) months."),
+    ("8.1", "liability_cap", "Each party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim."),
+    ("8.3", "liability_cap", "Customer's liability for breach of Section 6 shall be unlimited."),
+    ("10.1", "data_processing", "Customer Data may be stored and processed in any country."),
+    ("11.1", "termination", "Provider may terminate this Agreement for convenience upon ten (10) days' written notice."),
+]
+DOCS = [Document(page_content=text, metadata={"clause_id": cid, "topic": topic}) for cid, topic, text in CLAUSES]
+
+def build_store(docs):
+    store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+    store.add_documents(docs)
+    return store
+
+def search_ids(store, query, k=2, topic=None):
+    if topic is None:
+        hits = store.similarity_search(query, k=k)
+    else:
+        hits = store.similarity_search(query, k=k, filter=lambda d: d.metadata["topic"] == topic)
+    return [d.metadata["clause_id"] for d in hits]
+--- tests
+def _embed_requests():
+    MOCK.reset()
+    build_store(DOCS)
+    return len([c for c in MOCK.calls if c["url"].endswith("/embeddings")])
+expect("6 条文档只发 1 次 embeddings 请求", _embed_requests, 1)
+STORE = build_store(DOCS)
+expect("最相关的一条", lambda: search_ids(STORE, "When is the invoice due?", k=1), ["3.1"])
+expect("不过滤：第二名是误命中的 11.1", lambda: search_ids(STORE, "Is liability unlimited?"), ["8.3", "11.1"])
+expect("按 topic 过滤后只剩责任条款", lambda: search_ids(STORE, "Is liability unlimited?", topic="liability_cap"), ["8.3", "8.1"])
+expect("过滤后不足 k 条", lambda: search_ids(STORE, "When is the invoice due?", k=3, topic="payment"), ["3.1"])
+--- hints
+- `build_store`：先建 store，再 `store.add_documents(docs)`，最后 `return store`。
+- `filter` 是一个函数，收到一个 Document，返回 True 表示保留：`lambda d: d.metadata["topic"] == topic`。
+- 返回 `[d.metadata["clause_id"] for d in hits]`。
+
+@@ item d31-07
+type: testwrite
+title: 写测试：format_docs
+level: 2
+--- prompt
+被测函数 `format_docs(docs)` 把检索到的 Document 拼成放进 prompt 的文字：每个文档一行，行首是 `[条款号]`（来自 `metadata["clause_id"]`），行与行之间用一个换行。
+
+写测试函数（`def test_...():` 里用 `assert`），在正确的函数上全部通过，并抓住藏起来的有 bug 的版本。测试里自己造几个 `Document`（已经 import 好）。起始的测试太弱了。
+--- impl
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+--- mutants
+===== 出处：每行前面要有 [条款号]
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n".join(d.page_content for d in docs)
+===== 分隔：一个文档一行，只用一个换行
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+===== 最后一个文档也要在
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs[:-1])
+===== 条款号来自 metadata，不是文档自己的 id
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n".join(f"[{d.id}] {d.page_content}" for d in docs)
+--- starter
+from langchain_core.documents import Document
+
+def test_contains_text():
+    doc = Document(page_content="Fees are payable in 30 days.", metadata={"clause_id": "3.1"})
+    assert "Fees are payable" in format_docs([doc, doc])
+--- solution
+from langchain_core.documents import Document
+
+A = Document(page_content="Fees are payable in 30 days.", metadata={"clause_id": "3.1"})
+B = Document(page_content="Liability is unlimited.", metadata={"clause_id": "8.3"})
+
+def test_exact_two_docs():
+    assert format_docs([A, B]) == "[3.1] Fees are payable in 30 days.\n[8.3] Liability is unlimited."
+
+def test_single_doc():
+    assert format_docs([B]) == "[8.3] Liability is unlimited."
+
+def test_empty():
+    assert format_docs([]) == ""
+--- hints
+- 最有力的测试是比较**完整的字符串**：两个文档、写出你期望的整段文字，一个 `==` 就能同时抓住好几种 bug。
+- 只有一个文档时，「丢掉最后一个」的版本会返回空字符串。
+- 条款号写在 `metadata` 里；`Document` 自己的 `id` 默认是 `None`。
+
+@@ item d31-08
+type: predict
+title: 链里流过什么
+level: 2
+--- prompt
+写出输出。这条链到 `prompt` 为止，不调模型。向量库里只有两条，`k=1`，问发票（invoice）什么时候到期，取回的是 3.1。
+--- code
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+store.add_documents([
+    Document(page_content="Fees are payable within 30 days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Provider may terminate upon ten days' notice.", metadata={"clause_id": "11.1"}),
+])
+retriever = store.as_retriever(search_kwargs={"k": 1})
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+prompt = ChatPromptTemplate.from_messages([("system", "Cite clause ids."), ("user", "Q: {question}\nSources: {context}")])
+chain = {"context": retriever | format_docs, "question": RunnablePassthrough()} | prompt
+value = chain.invoke("When is the invoice due?")
+for m in value.to_messages():
+    print(type(m).__name__, "->", m.content)
+--- explain
+开头的字典把同一个问题送进两路：`context` 那路是「retriever → format_docs」，得到一行带编号的文字；`question` 那路 `RunnablePassthrough()` 原样传过去。两路的结果组成 `{"context": ..., "question": ...}`，正好填进 prompt 的两个变量。调试 RAG 时先看这一步：模型答错，常常是因为它根本没收到对的片段。
+
+@@ item d31-09
+type: fill
+title: 填空：RAG 链
+level: 1
+--- prompt
+补全 RAG 链：`context` 走「检索 → 拼成带编号的文字」，`question` 原样传过去，最后把模型的 AIMessage 变成字符串。
+--- template
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+
+store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+store.add_documents([
+    Document(page_content="Fees are payable within 30 days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Provider may terminate upon ten days' notice.", metadata={"clause_id": "11.1"}),
+])
+retriever = store.as_retriever(search_kwargs={"k": 1})
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+prompt = ChatPromptTemplate.from_messages([("system", "Cite clause ids."), ("user", "Question: {question}\nSources: {context}")])
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+chain = {"context": retriever | [[format_docs]], "question": [[RunnablePassthrough()]]} | prompt | model | [[StrOutputParser()]]
+--- tests
+expect("回答是字符串", lambda: chain.invoke("When is the invoice due?"), "Mock reply: Question: When is the invoice due?\nSources: [3.1] Fees are p")
+expect("模型收到了带编号的片段", lambda: (chain.invoke("Can the provider terminate?"), MOCK.calls[-1]["body"]["messages"][1]["content"])[1], "Question: Can the provider terminate?\nSources: [11.1] Provider may terminate upon ten days' notice.")
+--- hints
+- `context` 那路：检索结果（Document 列表）要先变成文字，用写好的 `format_docs`。一个普通函数放进 `|` 会自动变成 Runnable。
+- `question` 那路要「原样传过去」：`RunnablePassthrough()`，别忘了括号。
+- 最后一段把 AIMessage 变成字符串：`StrOutputParser()`。
+
+@@ item d31-10
+type: code
+title: 带出处的回答
+level: 3
+--- prompt
+写 `answer_with_sources(question, retriever, model)`，返回 `{"answer": 回答文字, "sources": [条款号, ...]}`：
+
+1. `question.strip()` 是空的：不检索、不调模型，返回 `{"answer": "", "sources": []}`
+2. `docs = retriever.invoke(question)`，**只检索一次**（每次检索都要一次 embeddings 请求）
+3. 用 `PROMPT | model | StrOutputParser()` 回答，变量 `question` 是问题，`context` 是 `format_docs(docs)`
+4. `sources`：这批 docs 的 `metadata["clause_id"]`，按检索到的顺序
+
+`PROMPT`、`format_docs`、一个 k=2 的 `RETRIEVER` 和 `MODEL` 已经写好。函数里用参数 `retriever` 和 `model`，不要直接用全局的 `RETRIEVER` / `MODEL`：测试会传别的进来（依赖注入，第 19 天）。
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the sources. Cite clause ids like [3.1]."),
+    ("user", "Question: {question}\n\nSources:\n{context}"),
+])
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+def answer_with_sources(question, retriever, model):
+    pass
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the sources. Cite clause ids like [3.1]."),
+    ("user", "Question: {question}\n\nSources:\n{context}"),
+])
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+def answer_with_sources(question, retriever, model):
+    if not question.strip():
+        return {"answer": "", "sources": []}
+    docs = retriever.invoke(question)
+    chain = PROMPT | model | StrOutputParser()
+    answer = chain.invoke({"question": question, "context": format_docs(docs)})
+    return {"answer": answer, "sources": [d.metadata["clause_id"] for d in docs]}
+--- tests
+Q = "When is the invoice due?"
+expect("出处：检索到的两条，按顺序", lambda: answer_with_sources(Q, RETRIEVER, MODEL)["sources"], ["3.1", "10.1"])
+expect("回答是模型说的字符串", lambda: answer_with_sources(Q, RETRIEVER, MODEL)["answer"], "Mock reply: Question: When is the invoice due?\n\nSources:\n[3.1] Fees are ")
+def _sent():
+    answer_with_sources(Q, RETRIEVER, MODEL)
+    return MOCK.calls[-1]["body"]["messages"][1]["content"].split("Sources:\n")[1]
+expect("片段带编号进了 prompt", _sent, "[3.1] Fees are invoiced annually and are payable within thirty (30) days of the invoice date.\n[10.1] Customer Data may be stored and processed in any country.")
+def _count():
+    MOCK.reset()
+    answer_with_sources(Q, RETRIEVER, MODEL)
+    return {"embeddings": len([c for c in MOCK.calls if c["url"].endswith("/embeddings")]), "chat": len([c for c in MOCK.calls if c["url"].endswith("/chat/completions")])}
+expect("只检索一次、只调一次模型", _count, {"embeddings": 1, "chat": 1})
+def _blank():
+    MOCK.reset()
+    return [answer_with_sources("   ", RETRIEVER, MODEL), len(MOCK.calls)]
+expect("空问题：什么都不调", _blank, [{"answer": "", "sources": []}, 0])
+from langchain_core.runnables import RunnableLambda
+def _own_parts():
+    fixed = RunnableLambda(lambda q: [Document(page_content="Either party may terminate on 30 days' notice.", metadata={"clause_id": "11.2"})])
+    pro = ChatDeepSeek(model="deepseek-v4-pro", extra_body={"thinking": {"type": "disabled"}})
+    result = answer_with_sources("Can we exit early?", fixed, pro)
+    return [result["sources"], MOCK.calls[-1]["body"]["model"]]
+expect("用传进来的 retriever 和 model，不是全局的", _own_parts, [["11.2"], "deepseek-v4-pro"])
+--- hints
+- 先写第 1 步的提前 return，再 `docs = retriever.invoke(question)`。
+- 回答：`(PROMPT | model | StrOutputParser()).invoke({"question": question, "context": format_docs(docs)})`。
+- `sources` 从同一个 `docs` 里取，不要为了取条款号再检索一次。
+
+@@ item d31-11
+type: code
+title: 把检索做成工具
+level: 2
+--- prompt
+agent 要能自己决定什么时候查合同。把检索包成一个工具：
+
+用 `@tool` 写 `search_contract(query: str) -> str`：
+
+- docstring 写 `"Search the contract and return the most relevant clauses with their ids."`（这句话就是模型看到的工具说明）
+- 用写好的 `RETRIEVER` 检索 `query`，返回 `format_docs(docs)` 的结果
+- 一条都没检索到时返回 `"no matching clauses"`
+
+参数名必须叫 `query`：模型（和模拟服务器）按参数名填值。
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.tools import tool
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+def search_contract(query: str) -> str:
+    return ""
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.tools import tool
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+@tool
+def search_contract(query: str) -> str:
+    """Search the contract and return the most relevant clauses with their ids."""
+    docs = RETRIEVER.invoke(query)
+    if not docs:
+        return "no matching clauses"
+    return format_docs(docs)
+--- tests
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.retrievers import BaseRetriever
+expect("是一个 LangChain 工具", lambda: type(search_contract).__name__, "StructuredTool")
+expect("名字和说明", lambda: [search_contract.name, search_contract.description], ["search_contract", "Search the contract and return the most relevant clauses with their ids."])
+expect("模型看到的参数", lambda: convert_to_openai_tool(search_contract)["function"]["parameters"], {"properties": {"query": {"type": "string"}}, "required": ["query"], "type": "object"})
+expect("调用：返回带编号的片段", lambda: search_contract.invoke({"query": "Can the provider cancel the contract?"}).split("\n")[0], "[11.1] Provider may terminate this Agreement for convenience upon ten (10) days' written notice.")
+class _Empty(BaseRetriever):
+    def _get_relevant_documents(self, query, *, run_manager=None):
+        return []
+def _nothing():
+    global RETRIEVER
+    saved, RETRIEVER = RETRIEVER, _Empty()
+    try:
+        return search_contract.invoke({"query": "governing law"})
+    finally:
+        RETRIEVER = saved
+expect("检索不到", _nothing, "no matching clauses")
+--- hints
+- 在函数上面加 `@tool`，函数体第一行写 docstring（三引号），没有 docstring 会报错。
+- `docs = RETRIEVER.invoke(query)`，空列表就返回 `"no matching clauses"`。
+- 类型标注 `query: str` 会变成工具的参数说明，别删。
+
+@@ item d31-12
+type: code
+title: create_agent 跑一次
+level: 2
+--- prompt
+用上一题的工具搭一个 agent：
+
+- `AGENT = create_agent(MODEL, tools=[search_contract], system_prompt=SYSTEM)`（模块里的全局变量）
+- 写 `run_agent(question)`：调用 AGENT，返回 `{"trace": [每条消息的类型名], "answer": 最后一条消息的文字}`
+
+例：`run_agent("When is the invoice due?")["trace"]` → `["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"]`
+
+`MODEL` 已经关掉了 thinking（卡片「create_agent」：开着 thinking，agent 第二次调模型就 400）。
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+
+@tool
+def search_contract(query: str) -> str:
+    """Search the contract and return the most relevant clauses with their ids."""
+    docs = RETRIEVER.invoke(query)
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs) or "no matching clauses"
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You answer questions about one contract. Search the contract first and cite clause ids."
+
+AGENT = None
+
+def run_agent(question):
+    pass
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+
+@tool
+def search_contract(query: str) -> str:
+    """Search the contract and return the most relevant clauses with their ids."""
+    docs = RETRIEVER.invoke(query)
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs) or "no matching clauses"
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You answer questions about one contract. Search the contract first and cite clause ids."
+
+AGENT = create_agent(MODEL, tools=[search_contract], system_prompt=SYSTEM)
+
+def run_agent(question):
+    result = AGENT.invoke({"messages": [("user", question)]})
+    return {"trace": [type(m).__name__ for m in result["messages"]], "answer": result["messages"][-1].content}
+--- tests
+Q = "When is the invoice due?"
+expect("轨迹", lambda: run_agent(Q)["trace"], ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"])
+expect("最终回答用上了工具的结果", lambda: run_agent(Q)["answer"], "Based on the playbook: [3.1] Fees are invoiced annually and are payable within thirty (30) days of the ")
+def _first_request():
+    MOCK.reset()
+    run_agent(Q)
+    body = [c for c in MOCK.calls if c["url"].endswith("/chat/completions")][0]["body"]
+    return [body["messages"][0], [t["function"]["name"] for t in body["tools"]], body["thinking"]]
+expect("第一次请求：system prompt 在最前，带着工具，thinking 关闭", _first_request, [{"role": "system", "content": SYSTEM}, ["search_contract"], {"type": "disabled"}])
+expect("AGENT 是编译好的图", lambda: list(AGENT.get_graph().nodes), ["__start__", "model", "tools", "__end__"])
+--- hints
+- `create_agent(MODEL, tools=[search_contract], system_prompt=SYSTEM)` 写在模块里（函数外面），替换掉 `AGENT = None`。
+- 调用：`result = AGENT.invoke({"messages": [("user", question)]})`，消息在 `result["messages"]`。
+- 类型名：`type(m).__name__`；最后一条：`result["messages"][-1].content`。
+
+@@ item d31-13
+type: order
+title: 排代码：搭一个 agent
+level: 2
+--- prompt
+排出一个完整的小程序：定义 playbook 工具，搭 agent，问一个问题，把最终回答存进 `ANSWER`。有两行干扰项。
+--- lines
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+RULES = {"liability_cap": "PB-01: cap at 12 months of fees."}
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return RULES.get(topic, "no rule for this topic")
+agent = create_agent(MODEL, tools=[lookup_playbook], system_prompt="Check the playbook before answering.")
+result = agent.invoke({"messages": [("user", "Clause 8.1 caps liability at 12 months of fees. OK?")]})
+ANSWER = result["messages"][-1].content
+--- distractors
+agent = create_agent(MODEL, tools=[lookup_playbook()], system_prompt="Check the playbook before answering.")
+ANSWER = result.content
+--- tests
+expect("最终回答", lambda: ANSWER, "Based on the playbook: PB-01: cap at 12 months of fees.")
+expect("调了两次模型：一次决定调工具，一次回答", lambda: len(MOCK.calls), 2)
+expect("工具被模型用 topic=liability_cap 调用", lambda: result["messages"][1].tool_calls[0]["args"], {"topic": "liability_cap"})
+--- hints
+- 用到的名字要先定义：`RULES` 和 `MODEL` 在工具和 agent 之前。
+- `tools=[...]` 里放的是工具对象本身，不是调用它的结果。
+- `agent.invoke` 返回的是字典，消息在 `result["messages"]` 里。
+
+@@ item d31-14
+type: fix
+title: 修 bug：DeepSeek 上的 response_format
+level: 2
+--- prompt
+同事想让 agent 最后交一个 `ClauseReview` 对象。运行测试：模型调用直接 400，错误信息里有 `json_schema`。
+
+读卡片「response_format」，想清楚 LangChain 替你选了哪种策略、为什么 DeepSeek 不接受，然后只改一处。
+--- starter
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+AGENT = create_agent(MODEL, tools=[lookup_playbook], response_format=ClauseReview)
+
+def review_clause(text):
+    return AGENT.invoke({"messages": [("user", text)]})["structured_response"]
+--- solution
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+AGENT = create_agent(MODEL, tools=[lookup_playbook], response_format=ToolStrategy(ClauseReview))
+
+def review_clause(text):
+    return AGENT.invoke({"messages": [("user", text)]})["structured_response"]
+--- tests
+expect("无限责任 → redline", lambda: review_clause("Review clause 8.3: Customer's liability shall be unlimited.").model_dump(), {"clause_id": "8.3", "verdict": "redline", "risk_level": "high"})
+expect("普通条款 → accept", lambda: review_clause("Review clause 8.1: liability is capped at 12 months of fees.").verdict, "accept")
+def _request():
+    review_clause("Review clause 3.1: Fees are payable within 30 days.")
+    body = MOCK.calls[-1]["body"]
+    return [[t["function"]["name"] for t in body["tools"]], body["tool_choice"], "response_format" in body]
+expect("答案是一个额外的工具，tool_choice 是 required", _request, [["lookup_playbook", "ClauseReview"], "required", False])
+--- hints
+- 错误说 `response_format type 'json_schema' is not supported`。谁发的 json_schema？只传一个类时，LangChain 按模型 profile 自动选了 ProviderStrategy。
+- DeepSeek 结构化输出要走工具调用。`ToolStrategy` 已经 import 好了。
+- `response_format=ToolStrategy(ClauseReview)`。
+
+@@ item d31-15
+type: code
+title: agent 交结构化答案
+level: 3
+--- prompt
+写 `review_with_agent(text)`，返回：
+
+```python
+{"review": ClauseReview 对象（structured_response）,
+ "tools": [模型调用过的工具名，按顺序，不包括答案工具 "ClauseReview"]}
+```
+
+- 用 `create_agent(MODEL, tools=[lookup_playbook, get_clause], response_format=ToolStrategy(ClauseReview))`
+- 工具名从轨迹里取：每条 `AIMessage` 的 `tool_calls`，每个 call 的 `"name"`
+
+这就是项目 evals 里的「轨迹断言」（README：审 8.1 必须调过 `get_clause`）的数据来源。
+
+例：`review_with_agent("Review clause 8.1 with get_clause: subject to section 12, liability is capped.")["tools"]` → `["get_clause"]`（问题里写了工具名，模拟服务器就选它）
+--- starter
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_core.messages import AIMessage
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+@tool
+def get_clause(clause_id: str) -> str:
+    """Return the full text of another clause, e.g. one it cross-references."""
+    return "12. The limitations in Section 8 shall not apply to Customer's payment obligations."
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def review_with_agent(text):
+    pass
+--- solution
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_core.messages import AIMessage
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+@tool
+def get_clause(clause_id: str) -> str:
+    """Return the full text of another clause, e.g. one it cross-references."""
+    return "12. The limitations in Section 8 shall not apply to Customer's payment obligations."
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+AGENT = create_agent(MODEL, tools=[lookup_playbook, get_clause], response_format=ToolStrategy(ClauseReview))
+
+def review_with_agent(text):
+    result = AGENT.invoke({"messages": [("user", text)]})
+    tools = []
+    for m in result["messages"]:
+        if isinstance(m, AIMessage):
+            for call in m.tool_calls:
+                if call["name"] != "ClauseReview":
+                    tools.append(call["name"])
+    return {"review": result["structured_response"], "tools": tools}
+--- tests
+T81 = "Review clause 8.1 with get_clause: subject to section 12, liability is capped."
+expect("8.1 的轨迹里有 get_clause", lambda: review_with_agent(T81)["tools"], ["get_clause"])
+expect("8.1 的审查结果", lambda: review_with_agent(T81)["review"].model_dump(), {"clause_id": "8.1", "verdict": "flag", "risk_level": "high"})
+expect("没点名工具：模拟服务器选第一个", lambda: review_with_agent("Review clause 8.3: Customer's liability shall be unlimited.")["tools"], ["lookup_playbook"])
+expect("review 是 ClauseReview 对象", lambda: type(review_with_agent("Review clause 3.1: Fees are due in 30 days.")["review"]).__name__, "ClauseReview")
+--- hints
+- 先搭 agent（放在函数外面，只搭一次）：`response_format=ToolStrategy(ClauseReview)`。
+- 遍历 `result["messages"]`，`isinstance(m, AIMessage)` 的才有 `tool_calls`。
+- 答案工具的调用也会出现在轨迹里（名字是 `"ClauseReview"`），要跳过它。
+
+@@ item d31-16
+type: code
+title: 给 agent 设上限
+level: 2
+--- prompt
+写 `ask_safely(agent, question, limit)`：
+
+- 调用 `agent.invoke({"messages": [("user", question)]}, {"recursion_limit": limit})`
+- 正常结束：返回 `{"status": "ok", "answer": 最后一条消息的文字}`
+- 超过上限（`GraphRecursionError`，从 `langgraph.errors` import）：返回 `{"status": "stopped", "answer": ""}`，不要让异常冒出去
+
+测试里的问题带 `[loop]` 时，模拟服务器会让模型一直调工具，永不停止，就像一个卡住的 agent。
+--- starter
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees."
+
+AGENT = create_agent(ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}), tools=[lookup_playbook])
+
+def ask_safely(agent, question, limit):
+    pass
+--- solution
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langgraph.errors import GraphRecursionError
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees."
+
+AGENT = create_agent(ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}), tools=[lookup_playbook])
+
+def ask_safely(agent, question, limit):
+    try:
+        result = agent.invoke({"messages": [("user", question)]}, {"recursion_limit": limit})
+    except GraphRecursionError:
+        return {"status": "stopped", "answer": ""}
+    return {"status": "ok", "answer": result["messages"][-1].content}
+--- tests
+# 测试给 AGENT 套了一个保底上限 40：忘了传 config 时测试会很快失败，而不是跑到默认的 10007 步
+_GUARDED = AGENT.with_config(recursion_limit=40)
+expect("正常问题", lambda: ask_safely(_GUARDED, "Is the liability cap ok?", 10), {"status": "ok", "answer": "Based on the playbook: PB-01: cap at 12 months of fees."})
+def _stuck(limit):
+    MOCK.reset()
+    result = ask_safely(_GUARDED, "[loop] check the liability cap", limit)
+    return [result, len(MOCK.calls)]
+expect("卡住的 agent：limit 6 时停下，只调了 3 次模型", lambda: _stuck(6), [{"status": "stopped", "answer": ""}, 3])
+expect("limit 越小，调用越少", lambda: _stuck(3)[1], 2)
+--- hints
+- `from langgraph.errors import GraphRecursionError`，然后 `try: ... except GraphRecursionError: ...`。
+- 上限通过第二个参数（config）传：`{"recursion_limit": limit}`。每跑一个节点（model 或 tools）算一步。
+- 千万别漏掉 config：真实项目里卡住的 agent 会一直跑到默认上限 10007 步，调几千次模型。（这里的测试套了一个保底上限 40，所以漏了只会让测试失败。）
+
+@@ item d31-17
+type: code
+title: 批准后才发出去
+level: 3
+--- prompt
+`send_redline` 会把修改意见真的发给对方，必须人批准。`AGENT` 已经配好 `HumanInTheLoopMiddleware` 和 `InMemorySaver`。写两个函数：
+
+- `start(question, thread_id)`：用 `{"configurable": {"thread_id": thread_id}}` 调用 AGENT。结果里有 `"__interrupt__"` 时，返回待批准的动作列表 `[(name, args), ...]`，取自 `result["__interrupt__"][0].value["action_requests"]` 里每一项的 `"name"` 和 `"args"`；没有中断就返回 `[]`
+- `finish(thread_id, approve)`：用**同一个** thread_id 恢复：`approve` 为 True 时决定是 `{"type": "approve"}`，否则 `{"type": "reject", "message": "Rejected by the reviewer."}`；返回最后一条消息的文字
+
+恢复的写法：`AGENT.invoke(Command(resume={"decisions": [决定]}), config)`。
+--- starter
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+SENT = []
+
+@tool
+def send_redline(clause_id: str) -> str:
+    """Email the proposed redline for one clause to the counterparty."""
+    SENT.append(clause_id)
+    return f"redline for {clause_id} sent"
+
+AGENT = create_agent(
+    ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}),
+    tools=[send_redline],
+    middleware=[HumanInTheLoopMiddleware(interrupt_on={"send_redline": True})],
+    checkpointer=InMemorySaver(),
+)
+
+def start(question, thread_id):
+    pass
+
+def finish(thread_id, approve):
+    pass
+--- solution
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+SENT = []
+
+@tool
+def send_redline(clause_id: str) -> str:
+    """Email the proposed redline for one clause to the counterparty."""
+    SENT.append(clause_id)
+    return f"redline for {clause_id} sent"
+
+AGENT = create_agent(
+    ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}),
+    tools=[send_redline],
+    middleware=[HumanInTheLoopMiddleware(interrupt_on={"send_redline": True})],
+    checkpointer=InMemorySaver(),
+)
+
+def start(question, thread_id):
+    config = {"configurable": {"thread_id": thread_id}}
+    result = AGENT.invoke({"messages": [("user", question)]}, config)
+    if "__interrupt__" not in result:
+        return []
+    requests = result["__interrupt__"][0].value["action_requests"]
+    return [(r["name"], r["args"]) for r in requests]
+
+def finish(thread_id, approve):
+    config = {"configurable": {"thread_id": thread_id}}
+    if approve:
+        decision = {"type": "approve"}
+    else:
+        decision = {"type": "reject", "message": "Rejected by the reviewer."}
+    result = AGENT.invoke(Command(resume={"decisions": [decision]}), config)
+    return result["messages"][-1].content
+--- tests
+def _approve():
+    SENT.clear()
+    pending = start("Send the redline for clause 8.3", "t-approve")
+    before = list(SENT)
+    answer = finish("t-approve", True)
+    return [pending, before, SENT, answer]
+expect("先停下、批准后才发", _approve, [[("send_redline", {"clause_id": "8.3"})], [], ["8.3"], "Based on the playbook: redline for 8.3 sent"])
+def _reject():
+    SENT.clear()
+    start("Send the redline for clause 9.1", "t-reject")
+    answer = finish("t-reject", False)
+    return [SENT, answer]
+expect("拒绝：什么都没发，模型收到拒绝理由", _reject, [[], "Based on the playbook: User rejected the tool call for `send_redline` with reason: Rejected by the revi"])
+def _two_threads():
+    SENT.clear()
+    start("Send the redline for clause 8.3", "t-a")
+    start("Send the redline for clause 9.1", "t-b")
+    finish("t-b", True)
+    return SENT
+expect("两个 thread 互不影响：只批准了 t-b", _two_threads, ["9.1"])
+--- hints
+- 两个函数用同一种 config：`{"configurable": {"thread_id": thread_id}}`。checkpointer 靠 thread_id 找回停下的那次运行。
+- `start`：`if "__interrupt__" not in result: return []`，否则从 `result["__interrupt__"][0].value["action_requests"]` 里取 name 和 args。
+- `finish`：先根据 approve 拼出 decision 字典，再 `AGENT.invoke(Command(resume={"decisions": [decision]}), config)`。
+
+@@ item d31-18
+type: choice
+title: overlap 等于 size
+level: 2
+--- prompt
+同事为了「重叠多一点，别漏信息」，写了 `RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=200)`。会发生什么？
+--- options
+- 构造时就抛 `ValueError`，因为重叠不能大于等于块大小
+- 不报错，但每块只比上一块往前挪一小步（一个词左右），切出一大堆几乎重复的块：embedding 请求变多，检索时同一段话占满 top-k
+- 死循环，程序卡住
+- LangChain 自动把 overlap 改成 chunk_size 的 10%
+answer: 2
+--- explain
+这一版只在 `chunk_overlap > chunk_size` 时报错，相等是允许的（卡片里 80/80 的例子切出了 8 块）。第 11 天你自己写 `chunk_fixed` 时，`overlap >= size` 直接 `raise ValueError`，比框架更严格。重复的块既费钱（每块都要算 embedding），又挤占检索名额：top-3 可能是同一句话的三个版本。常见的做法是 overlap 取块大小的 10%–20%。
+
+@@ item d31-19
+type: choice
+title: 选哪种写法
+level: 2
+--- prompt
+Clause Check 有三个需求：
+
+- A：每条条款审查前，先按主题取出 playbook 规则放进 prompt，每条都要做
+- B：审 8.1 时，模型读到 subject to Section 12，要自己决定去取第 12 条的全文
+- C：整份合同审完，有 redline 就停下等律师批准；律师第二天在另一台电脑上批准，然后继续导出
+
+哪种搭配最合适？
+--- options
+- A 用固定链，B 用 create_agent（或自己写的有界工具循环），C 用 LangGraph 的 interrupt + checkpointer
+- 三个都用 create_agent，middleware 什么都能做
+- A 用 create_agent，B 用固定链，C 用一个普通的 while 循环等人输入
+- 三个都写成固定链，agent 太不可控
+answer: 1
+--- explain
+A 的步骤事先知道，写死最便宜、最好测。B 要不要取、取哪条取决于条款内容，这正是 agent 的用处（项目里是 `review.py` 手写的有界循环）。C 要跨进程、跨时间恢复，需要检查点和中断，README 里写的 `graph.py` 引入 LangGraph 的理由正是这个。全用 agent 会多花调用、路径不可预测；「等人输入的 while 循环」进程一退出就什么都没了。
+
+@@ item d31-e1
+type: scratch
+title: 闭卷：条款索引与检索
+exam: yes
+level: 3
+--- prompt
+写两个函数：
+
+`index_contract(text)`：
+
+- 标题行匹配正则 `^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$`（多行模式 `re.M`），组 1 是条款号
+- 每条条款一个 `Document`（`from langchain_core.documents import Document`）：`page_content` 是标题行之后、下一个标题行之前的正文（`.strip()`），`metadata={"clause_id": 条款号}`
+- 把全部 Document 一次放进 `InMemoryVectorStore`（`from langchain_core.vectorstores import InMemoryVectorStore`），embedding 用 `OpenAIEmbeddings(model="text-embedding-3-small")`（`from langchain_openai import OpenAIEmbeddings`），返回这个 store
+- 一条标题都没有：`raise ValueError`
+
+`find(store, question, k=2)`：返回最相关的 k 条的条款号列表。
+--- solution
+import re
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$", re.M)
+
+def index_contract(text):
+    heads = list(HEAD.finditer(text))
+    if not heads:
+        raise ValueError("no numbered clauses")
+    docs = []
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        docs.append(Document(page_content=text[h.end():end].strip(), metadata={"clause_id": h.group(1)}))
+    store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+    store.add_documents(docs)
+    return store
+
+def find(store, question, k=2):
+    return [d.metadata["clause_id"] for d in store.similarity_search(question, k=k)]
+--- tests
+TEXT = """3.1 Invoicing
+Fees are invoiced annually and are payable within thirty (30) days of the invoice date.
+4.2 Automatic Renewal
+This Agreement renews automatically for successive periods of twenty-four (24) months.
+10.1 Location of Processing
+Customer Data may be stored and processed in any country.
+11.1 Termination by Provider
+Provider may terminate this Agreement for convenience upon ten (10) days' written notice."""
+expect("取消 → 终止条款", lambda: find(index_contract(TEXT), "Can the provider cancel the contract?", k=1), ["11.1"])
+expect("个人数据", lambda: find(index_contract(TEXT), "Where is personal data stored?", k=1), ["10.1"])
+expect("正文不含标题", lambda: index_contract(TEXT).similarity_search("renew", k=1)[0].page_content, "This Agreement renews automatically for successive periods of twenty-four (24) months.")
+expect_raises("没有编号", lambda: index_contract("no headings at all"), ValueError)
+def _one_request():
+    MOCK.reset()
+    index_contract(TEXT)
+    return len([c for c in MOCK.calls if c["url"].endswith("/embeddings")])
+expect("全部条款一次放进去：1 次 embeddings 请求", _one_request, 1)
+
+@@ item d31-e2
+type: scratch
+title: 闭卷：带出处的 RAG
+exam: yes
+level: 3
+--- prompt
+写 `rag(question, retriever, model)`，返回 `{"answer": ..., "sources": [...]}`：
+
+- `retriever.invoke(question)` 检索**一次**，得到 Document 列表（每个有 `metadata["clause_id"]`）
+- 一条都没检索到：不调模型，返回 `{"answer": "I could not find this in the contract.", "sources": []}`
+- 否则把片段拼成文字：每个文档一行 `[条款号] 正文`，用 `"\n"` 连接
+- 用 `ChatPromptTemplate.from_messages([("system", "Answer only from the sources and cite clause ids."), ("user", "Question: {question}\nSources:\n{context}")])`（`from langchain_core.prompts import ChatPromptTemplate`）、`model` 和 `StrOutputParser()`（`from langchain_core.output_parsers import StrOutputParser`）组成链，得到回答字符串
+- `sources`：检索到的条款号，按顺序
+--- solution
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the sources and cite clause ids."),
+    ("user", "Question: {question}\nSources:\n{context}"),
+])
+
+def rag(question, retriever, model):
+    docs = retriever.invoke(question)
+    if not docs:
+        return {"answer": "I could not find this in the contract.", "sources": []}
+    context = "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+    answer = (PROMPT | model | StrOutputParser()).invoke({"question": question, "context": context})
+    return {"answer": answer, "sources": [d.metadata["clause_id"] for d in docs]}
+--- tests
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+_store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+_store.add_documents([
+    Document(page_content="Fees are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Provider may terminate upon ten (10) days' notice.", metadata={"clause_id": "11.1"}),
+])
+_model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+_r = _store.as_retriever(search_kwargs={"k": 1})
+expect("回答和出处", lambda: rag("When is the invoice due?", _r, _model), {"answer": "Mock reply: Question: When is the invoice due?\nSources:\n[3.1] Fees are p", "sources": ["3.1"]})
+expect("模型收到的片段", lambda: (rag("Can the provider terminate?", _r, _model), MOCK.calls[-1]["body"]["messages"][1]["content"])[1], "Question: Can the provider terminate?\nSources:\n[11.1] Provider may terminate upon ten (10) days' notice.")
+_r2 = _store.as_retriever(search_kwargs={"k": 2})
+expect("两条片段：一行一条", lambda: (rag("Can the provider terminate?", _r2, _model), MOCK.calls[-1]["body"]["messages"][1]["content"].split("Sources:\n")[1])[1], "[11.1] Provider may terminate upon ten (10) days' notice.\n[3.1] Fees are payable within thirty (30) days of the invoice date.")
+def _empty():
+    MOCK.reset()
+    return [rag("Governing law?", RunnableLambda(lambda q: []), _model), len(MOCK.calls)]
+expect("检索不到：不调模型", _empty, [{"answer": "I could not find this in the contract.", "sources": []}, 0])
+
+@@ item d31-e3
+type: scratch
+title: 闭卷：agent 审条款
+exam: yes
+level: 3
+--- prompt
+已知（测试里会定义，你的代码直接用）：`MODEL`（关掉 thinking 的 ChatDeepSeek）、`ClauseReview`（Pydantic 模型，字段 `clause_id`、`verdict`、`risk_level`）、两个工具 `lookup_playbook(topic)` 和 `get_clause(clause_id)`。
+
+写 `agent_review(text)`：
+
+- 用 `create_agent`（`from langchain.agents import create_agent`）搭 agent：两个工具都给它，`system_prompt="Review the clause against the playbook."`，`response_format=ToolStrategy(ClauseReview)`（`from langchain.agents.structured_output import ToolStrategy`）
+- 调用时设 `{"recursion_limit": 8}`
+- 返回 `{"verdict": ..., "risk_level": ..., "tools": [调用过的工具名，按顺序，不含 "ClauseReview"]}`
+- 超过步数上限（`from langgraph.errors import GraphRecursionError`）：返回 `{"verdict": "flag", "risk_level": "medium", "tools": []}`（测试会模拟一个一直交不出合格答案、不停重试的 agent）
+
+注意：`MODEL` 等名字在测试里才定义，所以在**函数里面**搭 agent。
+--- solution
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+from langgraph.errors import GraphRecursionError
+
+def agent_review(text):
+    agent = create_agent(MODEL, tools=[lookup_playbook, get_clause], system_prompt="Review the clause against the playbook.",
+                         response_format=ToolStrategy(ClauseReview))
+    try:
+        result = agent.invoke({"messages": [("user", text)]}, {"recursion_limit": 8})
+    except GraphRecursionError:
+        return {"verdict": "flag", "risk_level": "medium", "tools": []}
+    tools = []
+    for m in result["messages"]:
+        for call in getattr(m, "tool_calls", None) or []:
+            if call["name"] != "ClauseReview":
+                tools.append(call["name"])
+    review = result["structured_response"]
+    return {"verdict": review.verdict, "risk_level": review.risk_level, "tools": tools}
+--- tests
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+@tool
+def get_clause(clause_id: str) -> str:
+    """Return the full text of another clause."""
+    return "12. The limitations in Section 8 shall not apply to Customer's payment obligations."
+expect("无限责任", lambda: agent_review("Review clause 8.3: Customer's liability shall be unlimited."), {"verdict": "redline", "risk_level": "high", "tools": ["lookup_playbook"]})
+expect("交叉引用：调了 get_clause", lambda: agent_review("Review clause 8.1 with get_clause: subject to section 12, liability is capped."), {"verdict": "flag", "risk_level": "high", "tools": ["get_clause"]})
+def _system():
+    agent_review("Review clause 3.1: Fees are payable in 30 days.")
+    return MOCK.calls[-1]["body"]["messages"][0]
+expect("system prompt", _system, {"role": "system", "content": "Review the clause against the playbook."})
+from pydantic import field_validator
+class _NeverValid(BaseModel):
+    """The final review of one clause."""
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    @field_validator("verdict")
+    @classmethod
+    def _reject(cls, v):
+        raise ValueError("the review service is down, try again")
+def _stuck():
+    # 答案每次都校验失败，ToolStrategy 让模型一直重交；保底上限 30 防止忘了 recursion_limit 时跑很久
+    g = globals()
+    saved_schema, saved_create = g["ClauseReview"], g.get("create_agent")
+    g["ClauseReview"] = _NeverValid
+    if saved_create is not None:
+        g["create_agent"] = lambda *a, **kw: saved_create(*a, **kw).with_config(recursion_limit=30)
+    MOCK.reset()
+    try:
+        return [agent_review("Review clause 8.3: Customer's liability shall be unlimited."), len(MOCK.calls)]
+    finally:
+        g["ClauseReview"] = saved_schema
+        if saved_create is not None:
+            g["create_agent"] = saved_create
+expect("一直交不出合格答案：8 步用完就停，交给人", _stuck, [{"verdict": "flag", "risk_level": "medium", "tools": []}, 7])

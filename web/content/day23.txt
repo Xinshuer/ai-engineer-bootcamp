@@ -1,0 +1,735 @@
+@@ day 23
+title: SQL 进阶：JOIN、子查询、CTE、窗口函数
+lang: sql
+dataset: clausecheck
+hours: 5 小时
+--- goal
+能把几张表连起来（JOIN），知道 LEFT JOIN 和 JOIN 放大的坑；会用子查询和 CTE 把长查询拆成有名字的几步；会用窗口函数做「每组最新一条」、组内排名、和上一条比较、累计。评测看板和费用看板背后都是这些写法，面试的 SQL 题也最爱考它们。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每个例子都改一改再运行
+- 练习区全部通过
+- 闭卷挑战 3 题
+- 能用自己的话讲清楚：LEFT JOIN 时右边表的条件为什么要写在 ON 里；「每组最新一条」怎么写
+
+@@ concept
+title: JOIN：把几张表连起来
+--- body
+表之间靠「键」连起来：`reviews.contract_id` 指向 `contracts.id`，`contracts.customer_id` 指向 `customers.id`。`JOIN ... ON ...` 把两张表里键对得上的行拼成一行，就像 Python 里拿 id 去字典里查：`contracts_by_id[review["contract_id"]]`。
+
+- 给表起短别名：`FROM reviews r JOIN contracts c`，之后写 `r.clause_id`、`c.title`
+- 两张表都有 `id` 列，只写 `id` 会报 `ambiguous column name`：前面加上别名
+- `ON` 写两张表**怎么对上**，`WHERE` 写**要哪些行**。对 JOIN 来说写在哪里结果一样，但分开写更清楚（LEFT JOIN 就不一样了，见下一张卡片）
+- `JOIN` 就是 `INNER JOIN`：两边都对得上的行才留下
+- 连三张表就写两个 JOIN，每个 JOIN 都有自己的 ON
+--- code
+SELECT r.id, c.title, r.clause_id, r.verdict, r.model
+FROM reviews r
+JOIN contracts c ON c.id = r.contract_id
+WHERE r.clause_id = '8.1';
+
+@@ concept
+title: LEFT JOIN：没有对上的也留下
+--- body
+客户 6（Amsterdam Data BV，8 月 30 日刚注册）还没有合同。`customers JOIN contracts` 之后，它就消失了。**LEFT JOIN** 保留左边表的每一行，右边对不上的列都填 NULL。
+
+- 数「每个客户几份合同」要写 `COUNT(c.id)`：没有合同的客户也有一行（右边全是 NULL），`COUNT(*)` 会把它数成 1
+- 经典 bug：右边表的条件写在 WHERE 里，比如 `WHERE c.status = 'reviewed'`。没有合同的那一行 `c.status` 是 NULL，被 WHERE 丢掉，LEFT JOIN 悄悄变成了 JOIN
+- 正确的写法：**右边表的条件写进 ON**：`LEFT JOIN contracts c ON c.customer_id = cu.id AND c.status = 'reviewed'`
+
+运行下面的例子，看最后一行：客户还在，合同的列都是 NULL。
+--- code
+SELECT cu.name, c.id AS contract_id, c.title, c.status
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+ORDER BY cu.id, c.id;
+
+@@ concept
+title: JOIN 放大：总数为什么翻倍了
+--- body
+一份合同有很多条审查。`contracts JOIN reviews` 之后，合同的每一列都被**复制**到它的每一条审查上：合同 101 有 12 条审查，它的 `pages`（12 页）就出现了 12 次，`SUM(c.pages)` 算出来是 144，而不是 12。
+
+解决办法：**先聚合，再 JOIN**。先把 reviews 汇总成「每份合同一行」，写在括号里当成一张临时的表（起个别名，后面才好用 `rs.contract_id` 引用它），再和合同 JOIN。两边都是每份合同一行，就不会放大：
+
+```sql
+JOIN (SELECT contract_id, COUNT(*) AS n
+      FROM reviews
+      GROUP BY contract_id) rs ON rs.contract_id = c.id
+```
+
+面试里被问「这个总数为什么翻倍了」，第一反应就应该是：JOIN 把行放大了。
+--- code
+SELECT c.id,
+       c.pages,
+       COUNT(*) AS rows_after_join,
+       SUM(c.pages) AS wrong_pages
+FROM contracts c
+JOIN reviews r ON r.contract_id = c.id
+GROUP BY c.id, c.pages
+ORDER BY c.id;
+
+@@ concept
+title: 子查询：IN、EXISTS、一个数
+--- body
+查询里面还可以放查询（写在括号里），叫**子查询**：
+
+- `WHERE id IN (SELECT contract_id FROM reviews WHERE model = 'deepseek-v4-pro')`：先算出一组值，再看在不在里面
+- `WHERE EXISTS (SELECT 1 FROM ... WHERE ... = 外层的列)`：只问「有没有」，找到一行就够了；`NOT EXISTS` 找「一条都没有」的
+- **标量子查询**：只返回一个值的子查询可以当成一个数来用，比如算占总数的百分比：`SUM(cost_usd) / (SELECT SUM(cost_usd) FROM reviews)`
+- 坑：`NOT IN (子查询)` 里只要出现一个 NULL，就一行也不返回（昨天的 NULL 规则）。找「没有」时用 `NOT EXISTS` 更安全
+--- code
+SELECT topic,
+       ROUND(SUM(cost_usd), 6) AS cost,
+       ROUND(100.0 * SUM(cost_usd) / (SELECT SUM(cost_usd) FROM reviews), 1) AS pct_of_total
+FROM reviews
+GROUP BY topic
+ORDER BY cost DESC;
+
+@@ concept
+title: CTE：用 WITH 给每一步起名字
+--- body
+查询一长，括号套括号就没法读了。`WITH` 给每一步起个名字，从上往下读，像在 Python 里先算好几个中间变量：
+
+```sql
+WITH per_contract AS (
+  SELECT contract_id, COUNT(*) AS reviews
+  FROM reviews
+  GROUP BY contract_id
+)
+SELECT ... FROM per_contract p JOIN contracts c ON c.id = p.contract_id
+```
+
+- 可以写好几个，用逗号隔开：`WITH a AS (...), b AS (...)`，后面的可以用前面的
+- CTE 里算出来的列（比如 `reviews`）在外层就是普通的列，可以直接放进 WHERE
+- 它和「JOIN 放大」那张卡片里写在 FROM / JOIN 后面括号里、起了别名的子查询是一回事，只是有名字、写在最前面。Postgres、BigQuery、SQLite 都支持，面试写长查询时首选
+
+下面的例子是 CTE 最典型的用法：两种不同的统计，先各自聚合成「每份合同一行」，再 JOIN 到一起（直接把三张表连起来再数，又会放大）。
+--- code
+WITH review_stats AS (
+  SELECT contract_id, COUNT(*) AS reviews
+  FROM reviews
+  GROUP BY contract_id
+),
+tool_stats AS (
+  SELECT r.contract_id, COUNT(*) AS tool_calls
+  FROM tool_calls t
+  JOIN reviews r ON r.id = t.review_id
+  GROUP BY r.contract_id
+)
+SELECT rs.contract_id, rs.reviews, COALESCE(ts.tool_calls, 0) AS tool_calls
+FROM review_stats rs
+LEFT JOIN tool_stats ts ON ts.contract_id = rs.contract_id
+ORDER BY rs.contract_id;
+
+@@ concept
+title: 窗口函数：每行都留下
+--- body
+GROUP BY 把一组行**压成一行**；窗口函数**每一行都留下**，只是在每行旁边多算一列「这一行在它那组里的情况」：
+
+```sql
+ROW_NUMBER() OVER (PARTITION BY contract_id ORDER BY cost_usd DESC)
+```
+
+- `PARTITION BY`：按什么分组（不写就是整张表一组）；`ORDER BY`：组内怎么排
+- `ROW_NUMBER()`：1、2、3、4，并列也硬分先后
+- `RANK()`：并列的名次相同，后面跳号：1、2、2、4
+- `DENSE_RANK()`：并列的名次相同，不跳号：1、2、2、3
+- 聚合函数也能加 OVER：`SUM(cost_usd) OVER (PARTITION BY contract_id)` 是整份合同的总费用，放在每一行旁边
+
+窗口函数在 SELECT 这一步才算，所以**不能写在 WHERE 里**（WHERE 更早执行）。要按它筛选，先把它放进 CTE。
+--- code
+SELECT contract_id, clause_id, cost_usd,
+       ROW_NUMBER() OVER (PARTITION BY contract_id ORDER BY cost_usd DESC) AS rn,
+       ROUND(cost_usd / SUM(cost_usd) OVER (PARTITION BY contract_id), 2) AS share_of_contract
+FROM reviews
+WHERE contract_id IN (104, 108)
+ORDER BY contract_id, rn;
+
+@@ concept
+title: 每组最新一条
+--- body
+合同 103 的 8.1 审查了两次：8 月 12 日用 v1 prompt 判了 redline，9 月 18 日换成 v2 又跑了一次，判 flag。合同 109 的 8.1 第一次 429 失败了，后来重跑成功。做报表时，每个条款只该算**最新**的那一次。
+
+「每组取最新 / 最大的一条」是面试高频题，套路是两步：
+
+1. CTE 里给每组从新到旧编号：`ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id ORDER BY created_at DESC) AS rn`
+2. 外层 `WHERE rn = 1`
+
+只用 `GROUP BY` + `MAX(created_at)` 只能拿到最新的时间，要拿那一行的 verdict 还得再 JOIN 回原表；ROW_NUMBER 一步就能做到。注意：SQLite 有个特殊规则，`SELECT clause_id, verdict, MAX(created_at) ... GROUP BY clause_id` 里没分组的 `verdict` 会取到时间最大的那一行，在本页能跑出对的结果；可在 Postgres 和 BigQuery 里这是错误写法，会直接报错。别这么写。
+
+BigQuery 有更短的 `QUALIFY`，本页跑不了（SQLite 不支持），认得就行（示意）：
+
+```sql
+SELECT clause_id, verdict
+FROM `clausecheck.reviews`
+WHERE contract_id = 103
+QUALIFY ROW_NUMBER() OVER (PARTITION BY clause_id ORDER BY created_at DESC) = 1
+```
+--- code
+WITH ranked AS (
+  SELECT id, contract_id, clause_id, verdict, prompt_version, created_at,
+         ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id
+                            ORDER BY created_at DESC) AS rn
+  FROM reviews
+  WHERE clause_id = '8.1'
+)
+SELECT *
+FROM ranked
+ORDER BY contract_id, rn;
+-- 在 ORDER BY 那一行前面加上 WHERE rn = 1 再运行
+
+@@ concept
+title: LAG 和累计
+--- body
+- `LAG(latency_ms) OVER (ORDER BY created_at)`：**上一行**的值（第一行没有上一行，是 NULL）；`LEAD` 取下一行。用来算「和上一次比变了多少」
+- `SUM(cost_usd) OVER (ORDER BY created_at)`：从第一行一直加到当前这一行，就是**累计**（running total）。小细节：排序值一样的几行（比如同一秒的两条）会一起加进去，拿到同一个累计值
+- 加上 `PARTITION BY contract_id`，就在每份合同里面各算各的
+
+按天、按月汇总时，先把时间变成日期：SQLite 用 `date(created_at)` 得到 `'2026-09-05'`，用 `strftime('%Y-%m', created_at)` 得到 `'2026-09'`。Postgres 写 `created_at::date`、`date_trunc('month', created_at)`；BigQuery 写 `DATE(created_at)`、`DATE_TRUNC(DATE(created_at), MONTH)`（第 25 天）。
+--- code
+SELECT id, clause_id, model, latency_ms,
+       LAG(latency_ms) OVER (ORDER BY created_at) AS prev_ms,
+       latency_ms - LAG(latency_ms) OVER (ORDER BY created_at) AS change_ms,
+       ROUND(SUM(cost_usd) OVER (ORDER BY created_at), 6) AS running_cost
+FROM reviews
+WHERE contract_id = 103
+ORDER BY created_at;
+
+@@ item d23-01
+type: sql
+title: 复习：不稳定的评测用例
+level: 1
+ordered: yes
+--- prompt
+复习昨天的 GROUP BY 和 HAVING，顺便认识 `evals` 表：每一行是一个评测用例（`case_id`）用某个 prompt 版本（`prompt_version`）跑一次，`run` 是第几次，`passed` 是 1（通过）或 0。
+
+找出「不稳定」的组合：同一个用例、同一个版本跑的几次里，**没有全部通过**的。三列：`case_id`、`prompt_version`、`passes`（通过了几次），按 `case_id`、`prompt_version` 排序。
+--- solution
+SELECT case_id, prompt_version, SUM(passed) AS passes
+FROM evals
+GROUP BY case_id, prompt_version
+HAVING SUM(passed) < COUNT(*)
+ORDER BY case_id, prompt_version;
+--- hints
+- 按两列分组：`GROUP BY case_id, prompt_version`。
+- 「没有全部通过」：通过次数小于运行次数，`HAVING SUM(passed) < COUNT(*)`（每组都跑了 3 次，写 `< 3` 也行）。
+
+@@ item d23-02
+type: sql
+title: 合同和客户
+level: 1
+--- prompt
+每份合同一行，三列：`title`、`customer`（客户名，`customers.name`）、`country`（客户所在国家）。行的顺序不限。
+--- starter
+SELECT title
+FROM contracts;
+--- solution
+SELECT c.title, cu.name AS customer, cu.country
+FROM contracts c
+JOIN customers cu ON cu.id = c.customer_id;
+--- hints
+- 合同的 `customer_id` 等于客户的 `id`：`JOIN customers cu ON cu.id = c.customer_id`。
+- 给两张表都起别名，列名前面带上别名：`cu.name AS customer`。
+
+@@ item d23-03
+type: sql
+title: redline 带上客户名
+level: 2
+ordered: yes
+--- prompt
+要给每位客户的法务发提醒：列出所有 `verdict` 是 `redline` 的审查，四列：`customer`（客户名）、`title`（合同标题）、`clause_id`、`heading`。按 `customer`、`title`、`clause_id` 排序（`clause_id` 这里按文字排就行）。
+--- solution
+SELECT cu.name AS customer, c.title, r.clause_id, r.heading
+FROM reviews r
+JOIN contracts c ON c.id = r.contract_id
+JOIN customers cu ON cu.id = c.customer_id
+WHERE r.verdict = 'redline'
+ORDER BY customer, c.title, r.clause_id;
+--- hints
+- 三张表：从 `reviews r` 出发，先 JOIN `contracts c`（`c.id = r.contract_id`），再 JOIN `customers cu`（`cu.id = c.customer_id`）。
+- 每个 JOIN 都要有自己的 ON；最后加 `WHERE r.verdict = 'redline'` 和 ORDER BY。
+
+@@ item d23-04
+type: sql
+title: 工具读了哪一条
+level: 2
+ordered: yes
+--- prompt
+`tool_calls` 记录了每次审查调用的工具，参数 `args` 是一段 JSON 文字，比如 `'{"clause_id": "12"}'`。SQLite 用 `json_extract(args, '$.clause_id')` 取出里面的值（BigQuery 写 `JSON_VALUE(args, '$.clause_id')`，第 24 天再细讲 JSON 列）。
+
+列出所有 `get_clause` 调用，四列：`review_id`、`clause_id`（被审查的条款，来自 `reviews`）、`requested`（模型想读的条款，来自 `args`）、`ok`。按 `review_id` 排序。
+
+做完看看：失败的那一次，模型想读的是哪一条？这份合同里有这一条吗？
+--- solution
+SELECT t.review_id,
+       r.clause_id,
+       json_extract(t.args, '$.clause_id') AS requested,
+       t.ok
+FROM tool_calls t
+JOIN reviews r ON r.id = t.review_id
+WHERE t.tool = 'get_clause'
+ORDER BY t.review_id;
+--- hints
+- 每次工具调用属于一次审查：`JOIN reviews r ON r.id = t.review_id`。
+- `json_extract(t.args, '$.clause_id') AS requested`，再加 `WHERE t.tool = 'get_clause'`。
+- 失败的那次（`ok` 是 0）要读第 99 条：工具没找到它，合同 103 审查过的条款最大才到 15.4，这多半是模型编出来的交叉引用。项目 `tools.py` 的 `get_clause` 这时返回 `NOT_FOUND` 和已有的条款编号，而不是编一段内容给模型，这正是第 17 天说的「错误是写给模型看的」。
+
+@@ item d23-05
+type: choice
+title: LEFT JOIN 之后数一数
+level: 2
+--- prompt
+客户 6 Amsterdam Data BV 还没有任何合同。下面这条查询里，它那一行的 `n` 是多少？如果把 `LEFT JOIN` 换成 `JOIN` 呢？
+--- code
+SELECT cu.name, COUNT(*) AS n
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+GROUP BY cu.id, cu.name;
+--- options
+- LEFT JOIN 时 `n` 是 1；换成 JOIN，这一行不出现
+- LEFT JOIN 时 `n` 是 0；换成 JOIN，`n` 还是 0
+- LEFT JOIN 时 `n` 是 NULL；换成 JOIN，这一行不出现
+- 两种写法 `n` 都是 1
+answer: 1
+--- explain
+LEFT JOIN 保留了这位客户，右边的列全是 NULL，但这仍然是**一行**，`COUNT(*)` 数行，所以是 1。要写 `COUNT(c.id)`（只数不是 NULL 的）才会得到 0。JOIN 只留两边都对得上的行，没有合同的客户整行消失。而报表里「0 份合同的客户」往往最值得关注：刚注册、还没用起来。
+
+@@ item d23-06
+type: sql
+title: 每个客户几份合同
+level: 2
+ordered: yes
+--- prompt
+每个客户一行，**包括还没有合同的客户**：两列 `name`、`contracts`（合同份数）。按 `contracts` 从多到少，一样多的按 `name`。
+--- solution
+SELECT cu.name, COUNT(c.id) AS contracts
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+GROUP BY cu.id, cu.name
+ORDER BY contracts DESC, cu.name;
+--- hints
+- 从 `customers cu` 出发 `LEFT JOIN contracts c`，没有合同的客户也会留下一行。
+- 数 `COUNT(c.id)`，不要数 `COUNT(*)`（上一题）。
+- `GROUP BY cu.id, cu.name`：分组时带上 id，就算两个客户重名也不会被并成一组。
+
+@@ item d23-07
+type: sql
+title: 修 bug：9 月的客户少了
+level: 2
+ordered: yes
+--- prompt
+月报要列出**每一个**客户 9 月上传了几份合同（`uploaded_at` 在 `'2026-09-01'` 或之后），没上传的写 0。下面的查询只返回了 4 个客户，Fjord Health AS 和 Amsterdam Data BV 不见了。
+
+运行，修好它。两列 `name`、`september`，按 `name` 排序。
+--- starter
+SELECT cu.name, COUNT(c.id) AS september
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+WHERE c.uploaded_at >= '2026-09-01'
+GROUP BY cu.id, cu.name
+ORDER BY cu.name;
+--- solution
+SELECT cu.name, COUNT(c.id) AS september
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+                     AND c.uploaded_at >= '2026-09-01'
+GROUP BY cu.id, cu.name
+ORDER BY cu.name;
+--- hints
+- 没有 9 月合同的客户，LEFT JOIN 之后 `c.uploaded_at` 是 NULL（或者是 8 月的日期），WHERE 把这一行丢掉了。
+- 右边表（contracts）的条件写进 ON：`LEFT JOIN contracts c ON c.customer_id = cu.id AND c.uploaded_at >= '2026-09-01'`。
+
+@@ item d23-08
+type: sql
+title: 修 bug：页数翻了好几倍
+level: 3
+ordered: yes
+--- prompt
+每个客户一行：合同总页数 `pages` 和审查条数 `reviews`。下面的查询审查条数是对的，页数却大得离谱：Nordlys AB 三份合同一共 20 页（12 + 6 + 2），查询说是 178 页。
+
+运行，找出原因，修好它。三列 `name`、`pages`、`reviews`，按 `name` 排序（只看有合同的客户）。
+
+注意：这道题的库里多了一份合同 111（CloudNotes Inc 的 `Mutual NDA (Renewal)`，3 页，1 条审查），和 108 一样都是 3 页。
+--- schema
+INSERT INTO contracts VALUES (111, 4, 'Mutual NDA (Renewal)', '2026-09-20 10:00:00', 3, 'reviewed');
+INSERT INTO reviews VALUES (1066, 111, '6.2', 'Duration of Confidentiality', 'confidentiality', 'redline', 'medium', '["PB-06"]', 'deepseek-v4-flash', 'v2', 2702, 201, 0, 1804, 0.001052, NULL, '2026-09-20 10:02:05');
+--- starter
+SELECT cu.name,
+       SUM(c.pages) AS pages,
+       COUNT(r.id) AS reviews
+FROM customers cu
+JOIN contracts c ON c.customer_id = cu.id
+JOIN reviews r ON r.contract_id = c.id
+GROUP BY cu.id, cu.name
+ORDER BY cu.name;
+--- solution
+SELECT cu.name,
+       SUM(c.pages) AS pages,
+       SUM(rs.n) AS reviews
+FROM customers cu
+JOIN contracts c ON c.customer_id = cu.id
+JOIN (SELECT contract_id, COUNT(*) AS n
+      FROM reviews
+      GROUP BY contract_id) rs ON rs.contract_id = c.id
+GROUP BY cu.id, cu.name
+ORDER BY cu.name;
+--- hints
+- JOIN reviews 之后，合同的每一列都被复制到它的每一条审查上：合同 101 有 12 条审查，它的 12 页被加了 12 次（12 × 12 + 6 × 5 + 2 × 2 = 178）。
+- 先聚合再 JOIN：把 reviews 先汇总成每份合同一行 `(SELECT contract_id, COUNT(*) AS n FROM reviews GROUP BY contract_id) rs`，再 `JOIN ... ON rs.contract_id = c.id`。
+- 这时审查条数要写 `SUM(rs.n)`。别用 `SUM(DISTINCT c.pages)` 蒙混过去：108 和 111 都是 3 页，DISTINCT 会把它们当成一份。
+
+@@ item d23-09
+type: sql
+title: 用过 v4-pro 的合同
+level: 2
+--- prompt
+Clause Check 平时用 flash 模型（表里记作 `deepseek-v4-flash`），只在少数高风险条款上换成更大的 `deepseek-v4-pro`：它更慢，单价也高得多，输出的 token 也更多。哪些合同的审查用到了它？两列 `id`、`title`，用 `WHERE id IN (子查询)` 写，每份合同只出现一次。行的顺序不限。
+--- solution
+SELECT id, title
+FROM contracts
+WHERE id IN (SELECT contract_id
+             FROM reviews
+             WHERE model = 'deepseek-v4-pro');
+--- hints
+- 子查询先算出一组合同 id：`SELECT contract_id FROM reviews WHERE model = 'deepseek-v4-pro'`。
+- 外层：`SELECT id, title FROM contracts WHERE id IN (...)`。
+- 用 JOIN 的话，合同 103 会出现两次（它有两条 v4-pro 审查）；IN 只问「在不在」，不会重复。
+
+@@ item d23-10
+type: sql
+title: 从没收到 redline 的客户
+level: 2
+--- prompt
+哪些客户**从来没有**收到过 redline？还没有合同的客户也算。返回一列 `name`，用 `NOT EXISTS` 写。行的顺序不限。
+--- solution
+SELECT cu.name
+FROM customers cu
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM contracts c
+  JOIN reviews r ON r.contract_id = c.id
+  WHERE c.customer_id = cu.id
+    AND r.verdict = 'redline'
+);
+--- hints
+- `NOT EXISTS (子查询)`：子查询一行都找不到时才成立。
+- 子查询里 JOIN contracts 和 reviews，用 `c.customer_id = cu.id` 连到外层的这位客户，再加 `r.verdict = 'redline'`。
+- EXISTS 只关心有没有行，所以子查询习惯写 `SELECT 1`。
+
+@@ item d23-11
+type: sql
+title: CTE：需要人看的合同
+level: 2
+ordered: yes
+--- prompt
+用 `WITH` 分两步写：
+
+1. `per_contract`：每份合同一行，`contract_id`、`reviews`（审查条数）、`attention`（需要人看的条数：verdict 不是 accept，**失败的也算**）
+2. 外层：JOIN `contracts` 拿到 `title`，只要 `attention` 至少 2 条的合同
+
+返回三列 `title`、`reviews`、`attention`，按 `attention` 从多到少，一样的按 `title`。
+--- solution
+WITH per_contract AS (
+  SELECT contract_id,
+         COUNT(*) AS reviews,
+         SUM(CASE WHEN verdict = 'accept' THEN 0 ELSE 1 END) AS attention
+  FROM reviews
+  GROUP BY contract_id
+)
+SELECT c.title, p.reviews, p.attention
+FROM per_contract p
+JOIN contracts c ON c.id = p.contract_id
+WHERE p.attention >= 2
+ORDER BY p.attention DESC, c.title;
+--- hints
+- 「不是 accept，失败的也算」：`SUM(CASE WHEN verdict = 'accept' THEN 0 ELSE 1 END)`。反过来写 `CASE WHEN verdict <> 'accept' THEN 1 ELSE 0 END` 会漏掉 NULL（昨天的坑）。
+- 外层把 CTE 当成一张普通的表：`FROM per_contract p JOIN contracts c ON c.id = p.contract_id`。
+- CTE 里算出来的 `attention` 在外层是普通的列，直接 `WHERE p.attention >= 2`。
+
+@@ item d23-12
+type: order
+title: 排代码：CTE
+level: 2
+--- prompt
+排出这条查询：先用 CTE 算出每份合同的审查条数，再拿到合同标题，只要至少 5 条的，条数多的在前（一样多的按标题）。有两行干扰项。
+--- lines
+WITH per_contract AS (
+  SELECT contract_id, COUNT(*) AS reviews
+  FROM reviews
+  GROUP BY contract_id
+)
+SELECT c.title, p.reviews
+FROM per_contract p
+JOIN contracts c ON c.id = p.contract_id
+WHERE p.reviews >= 5
+ORDER BY p.reviews DESC, c.title;
+--- distractors
+) AS per_contract
+HAVING p.reviews >= 5
+--- hints
+- CTE 的写法：`WITH 名字 AS (`，括号里是一条完整的查询，最后单独一个 `)`。`(...) AS 名字` 是把子查询写在 FROM 里的写法，不是 CTE。
+- 外层查询把 `per_contract` 当成一张表：SELECT → FROM → JOIN → WHERE → ORDER BY。外层没有 GROUP BY，所以用 WHERE，不用 HAVING。
+
+@@ item d23-13
+type: choice
+title: 并列时的三种编号
+level: 2
+--- prompt
+CTE `topic_problems` 就是昨天填空题的结果（每个主题 flag + redline 一共几条），它有 5 行：liability_cap 7、auto_renewal 4、data_processing 4、payment 4、confidentiality 3。下面的查询里，confidentiality 那一行的 `rn`、`rnk`、`drnk` 分别是多少？
+--- code
+WITH topic_problems AS (
+  SELECT topic, COUNT(*) AS problems
+  FROM reviews
+  WHERE verdict IN ('flag', 'redline')
+  GROUP BY topic
+  HAVING COUNT(*) >= 3
+)
+SELECT topic, problems,
+       ROW_NUMBER() OVER (ORDER BY problems DESC, topic) AS rn,
+       RANK() OVER (ORDER BY problems DESC) AS rnk,
+       DENSE_RANK() OVER (ORDER BY problems DESC) AS drnk
+FROM topic_problems;
+--- options
+- `5, 5, 3`
+- `5, 3, 3`
+- `3, 3, 3`
+- `5, 5, 5`
+answer: 1
+--- explain
+三个主题并列 4 条。`ROW_NUMBER` 不管并列，硬排成 1 到 5，所以是 5；`RANK` 让并列的三个都是第 2 名，后面跳号，下一个是第 5 名；`DENSE_RANK` 不跳号，下一个是第 3 名。怎么选：「每组只要一条」（比如每组最新一条）用 `ROW_NUMBER`，它保证只有一个 1；「前三名，并列的都要」用 `RANK` 或 `DENSE_RANK`。
+
+@@ item d23-14
+type: sql
+title: 客户内部给合同排名
+level: 3
+ordered: yes
+--- prompt
+每位客户的合同，按审查总费用排名。四列：
+
+- `customer`：客户名
+- `contract_id`
+- `cost`：这份合同所有审查的 `cost_usd` 之和，保留 6 位小数
+- `rank_in_customer`：在**同一位客户**的合同里，按 `cost` 从高到低的名次（用 `RANK()`）
+
+按 `customer`、`rank_in_customer` 排序。
+--- solution
+WITH contract_cost AS (
+  SELECT contract_id, ROUND(SUM(cost_usd), 6) AS cost
+  FROM reviews
+  GROUP BY contract_id
+)
+SELECT cu.name AS customer,
+       cc.contract_id,
+       cc.cost,
+       RANK() OVER (PARTITION BY cu.id ORDER BY cc.cost DESC) AS rank_in_customer
+FROM contract_cost cc
+JOIN contracts c ON c.id = cc.contract_id
+JOIN customers cu ON cu.id = c.customer_id
+ORDER BY customer, rank_in_customer;
+--- hints
+- 先用 CTE 算出每份合同的费用（每份合同一行），再 JOIN `contracts` 和 `customers` 拿到客户名。
+- 名次：`RANK() OVER (PARTITION BY cu.id ORDER BY cc.cost DESC)`。PARTITION BY 让每位客户各排各的。
+- 最后 `ORDER BY customer, rank_in_customer`。
+
+@@ item d23-15
+type: sql
+title: 修 bug：窗口函数的位置
+level: 2
+ordered: yes
+--- prompt
+合同 109 的 8.1 第一次审查失败（429），后来重跑成功了；合同 106 的 10.1 失败以后还没有重跑。报告里每个「合同 + 条款」只要**最新**的一次：重跑过的显示重跑的结果，还没重跑的就显示那次失败。同事的查询报错：`misuse of aliased window function rn`。
+
+运行看报错，修好它：返回合同 106 和 109 每个条款最新的那一次，四列 `contract_id`、`clause_id`、`verdict`、`created_at`，按 `contract_id`、`clause_id` 排序（`clause_id` 按文字排就行）。
+--- starter
+SELECT contract_id, clause_id, verdict, created_at,
+       ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id ORDER BY created_at DESC) AS rn
+FROM reviews
+WHERE contract_id IN (106, 109) AND rn = 1
+ORDER BY contract_id, clause_id;
+--- solution
+WITH ranked AS (
+  SELECT contract_id, clause_id, verdict, created_at,
+         ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id ORDER BY created_at DESC) AS rn
+  FROM reviews
+  WHERE contract_id IN (106, 109)
+)
+SELECT contract_id, clause_id, verdict, created_at
+FROM ranked
+WHERE rn = 1
+ORDER BY contract_id, clause_id;
+--- hints
+- 执行顺序：WHERE 比 SELECT 先执行，而窗口函数在 SELECT 这一步才算，所以 WHERE 里还用不了 `rn`。
+- 把带 ROW_NUMBER 的查询放进 CTE：`WITH ranked AS (...)`，在外层写 `WHERE rn = 1`。
+- 外层只 SELECT 四列，不要把 `rn` 也带出来。直接用 `verdict IS NOT NULL` 去掉失败的行不对：106 的 10.1 最新的那次就是失败，报告里要看得到它。
+
+@@ item d23-16
+type: fill
+title: 填空：只算最新的一次
+level: 2
+ordered: yes
+--- prompt
+每个「合同 + 条款」只算最新的一次审查，再数每种 verdict 各几条。填好以后和昨天的结果（accept 37、flag 14、redline 12、NULL 2）比一比：哪些数变了？为什么？
+--- template
+WITH latest AS (
+  SELECT verdict,
+         ROW_NUMBER() OVER (PARTITION BY [[contract_id, clause_id]]
+                            ORDER BY created_at [[DESC]]) AS rn
+  FROM reviews
+)
+SELECT verdict, COUNT(*) AS n
+FROM latest
+WHERE [[rn = 1]]
+GROUP BY verdict
+ORDER BY n DESC;
+--- hints
+- 「每个合同 + 条款」一组：PARTITION BY 两列，用逗号隔开。
+- 最新的要排第 1：按时间**从新到旧**；每组只留第一行：`rn = 1`。
+- 比较：redline 少了 1 条（103 的 8.1 旧的 redline 被新的 flag 取代，那条 flag 本来就算在 14 条里），NULL 少了 1 条（109 的 8.1 失败以后重跑成功了）。
+
+@@ item d23-17
+type: sql
+title: 每天的累计费用
+level: 3
+ordered: yes
+--- prompt
+画一张「费用随时间累计」的图，需要这样的数据：每个有审查的日子一行，三列：
+
+- `day`：`date(created_at)`，形如 `'2026-09-05'`
+- `cost`：当天所有审查的 `cost_usd` 之和，保留 6 位小数
+- `running_cost`：从第一天累计到当天的费用，保留 6 位小数
+
+按 `day` 排序。
+--- solution
+WITH daily AS (
+  SELECT date(created_at) AS day, SUM(cost_usd) AS cost
+  FROM reviews
+  GROUP BY date(created_at)
+)
+SELECT day,
+       ROUND(cost, 6) AS cost,
+       ROUND(SUM(cost) OVER (ORDER BY day), 6) AS running_cost
+FROM daily
+ORDER BY day;
+--- hints
+- 第一步（CTE）：`GROUP BY date(created_at)`，每天一行，算出当天的总费用。
+- 第二步：`SUM(cost) OVER (ORDER BY day)` 从第一天加到当前这一天。
+- 不用 CTE 也能写：`SUM(SUM(cost_usd)) OVER (ORDER BY date(created_at))`，里面的 SUM 是每天的总额，外面的 SUM 是累计。CTE 的写法更好读。
+
+@@ item d23-18
+type: sql
+title: 延迟突然变大
+level: 3
+ordered: yes
+--- prompt
+找出延迟突然变大的审查：在**同一份合同**里按 `created_at` 排，每条审查和它的上一条比，`latency_ms` 增加了 4000 以上（`> 4000`）的。四列：`id`、`model`、`latency_ms`、`jump_ms`（这条的 `latency_ms` 减去上一条的），按 `id` 排序。
+
+做完看看 `model` 这一列：你能解释这些突增吗？
+--- solution
+WITH with_prev AS (
+  SELECT id, model, latency_ms,
+         latency_ms - LAG(latency_ms) OVER (PARTITION BY contract_id ORDER BY created_at) AS jump_ms
+  FROM reviews
+)
+SELECT id, model, latency_ms, jump_ms
+FROM with_prev
+WHERE jump_ms > 4000
+ORDER BY id;
+--- hints
+- 同一份合同里的上一条：`LAG(latency_ms) OVER (PARTITION BY contract_id ORDER BY created_at)`。每份合同的第一条没有上一条，结果是 NULL，`NULL > 4000` 不成立，自然被排除。
+- 窗口函数不能写在 WHERE 里：先在 CTE 里算出 `jump_ms`，外层再 `WHERE jump_ms > 4000`。
+- 别漏了 `PARTITION BY contract_id`：不加的话，每份合同的第一条会和**上一份合同**的最后一条比。这份数据里碰巧不影响结果，但逻辑是错的。
+
+@@ item d23-19
+type: sql
+title: v1 和 v2 并排
+level: 3
+ordered: yes
+--- prompt
+把 `evals` 里每个用例的 v1 和 v2 并排放在一行：三列 `case_id`、`v1_passes`（v1 跑的几次里通过了几次）、`v2_passes`，按 `case_id` 排序。
+--- solution
+SELECT case_id,
+       SUM(CASE WHEN prompt_version = 'v1' THEN passed ELSE 0 END) AS v1_passes,
+       SUM(CASE WHEN prompt_version = 'v2' THEN passed ELSE 0 END) AS v2_passes
+FROM evals
+GROUP BY case_id
+ORDER BY case_id;
+--- hints
+- 每个用例一行：`GROUP BY case_id`。两个版本各一列，用昨天的「按条件求和」：`SUM(CASE WHEN prompt_version = 'v1' THEN passed ELSE 0 END)`。
+- 另一种写法：两个 CTE（v1 一个、v2 一个，各自 GROUP BY case_id），再按 `case_id` JOIN 起来。面试时两种都值得会。
+
+@@ item d23-e1
+type: sql
+title: 闭卷：合同 103 的最终结论
+exam: yes
+level: 3
+ordered: yes
+--- prompt
+`reviews` 表里，合同 103 有的条款审查过不止一次。每个条款（`clause_id`）只保留**最新**的一次审查（`created_at` 最大），返回三列 `clause_id`、`verdict`、`prompt_version`。
+
+按条款编号的**数字**顺序排：编号是 `'8.1'`、`'10.3'` 这样的文字，小数点后面都只有一位数。
+--- solution
+WITH ranked AS (
+  SELECT clause_id, verdict, prompt_version,
+         ROW_NUMBER() OVER (PARTITION BY clause_id ORDER BY created_at DESC) AS rn
+  FROM reviews
+  WHERE contract_id = 103
+)
+SELECT clause_id, verdict, prompt_version
+FROM ranked
+WHERE rn = 1
+ORDER BY CAST(clause_id AS REAL);
+
+@@ item d23-e2
+type: sql
+title: 闭卷：每个客户的花费
+exam: yes
+level: 3
+ordered: yes
+--- prompt
+用 `customers`、`contracts`（`customer_id` 指向客户）和 `reviews`（`contract_id` 指向合同）。每个客户一行，**包括还没有任何合同的客户**，三列：
+
+- `name`
+- `reviews`：这位客户所有合同的审查条数，没有就是 0
+- `total_cost`：这些审查的 `cost_usd` 之和，保留 6 位小数，没有就是 0
+
+按 `total_cost` 从高到低，一样的按 `name`。
+--- solution
+SELECT cu.name,
+       COUNT(r.id) AS reviews,
+       COALESCE(ROUND(SUM(r.cost_usd), 6), 0) AS total_cost
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+LEFT JOIN reviews r ON r.contract_id = c.id
+GROUP BY cu.id, cu.name
+ORDER BY total_cost DESC, cu.name;
+
+@@ item d23-e3
+type: sql
+title: 闭卷：v1 和 v2 的通过率
+exam: yes
+level: 3
+ordered: yes
+--- prompt
+`evals` 表每一行是一个用例（`case_id`）用某个 prompt 版本（`prompt_version`，`'v1'` 或 `'v2'`）跑一次，`passed` 是 1 或 0。每个用例一行，四列：
+
+- `case_id`
+- `v1_rate`：v1 的通过率（通过次数 ÷ 运行次数），保留 2 位小数
+- `v2_rate`：v2 的通过率，保留 2 位小数
+- `diff`：v2 的通过率减 v1 的通过率，**用四舍五入之前的通过率相减**，再保留 2 位小数
+
+只要两个版本通过率**不一样**的用例，按 `case_id` 排序。
+--- solution
+WITH rates AS (
+  SELECT case_id,
+         AVG(CASE WHEN prompt_version = 'v1' THEN passed END) AS v1,
+         AVG(CASE WHEN prompt_version = 'v2' THEN passed END) AS v2
+  FROM evals
+  GROUP BY case_id
+)
+SELECT case_id,
+       ROUND(v1, 2) AS v1_rate,
+       ROUND(v2, 2) AS v2_rate,
+       ROUND(v2 - v1, 2) AS diff
+FROM rates
+WHERE v1 <> v2
+ORDER BY case_id;

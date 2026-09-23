@@ -5,6 +5,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/python/python.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/sql/sql.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/addon/edit/matchbrackets.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/addon/runmode/runmode.min.js"></script>
 <script src="harness.js"></script>
@@ -241,6 +242,16 @@ table.dayTable th { font: 600 12px var(--font-head); color: var(--muted); letter
 .tableWrap { overflow-x: auto; }
 .emptyNote { color: var(--muted); font-size: 14px; }
 .toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 20px); transform: translateX(-50%); background: var(--ink); color: var(--surface); padding: 8px 16px; border-radius: 8px; font-size: 14px; z-index: 50; box-shadow: var(--shadow); }
+.sqlTable { border-collapse: collapse; font: 12.5px/1.5 var(--font-code); background: var(--code-bg); }
+.sqlTable th, .sqlTable td { padding: 4px 10px; border: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.sqlTable th { background: var(--surface-2); font-weight: 600; }
+.sqlTable td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.sqlTable td.null { color: var(--faint); font-style: italic; }
+details.schema { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--surface-2); }
+details.schema > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); }
+details.schema[open] > summary { margin-bottom: 8px; }
+.schemaTable { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 12px; min-width: 0; }
+.schemaCols { font-size: 12px; color: var(--muted); white-space: normal; word-break: break-word; }
 .copyArea { width: 100%; min-height: 160px; font: 12px/1.5 var(--font-code); border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--code-bg); }
 
 @media (max-width: 1020px) {
@@ -292,10 +303,10 @@ const COURSE = window.CC_COURSE || { days: [] };
 const H = window.CC_HARNESS || {};
 const BASE = new URL(".", document.baseURI).href;
 const HAS_CM = typeof window.CodeMirror === "function";
-const KIND = { choice: "选择", predict: "预测输出", code: "写函数", fix: "修 bug", fill: "填空", order: "排代码", scratch: "从零手写", translate: "翻译", local: "本机任务", testwrite: "写测试" };
-const WEEK_TITLE = { 1: "第 1 周 · 入门", 2: "第 2 周 · 写成小程序", 3: "第 3 周 · 工程与 Agent" };
+const KIND = { choice: "选择", predict: "预测输出", code: "写函数", fix: "修 bug", fill: "填空", order: "排代码", scratch: "从零手写", translate: "翻译", local: "本机任务", testwrite: "写测试", sql: "写 SQL" };
+const WEEK_TITLE = { 1: "第 1 周 · 入门", 2: "第 2 周 · 写成小程序", 3: "第 3 周 · 工程与 Agent", 4: "第 4 周 · 云与数据", 5: "第 5 周 · LangChain 与 LangGraph" };
 const weekOf = (dayId) => Math.ceil(Number(dayId) / 7);
-const LANG = { py: "Python", ts: "TypeScript" };
+const LANG = { py: "Python", ts: "TypeScript", sql: "SQL", docker: "Dockerfile" };
 const RUNNABLE = new Set(["code", "fix", "scratch", "translate", "fill", "order"]);
 const SOLUTION_AFTER_TRIES = 2;
 const SOLUTION_AFTER_MS = 10 * 60 * 1000;
@@ -322,14 +333,16 @@ function toast(msg) { const t = $("#toast"); t.textContent = msg; t.hidden = fal
 
 // ---------------------------------------------------------------- markdown (small subset)
 function inline(s) {
-  return esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  // ``a `b` c`` (double backticks, for code that contains a backtick) before `code`
+  return esc(s).replace(/``\s?(.+?)\s?``|`([^`]+)`/g, (m, dbl, one) => `<code>${dbl !== undefined ? dbl : one}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
 }
 function md(text) {
   if (!text) return "";
   const lines = text.split("\n");
   let html = "", para = [], list = null;
   const flushPara = () => { if (para.length) { html += `<p>${inline(para.join(" "))}</p>`; para = []; } };
-  const flushList = () => { if (list) { html += `<${list.tag}>${list.items.map((x) => `<li>${inline(x)}</li>`).join("")}</${list.tag}>`; list = null; } };
+  const flushList = () => { if (list) { html += `<${list.tag}${list.start > 1 ? ` start="${list.start}"` : ""}>${list.items.map((x) => `<li>${inline(x)}</li>`).join("")}</${list.tag}>`; list = null; } };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const fence = /^```(\w*)/.exec(line);
@@ -340,9 +353,14 @@ function md(text) {
       html += `<pre class="codeBlock" data-lang="${fence[1] || ""}">${esc(buf.join("\n"))}</pre>`;
       continue;
     }
-    const ul = /^\s*[-*] (.*)$/.exec(line), ol = /^\s*\d+\. (.*)$/.exec(line), hd = /^###\s+(.*)$/.exec(line);
+    const ul = /^\s*[-*] (.*)$/.exec(line), ol = /^\s*(\d+)\. (.*)$/.exec(line), hd = /^###\s+(.*)$/.exec(line);
     if (hd) { flushPara(); flushList(); html += `<h3>${inline(hd[1])}</h3>`; }
-    else if (ul || ol) { flushPara(); const tag = ul ? "ul" : "ol"; if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; } list.items.push((ul || ol)[1]); }
+    else if (ul || ol) {
+      flushPara();
+      const tag = ul ? "ul" : "ol";
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [], start: ol ? Number(ol[1]) : 1 }; }
+      list.items.push(ul ? ul[1] : ol[2]);
+    }
     else if (!line.trim()) { flushPara(); flushList(); }
     else if (list && /^\s{2,}/.test(line)) list.items[list.items.length - 1] += " " + line.trim();
     else { flushList(); para.push(line.trim()); }
@@ -354,7 +372,7 @@ function highlightIn(root, fallbackLang) {
   if (!HAS_CM || !CodeMirror.runMode) return;
   root.querySelectorAll("pre.codeBlock").forEach((pre) => {
     const lang = pre.dataset.lang || fallbackLang;
-    const mode = lang === "ts" || lang === "typescript" ? "text/typescript" : lang === "py" || lang === "python" ? "python" : null;
+    const mode = lang === "ts" || lang === "typescript" ? "text/typescript" : lang === "py" || lang === "python" ? "python" : lang === "sql" ? "text/x-sqlite" : null;
     if (!mode) return;
     const text = pre.textContent;
     pre.textContent = "";
@@ -450,10 +468,23 @@ function mergeDrafts(items) {
   }
 }
 let saveTimer = null;
+function writeLocal() { try { localStorage.setItem(STORE_KEY, JSON.stringify(STATE)); } catch (e) { /* ignore */ } }
 function save() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(STATE)); } catch (e) { /* ignore */ } }, 300);
+  saveTimer = setTimeout(writeLocal, 300);
   scheduleCloud();
+}
+// an editor's draft that is still waiting for its debounce; flushed when the tab is hidden or closed
+let PENDING_DRAFT = null;
+function pendingDraft(fn) {
+  const run = () => { if (PENDING_DRAFT === run) PENDING_DRAFT = null; fn(); };
+  PENDING_DRAFT = run;
+  return run;
+}
+function saveNow() {
+  if (PENDING_DRAFT) PENDING_DRAFT();
+  clearTimeout(saveTimer);
+  writeLocal();
 }
 
 // ---- cloud progress (db capability): readable by Claude, survives devices
@@ -496,10 +527,17 @@ async function initCloud() {
     if (snap.exists || (drafts && !drafts.empty)) render();
     CLOUD.ready = true;
     setChip("syncChip", "ok", "进度：已同步");
-    if (snap.exists && (snap.data() || {}).v !== 2) scheduleCloud();   // move a v1 doc to the new layout
+    // push what only this browser has (e.g. work done offline, or a v1 doc to move to the new layout)
+    const stable = (o) => JSON.stringify(o, (k, v) => (v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort()) : v));
+    const cloudDoc = snap.exists ? snap.data() || {} : {};
+    const mine = snapshot();
+    const differs = ["items", "exams", "checks", "seen"].some((k) => stable(mine[k] || {}) !== stable(cloudDoc[k] || {}));
+    const draftsDiffer = Object.entries(draftDocs()).some(([key, body]) => CLOUD.sent[key] === undefined || stable(JSON.parse(CLOUD.sent[key])) !== stable(body));
+    if ((snap.exists && cloudDoc.v !== 2) || differs || draftsDiffer) scheduleCloud();
   } catch (e) { setChip("syncChip", "", "进度：本机"); }
 }
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { clearTimeout(CLOUD.timer); flushCloud(); } });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { saveNow(); clearTimeout(CLOUD.timer); flushCloud(); } });
+window.addEventListener("pagehide", saveNow);
 
 // ---------------------------------------------------------------- Python runtime (Pyodide in a module worker)
 const PY = { state: "idle", worker: null, ready: null, main: null, seq: 0, waiters: new Map() };
@@ -520,11 +558,30 @@ async function ccEnsurePydantic(py, idx, wheels, code) {
   py.runPython("import importlib; importlib.invalidate_caches()");
   py.__ccPydantic = true;
 }
+// The LangChain week: the real libraries (+ everything they import) and tiktoken's encoding file,
+// then one import of the whole stack (a few seconds), before any timed run.
+async function ccEnsureLangchain(py, idx, wheels, lcWheels, tiktoken) {
+  if (py.__ccLangchain) return;
+  await ccEnsurePydantic(py, idx, wheels, "pydantic");
+  const get = async (f) => {
+    const res = await fetch(idx + "pkg/" + f);
+    if (!res.ok) throw new Error("下载 " + f + " 失败：" + res.status);
+    return new Uint8Array(await res.arrayBuffer());
+  };
+  const [files, enc] = await Promise.all([Promise.all(lcWheels.map(get)), get(tiktoken.file)]);
+  const site = py.runPython("import site; site.getsitepackages()[0]");
+  for (const bytes of files) py.unpackArchive(bytes, "wheel", { extractDir: site });
+  py.FS.mkdirTree(tiktoken.cache.slice(0, tiktoken.cache.lastIndexOf("/")));
+  py.FS.writeFile(tiktoken.cache, enc);
+  py.runPython("import importlib; importlib.invalidate_caches(); import _cclc; _cclc.prepare()");
+  py.__ccLangchain = true;
+}
 function pyWorkerSource() {
   const idx = BASE + "pyodide/";
   return `import { loadPyodide } from ${JSON.stringify(idx + "pyodide.mjs")};
 ${ccEnsurePydantic.toString()}
-let py = null, run = null, wheels = [];
+${ccEnsureLangchain.toString()}
+let py = null, run = null, runSql = null, wheels = [];
 self.onmessage = async (e) => {
   const m = e.data;
   try {
@@ -532,14 +589,20 @@ self.onmessage = async (e) => {
       wheels = m.wheels;
       py = await loadPyodide({ indexURL: ${JSON.stringify(idx)}, stdLibURL: ${JSON.stringify(idx + "python_stdlib.wasm")} });
       py.runPython(m.runner);
+      for (const [name, src] of m.modules) py.globals.get("_cc_load_module")(name, src);
       run = py.globals.get("run");
+      runSql = py.globals.get("_cc_run_sql");
       postMessage({ type: "ready" });
+    } else if (m.type === "prep") {
+      await ccEnsureLangchain(py, ${JSON.stringify(idx)}, wheels, m.lcWheels, m.tiktoken);
+      postMessage({ type: "prepped", id: m.id });
     } else if (m.type === "run") {
-      await ccEnsurePydantic(py, ${JSON.stringify(idx)}, wheels, m.code + "\\n" + (m.tests || "") + "\\n" + (m.setup || ""));
-      postMessage({ type: "result", id: m.id, result: JSON.parse(run(m.code, m.tests || "", m.setup || "")) });
+      if (m.kind !== "sql") await ccEnsurePydantic(py, ${JSON.stringify(idx)}, wheels, m.code + "\\n" + (m.tests || "") + "\\n" + (m.setup || ""));
+      const fn = m.kind === "sql" ? runSql : run;
+      postMessage({ type: "result", id: m.id, result: JSON.parse(fn(m.code, m.tests || "", m.setup || "")) });
     }
   } catch (err) {
-    postMessage({ type: m.type === "init" ? "init-error" : "run-error", id: m.id, error: String((err && err.message) || err) });
+    postMessage({ type: m.type === "init" ? "init-error" : "run-error", id: m.id, error: String((err && err.message) || err).slice(-2000) });
   }
 };`;
 }
@@ -549,6 +612,7 @@ function wasmAllowed() {
 }
 function pyStart() {
   if (PY.ready) return PY.ready;
+  PY.lc = null;   // a new runtime has not loaded LangChain yet
   if (typeof WebAssembly !== "object" || !wasmAllowed()) {
     PY.state = "failed"; pySetChip();
     return Promise.reject(new Error("这个浏览器环境不允许运行 WebAssembly，所以没法在页面里跑 Python"));
@@ -567,7 +631,7 @@ function pyStart() {
       else { const done = PY.waiters.get(m.id); if (done) { PY.waiters.delete(m.id); done(m); } }
     };
     w.onerror = (e) => { if (PY.state === "loading") { e.preventDefault(); w.terminate(); PY.worker = null; pyStartMain().then(resolve, reject); } };
-    w.postMessage({ type: "init", runner: H.PY_RUNNER, wheels: H.WHEELS || [] });
+    w.postMessage({ type: "init", runner: H.PY_RUNNER, modules: PY_MODULES(), wheels: H.WHEELS || [] });
   });
   PY.ready.catch(() => { PY.state = "failed"; pySetChip(); PY.ready = null; });
   return PY.ready;
@@ -577,14 +641,39 @@ async function pyStartMain() {
   const mod = await import(BASE + "pyodide/pyodide.mjs");
   const py = await mod.loadPyodide({ indexURL: BASE + "pyodide/", stdLibURL: BASE + "pyodide/python_stdlib.wasm" });
   py.runPython(H.PY_RUNNER);
-  PY.main = { py, run: py.globals.get("run") };
+  for (const [name, src] of PY_MODULES()) py.globals.get("_cc_load_module")(name, src);
+  PY.main = { py, run: py.globals.get("run"), runSql: py.globals.get("_cc_run_sql") };
   PY.state = "ready"; pySetChip();
 }
-async function runPython(code, tests, mock, extraSetup) {
+// harness files loaded as their own Python modules (SQL judge + BigQuery helpers, mock cloud SDKs)
+function PY_MODULES() { return [["_ccsql", H.PY_SQL || ""], ["_cccloud", H.PY_CLOUD || ""], ["_cclc", H.PY_LANGCHAIN || ""]]; }
+// what runs before a Python exercise; the build validator builds the same string (pySetup in build.mjs)
+const FRESH_DB = "def fresh_db():\n    import sqlite3\n    conn = sqlite3.connect(':memory:')\n    conn.executescript(DATASET_SQL)\n    return conn\n";
+const LC_PREP = "import _cclc\n_cclc.prepare()\n";
+function pySetup(o) {
+  let s = o.langchain ? LC_PREP : "";
+  s += o.mock || o.langchain ? H.PY_MOCK + "\n" : "";
+  if (o.langchain) s += "_cclc.use_mock(MOCK)\n";
+  if (o.dataset) s += `DATASET_SQL = ${JSON.stringify((COURSE.datasets || {})[o.dataset] || "")}\n${FRESH_DB}`;
+  if (o.cloud) s += `import _cccloud\nCLOUD = _cccloud._cc_cloud_install(${o.dataset ? "DATASET_SQL" : '""'})\n`;
+  return s;
+}
+// SQL exercises: the dataset (+ the item's own --- schema) is the setup, the reference query the answer
+function sqlSetup(o) { return [o.dataset ? (COURSE.datasets || {})[o.dataset] || "" : "", o.schema || ""].join("\n"); }
+function runSql(o, code, judge) {
+  const spec = JSON.stringify({ solution: judge ? o.solution : null, check: o.check || null, ordered: !!o.ordered, bq: !!o.bq });
+  return runPython(code, spec, sqlSetup(o), "sql");
+}
+async function runPython(code, tests, setup, kind) {
   try { await pyStart(); }
   catch (e) { return { runtimeError: "浏览器里的 Python 启动失败：" + (e && e.message || e) + "。可以用「复制为本机文件」在 VS Code 里运行同样的题目和测试。" }; }
-  const setup = (mock ? H.PY_MOCK + "\n" : "") + (extraSetup || "");
+  setup = setup || "";
+  if (setup.includes(LC_PREP)) {
+    try { await pyPrepLangchain(); }
+    catch (e) { return { runtimeError: "浏览器里的 LangChain 加载失败：" + (e && e.message || e) + "。刷新页面再试；也可以用「复制为本机文件」在本机运行。" }; }
+  }
   if (PY.main) {
+    if (kind === "sql") return JSON.parse(PY.main.runSql(code, tests || "", setup));
     await ccEnsurePydantic(PY.main.py, BASE + "pyodide/", H.WHEELS || [], code + "\n" + (tests || "") + "\n" + setup);
     return JSON.parse(PY.main.run(code, tests || "", setup));
   }
@@ -596,8 +685,27 @@ async function runPython(code, tests, mock, extraSetup) {
       resolve({ runtimeError: "运行超过 10 秒被强制停止。最常见的原因是死循环：while 的条件永远成立，或者循环里忘了更新变量。" });
     }, 10000);
     PY.waiters.set(id, (m) => { clearTimeout(timer); resolve(m.type === "result" ? m.result : { runtimeError: m.error }); });
-    PY.worker.postMessage({ type: "run", id, code, tests, setup });
+    PY.worker.postMessage({ type: "run", id, code, tests, setup, kind });
   });
+}
+// Load LangChain once per runtime, outside the 10-second limit of a run (~11 MB the first time, then cached).
+function pyPrepLangchain() {
+  if (PY.lc) return PY.lc;
+  setChip("pyChip", "busy", "LangChain：首次加载约 11 MB…");
+  PY.lc = (async () => {
+    if (PY.main) await ccEnsureLangchain(PY.main.py, BASE + "pyodide/", H.WHEELS || [], H.LC_WHEELS || [], H.TIKTOKEN);
+    else {
+      const id = ++PY.seq;
+      const m = await new Promise((resolve) => {
+        const timer = setTimeout(() => { PY.waiters.delete(id); resolve({ error: "超过 3 分钟：网络太慢" }); }, 180000);
+        PY.waiters.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
+        PY.worker.postMessage({ type: "prep", id, lcWheels: H.LC_WHEELS || [], tiktoken: H.TIKTOKEN });
+      });
+      if (m.type !== "prepped") throw new Error(m.error || "未知错误");
+    }
+  })();
+  PY.lc.then(pySetChip, () => { PY.lc = null; pySetChip(); });
+  return PY.lc;
 }
 
 // ---------------------------------------------------------------- TypeScript runtime (compiler in page, code in a worker)
@@ -644,7 +752,8 @@ async function runTypeScript(code, tests) {
   return { ...result, diagnostics: compiled.diagnostics };
 }
 function runCode(item, code) {
-  return item.lang === "ts" ? runTypeScript(code, item.tests || "") : runPython(code, item.tests || "", item.mock);
+  if (item.lang === "sql") return runSql(item, code, true);
+  return item.lang === "ts" ? runTypeScript(code, item.tests || "") : runPython(code, item.tests || "", pySetup(item));
 }
 
 // ---------------------------------------------------------------- error glosses (Chinese hints for common errors)
@@ -673,6 +782,15 @@ const PY_GLOSS = {
   StopIteration: "迭代器已经没有下一个值了：常见于 next(...) 没有给默认值。",
   NotImplementedError: "这个方法还没有实现（通常是留给你写的）。",
   TimeoutError: "等待超时：请求或操作在规定时间内没有完成。",
+  ClientError: "AWS 返回了错误：看 e.response[\"Error\"][\"Code\"]，比如 NoSuchKey（对象不存在）、NoSuchBucket、AccessDenied（权限不够）、ThrottlingException（太频繁）。",
+  NoCredentialsError: "boto3 找不到 AWS 凭证：本机要先配置（aws configure / 环境变量 / IAM 角色）。",
+  NotFound: "Google Cloud 返回 404：桶、对象、表或密钥不存在，检查名字和项目。",
+  BadRequest: "Google Cloud 返回 400：请求本身有问题，BigQuery 里通常是 SQL 写错了或参数没传。",
+  Forbidden: "Google Cloud 返回 403：服务账号没有这个权限（IAM）。",
+  TooManyRequests: "请求太频繁（429）：等一会儿再重试，最好用指数退避。",
+  OperationalError: "SQL 执行出错：多半是表名或列名写错、SQL 语法错误。看报错里的 near 或 no such。",
+  IntegrityError: "违反数据库约束：主键重复、NOT NULL 列没给值，或外键指向不存在的行。",
+  ProgrammingError: "数据库 API 用法不对：比如一次 execute 里写了多条语句，或参数个数和 ? 的个数不一致。",
 };
 const TS_GLOSS = {
   2322: "类型不匹配：你给的值和声明的类型不一致。",
@@ -721,7 +839,7 @@ function makeEditor(host, { value, lang, exam, onRun, onChange, minHeight }) {
   const blockPaste = () => exam || !STATE.settings.allowPaste;
   if (HAS_CM) {
     const cm = CodeMirror(host, {
-      value, mode: lang === "ts" ? "text/typescript" : "python", lineNumbers: true, indentUnit: lang === "ts" ? 2 : 4, tabSize: 4,
+      value, mode: lang === "ts" ? "text/typescript" : lang === "sql" ? "text/x-sqlite" : "python", lineNumbers: true, indentUnit: lang === "py" ? 4 : 2, tabSize: 4,
       indentWithTabs: false, matchBrackets: true, viewportMargin: Infinity, lineWrapping: false,
       extraKeys: {
         Tab: (c) => (c.somethingSelected() ? c.indentSelection("add") : c.replaceSelection(" ".repeat(c.getOption("indentUnit")), "end")),
@@ -755,7 +873,58 @@ function makeEditor(host, { value, lang, exam, onRun, onChange, minHeight }) {
 }
 
 // ---------------------------------------------------------------- local file export
+function sqlFile(item, code) {
+  const py = (s) => JSON.stringify(s);   // a JSON string is also a valid Python string literal
+  return `# ${item.title} —— 从 Clause Check 编程营导出
+# 运行：python ${item.id}.py        （Python 自带 sqlite3，不用安装任何东西）
+${item.bq ? "# 注意：本页在 SQLite 上模拟了几个 BigQuery 写法（反引号表名、SAFE_DIVIDE、COUNTIF、DATE_TRUNC……），本机的 SQLite 没有它们。\n" : ""}import sqlite3
+
+SETUP = ${py(sqlSetup(item))}
+QUERY = ${py(code)}
+${item.check ? `CHECK = ${py(item.check)}\n` : ""}
+conn = sqlite3.connect(":memory:")
+conn.executescript(SETUP)
+${item.check ? "conn.executescript(QUERY)\ncur = conn.execute(CHECK)" : "cur = conn.execute(QUERY)"}
+print(" | ".join(d[0] for d in cur.description))
+for row in cur.fetchall():
+    print(" | ".join("NULL" if v is None else str(v) for v in row))
+`;
+}
+function cloudPrelude(item) {
+  if (!item.cloud && !item.dataset) return "";
+  const py = (s) => JSON.stringify(s);
+  return `
+# ---- 本页的模拟云 SDK 和样例数据 ----
+# 真项目里：pip install boto3 google-cloud-storage google-cloud-bigquery ...，配置好凭证，再删掉这一段。
+import sys as _sys, types as _types
+def _cc_load_module(name, source):
+    mod = _types.ModuleType(name)
+    _sys.modules[name] = mod
+    exec(compile(source, name + ".py", "exec"), mod.__dict__)
+    return mod
+_cc_load_module("_ccsql", ${py(H.PY_SQL || "")})
+_cc_load_module("_cccloud", ${py(H.PY_CLOUD || "")})
+${pySetup({ dataset: item.dataset, cloud: item.cloud })}# ---- 模拟结束 ----
+`;
+}
+const LC_INSTALL = "python -m pip install langchain langgraph langchain-deepseek langchain-openai langchain-text-splitters langgraph-checkpoint-sqlite numpy";
+function lcPrelude(item) {
+  if (!item.langchain) return "";
+  return `
+# ---- 本页的 LangChain 环境：真正的 LangChain / LangGraph，模型调用都走上面的模拟服务器 ----
+# 先安装：${LC_INSTALL}
+# 想调用真实的 DeepSeek：删掉这一段和上面的模拟服务器，把 DEEPSEEK_API_KEY 放进环境变量（或 .env + python-dotenv）
+import sys as _sys, types as _types
+_cclc = _types.ModuleType("_cclc")
+exec(compile(${JSON.stringify(H.PY_LANGCHAIN || "")}, "_cclc.py", "exec"), _cclc.__dict__)
+_sys.modules["_cclc"] = _cclc
+_cclc.prepare()
+_cclc.use_mock(MOCK)
+# ---- LangChain 环境结束 ----
+`;
+}
 function localFile(item, code) {
+  if (item.lang === "sql") return sqlFile(item, code);
   if (item.lang === "py") {
     if (item.type === "testwrite") return testwriteFile(item, code);
     const prelude = `# ${item.title} —— 从 Clause Check 编程营导出
@@ -765,7 +934,7 @@ _passed = _total = 0
 def _show(ok, label, detail=""):
     global _passed, _total
     _total += 1; _passed += ok
-    print(("✓ " if ok else "✗ ") + label + ("" if ok else "  " + detail))
+    print(("√ " if ok else "× ") + label + ("" if ok else "  " + detail))
 def expect(label, fn, expected):
     try:
         got = fn(); _show(got == expected, label, f"得到 {got!r}，期望 {expected!r}")
@@ -784,8 +953,8 @@ def expect_output(label, fn, expected):
     finally: sys.stdout = old
     got = buf.getvalue().rstrip("\\n"); _show(got == expected.rstrip("\\n"), label, f"输出 {got!r}，期望 {expected!r}")
 `;
-    const mock = item.mock ? `\n# ---- 模拟 DeepSeek 服务器（删掉这一段、pip install requests python-dotenv、在 .env 放真 key，就会调用真实 API）----\n${H.PY_MOCK}\n# ---- 模拟服务器结束 ----\n` : "";
-    return `${prelude}${mock}\n# ---- 你的代码 ----\n${code}\n\n# ---- 测试 ----\n${item.tests || ""}\nprint(f"\\n{_passed}/{_total} 通过")\n`;
+    const mock = item.mock || item.langchain ? `\n# ---- 模拟 DeepSeek 服务器（删掉这一段、pip install requests python-dotenv、在 .env 放真 key，就会调用真实 API）----\n${H.PY_MOCK}\n# ---- 模拟服务器结束 ----\n` : "";
+    return `${prelude}${mock}${lcPrelude(item)}${cloudPrelude(item)}\n# ---- 你的代码 ----\n${code}\n\n# ---- 测试 ----\n${item.tests || ""}\nprint(f"\\n{_passed}/{_total} 通过")\n`;
   }
   const imports = (code.match(/^import .*$/gm) || []).join("\n");
   const body = code.replace(/^import .*$/gm, "");
@@ -814,8 +983,8 @@ Promise.all(_pending).then(() => console.log(\`\\n\${_passed}/\${_total} 通过\
 }
 function testwriteFile(item, code) {
   return `# ${item.title} —— 从 Clause Check 编程营导出
-# 运行：python -m pytest ${item.id}.py -q     （需要 pip install pytest）
-#   或：python ${item.id}.py                 （不用 pytest 也能跑，但不能 import pytest）
+# 运行：python -m pytest ${item.id}.py        （需要 pip install pytest）
+${item.langchain ? "#   先安装真正的 LangChain：" + LC_INSTALL + "\n" : ""}#   或：python ${item.id}.py                （不用 pytest 也能跑，但不能 import pytest）
 
 # ---- 被测函数（正确版本）----
 ${item.impl}
@@ -832,9 +1001,9 @@ if __name__ == "__main__":
         try:
             fn()
             passed += 1
-            print("✓", name)
+            print("√", name)
         except Exception:
-            print("✗", name)
+            print("×", name)
             traceback.print_exc()
     print(f"\\n{passed}/{len(tests)} 通过")
 `;
@@ -988,14 +1157,15 @@ function renderLearn(main, day) {
       const out = h("div", { class: "results" });
       side.append(host, h("div", { class: "actions" },
         h("button", { class: "btn primary", onclick: () => run() }, "运行 ", h("kbd", {}, "Ctrl+Enter")),
-        h("button", { class: "btn ghost", onclick: () => { ed.set(c.code); out.replaceChildren(); } }, "还原例子")), out);
+        h("button", { class: "btn ghost", onclick: () => { ed.set(c.code); out.replaceChildren(); } }, "还原例子")),
+        c.lang === "sql" && c.tables ? schemaPanel(c.tables, false) : "", out);
       body.append(side);
       let ed = null;
       const mount = () => { if (!ed) ed = makeEditor(host, { value: c.code, lang: c.lang, onRun: () => run(), minHeight: "120px" }); else ed.refresh(); };
       async function run() {
         mount();
-        out.replaceChildren(h("p", { class: "note" }, c.lang === "py" && PY.state !== "ready" ? "正在启动 Python（第一次需要下载运行环境）…" : "运行中…"));
-        const r = c.lang === "ts" ? await runTypeScript(ed.get(), "") : await runPython(ed.get(), "", c.mock);
+        out.replaceChildren(h("p", { class: "note" }, c.lang !== "ts" && PY.state !== "ready" ? "正在启动 Python（第一次需要下载运行环境）…" : "运行中…"));
+        const r = c.lang === "ts" ? await runTypeScript(ed.get(), "") : c.lang === "sql" ? await runSql(c, ed.get(), false) : await runPython(ed.get(), "", pySetup(c));
         out.replaceChildren(...resultView(r, { item: { lang: c.lang }, editor: ed, noTests: true }));
         if (!STATE.seen[seenKey]) { STATE.seen[seenKey] = Date.now(); save(); }
       }
@@ -1051,7 +1221,8 @@ function renderItem(work, item, ctx) {
   const prompt = h("div", { class: "md", html: md(item.prompt) });
   highlightIn(prompt, item.lang);
   work.append(prompt);
-  const renderer = { choice: viewChoice, predict: viewPredict, fill: viewFill, order: viewOrder, local: viewLocal, testwrite: viewTestwrite }[item.type] || viewCode;
+  const renderer = { choice: viewChoice, predict: viewPredict, fill: viewFill, order: viewOrder, local: viewLocal, testwrite: viewTestwrite, sql: viewSql }[item.type] || viewCode;
+  if (item.lang === "sql" && item.tables && item.type !== "sql" && item.type !== "choice") work.append(schemaPanel(item.tables, false));
   renderer(work, item, { ...ctx, exam });
 }
 
@@ -1128,7 +1299,7 @@ function resultView(res, { item, editor, onPassNext, noTests }) {
   } else if (editor) editor.markLines(res.error_line ? [res.error_line] : []);
   if (res.error) {
     els.push(h("p", { class: "panelLabel" }, "报错"), h("pre", { class: "outBox err" }, res.error));
-    const g = item.lang === "py" ? pyGloss(res.error) : null;
+    const g = item.lang === "py" ? pyGloss(res.error) : item.lang === "sql" ? sqlGloss(res.error) : null;
     if (g) els.push(h("div", { class: "gloss" }, g));
   }
   if (tests.length) {
@@ -1145,10 +1316,54 @@ function resultView(res, { item, editor, onPassNext, noTests }) {
     }
     els.push(ul);
   }
+  if (res.table) {
+    els.push(h("p", { class: "panelLabel" }, "你的查询结果"), sqlTableEl(res.table));
+    if (res.expected_table && !ok && !noTests) els.push(h("p", { class: "panelLabel" }, "期望的结果"), sqlTableEl(res.expected_table));
+    return els;
+  }
   if (res.stdout) els.push(h("p", { class: "panelLabel" }, "输出（print / console.log）"), h("pre", { class: "outBox" }, res.stdout));
   if (noTests && !res.error && !res.stdout && !diags.length) els.push(h("p", { class: "note" }, "运行完成，没有输出。加一行 print / console.log 看看结果。"));
   return els;
 }
+// ---- SQL result tables and the schema panel
+function sqlTableEl(t, max = 50) {
+  const wrap = h("div", { class: "tableWrap" });
+  wrap.append(h("table", { class: "sqlTable" },
+    h("thead", {}, h("tr", {}, t.columns.map((c) => h("th", {}, c)))),
+    h("tbody", {}, t.rows.slice(0, max).map((row) => h("tr", {}, row.map((v) =>
+      h("td", { class: v === null ? "null" : typeof v === "number" ? "num" : "" }, v === null ? "NULL" : String(v))))))));
+  wrap.append(h("p", { class: "note" }, t.rows.length > max ? `一共 ${t.rows.length} 行${t.rows.length >= 200 ? "（最多取 200 行）" : ""}，只显示前 ${max} 行` : `${t.rows.length} 行`));
+  return wrap;
+}
+function schemaPanel(key, open) {
+  const info = (COURSE.tables || {})[key];
+  if (!info) return "";
+  return h("details", { class: "schema", open: open ? true : undefined },
+    h("summary", {}, `表结构：${info.map((t) => t.name).join("、")}`),
+    ...info.map((t) => h("div", { class: "schemaTable" },
+      h("div", {}, h("strong", { class: "mono" }, t.name), h("span", { class: "note" }, `  ${t.count} 行`)),
+      h("div", { class: "schemaCols mono" }, t.columns.map((c) => `${c.name} ${c.type || ""}`.trim()).join("  ·  ")),
+      t.sample.length ? sqlTableEl({ columns: t.columns.map((c) => c.name), rows: t.sample }, 3) : "")));
+}
+const SQL_GLOSS = [
+  [/no such column/i, "没有这一列：列名拼错了，或者这张表里根本没有它。看上面的「表结构」。JOIN 之后别忘了写 表名.列名。"],
+  [/no such table/i, "没有这张表：表名拼错了。看上面的「表结构」。"],
+  [/syntax error/i, "SQL 写法错误：看 near 后面引号里的词，错误通常就在它前面一点（少了逗号、多了逗号、关键字拼错、括号不成对）。"],
+  [/ambiguous column name/i, "列名有歧义：JOIN 的两张表都有这一列，写成 表名.列名（或 别名.列名）。"],
+  [/misuse of aggregate/i, "聚合函数（COUNT、SUM……）不能写在 WHERE 里：先 GROUP BY，再用 HAVING 过滤分组。"],
+  [/one statement at a time|一次只能写一条/i, "一次只能写一条查询。"],
+  [/UNIQUE constraint failed/i, "违反唯一约束：这个主键（或唯一列）的值已经存在了。"],
+  [/NOT NULL constraint failed/i, "这一列不能为空（NOT NULL），插入时要给它一个值。"],
+  [/FOREIGN KEY constraint failed/i, "外键约束失败：引用的那一行在另一张表里不存在。"],
+  [/incomplete input/i, "SQL 没写完：括号或引号没有闭合。"],
+  [/wrong number of arguments/i, "函数的参数个数不对。"],
+  [/no such function/i, "没有这个函数：SQLite 和 BigQuery 的函数名不完全一样，看知识卡片里的对照。"],
+  [/missing dataset while no default dataset/i, "BigQuery 的表名要带数据集：写 clausecheck.reviews 或 `clausecheck-dev.clausecheck.reviews`，不能只写 reviews。"],
+  [/does not support the \w+ date part/i, "这个函数不支持这个日期部件：TIMESTAMP_DIFF 最大到 DAY；按月算差值用 DATE_DIFF(DATE(a), DATE(b), MONTH)。"],
+  [/日期部件要写成/, "日期部件是关键字，不加引号：DATE_TRUNC(DATE(created_at), MONTH)。"],
+  [/division by zero/i, "除数是 0：用 SAFE_DIVIDE(a, b)，除数为 0 时得到 NULL 而不是报错。"],
+];
+function sqlGloss(text) { const hit = SQL_GLOSS.find(([re]) => re.test(String(text))); return hit ? hit[1] : null; }
 function isPass(res) {
   const tests = res.tests || [];
   return !res.runtimeError && !res.error && !(res.diagnostics || []).length && tests.length > 0 && tests.every((t) => t.passed);
@@ -1166,7 +1381,7 @@ function viewCode(work, item, ctx) {
   let saveT = null;
   const ed = makeEditor(host, {
     value: initial, lang: item.lang, exam: ctx.exam, onRun: () => run(),
-    onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }, 800); },
+    onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(pendingDraft(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }), 800); },
   });
   const runBtn = h("button", { class: "btn primary", onclick: () => run() }, "运行并判题 ", h("kbd", {}, "Ctrl+Enter"));
   const actions = h("div", { class: "actions" }, runBtn,
@@ -1209,8 +1424,10 @@ async function exportLocal(item, code, out) {
   const ok = await copyText(text);
   const name = `${item.id}.${item.lang === "ts" ? "ts" : "py"}`;
   const area = h("textarea", { class: "copyArea", readonly: true }, text);
-  const cmd = item.lang === "ts" ? "npx tsx " + name : item.type === "testwrite" ? "python -m pytest " + name + " -q" : "python " + name;
-  const what = item.type === "testwrite" ? "文件里是被测函数和你的测试（本机只有正确版本，没有那些坏版本）" : `文件里包含同样的测试${item.mock ? "和模拟服务器" : ""}，结果会逐条打印`;
+  const cmd = item.lang === "ts" ? "npx tsx " + name : item.type === "testwrite" ? "python -m pytest " + name : "python " + name;
+  const what = item.type === "testwrite" ? "文件里是被测函数和你的测试（本机只有正确版本，没有那些坏版本）"
+    : item.lang === "sql" ? "文件里是样例数据和你的查询，运行后打印结果表"
+    : `文件里包含同样的测试${item.mock || item.langchain ? "和模拟服务器" : ""}${item.cloud ? "和模拟的云 SDK" : ""}，结果会逐条打印${item.langchain ? `。第一次先安装真正的 LangChain：\n\n\`${LC_INSTALL}\`` : ""}`;
   out.replaceChildren(h("div", { class: "explain", html: md(`${ok ? "已复制到剪贴板。" : "浏览器不允许自动复制，请在下面全选（Ctrl+A）后复制。"}在 VS Code 里新建 \`${name}\`，粘贴保存，然后在终端运行：\n\n\`${cmd}\`\n\n${what}。`) }), ok ? "" : area);
   if (!ok) { area.focus(); area.select(); }
 }
@@ -1281,7 +1498,7 @@ function viewPredict(work, item, ctx) {
     const r = rec(item.id);
     if (r.s !== "solved" && (r.a || 0) < 2) { toast("先自己写答案并提交；提交正确或错两次后可以运行"); return; }
     out.append(h("p", { class: "note" }, "运行中…"));
-    const res = item.lang === "ts" ? await runTypeScript(item.code, "") : await runPython(item.code, "", item.mock);
+    const res = item.lang === "ts" ? await runTypeScript(item.code, "") : await runPython(item.code, "", pySetup(item));
     out.lastElementChild.remove();
     out.append(...resultView(res, { item, noTests: true }));
   }
@@ -1384,13 +1601,54 @@ function viewLocal(work, item, ctx) {
   helpers(work, item, { exam: false, solution: item.solution, onRedo: null });
 }
 
+// ---- write SQL: the result table must match the reference query's
+function viewSql(work, item, ctx) {
+  const r = rec(item.id);
+  const exam = ctx.exam;
+  if (item.tables) work.append(schemaPanel(item.tables, true));
+  if (!exam && item.expected_table && !item.check) work.append(h("details", { class: "schema" }, h("summary", {}, "看看期望的结果长什么样"), sqlTableEl(item.expected_table, 10)));
+  if (item.bq) work.append(h("p", { class: "note" }, "这道题可以用 BigQuery 的写法：`project.dataset.table` 反引号表名、SAFE_DIVIDE、COUNTIF、DATE_TRUNC(x, MONTH)、TIMESTAMP_DIFF(a, b, HOUR)。本页在 SQLite 上模拟这几个，其余 BigQuery 独有语法这里跑不了。"));
+  const blank = item.exam ? "-- 从这里开始写\n" : item.starter || "";
+  const host = h("div", { class: "editorWrap" + (exam ? " exam" : "") });
+  work.append(host);
+  const out = h("div", { class: "results" });
+  let saveT = null;
+  const ed = makeEditor(host, {
+    value: r.code !== undefined ? r.code : blank, lang: "sql", exam, onRun: () => run(true),
+    onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(pendingDraft(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }), 800); },
+  });
+  const runBtn = h("button", { class: "btn primary", onclick: () => run(true) }, "运行并判题 ", h("kbd", {}, "Ctrl+Enter"));
+  work.append(h("div", { class: "actions" }, runBtn,
+    h("button", { class: "btn", onclick: () => run(false) }, "只运行看看"),
+    h("button", { class: "btn ghost", onclick: () => { ed.set(blank); out.replaceChildren(); } }, item.exam ? "清空" : "还原起始代码"),
+    !exam ? h("button", { class: "btn ghost", onclick: () => exportLocal(item, ed.get(), out) }, "复制为本机文件") : ""));
+  helpers(work, item, { exam, solution: item.solution, onRedo: () => { SESSION.redo[item.id] = true; r.code = blank; r.u = Date.now(); save(); ed.set(blank); out.replaceChildren(); ed.focus(); } });
+  work.append(out);
+  if (SESSION.results[item.id]) out.append(...resultView(SESSION.results[item.id], { item, onPassNext: ctx.next }));
+  async function run(judge) {
+    runBtn.disabled = true;
+    out.replaceChildren(h("p", { class: "note" }, PY.state !== "ready" ? "正在启动 SQL 运行环境（第一次需要下载约 14 MB）…" : "运行中…"));
+    const code = ed.get();
+    r.code = code.slice(0, 8000);
+    const res = await runSql(item, code, judge);
+    runBtn.disabled = false;
+    if (judge) {
+      SESSION.results[item.id] = res;
+      if (!res.runtimeError) markAttempt(item, isPass(res));
+      if (exam) examCheck();
+    }
+    out.replaceChildren(...resultView(res, { item, onPassNext: ctx.next, noTests: !judge }));
+    refreshHead(work, item);
+  }
+}
+
 // ---- write the tests: must pass on the correct function and catch every hidden buggy version
 async function runTestwrite(item, tests) {
-  const onImpl = await runPython(tests, H.PY_DISCOVER, item.mock, item.impl);
+  const onImpl = await runPython(tests, H.PY_DISCOVER, pySetup(item) + "\n" + item.impl);
   if (onImpl.runtimeError || !isPass(onImpl)) return { onImpl, mutants: [], pass: false };
   const mutants = [];
   for (const m of item.mutants) {
-    const r = await runPython(tests, H.PY_DISCOVER, item.mock, m.code);
+    const r = await runPython(tests, H.PY_DISCOVER, pySetup(item) + "\n" + m.code);
     if (r.runtimeError) return { onImpl: r, mutants: [], pass: false };
     const failed = (r.tests || []).filter((t) => !t.passed).map((t) => t.label);
     mutants.push({ note: m.note, caught: !!r.error || failed.length > 0, by: failed });
@@ -1432,7 +1690,7 @@ function viewTestwrite(work, item, ctx) {
   let saveT = null;
   const ed = makeEditor(host, {
     value: r.code !== undefined ? r.code : blank, lang: "py", onRun: () => run(),
-    onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }, 800); },
+    onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(pendingDraft(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }), 800); },
   });
   const runBtn = h("button", { class: "btn primary", onclick: () => run() }, "运行我的测试 ", h("kbd", {}, "Ctrl+Enter"));
   work.append(h("div", { class: "actions" }, runBtn,

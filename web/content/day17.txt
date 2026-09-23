@@ -23,6 +23,8 @@ type StopReason = "answer" | "max_steps" | "budget";
 ```
 
 Clause Check 的 `review.py` 里 `while trace.steps < settings.max_steps` 就是这个上限（`config.py` 默认 6 步）。本页的模拟服务器有个开关：用户消息里带 `[loop]`，模型就会一直调工具，专门用来测上限。
+
+请求体里的 `thinking: { type: "disabled" }` 关掉了 DeepSeek 默认开着的思考模式。Agent 每一步都要请求一次模型，思考的 token 按输出计费，还拖慢每一步；选工具、给判定用不着长推理，所以工具循环一般把思考关掉（关掉后 `temperature` 也重新起作用）。今天的请求都这样写。
 --- code
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
@@ -31,7 +33,7 @@ const TOOLS = [{ type: "function", function: { name: "lookup_playbook", descript
 async function run(question: string, maxSteps: number): Promise<string> {
   const messages: any[] = [{ role: "user", content: question }];
   for (let step = 1; step <= maxSteps; step++) {
-    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }) });
     const choice = (await res.json()).choices[0];
     console.log(`  step ${step}: ${choice.finish_reason}`);
     if (choice.finish_reason !== "tool_calls") {
@@ -122,7 +124,7 @@ title: 上限和停止原因
 两种上限一起用：
 
 - **步数**：最多请求模型几次（`maxSteps`）
-- **预算**：把每次回答里的 `usage.total_tokens` 加起来，超过 `maxTokens` 就停。messages 越来越长，所以每一步都比上一步贵（运行下面的例子看数字）
+- **预算**：把每次回答里的 `usage.total_tokens` 加起来，超过 `maxTokens` 就停。messages 越来越长，所以每一步都比上一步贵（运行下面的例子看数字）。思考模式开着的话，思考的 token 也算在 `completion_tokens` 里，预算花得更快
 
 停下来时返回的不只是一段文字，而是一个说明「为什么停」的对象：
 
@@ -140,7 +142,7 @@ async function main() {
   const messages: any[] = [{ role: "user", content: "Is unlimited liability acceptable? [loop]" }];
   let used = 0;
   for (let step = 1; step <= 4; step++) {
-    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }) });
     const data = await res.json();
     used += data.usage.total_tokens;
     console.log(`step ${step}: +${data.usage.total_tokens} tokens, total ${used}`);
@@ -661,7 +663,7 @@ level: 3
 --- prompt
 写 `runAgent(question, registry, maxSteps = 4)`，返回 `RunResult`：
 
-1. `messages` 从一条 user 消息开始；每一步 POST 一次，请求体带 `model: "deepseek-chat"`、`messages`、`tools`（注册表里每个工具的 `toolSpec`）
+1. `messages` 从一条 user 消息开始；每一步 POST 一次，请求体带 `model: "deepseek-flash"`、`messages`、`tools`（注册表里每个工具的 `toolSpec`）、`thinking: { type: "disabled" }`
 2. `finish_reason` 不是 `"tool_calls"`：返回 `{ reason: "answer", answer: 回答文字, steps: 已请求次数 }`
 3. 否则：先把模型那条消息 push 进 `messages`，再对 `tool_calls` 里的**每一个**调用 `dispatch`，各 push 一条 `{ role: "tool", tool_call_id, content }`
 4. 请求满 `maxSteps` 次还没有回答：返回 `{ reason: "max_steps", answer: null, steps: maxSteps }`
@@ -767,7 +769,7 @@ async function runAgent(question: string, registry: Map<string, Tool>, maxSteps 
     const res = await fetch(API_URL, {
       method: "POST",
       headers: HEADERS,
-      body: JSON.stringify({ model: "deepseek-chat", messages, tools }),
+      body: JSON.stringify({ model: "deepseek-flash", messages, tools, thinking: { type: "disabled" } }),
     });
     const choice = (await res.json()).choices[0];
     if (choice.finish_reason !== "tool_calls") {
@@ -787,11 +789,12 @@ expectAsync("正常：调一次工具，第 2 步回答", async () => {
   const r = await runAgent("Is unlimited liability acceptable?", REGISTRY);
   return [r, MOCK.calls.length];
 }, [{ reason: "answer", answer: "Based on the playbook: rule for liability_cap: cap at 12 months of fees", steps: 2 }, 2]);
-expectAsync("请求里带着工具定义", async () => {
+expectAsync("请求里带着工具定义、模型名，思考已关", async () => {
   MOCK.reset();
   await runAgent("Is unlimited liability acceptable?", REGISTRY);
-  return MOCK.calls[0].body.tools[0].function.name;
-}, "lookup_playbook");
+  const body = MOCK.calls[0].body;
+  return [body.tools[0].function.name, body.model, body.thinking];
+}, ["lookup_playbook", "deepseek-flash", { type: "disabled" }]);
 expectAsync("[bad-args]：错误回给模型，循环不崩", async () => {
   MOCK.reset();
   const r = await runAgent("Is unlimited liability acceptable? [bad-args]", REGISTRY);
@@ -813,7 +816,7 @@ type: fix
 title: 修 bug：少了一条消息
 level: 2
 --- prompt
-这个循环在本页能拿到回答，但换成真实的 DeepSeek / OpenAI 接口会返回 400：每条 `tool` 消息前面，必须有那条带 `tool_calls` 的 assistant 消息（模型要知道「我刚才调了什么」）。模拟服务器没那么严格，所以测试会直接检查第二次请求的 messages。运行测试，看角色顺序，修好它。
+这个循环一到第二次请求就出错。DeepSeek / OpenAI 接口规定：每条 `tool` 消息前面，必须有那条带 `tool_calls` 的 assistant 消息（模型要知道「我刚才调了什么」），否则返回 400。本页的模拟服务器也按这个规矩检查，所以代码拿到的是 400 的错误回答，读 `choices[0]` 时就崩了。运行测试，看第二次请求的角色顺序，修好它。
 --- starter
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
@@ -822,7 +825,7 @@ const TOOLS = [{ type: "function", function: { name: "lookup_playbook", descript
 async function agent(question: string, maxSteps = 3): Promise<string> {
   const messages: any[] = [{ role: "user", content: question }];
   for (let step = 0; step < maxSteps; step++) {
-    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }) });
     const choice = (await res.json()).choices[0];
     if (choice.finish_reason !== "tool_calls") {
       return choice.message.content;
@@ -842,7 +845,7 @@ const TOOLS = [{ type: "function", function: { name: "lookup_playbook", descript
 async function agent(question: string, maxSteps = 3): Promise<string> {
   const messages: any[] = [{ role: "user", content: question }];
   for (let step = 0; step < maxSteps; step++) {
-    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }) });
     const choice = (await res.json()).choices[0];
     if (choice.finish_reason !== "tool_calls") {
       return choice.message.content;
@@ -887,7 +890,7 @@ async function agent(question: string, maxSteps: number): Promise<{ reason: stri
   let steps = 0;
   while (steps <= maxSteps) {
     steps += 1;
-    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }) });
     const choice = (await res.json()).choices[0];
     if (choice.finish_reason !== "tool_calls") {
       return { reason: "answer", steps };
@@ -909,7 +912,7 @@ async function agent(question: string, maxSteps: number): Promise<{ reason: stri
   let steps = 0;
   while (steps < maxSteps) {
     steps += 1;
-    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }) });
     const choice = (await res.json()).choices[0];
     if (choice.finish_reason !== "tool_calls") {
       return { reason: "answer", steps };
@@ -963,7 +966,7 @@ async function agentLoop(question: string, maxSteps: number): Promise<string> {
 --- tests
 async function callModel(messages: any[]): Promise<any> {
   const tools = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
-  const res = await fetch("https://api.deepseek.com/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` }, body: JSON.stringify({ model: "deepseek-chat", messages, tools }) });
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` }, body: JSON.stringify({ model: "deepseek-flash", messages, tools, thinking: { type: "disabled" } }) });
   return res.json();
 }
 async function dispatch(call: any): Promise<string> {
@@ -1113,7 +1116,7 @@ async function callModel(messages: any[], registry: Map<string, Tool>): Promise<
   const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-    body: JSON.stringify({ model: "deepseek-chat", messages, tools }),
+    body: JSON.stringify({ model: "deepseek-flash", messages, tools, thinking: { type: "disabled" } }),
   });
   return res.json();
 }
@@ -1171,7 +1174,7 @@ async function callModel(messages: any[], registry: Map<string, Tool>): Promise<
   const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-    body: JSON.stringify({ model: "deepseek-chat", messages, tools }),
+    body: JSON.stringify({ model: "deepseek-flash", messages, tools, thinking: { type: "disabled" } }),
   });
   return res.json();
 }
@@ -1562,7 +1565,7 @@ level: 3
 --- prompt
 写 `agent(question: string, maxSteps: number)`，返回 `Promise<{ reason: "answer" | "max_steps"; answer: string | null; steps: number }>`。
 
-- 每一步 POST 到 `https://api.deepseek.com/v1/chat/completions`，请求头 `Authorization: Bearer ${process.env.DEEPSEEK_API_KEY}`，请求体 `{ model: "deepseek-chat", messages, tools: TOOLS }`，`TOOLS` 如下（原样复制）：
+- 每一步 POST 到 `https://api.deepseek.com/v1/chat/completions`，请求头 `Authorization: Bearer ${process.env.DEEPSEEK_API_KEY}`，请求体 `{ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }`，`TOOLS` 如下（原样复制）：
 
 ```ts
 const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
@@ -1588,7 +1591,7 @@ async function agent(question: string, maxSteps: number): Promise<{ reason: "ans
     const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }),
+      body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }),
     });
     const choice = (await res.json()).choices[0];
     if (choice.finish_reason !== "tool_calls") {
@@ -1609,6 +1612,11 @@ expectAsync("[loop] 停在上限", async () => {
   const r = await agent("Is unlimited liability acceptable? [loop]", 3);
   return [r, MOCK.calls.length];
 }, [{ reason: "max_steps", answer: null, steps: 3 }, 3]);
+expectAsync("请求体：deepseek-flash，思考已关", async () => {
+  MOCK.reset();
+  await agent("Is unlimited liability acceptable?", 4);
+  return [MOCK.calls[0].body.model, MOCK.calls[0].body.thinking];
+}, ["deepseek-flash", { type: "disabled" }]);
 
 @@ item d17-e3
 type: scratch

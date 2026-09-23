@@ -166,7 +166,7 @@ lang: ts
 2. **数据流**：上传 → 解析 → 切条款 → 逐条审（模型 + playbook 检索）→ 汇总 → 人批准 → 导出
 3. **失败模式**：解析出错、输出格式坏了、429、提示注入、模型漏报
 4. **评测**：用例集跑 N 次看通过率，盯住高风险条款的召回率
-5. **成本和延迟**：前缀缓存、有上限的并发、重复条款只审一次
+5. **成本和延迟**：逐条分类关掉思考模式、前缀缓存、有上限的并发、重复条款只审一次
 6. **第一步**：「我先加 trace 量出每一步的耗时，再决定优化哪里」
 
 第 6 步最关键：面试官想听到你**先测量，再动手**。
@@ -176,7 +176,7 @@ const answer: [string, string][] = [
   ["data flow", "parse -> split -> review -> summarise -> approve"],
   ["failure modes", "bad JSON, 429, injection, missed risk"],
   ["evals", "cases x N runs, high-risk recall"],
-  ["cost/latency", "prefix cache, bounded concurrency, dedupe"],
+  ["cost/latency", "thinking off, prefix cache, bounded concurrency, dedupe"],
   ["first step", "add tracing, measure, then optimise"],
 ];
 answer.forEach(([step, note], i) => console.log(`${i + 1}. ${step.padEnd(14)} ${note}`));
@@ -288,13 +288,15 @@ console.log("B");
 
 @@ item d20-06
 type: fix
-title: 修 bug：Agent 一直调工具
+title: 修 bug：工具结果丢了
 level: 2
 mock: yes
 --- prompt
-这个 Agent 循环有 bug。运行测试：模型一直在要求调工具，4 步用完返回了 `"STOPPED"`。对照 Agent 循环的检查清单，找出原因并修好。
+这个 Agent 循环有 bug。运行测试：第二次请求报错 `KeyError: 'choices'`，因为服务器回的是 400，错误信息说带 `tool_calls` 的 assistant 消息后面缺了 tool 消息。对照 Agent 循环的检查清单，找出原因并修好。
 
-修好以后，第二次请求的 messages 应该是 user → assistant（带 tool_calls）→ tool。本页的模拟服务器比较宽容，真的 DeepSeek 对顺序错的请求会直接返回 400。
+修好以后，第二次请求的 messages 应该是 user → assistant（带 tool_calls）→ tool。真的 DeepSeek 和本页的模拟服务器一样：顺序不对、缺了 tool 消息的请求，都直接返回 400。
+
+请求体里的 `"thinking": {"type": "disabled"}` 关掉了 DeepSeek 默认开着的思考模式：工具循环每一步都要请求一次，选工具用不着长推理，关掉更快、更省钱。
 --- starter
 import json
 import os
@@ -310,7 +312,7 @@ def lookup_playbook(topic):
 def agent(question, max_steps=4):
     messages = [{"role": "user", "content": question}]
     for step in range(max_steps):
-        body = {"model": "deepseek-chat", "messages": messages, "tools": TOOLS}
+        body = {"model": "deepseek-flash", "messages": messages, "tools": TOOLS, "thinking": {"type": "disabled"}}
         message = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]["message"]
         if not message.get("tool_calls"):
             return message["content"]
@@ -333,7 +335,7 @@ def lookup_playbook(topic):
 def agent(question, max_steps=4):
     messages = [{"role": "user", "content": question}]
     for step in range(max_steps):
-        body = {"model": "deepseek-chat", "messages": messages, "tools": TOOLS}
+        body = {"model": "deepseek-flash", "messages": messages, "tools": TOOLS, "thinking": {"type": "disabled"}}
         message = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]["message"]
         if not message.get("tool_calls"):
             return message["content"]
@@ -354,7 +356,7 @@ def _ids_match():
     return ms[2]["tool_call_id"] == ms[1]["tool_calls"][0]["id"]
 expect_true("tool 消息的 tool_call_id 和模型的调用 id 一致", _ids_match)
 --- hints
-- 模型为什么一直要调工具？想想它在第二次请求里看到了什么：`result` 算出来以后去哪了？
+- 400 的错误信息说缺了什么？想想第二次请求里模型看到了什么：`result` 算出来以后去哪了？
 - 每次工具调用后要往 messages 里加**两条**：先是模型那条消息，再是 `{"role": "tool", "tool_call_id": call["id"], "content": result}`，顺序不能反。
 
 @@ item d20-07
@@ -826,7 +828,7 @@ level: 2
 - 先看 trace，量出时间花在哪一步（解析？每条的模型调用？工具循环的步数？重试？），再对最慢的那一步下手；如果是 600 次串行调用，就改成有上限的并发
 answer: 4
 --- explain
-设计题的第一步永远是测量。600 条 × 每条 4 秒 ≈ 40 分钟，瓶颈是网络上的模型调用，不是代码本身的速度，换语言没用。并发要有上限（比如同时 8 个，否则会 429）；稳定的前缀放前面吃缓存；重复的样板条款只审一次（今天的去重题）。一次全发：输出太长、质量下降，一条出错整份重来。换模型也许有用，但要先用评测确认召回率没掉。
+设计题的第一步永远是测量。600 条 × 每条 4 秒 ≈ 40 分钟，瓶颈是网络上的模型调用，不是代码本身的速度，换语言没用。并发要有上限（比如同时 8 个，否则容易撞上限流、收到 429）；逐条分类用不着长推理，关掉思考模式，每次调用都更快、更便宜；稳定的前缀放前面吃缓存；重复的样板条款只审一次（今天的去重题）。一次全发：输出太长、质量下降，一条出错整份重来。换模型也许有用，但要先用评测确认召回率没掉。
 
 @@ item d20-e1
 type: scratch

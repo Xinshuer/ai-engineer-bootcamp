@@ -254,7 +254,7 @@ title: 并行：Promise.all 和并发上限
 --- body
 300 条条款一条一条审太慢。`Promise.all(items.map(fn))` 让它们同时进行，而且**结果顺序和输入顺序一致**（不管谁先完成）。
 
-但 300 个请求同时发出去，DeepSeek 会回 429。所以要**限制并发**。最简单的办法是分批：每批 N 个一起跑，这批全部完成再跑下一批：
+但 300 个请求一下子全发出去，可能撞上服务商的限流，收到 429（DeepSeek 按整个账户同时进行的请求数算，OpenAI 按每分钟的请求数和 token 数算，上限以各家文档为准）。所以要**限制并发**。最简单的办法是分批：每批 N 个一起跑，这批全部完成再跑下一批：
 
 ```ts
 for (let i = 0; i < items.length; i += limit) {
@@ -792,7 +792,12 @@ type Node = (s: State) => Partial<State> | Promise<Partial<State>>;
 type Graph = { nodes: Record<string, Node>; edges: Record<string, string> };
 
 async function classify(clause: string): Promise<string> {
-  const body = { model: "deepseek-chat", messages: [{ role: "user", content: `Review clause ${clause}` }], response_format: { type: "json_object" } };
+  const body = {
+    model: "deepseek-flash",
+    messages: [{ role: "user", content: `Review clause ${clause}` }],
+    response_format: { type: "json_object" },
+    thinking: { type: "disabled" }, // 只要一个判定：关掉默认的思考模式，更快、更便宜
+  };
   const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content).verdict;
@@ -834,7 +839,12 @@ type Node = (s: State) => Partial<State> | Promise<Partial<State>>;
 type Graph = { nodes: Record<string, Node>; edges: Record<string, string> };
 
 async function classify(clause: string): Promise<string> {
-  const body = { model: "deepseek-chat", messages: [{ role: "user", content: `Review clause ${clause}` }], response_format: { type: "json_object" } };
+  const body = {
+    model: "deepseek-flash",
+    messages: [{ role: "user", content: `Review clause ${clause}` }],
+    response_format: { type: "json_object" },
+    thinking: { type: "disabled" }, // 只要一个判定：关掉默认的思考模式，更快、更便宜
+  };
   const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content).verdict;

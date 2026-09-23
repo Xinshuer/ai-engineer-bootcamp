@@ -1,0 +1,2011 @@
+@@ day 34
+title: 人在回路：审批、map-reduce、子图、流式
+lang: py
+langchain: yes
+hours: 4–5 小时
+--- goal
+用 `interrupt()` 和 `Command(resume=...)` 做真正的人工审批（批准、拒绝、修改后批准，并校验人的输入），弄懂「恢复时节点从头再跑」这个坑；用 `Command(goto=...)` 在节点里路由；用 `Send` 把每条款的审查并行展开再汇总（map-reduce）；把一条款的审查做成子图复用；用流式把进度和 token 推给界面。最后逐行读懂 `clausecheck/graph.py`：第 18、19 天你手写的「中断 → 批准 → 恢复」，在真实项目里就是这几行。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过
+- 闭卷挑战 3 题
+- 打开 `clausecheck/graph.py`，说出 `approve`、`run_graph`、`pending_interrupt`、`resume` 各用了今天的哪个概念，以及为什么批准后由代码执行、不让模型再决定
+
+@@ concept
+title: interrupt()：停下来问人
+--- body
+昨天的 `interrupt_before` 只能停在节点前面，停下时也不说要人看什么。`interrupt(payload)` 在节点**里面**停下，还把「人需要看的东西」一起交出去：
+
+```python
+def approve(state):
+    decision = interrupt({"question": "Apply these redlines?", "redlines": state["redlines"]})
+    return {"approved": bool(decision)}
+```
+
+- 第一次跑到这一行：图停下，`invoke` 的返回值里多一个 `"__interrupt__"` 键，它是一个列表，`[0].value` 就是你传进去的 payload
+- 人做完决定：`app.invoke(Command(resume=True), cfg)`，这一次 `interrupt(...)` **返回** True，节点接着往下走
+- 一定要有 checkpointer 和 thread_id。没有 checkpointer 时图照样会停，但 `Command(resume=...)` 直接报 `RuntimeError`：这次运行永远恢复不了
+- `interrupt` 和 `Command` 都从 `langgraph.types` 导入
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+    exported: list[str]
+
+def approve(state: State):
+    decision = interrupt({"question": "Apply these redlines?", "redlines": state["redlines"]})
+    return {"approved": bool(decision)}
+
+def export(state: State):
+    return {"exported": state["redlines"] if state["approved"] else []}
+
+g = StateGraph(State)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "approve")
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {"configurable": {"thread_id": "msa-7"}}
+
+result = app.invoke({"redlines": ["8.1", "12"]}, cfg)
+print(sorted(result))                          # 多了 __interrupt__
+print(result["__interrupt__"][0].value)        # 交给人看的内容
+print("next:", app.get_state(cfg).next)
+print(app.invoke(Command(resume=True), cfg))   # 这次 interrupt(...) 返回 True
+
+no_saver = g.compile()                         # 没有 checkpointer
+print("__interrupt__" in no_saver.invoke({"redlines": ["8.1"]}, cfg))
+try:
+    no_saver.invoke(Command(resume=True), cfg)
+except RuntimeError as e:
+    print("RuntimeError:", e)
+
+@@ concept
+title: 恢复时节点从头再跑
+--- body
+最容易踩的坑：恢复时，LangGraph **不是**从 `interrupt()` 那一行接着跑，而是把整个节点**从第一行重新跑一遍**，跑到 `interrupt()` 时直接返回恢复值。（第 19 天你的执行器也是这样：被中断的节点重跑一次。）
+
+- 所以 `interrupt()` **前面**的代码会跑两次：发通知、扣费、写数据库……都会重复
+- 办法一：有副作用的事放进**前一个节点**，那个节点已经跑完并存了检查点，不会重跑
+- 办法二：放在 `interrupt()` **后面**（只在拿到回答以后执行一次）
+- 办法三：实在要放前面，就做成幂等的：第 17 天的发件箱、第 4 周的「至少一次 + 幂等键」
+- 纯计算（比如从 state 里算出待批清单）重跑没关系，`graph.py` 的 `approve` 就是先算 `pending` 再 `interrupt`
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+RUNS = []
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def approve(state: State):
+    RUNS.append("before interrupt")              # 恢复时会再跑一次
+    decision = interrupt({"redlines": state["redlines"]})
+    RUNS.append(f"after interrupt: {decision}")  # 只在拿到回答后跑
+    return {"approved": decision}
+
+g = StateGraph(State)
+g.add_node("approve", approve)
+g.add_edge(START, "approve")
+g.add_edge("approve", END)
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {"configurable": {"thread_id": "t1"}}
+
+app.invoke({"redlines": ["8.1"]}, cfg)
+print("paused :", RUNS)
+app.invoke(Command(resume=True), cfg)
+print("resumed:", RUNS)
+
+@@ concept
+title: 审批的几种回答
+--- body
+真实的审批不只是「同意 / 不同意」，律师可能想删掉一两条再批。恢复值可以是任何能存进检查点的东西，比如字典：
+
+```python
+Command(resume={"action": "approve"})
+Command(resume={"action": "reject"})
+Command(resume={"action": "edit", "redlines": ["12"]})
+```
+
+- 人的输入也要**校验**，就像校验模型的输出：不认识的回答就再 `interrupt()` 一次问清楚，别猜。同一个节点里可以多次调用 `interrupt()`，恢复时按调用顺序对上号
+- 「修改」要有边界：只允许从待批清单里删减，不能借机加进新的条款
+- `interrupt_before` 还是 `interrupt()`？前者编译时写死，不带说明，人要改只能 `update_state`；后者在节点里，带 payload，人的回答直接回到你的代码里校验、执行。审批流程用 `interrupt()`，`interrupt_before` 更适合调试时一步一停
+- 第 31 天的 `HumanInTheLoopMiddleware` 内部也是调用 `interrupt()`，它的恢复值是 `{"decisions": [...]}`
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def approve(state: State):
+    pending = state["redlines"]
+    ask = {"question": "approve / reject / edit?", "redlines": pending}
+    while True:
+        decision = interrupt(ask)
+        action = decision.get("action") if isinstance(decision, dict) else None
+        if action == "approve":
+            return {"approved": True}
+        if action == "reject":
+            return {"approved": False, "redlines": []}
+        if action == "edit":
+            keep = [r for r in pending if r in decision.get("redlines", [])]   # 只能删减
+            return {"approved": True, "redlines": keep}
+        ask = {"question": f"unknown answer {decision!r}; approve / reject / edit?", "redlines": pending}
+
+g = StateGraph(State)
+g.add_node("approve", approve)
+g.add_edge(START, "approve")
+g.add_edge("approve", END)
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {"configurable": {"thread_id": "t1"}}
+
+r = app.invoke({"redlines": ["8.1", "12"]}, cfg)
+print(r["__interrupt__"][0].value["question"])
+r = app.invoke(Command(resume="looks good"), cfg)          # 看不懂的回答：再问一次
+print(r["__interrupt__"][0].value["question"])
+r = app.invoke(Command(resume={"action": "edit", "redlines": ["12", "99"]}), cfg)
+print(r)
+
+@@ concept
+title: Command：在节点里更新 + 跳转
+--- body
+到现在，「去哪」一直由边决定：节点返回更新，路由函数再看 state 决定下一步。`Command` 让节点一次说完两件事：
+
+```python
+def triage(state) -> Command[Literal["approve", "export"]]:
+    if "redline" in state["verdicts"]:
+        return Command(update={"status": "needs approval"}, goto="approve")
+    return Command(update={"status": "clean"}, goto="export")
+```
+
+- 返回类型标注 `Command[Literal[...]]` 告诉图「可能去哪几个节点」：编译时会检查这些名字是不是真的节点，`draw_mermaid()` 也靠它画出虚线边。不写的话照样能跑，只是图上看不到这些边
+- 但运行时 `goto` 的值不会拿标注去对：`goto` 写错节点名，不报错，只打一条警告日志，图就停了（和第 32 天路由函数写错一样），所以每条路都要有测试
+- 什么时候用：路由的判断和要写的更新本来就是一起算出来的（比如审批节点根据人的回答决定去 export 还是回到 review）；普通分支用条件边更清楚
+--- code
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
+
+class State(TypedDict, total=False):
+    verdicts: list[str]
+    status: str
+
+def triage(state: State) -> Command[Literal["approve", "export"]]:
+    if "redline" in state["verdicts"]:
+        return Command(update={"status": "needs approval"}, goto="approve")
+    return Command(update={"status": "clean"}, goto="export")
+
+def approve(state: State):
+    return {"status": state["status"] + " -> approved"}
+
+def export(state: State):
+    return {"status": state["status"] + " -> exported"}
+
+g = StateGraph(State)
+g.add_node("triage", triage)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "triage")          # triage 后面不用画边：Command 决定
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+app = g.compile()
+
+print(app.invoke({"verdicts": ["accept", "redline"]})["status"])
+print(app.invoke({"verdicts": ["accept"]})["status"])
+print([line.strip() for line in app.get_graph().draw_mermaid().splitlines() if "-.->" in line])
+
+@@ concept
+title: Send：一条款一个分支（map-reduce）
+--- body
+一份合同 30 条款，逐条审查互不依赖，适合并行。可条款数要到运行时才知道，没法事先画 30 条边。`Send` 解决这个：条件边的路由函数返回一个 `Send` 列表，每个 `Send("review", {"clause": c})` 启动一次 `review` 节点，带着**它自己的输入**。
+
+```python
+def fan_out(state):
+    return [Send("review", {"clause": c}) for c in state["clauses"]]
+g.add_conditional_edges(START, fan_out, ["review"])
+```
+
+- `review` 收到的不是整个 state，只是 Send 的那个字典（可以用单独的 `ClauseState` 描述）
+- 结果写回主 state 的键**必须有 reducer**（`Annotated[list, operator.add]`），否则多个分支同一步写一个键会 `InvalidUpdateError`。合并顺序 = Send 的顺序
+- 所有分支结束后，`review → summarise` 这条边只让 summarise 跑**一次**：这就是 reduce
+- 在你的电脑上，分支真的在多个线程里并行；`config={"max_concurrency": 4}` 限制同时跑几个，免得撞上 API 的限流。本页没有线程，一个接一个跑，结果一样
+- 条款列表为空时路由返回 `[]`，后面的节点全都不跑；需要的话返回 `"summarise"` 直接跳过去（它也要写进第三个参数的列表里）
+- 只是想同时调几次模型、不需要图的时候，第 29 天的 `reviewer.batch(prompts, config={"max_concurrency": 4})` 更简单。Send 适合每个分支本来就是流程里一步的时候：后面要汇总、要看进度、要检查点
+--- code
+import operator
+from typing import Annotated, Literal, TypedDict
+from pydantic import BaseModel, Field
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+class ClauseReview(BaseModel):
+    """Review of one contract clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+
+# with_structured_output 发的是 tools（第 30 天）：照本周的规则关掉思考，分类也用不着长推理，更快、更便宜
+reviewer =ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).with_structured_output(ClauseReview)
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    reviews: Annotated[list[dict], operator.add]     # 多个分支都往这里写：必须有 reducer
+    counts: dict
+
+class ClauseState(TypedDict):
+    clause: dict
+
+def fan_out(state: State):
+    return [Send("review", {"clause": c}) for c in state["clauses"]]
+
+def review(state: ClauseState):
+    c = state["clause"]
+    result = reviewer.invoke(f"Review clause {c['id']}: {c['text']}")
+    return {"reviews": [{"clause_id": c["id"], "verdict": result.verdict}]}
+
+def summarise(state: State):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in state["reviews"]:
+        counts[r["verdict"]] += 1
+    return {"counts": counts}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("summarise", summarise)
+g.add_conditional_edges(START, fan_out, ["review"])
+g.add_edge("review", "summarise")
+g.add_edge("summarise", END)
+app = g.compile()
+
+clauses = [{"id": "8.1", "text": "Liability is unlimited."},
+           {"id": "9.2", "text": "Fees may change without notice."},
+           {"id": "3.1", "text": "Invoices are payable within 30 days."}]
+out = app.invoke({"clauses": clauses}, {"max_concurrency": 4})
+print([(r["clause_id"], r["verdict"]) for r in out["reviews"]])
+print(out["counts"], "| model calls:", len(MOCK.calls))
+
+@@ concept
+title: 子图：把一条款的审查打包复用
+--- body
+编译好的图本身就是一个 Runnable，可以直接当另一个图的节点：`parent.add_node("review", review_graph)`。
+
+- 为什么：审一条款的几步（分类 → 判定）可以单独写、单独测试，再放进整份合同的流程里复用。Clause Check 里 `review.py` 的有界工具循环本来就是一个独立的零件，改用 LangGraph 写时很适合做成子图
+- 两边 State 里**都有**的键（比如 `text`、`verdict`）自动传进传出；子图**私有**的键（比如 `topic`）不会出现在父图的 state 里
+- 两边 State 完全不同：在一个普通节点函数里调用 `review_graph.invoke({...})`，自己转换输入和输出（Send 的分支里也可以这样调用）
+- `stream(..., subgraphs=True)` 能看到子图内部每一步。它的命名空间带随机后缀（`review:<uuid>`），别打印整个
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class ClauseState(TypedDict, total=False):
+    text: str
+    topic: str        # 只有子图有
+    verdict: str
+
+def classify(state: ClauseState):
+    return {"topic": "liability_cap" if "liab" in state["text"].lower() else "other"}
+
+def judge(state: ClauseState):
+    risky = state["topic"] == "liability_cap" and "unlimited" in state["text"].lower()
+    return {"verdict": "redline" if risky else "accept"}
+
+sub = StateGraph(ClauseState)
+sub.add_node("classify", classify)
+sub.add_node("judge", judge)
+sub.add_edge(START, "classify")
+sub.add_edge("classify", "judge")
+sub.add_edge("judge", END)
+review_graph = sub.compile()
+print("alone :", review_graph.invoke({"text": "Liability is unlimited."}))
+
+class ContractState(TypedDict, total=False):
+    text: str
+    verdict: str
+    report: str
+
+parent = StateGraph(ContractState)
+parent.add_node("review", review_graph)       # 编译好的子图直接当节点
+parent.add_node("report", lambda state: {"report": f"verdict={state['verdict']}"})
+parent.add_edge(START, "review")
+parent.add_edge("review", "report")
+parent.add_edge("report", END)
+app = parent.compile()
+print("parent:", app.invoke({"text": "Liability is unlimited."}))
+for namespace, update in app.stream({"text": "Liability is unlimited."}, stream_mode="updates", subgraphs=True):
+    print("inside subgraph" if namespace else "parent         ", update)
+
+@@ concept
+title: 流式：让界面看到进度
+--- body
+审一份合同要好几分钟，界面不能一直空白。`app.stream(...)` 的几种模式：
+
+- `"updates"`（第 32 天）：每个节点跑完，给出它返回的更新
+- `"messages"`：模型输出的 token 一小段一小段地来，每个元素是 `(chunk, metadata)`，`metadata["langgraph_node"]` 说明是哪个节点在说话。节点里照常写 `model.invoke(...)`，LangGraph 会自动改成流式请求
+- `"custom"`：节点里 `writer = get_stream_writer()`（`from langgraph.config import get_stream_writer`），`writer({"progress": "3/10"})` 发你自己的事件
+- 同时要几种：`stream_mode=["custom", "updates"]`，每个元素变成 `(模式, 数据)`
+
+和第 29 天的 `chain.stream` 一样：思考模式开着时，思考的片段 `content` 是空字符串，显示前跳过。真实服务里用 `astream` 推给前端，本页不能运行 asyncio，只用同步版本。
+--- code
+from typing import TypedDict
+from langchain_deepseek import ChatDeepSeek
+from langgraph.config import get_stream_writer
+from langgraph.graph import StateGraph, START, END
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+class State(TypedDict, total=False):
+    clauses: dict
+    verdicts: dict
+    summary: str
+
+def review_all(state: State):
+    writer = get_stream_writer()
+    verdicts = {}
+    for i, (cid, text) in enumerate(state["clauses"].items(), start=1):
+        verdicts[cid] = "redline" if "unlimited" in text else "accept"
+        writer({"progress": f"{i}/{len(state['clauses'])}", "clause": cid})
+    return {"verdicts": verdicts}
+
+def summarise(state: State):
+    return {"summary": model.invoke(f"Summarise {state['verdicts']}").content}
+
+g = StateGraph(State)
+g.add_node("review_all", review_all)
+g.add_node("summarise", summarise)
+g.add_edge(START, "review_all")
+g.add_edge("review_all", "summarise")
+g.add_edge("summarise", END)
+app = g.compile()
+inputs = {"clauses": {"8.1": "unlimited liability", "3.1": "net 30"}}
+
+for mode, data in app.stream(inputs, stream_mode=["custom", "updates"]):
+    print(mode, data)
+pieces = [chunk.content for chunk, meta in app.stream(inputs, stream_mode="messages")
+          if meta["langgraph_node"] == "summarise" and chunk.content]
+print(pieces)
+
+@@ concept
+title: 读 graph.py
+--- body
+把 `clausecheck/graph.py` 和今天的概念对上号（下面的代码是它的骨架，审查换成了假的）：
+
+- `approve` 节点：先用代码算出 `pending`（纯计算，重跑也没关系），再 `interrupt({"question": ..., "redlines": pending})`，返回 `{"approved": bool(decision)}`
+- `route` + `add_conditional_edges("summarise", route)`：有 redline 才去 approve
+- `run_graph`：`with SqliteSaver.from_conn_string(...)` → `invoke` → 结果里有 `__interrupt__` 就把 payload 交给 `decide`（CLI 里问 y/N）→ `Command(resume=approved)`
+- `pending_interrupt`：另一个进程打开同一个文件，`get_state` 后在 `snap.tasks` 里找 `interrupts`，**只看不恢复**
+- `resume`：另一个进程用 `Command(resume=approved)` 继续
+- 批准以后改文件的是 `export` 里的**代码**，模型不参与：人批准的是一份确定的清单，执行的也必须正是这份清单。让模型再「理解一下」律师的决定，就可能执行出别的东西
+- `review` 节点现在是一个 for 循环逐条审查，今天的 `Send` 可以把它改成并行（第 35 天你会做）
+--- code
+import os
+from typing import TypedDict
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command, interrupt
+
+class State(TypedDict, total=False):
+    reviews: list[dict]
+    approved: bool | None
+    exported: list[str]
+
+def approve(state: State):
+    pending = [r["clause_id"] for r in state["reviews"] if r["verdict"] == "redline"]
+    decision = interrupt({"question": "Apply these redlines to the exported copy?", "redlines": pending})
+    return {"approved": bool(decision)}
+
+def export(state: State):
+    return {"exported": ["report.json", "report.redlined.txt"] if state.get("approved") else ["report.json"]}
+
+def build_graph(checkpointer):
+    g = StateGraph(State)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "approve")
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=checkpointer)
+
+def pending_interrupt(path, thread_id):
+    with SqliteSaver.from_conn_string(path) as saver:
+        snap = build_graph(saver).get_state({"configurable": {"thread_id": thread_id}})
+        for task in snap.tasks:
+            if task.interrupts:
+                return task.interrupts[0].value
+    return None
+
+def resume(path, thread_id, approved):
+    with SqliteSaver.from_conn_string(path) as saver:
+        return build_graph(saver).invoke(Command(resume=approved), {"configurable": {"thread_id": thread_id}})
+
+os.makedirs("work/d34", exist_ok=True)
+path = "work/d34/graph.sqlite"
+if os.path.exists(path):
+    os.remove(path)
+reviews = [{"clause_id": "8.1", "verdict": "redline"}, {"clause_id": "3.1", "verdict": "accept"}]
+with SqliteSaver.from_conn_string(path) as saver:      # 进程 1：跑到中断就退出
+    first = build_graph(saver).invoke({"reviews": reviews}, {"configurable": {"thread_id": "demo-1"}})
+print("paused:", "__interrupt__" in first)
+print("process 2 sees:", pending_interrupt(path, "demo-1"))
+print("process 3 resumes:", resume(path, "demo-1", True)["exported"])
+print("after resume:", pending_interrupt(path, "demo-1"))
+
+@@ item d34-01
+type: predict
+title: 复习：两个 thread、改判
+level: 1
+--- prompt
+复习第 33 天。写出输出。两个 thread 都停在 export 前，只有 `a` 被改判。注意最后一行历史里每个检查点的来源。
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": f"{state['clause']} -> {state['verdict']}"}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_edge("review", "export")
+g.add_edge("export", END)
+app = g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+a = {"configurable": {"thread_id": "a"}}
+b = {"configurable": {"thread_id": "b"}}
+app.invoke({"clause": "8.1 unlimited"}, a)
+app.invoke({"clause": "3.1 net 30"}, b)
+app.update_state(a, {"verdict": "flag"})
+print(app.get_state(a).next, app.get_state(b).next)
+print(app.invoke(None, a)["report"])
+print(app.get_state(b).values)
+print([s.metadata["source"] for s in app.get_state_history(a)])
+--- explain
+两个 thread 各有各的检查点，互不影响：`b` 还停在 export 前，`report` 没有生成。`update_state` 在 `a` 的历史里留下一个来源为 `"update"` 的检查点，`invoke(None, a)` 从它接着跑。历史最新的在前：export 跑完（loop）→ 人改判（update）→ review 跑完（loop）→ 开始（loop）→ 输入（input）。
+
+@@ item d34-02
+type: predict
+title: 恢复时谁又跑了一遍
+level: 2
+--- prompt
+写出输出。`approve` 在 `interrupt()` 前后各打印一行。想清楚：恢复时从哪一行开始跑？`prepare` 会再跑吗？
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def prepare(state: State):
+    print("prepare")
+    return {"redlines": ["8.1", "12"]}
+
+def approve(state: State):
+    print("approve: notify legal about", len(state["redlines"]), "redlines")
+    ok = interrupt({"redlines": state["redlines"]})
+    print("approve: got", ok)
+    return {"approved": ok}
+
+g = StateGraph(State)
+g.add_node("prepare", prepare)
+g.add_node("approve", approve)
+g.add_edge(START, "prepare")
+g.add_edge("prepare", "approve")
+g.add_edge("approve", END)
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {"configurable": {"thread_id": "1"}}
+
+first = app.invoke({}, cfg)
+print("paused with", first["__interrupt__"][0].value)
+final = app.invoke(Command(resume=True), cfg)
+print("final", final)
+--- explain
+恢复时被中断的 `approve` **从第一行重新跑**，所以「notify legal」打印了两次；这次 `interrupt()` 直接返回 True，后面的代码才第一次执行。`prepare` 已经跑完并存了检查点，不会再跑。如果「notify」是真的发邮件，法务就收到两封：把它挪到前一个节点里，是下一道修 bug 题。
+
+@@ item d34-03
+type: code
+title: 审批节点
+level: 2
+--- prompt
+图已经搭好：有 redline 时先去 `approve` 再 `export`，没有就直接 `export`。写三处：
+
+- `approve(state)`：`interrupt` 的 payload 是 `{"question": "Apply these redlines?", "redlines": [...]}`，`redlines` 是所有 verdict 为 `"redline"` 的 `clause_id`，按原顺序；返回 `{"approved": bool(回答)}`
+- `start(app, thread_id, reviews)`：在这个 thread 上运行；停在中断处就返回 payload（`result["__interrupt__"][0].value`），没有中断（直接跑完了）返回 `None`
+- `finish(app, thread_id, approved)`：用 `Command(resume=approved)` 继续，返回最终 state 的 `"exported"`
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    reviews: list[dict]
+    approved: bool
+    exported: list[str]
+
+def route(state: State):
+    if any(r["verdict"] == "redline" for r in state["reviews"]):
+        return "approve"
+    return "export"
+
+def approve(state: State):
+    pass
+
+def export(state: State):
+    if not state.get("approved"):
+        return {"exported": []}
+    return {"exported": [r["clause_id"] for r in state["reviews"] if r["verdict"] == "redline"]}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_conditional_edges(START, route, ["approve", "export"])
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+def start(app, thread_id, reviews):
+    pass
+
+def finish(app, thread_id, approved):
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    reviews: list[dict]
+    approved: bool
+    exported: list[str]
+
+def route(state: State):
+    if any(r["verdict"] == "redline" for r in state["reviews"]):
+        return "approve"
+    return "export"
+
+def approve(state: State):
+    redlines = [r["clause_id"] for r in state["reviews"] if r["verdict"] == "redline"]
+    decision = interrupt({"question": "Apply these redlines?", "redlines": redlines})
+    return {"approved": bool(decision)}
+
+def export(state: State):
+    if not state.get("approved"):
+        return {"exported": []}
+    return {"exported": [r["clause_id"] for r in state["reviews"] if r["verdict"] == "redline"]}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_conditional_edges(START, route, ["approve", "export"])
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+def start(app, thread_id, reviews):
+    result = app.invoke({"reviews": reviews}, {"configurable": {"thread_id": thread_id}})
+    if "__interrupt__" in result:
+        return result["__interrupt__"][0].value
+    return None
+
+def finish(app, thread_id, approved):
+    result = app.invoke(Command(resume=approved), {"configurable": {"thread_id": thread_id}})
+    return result["exported"]
+--- tests
+REVIEWS = [{"clause_id": "8.1", "verdict": "redline"}, {"clause_id": "3.1", "verdict": "accept"}, {"clause_id": "12", "verdict": "redline"}]
+expect("停下时交出的 payload", lambda: start(build(), "t1", REVIEWS), {"question": "Apply these redlines?", "redlines": ["8.1", "12"]})
+def _decide(approved):
+    app = build()
+    start(app, "t2", REVIEWS)
+    return finish(app, "t2", approved)
+expect("批准：导出两条 redline", lambda: _decide(True), ["8.1", "12"])
+expect("拒绝：什么都不导出", lambda: _decide(False), [])
+def _clean():
+    app = build()
+    paused = start(app, "t3", REVIEWS[1:2])
+    return [paused, app.get_state({"configurable": {"thread_id": "t3"}}).values["exported"]]
+expect("没有 redline：不中断，直接导出完", _clean, [None, []])
+--- hints
+- `approve`：先用列表推导式算出 redline 的编号，再 `decision = interrupt({...})`，最后 `return {"approved": bool(decision)}`。
+- `start`：`result = app.invoke({"reviews": reviews}, cfg)`，然后 `if "__interrupt__" in result:`。
+- `finish` 的输入不是字典，是 `Command(resume=approved)`；config 要用同一个 thread_id。
+
+@@ item d34-04
+type: fix
+title: 修 bug：法务收到两封通知
+level: 2
+--- prompt
+`approve` 在停下之前给法务发一条通知，然后等他们批准。上线后法务抱怨：每次审批都收到**两封**一样的通知。
+
+运行测试看 `OUTBOX`。修法：新建一个节点 `notify`（放在 `approve` 前面）专门发通知，`approve` 里只留 `interrupt`。图变成 START → notify → approve → END。
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+OUTBOX = []
+
+def send_to_legal(text):
+    OUTBOX.append(text)          # 真实项目里：发邮件、发 Slack
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def approve(state: State):
+    send_to_legal(f"{len(state['redlines'])} redline(s) waiting for approval")
+    decision = interrupt({"redlines": state["redlines"]})
+    return {"approved": bool(decision)}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("approve", approve)
+    g.add_edge(START, "approve")
+    g.add_edge("approve", END)
+    return g.compile(checkpointer=InMemorySaver())
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+OUTBOX = []
+
+def send_to_legal(text):
+    OUTBOX.append(text)          # 真实项目里：发邮件、发 Slack
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def notify(state: State):
+    send_to_legal(f"{len(state['redlines'])} redline(s) waiting for approval")
+    return {}
+
+def approve(state: State):
+    decision = interrupt({"redlines": state["redlines"]})
+    return {"approved": bool(decision)}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("notify", notify)
+    g.add_node("approve", approve)
+    g.add_edge(START, "notify")
+    g.add_edge("notify", "approve")
+    g.add_edge("approve", END)
+    return g.compile(checkpointer=InMemorySaver())
+--- tests
+MSG = "2 redline(s) waiting for approval"
+def _flow(answer):
+    OUTBOX.clear()
+    app = build()
+    cfg = {"configurable": {"thread_id": "t"}}
+    first = app.invoke({"redlines": ["8.1", "12"]}, cfg)
+    before = list(OUTBOX)
+    final = app.invoke(Command(resume=answer), cfg)
+    return [first["__interrupt__"][0].value, before, list(OUTBOX), final["approved"]]
+expect("批准：通知在停下之前发出，而且只发一封", lambda: _flow(True), [{"redlines": ["8.1", "12"]}, [MSG], [MSG], True])
+expect("拒绝：同样只发一封", lambda: _flow(False)[2:], [[MSG], False])
+expect("图里有 notify 节点", lambda: sorted(build().get_graph().nodes), ["__end__", "__start__", "approve", "notify"])
+--- hints
+- 恢复时 `approve` 从第一行重跑，`send_to_legal` 又执行了一次。
+- 已经跑完的节点不会重跑：把发通知的那行挪进新节点 `notify`，它返回 `{}`（什么都不改）。
+- 加节点、改边：`START → "notify" → "approve" → END`。
+
+@@ item d34-05
+type: code
+title: 批准、拒绝、修改后批准
+level: 2
+--- prompt
+写 `approve(state)` 节点。payload 是 `{"redlines": state["redlines"]}`，恢复值是一个字典：
+
+- `{"action": "approve"}` → 返回 `{"approved": True}`
+- `{"action": "reject"}` → 返回 `{"approved": False, "redlines": []}`
+- `{"action": "edit", "redlines": [...]}` → 返回 `{"approved": True, "redlines": 新清单}`。**只能删减**：新清单只保留原来就在 `state["redlines"]` 里的编号，顺序按原清单
+- 其他任何回答：`raise ValueError`（下一题会改成再问一次）
+
+例：待批 `["8.1", "12", "13"]`，回答 `{"action": "edit", "redlines": ["13", "99", "8.1"]}` → 导出 `["8.1", "13"]`
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+    exported: list[str]
+
+def approve(state: State):
+    pass
+
+def export(state: State):
+    return {"exported": state["redlines"] if state["approved"] else []}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "approve")
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver())
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+    exported: list[str]
+
+def approve(state: State):
+    pending = state["redlines"]
+    decision = interrupt({"redlines": pending})
+    action = decision.get("action") if isinstance(decision, dict) else None
+    if action == "approve":
+        return {"approved": True}
+    if action == "reject":
+        return {"approved": False, "redlines": []}
+    if action == "edit":
+        keep = [r for r in pending if r in decision.get("redlines", [])]
+        return {"approved": True, "redlines": keep}
+    raise ValueError(f"unknown decision: {decision!r}")
+
+def export(state: State):
+    return {"exported": state["redlines"] if state["approved"] else []}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "approve")
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver())
+--- tests
+PENDING = ["8.1", "12", "13"]
+def _decide(decision):
+    app = build()
+    cfg = {"configurable": {"thread_id": "t"}}
+    first = app.invoke({"redlines": PENDING}, cfg)
+    final = app.invoke(Command(resume=decision), cfg)
+    return {"payload": first["__interrupt__"][0].value, "approved": final["approved"], "exported": final["exported"]}
+expect("批准", lambda: _decide({"action": "approve"}), {"payload": {"redlines": PENDING}, "approved": True, "exported": PENDING})
+expect("拒绝", lambda: _decide({"action": "reject"})["exported"], [])
+expect("修改：只能删减，顺序按原清单", lambda: _decide({"action": "edit", "redlines": ["13", "99", "8.1"]})["exported"], ["8.1", "13"])
+expect("修改成空清单也可以", lambda: _decide({"action": "edit", "redlines": []})["exported"], [])
+expect_raises("看不懂的回答", lambda: _decide("sure"), ValueError)
+--- hints
+- 先 `decision = interrupt({"redlines": pending})`，再按 `decision["action"]` 分三种情况。
+- 回答可能根本不是字典（比如 `"sure"`）：先用 `isinstance(decision, dict)` 判断，再取 `action`。
+- 删减：遍历**原清单**，保留出现在新清单里的：`[r for r in pending if r in decision.get("redlines", [])]`。
+
+@@ item d34-06
+type: code
+title: 答不清楚就再问
+level: 3
+--- prompt
+律师在网页上输入 yes 或 no。人会打错字，所以 `approve` 要校验：
+
+- 第一次问：`f"Apply {n} redline(s)? Answer yes or no."`（`n` 是 `state["redlines"]` 的条数）
+- 回答是字符串，去掉首尾空格、转小写后是 `"yes"` 或 `"no"` → 返回 `{"approved": 是不是 yes}`
+- 否则再 `interrupt` 一次，问题变成 `f"{answer!r} is not yes or no. Apply {n} redline(s)?"`（`answer` 是刚才收到的原样回答），直到答对为止
+
+提示：在一个 `while True` 循环里调用 `interrupt()`。每次恢复，节点都会从头重跑，前面已经回答过的 `interrupt()` 会按顺序直接返回旧的回答，所以循环会自己「快进」到新的那一问。
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def approve(state: State):
+    answer = interrupt("Apply redlines?")
+    return {"approved": answer == "yes"}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("approve", approve)
+    g.add_edge(START, "approve")
+    g.add_edge("approve", END)
+    return g.compile(checkpointer=InMemorySaver())
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def approve(state: State):
+    n = len(state["redlines"])
+    question = f"Apply {n} redline(s)? Answer yes or no."
+    while True:
+        answer = interrupt(question)
+        if isinstance(answer, str) and answer.strip().lower() in ("yes", "no"):
+            return {"approved": answer.strip().lower() == "yes"}
+        question = f"{answer!r} is not yes or no. Apply {n} redline(s)?"
+
+def build():
+    g = StateGraph(State)
+    g.add_node("approve", approve)
+    g.add_edge(START, "approve")
+    g.add_edge("approve", END)
+    return g.compile(checkpointer=InMemorySaver())
+--- tests
+Q0 = "Apply 2 redline(s)? Answer yes or no."
+def _answers(*answers):
+    app = build()
+    cfg = {"configurable": {"thread_id": "t"}}
+    r = app.invoke({"redlines": ["8.1", "12"]}, cfg)
+    asked = [r["__interrupt__"][0].value]
+    for a in answers:
+        r = app.invoke(Command(resume=a), cfg)
+        if "__interrupt__" in r:
+            asked.append(r["__interrupt__"][0].value)
+    return [asked, r.get("approved")]
+expect("直接回答 yes", lambda: _answers("yes"), [[Q0], True])
+expect("先答错一次，再答 no", lambda: _answers("maybe", "no"), [[Q0, "'maybe' is not yes or no. Apply 2 redline(s)?"], False])
+expect("大小写和空格不影响", lambda: _answers(" YES ")[1], True)
+expect("答错两次（第二次连字符串都不是）", lambda: _answers("ok", 1, "yes"), [[Q0, "'ok' is not yes or no. Apply 2 redline(s)?", "1 is not yes or no. Apply 2 redline(s)?"], True])
+--- hints
+- 结构：`question = 第一问` → `while True:` → `answer = interrupt(question)` → 合格就 `return`，不合格就改写 `question`。
+- 合格的判断：`isinstance(answer, str) and answer.strip().lower() in ("yes", "no")`。不先判断类型，回答 `1` 时 `.strip()` 会报错。
+- `{answer!r}` 用 repr：字符串带引号 `'maybe'`，数字不带 `1`。
+
+@@ item d34-07
+type: choice
+title: 网页上的审批用哪种写法
+level: 2
+--- prompt
+你要给 Clause Check 加一个功能：导出前，律师在网页上看到待应用的 redline 清单，可以点「批准」「拒绝」或「删掉几条后批准」。用哪种写法最合适？
+--- options
+- `compile(interrupt_before=["export"])`，前端直接读数据库里的 state 自己拼清单；律师修改时由前端调用 `update_state` 改 state
+- 在 `approve` 节点里 `interrupt({"redlines": pending})` 交出清单；前端显示 payload，把律师的决定作为 `Command(resume={...})` 的值传回；节点里的代码校验并执行这个决定
+- 在 `approve` 节点里用 `input()` 等律师在终端输入
+- 不停下来：让模型根据以往的审批记录，自己判断律师会不会批准
+answer: 2
+--- explain
+`interrupt()` 让「给人看什么」和「怎么处理人的回答」都写在同一个节点的代码里：payload 就是界面要显示的清单，恢复值回到代码里先校验（只能删减、看不懂就再问）再执行。第一种也能做，但前端要知道 state 的内部结构，还能绕过校验随便改。`input()` 会卡住服务器进程，而且进程重启就丢了；`graph.py` 里问 y/N 的是 CLI 的 `decide`，不是节点本身。让模型替律师做决定，正是人在回路要防止的事。
+
+@@ item d34-08
+type: fix
+title: 修 bug：审批永远恢复不了
+level: 1
+--- prompt
+第一次运行正常停下、交出了待批清单，可律师批准后一调用 `finish` 就报错。运行测试，读报错信息，修好它。只改一行。
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def approve(state: State):
+    return {"approved": bool(interrupt({"redlines": state["redlines"]}))}
+
+g = StateGraph(State)
+g.add_node("approve", approve)
+g.add_edge(START, "approve")
+g.add_edge("approve", END)
+app = g.compile()
+
+def start(thread_id, redlines):
+    result = app.invoke({"redlines": redlines}, {"configurable": {"thread_id": thread_id}})
+    return result["__interrupt__"][0].value
+
+def finish(thread_id, approved):
+    return app.invoke(Command(resume=approved), {"configurable": {"thread_id": thread_id}})["approved"]
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def approve(state: State):
+    return {"approved": bool(interrupt({"redlines": state["redlines"]}))}
+
+g = StateGraph(State)
+g.add_node("approve", approve)
+g.add_edge(START, "approve")
+g.add_edge("approve", END)
+app = g.compile(checkpointer=InMemorySaver())
+
+def start(thread_id, redlines):
+    result = app.invoke({"redlines": redlines}, {"configurable": {"thread_id": thread_id}})
+    return result["__interrupt__"][0].value
+
+def finish(thread_id, approved):
+    return app.invoke(Command(resume=approved), {"configurable": {"thread_id": thread_id}})["approved"]
+--- tests
+expect("停下时交出清单", lambda: start("t1", ["8.1"]), {"redlines": ["8.1"]})
+expect("批准后能恢复", lambda: (start("t2", ["8.1"]), finish("t2", True))[1], True)
+expect("拒绝也能恢复", lambda: (start("t3", ["8.1"]), finish("t3", False))[1], False)
+expect("停着的时候能查到它在等", lambda: (start("t4", ["12"]), app.get_state({"configurable": {"thread_id": "t4"}}).next)[1], ("approve",))
+--- hints
+- 报错说 `Command(resume=...)` 离不开什么？
+- 没有 checkpointer，图停下时的状态没有地方存，恢复时也就找不到。
+- `g.compile(checkpointer=InMemorySaver())`，`InMemorySaver` 已经导入了。
+
+@@ item d34-09
+type: code
+title: 用 Command 分诊
+level: 2
+--- prompt
+写 `triage(state)` 节点，用 `Command` 同时更新和跳转（图里 triage 后面**没有**画边）：
+
+- 有任何 `"redline"` → 去 `"approve"`，`status` 为 `"needs_approval"`
+- 否则有任何 `"flag"` → 去 `"human_review"`，`status` 为 `"needs_review"`
+- 否则 → 去 `"export"`，`status` 为 `"clean"`
+- 三种情况都在 `log` 里记一笔 `["triage"]`（`log` 有 `operator.add` reducer）
+
+别忘了返回类型标注 `-> Command[Literal["approve", "human_review", "export"]]`：测试会检查画出来的图里有这三条虚线边。
+--- starter
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
+
+class State(TypedDict, total=False):
+    verdicts: list[str]
+    status: str
+    log: Annotated[list[str], operator.add]
+
+def triage(state: State):
+    return {"log": ["triage"]}
+
+def approve(state: State):
+    return {"log": ["approve"]}
+
+def human_review(state: State):
+    return {"log": ["human_review"]}
+
+def export(state: State):
+    return {"log": ["export"]}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("triage", triage)
+    g.add_node("approve", approve)
+    g.add_node("human_review", human_review)
+    g.add_node("export", export)
+    g.add_edge(START, "triage")
+    g.add_edge("approve", "export")
+    g.add_edge("human_review", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- solution
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
+
+class State(TypedDict, total=False):
+    verdicts: list[str]
+    status: str
+    log: Annotated[list[str], operator.add]
+
+def triage(state: State) -> Command[Literal["approve", "human_review", "export"]]:
+    if "redline" in state["verdicts"]:
+        return Command(update={"status": "needs_approval", "log": ["triage"]}, goto="approve")
+    if "flag" in state["verdicts"]:
+        return Command(update={"status": "needs_review", "log": ["triage"]}, goto="human_review")
+    return Command(update={"status": "clean", "log": ["triage"]}, goto="export")
+
+def approve(state: State):
+    return {"log": ["approve"]}
+
+def human_review(state: State):
+    return {"log": ["human_review"]}
+
+def export(state: State):
+    return {"log": ["export"]}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("triage", triage)
+    g.add_node("approve", approve)
+    g.add_node("human_review", human_review)
+    g.add_node("export", export)
+    g.add_edge(START, "triage")
+    g.add_edge("approve", "export")
+    g.add_edge("human_review", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+def _run(verdicts):
+    out = build().invoke({"verdicts": verdicts, "log": []})
+    return [out["status"], out["log"]]
+expect("有 redline", lambda: _run(["accept", "flag", "redline"]), ["needs_approval", ["triage", "approve", "export"]])
+expect("只有 flag", lambda: _run(["accept", "flag"]), ["needs_review", ["triage", "human_review", "export"]])
+expect("全是 accept", lambda: _run(["accept"]), ["clean", ["triage", "export"]])
+expect("没有条款", lambda: _run([]), ["clean", ["triage", "export"]])
+def _edges():
+    lines = build().get_graph().draw_mermaid().splitlines()
+    return sorted(line.strip() for line in lines if line.strip().startswith("triage -"))
+expect("图里画出了 triage 的三条虚线边（靠返回类型标注）", _edges, ["triage -.-> approve;", "triage -.-> export;", "triage -.-> human_review;"])
+--- hints
+- 每个分支都是 `return Command(update={...}, goto="...")`，`update` 里同时放 `status` 和 `log`。
+- 判断顺序：先 redline，再 flag，最后 clean。
+- 函数签名：`def triage(state: State) -> Command[Literal["approve", "human_review", "export"]]:`。
+
+@@ item d34-10
+type: fill
+title: 填空：Send 展开
+level: 1
+--- prompt
+补全 map-reduce：每条款一个 `review` 分支，结果合并进 `reviews`，全部完成后 `summarise` 跑一次。
+--- template
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    reviews: Annotated[list[dict], [[operator.add]]]
+    count: int
+
+def fan_out(state: State):
+    sends = []
+    for c in state["clauses"]:
+        sends.append([[Send]]("review", {"clause": c}))
+    return sends
+
+def review(state: dict):
+    c = state["clause"]
+    return {"reviews": [{"clause_id": c["id"], "verdict": "redline" if "unlimited" in c["text"] else "accept"}]}
+
+def summarise(state: State):
+    return {"count": len(state["reviews"])}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("summarise", summarise)
+g.add_conditional_edges(START, [[fan_out]], ["review"])
+g.add_edge("review", [["summarise"]])
+g.add_edge("summarise", END)
+app = g.compile()
+--- tests
+CL = [{"id": "8.1", "text": "unlimited liability"}, {"id": "3.1", "text": "net 30"}, {"id": "12", "text": "unlimited damages"}]
+expect("每条款一个结果，顺序和 Send 一样", lambda: [r["clause_id"] for r in app.invoke({"clauses": CL})["reviews"]], ["8.1", "3.1", "12"])
+expect("判定", lambda: [r["verdict"] for r in app.invoke({"clauses": CL})["reviews"]], ["redline", "accept", "redline"])
+expect("summarise 在全部分支之后跑一次", lambda: app.invoke({"clauses": CL})["count"], 3)
+--- hints
+- 多个分支写同一个键，要一个把列表连起来的 reducer：`operator.add`。
+- 条件边的第二个参数是路由函数本身（这里返回的是 Send 列表），第三个参数列出可能去的节点。
+
+@@ item d34-11
+type: code
+title: 并行审查整份合同
+level: 3
+--- prompt
+用 Send 并行审查每一条款，模型是 `reviewer`（已给出：DeepSeek flash，思考关闭，结构化输出 `ClauseReview`）。写三个函数：
+
+- `fan_out(state)`：每条款一个 `Send("review", {"clause": c})`；**条款列表为空**时返回 `"summarise"`（直接去汇总）
+- `review(state)`：用 `f"Review clause {c['id']}: {c['text']}"` 调 `reviewer`，返回 `{"reviews": [{"clause_id": c["id"], "verdict": ..., "risk_level": ...}]}`。`clause_id` 用**输入里的**编号，不用模型回答里的：你已经知道的东西别让模型再说一遍
+- `summarise(state)`：`{"counts": {"accept": 数量, "flag": 数量, "redline": 数量}}`，三个键都要有
+
+例：4 条款里一条 unlimited、一条 without notice → `{"accept": 2, "flag": 1, "redline": 1}`
+--- starter
+import operator
+from typing import Annotated, Literal, TypedDict
+from pydantic import BaseModel, Field
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+class ClauseReview(BaseModel):
+    """Review of one contract clause against the customer's playbook."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+reviewer = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).with_structured_output(ClauseReview)
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    reviews: Annotated[list[dict], operator.add]
+    counts: dict
+
+def fan_out(state: State):
+    return []
+
+def review(state: dict):
+    return {"reviews": []}
+
+def summarise(state: State):
+    return {"counts": {}}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("summarise", summarise)
+    g.add_conditional_edges(START, fan_out, ["review", "summarise"])
+    g.add_edge("review", "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- solution
+import operator
+from typing import Annotated, Literal, TypedDict
+from pydantic import BaseModel, Field
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+class ClauseReview(BaseModel):
+    """Review of one contract clause against the customer's playbook."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+reviewer = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).with_structured_output(ClauseReview)
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    reviews: Annotated[list[dict], operator.add]
+    counts: dict
+
+def fan_out(state: State):
+    if not state["clauses"]:
+        return "summarise"
+    return [Send("review", {"clause": c}) for c in state["clauses"]]
+
+def review(state: dict):
+    c = state["clause"]
+    result = reviewer.invoke(f"Review clause {c['id']}: {c['text']}")
+    return {"reviews": [{"clause_id": c["id"], "verdict": result.verdict, "risk_level": result.risk_level}]}
+
+def summarise(state: State):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in state.get("reviews", []):
+        counts[r["verdict"]] += 1
+    return {"counts": counts}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("summarise", summarise)
+    g.add_conditional_edges(START, fan_out, ["review", "summarise"])
+    g.add_edge("review", "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- tests
+CLAUSES = [
+    {"id": "8.1", "text": "Liability is unlimited."},
+    {"id": "9.2", "text": "Fees may change without notice."},
+    {"id": "3.1", "text": "Invoices are payable within 30 days."},
+    {"id": "A-7", "text": "Each party keeps its own IP."},
+]
+def _run(clauses):
+    MOCK.reset()
+    out = build().invoke({"clauses": clauses}, {"max_concurrency": 4})
+    return out, len(MOCK.calls)
+expect("汇总", lambda: _run(CLAUSES)[0]["counts"], {"accept": 2, "flag": 1, "redline": 1})
+expect("每条款一个结果，按条款顺序", lambda: [(r["clause_id"], r["verdict"], r["risk_level"]) for r in _run(CLAUSES)[0]["reviews"]], [("8.1", "redline", "high"), ("9.2", "flag", "medium"), ("3.1", "accept", "low"), ("A-7", "accept", "low")])
+expect("每条款调一次模型", lambda: _run(CLAUSES)[1], 4)
+expect("发给模型的 prompt", lambda: (_run(CLAUSES[:1]), MOCK.calls[0]["body"]["messages"][-1]["content"])[1], "Review clause 8.1: Liability is unlimited.")
+expect("没有条款：不调模型，计数全为 0", lambda: [_run([])[0]["counts"], _run([])[1]], [{"accept": 0, "flag": 0, "redline": 0}, 0])
+--- hints
+- `fan_out`：先 `if not state["clauses"]: return "summarise"`，再返回 Send 列表。`"summarise"` 已经写在 `add_conditional_edges` 的第三个参数里了。
+- `review` 收到的是 Send 的字典 `{"clause": c}`；`result = reviewer.invoke(...)` 是一个 `ClauseReview` 对象，用 `result.verdict`。
+- 条款 `A-7` 的编号里没有数字，模型（mock）答不出它的编号：所以 `clause_id` 要用 `c["id"]`。没有条款时 `reviews` 是空列表（带 reducer 的列表键默认就是 `[]`），三个计数都是 0。
+
+@@ item d34-12
+type: fix
+title: 修 bug：一条款没问题，三条款就崩
+level: 2
+--- prompt
+并行审查在只有一条款的测试合同上一切正常，换成真合同就报 `InvalidUpdateError`。运行测试，读错误信息，修好它。只改一行。
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    reviews: list[dict]
+
+def judge(text):
+    return "redline" if "unlimited" in text.lower() else "accept"
+
+def fan_out(state: State):
+    return [Send("review", {"clause": c}) for c in state["clauses"]]
+
+def review(state: dict):
+    c = state["clause"]
+    return {"reviews": [{"clause_id": c["id"], "verdict": judge(c["text"])}]}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_conditional_edges(START, fan_out, ["review"])
+g.add_edge("review", END)
+app = g.compile()
+--- solution
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    reviews: Annotated[list[dict], operator.add]
+
+def judge(text):
+    return "redline" if "unlimited" in text.lower() else "accept"
+
+def fan_out(state: State):
+    return [Send("review", {"clause": c}) for c in state["clauses"]]
+
+def review(state: dict):
+    c = state["clause"]
+    return {"reviews": [{"clause_id": c["id"], "verdict": judge(c["text"])}]}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_conditional_edges(START, fan_out, ["review"])
+g.add_edge("review", END)
+app = g.compile()
+--- tests
+ONE = [{"id": "8.1", "text": "Liability is unlimited."}]
+THREE = ONE + [{"id": "3.1", "text": "Net 30."}, {"id": "12", "text": "Unlimited damages."}]
+expect("一条款", lambda: app.invoke({"clauses": ONE})["reviews"], [{"clause_id": "8.1", "verdict": "redline"}])
+expect("三条款：三个结果都在，按顺序", lambda: [(r["clause_id"], r["verdict"]) for r in app.invoke({"clauses": THREE})["reviews"]], [("8.1", "redline"), ("3.1", "accept"), ("12", "redline")])
+--- hints
+- 错误信息说：同一步里 `reviews` 收到了多个值，要用 Annotated 的键。
+- 三个 Send 分支在同一个超步里跑，都写 `reviews`；没有 reducer 时，LangGraph 不知道该留哪个。
+- `reviews: Annotated[list[dict], operator.add]`，别忘了 `import operator` 和从 `typing` 导入 `Annotated`。
+
+@@ item d34-13
+type: code
+title: 子图：一条款的审查
+level: 2
+--- prompt
+把「审一条款」做成子图，再放进整份流程：
+
+1. `build_clause_graph()`：`ClauseState` 图，START → `classify` → `judge` → END（两个节点函数已写好），返回编译好的图
+2. `build_contract_graph(clause_graph)`：`ContractState` 图，节点 `"review"` 就是传进来的 `clause_graph`（编译好的子图直接 `add_node`），节点 `"report"` 用已写好的 `report` 函数；START → review → report → END
+
+`topic` 只在 `ClauseState` 里，所以最终结果里不应该有它。
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class ClauseState(TypedDict, total=False):
+    text: str
+    topic: str
+    verdict: str
+
+def classify(state: ClauseState):
+    text = state["text"].lower()
+    if "liab" in text:
+        return {"topic": "liability_cap"}
+    if "renew" in text:
+        return {"topic": "auto_renewal"}
+    return {"topic": "other"}
+
+def judge(state: ClauseState):
+    text = state["text"].lower()
+    if state["topic"] == "liability_cap" and "unlimited" in text:
+        return {"verdict": "redline"}
+    if state["topic"] == "auto_renewal" and "twenty-four" in text:
+        return {"verdict": "redline"}
+    return {"verdict": "accept"}
+
+class ContractState(TypedDict, total=False):
+    text: str
+    verdict: str
+    report: str
+
+def report(state: ContractState):
+    return {"report": f"verdict={state['verdict']}"}
+
+def build_clause_graph():
+    pass
+
+def build_contract_graph(clause_graph):
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class ClauseState(TypedDict, total=False):
+    text: str
+    topic: str
+    verdict: str
+
+def classify(state: ClauseState):
+    text = state["text"].lower()
+    if "liab" in text:
+        return {"topic": "liability_cap"}
+    if "renew" in text:
+        return {"topic": "auto_renewal"}
+    return {"topic": "other"}
+
+def judge(state: ClauseState):
+    text = state["text"].lower()
+    if state["topic"] == "liability_cap" and "unlimited" in text:
+        return {"verdict": "redline"}
+    if state["topic"] == "auto_renewal" and "twenty-four" in text:
+        return {"verdict": "redline"}
+    return {"verdict": "accept"}
+
+class ContractState(TypedDict, total=False):
+    text: str
+    verdict: str
+    report: str
+
+def report(state: ContractState):
+    return {"report": f"verdict={state['verdict']}"}
+
+def build_clause_graph():
+    g = StateGraph(ClauseState)
+    g.add_node("classify", classify)
+    g.add_node("judge", judge)
+    g.add_edge(START, "classify")
+    g.add_edge("classify", "judge")
+    g.add_edge("judge", END)
+    return g.compile()
+
+def build_contract_graph(clause_graph):
+    g = StateGraph(ContractState)
+    g.add_node("review", clause_graph)
+    g.add_node("report", report)
+    g.add_edge(START, "review")
+    g.add_edge("review", "report")
+    g.add_edge("report", END)
+    return g.compile()
+--- tests
+TEXT = "Renewal terms are twenty-four months."
+expect("子图单独测试：能看到 topic", lambda: build_clause_graph().invoke({"text": TEXT}), {"text": TEXT, "topic": "auto_renewal", "verdict": "redline"})
+expect("整份流程：topic 不会漏到父图", lambda: build_contract_graph(build_clause_graph()).invoke({"text": TEXT}), {"text": TEXT, "verdict": "redline", "report": "verdict=redline"})
+expect("另一条款", lambda: build_contract_graph(build_clause_graph()).invoke({"text": "Liability is capped at fees paid."})["report"], "verdict=accept")
+expect("父图的节点", lambda: sorted(build_contract_graph(build_clause_graph()).get_graph().nodes), ["__end__", "__start__", "report", "review"])
+--- hints
+- `build_clause_graph` 就是普通的三行边：START → classify → judge → END，最后 `compile()`。
+- 子图当节点：`g.add_node("review", clause_graph)`，和传一个函数一样。
+
+@@ item d34-14
+type: code
+title: 进度事件
+level: 2
+--- prompt
+写两处：
+
+- `review_all(state)` 节点：按顺序审每一条款（用已写好的 `judge(text)`），每审完一条就用 `get_stream_writer()` 发一个事件 `{"done": 第几条（从 1 开始）, "total": 总条数, "clause_id": 编号}`；返回 `{"verdicts": {编号: 结论}}`
+- `run_with_progress(app, clauses)`：用 `stream_mode=["custom", "values"]` 运行，返回 `(lines, verdicts)`。`lines` 是每个进度事件变成的一行 `f"{done}/{total} {clause_id}"`；`verdicts` 取**最后一个** `"values"` 里的 `verdicts`（没有条款时是 `{}`）
+
+例：三条款 → `(["1/3 8.1", "2/3 9.2", "3/3 3.1"], {"8.1": "redline", ...})`
+--- starter
+from typing import TypedDict
+from langgraph.config import get_stream_writer
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    verdicts: dict
+
+def judge(text):
+    return "redline" if "unlimited" in text.lower() else "accept"
+
+def review_all(state: State):
+    return {"verdicts": {}}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review_all", review_all)
+    g.add_edge(START, "review_all")
+    g.add_edge("review_all", END)
+    return g.compile()
+
+def run_with_progress(app, clauses):
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.config import get_stream_writer
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    verdicts: dict
+
+def judge(text):
+    return "redline" if "unlimited" in text.lower() else "accept"
+
+def review_all(state: State):
+    writer = get_stream_writer()
+    verdicts = {}
+    total = len(state["clauses"])
+    for i, c in enumerate(state["clauses"], start=1):
+        verdicts[c["id"]] = judge(c["text"])
+        writer({"done": i, "total": total, "clause_id": c["id"]})
+    return {"verdicts": verdicts}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review_all", review_all)
+    g.add_edge(START, "review_all")
+    g.add_edge("review_all", END)
+    return g.compile()
+
+def run_with_progress(app, clauses):
+    lines = []
+    last = {}
+    for mode, data in app.stream({"clauses": clauses}, stream_mode=["custom", "values"]):
+        if mode == "custom":
+            lines.append(f"{data['done']}/{data['total']} {data['clause_id']}")
+        else:
+            last = data
+    return lines, last.get("verdicts", {})
+--- tests
+CL = [{"id": "8.1", "text": "Liability is unlimited."}, {"id": "9.2", "text": "Fees may change."}, {"id": "3.1", "text": "Net 30."}]
+expect("进度行", lambda: run_with_progress(build(), CL)[0], ["1/3 8.1", "2/3 9.2", "3/3 3.1"])
+expect("最终结论", lambda: run_with_progress(build(), CL)[1], {"8.1": "redline", "9.2": "accept", "3.1": "accept"})
+expect("一条款", lambda: run_with_progress(build(), CL[:1]), (["1/1 8.1"], {"8.1": "redline"}))
+expect("没有条款", lambda: run_with_progress(build(), []), ([], {}))
+expect("普通 invoke 照样能用（writer 没人听时什么也不做）", lambda: build().invoke({"clauses": CL[:1]})["verdicts"], {"8.1": "redline"})
+--- hints
+- 节点里：`writer = get_stream_writer()`，循环用 `enumerate(state["clauses"], start=1)`，每条之后 `writer({...})`。
+- 两种模式一起要时，每个元素是 `(mode, data)`：`for mode, data in app.stream(..., stream_mode=["custom", "values"]):`。
+- `"values"` 每一步给一次完整的 state，最后一次就是最终结果；记下最后一个，结束后 `.get("verdicts", {})`。
+
+@@ item d34-15
+type: code
+title: 只把一个节点的 token 给用户
+level: 2
+--- prompt
+图里有两个节点都调模型：`summarise`（思考关闭）和 `advise`（思考**开着**）。界面上只想打字机式显示某一个节点的输出。
+
+写 `stream_text(app, inputs, node)`：用 `stream_mode="messages"` 运行，只要 `metadata["langgraph_node"] == node` 的片段，**跳过 content 为空字符串的片段**（思考的片段、开头结尾的空块），返回 `(拼起来的文字, 非空片段的个数)`。没有这个节点：`("", 0)`。
+--- starter
+from typing import TypedDict
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END
+
+fast = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+thinker = ChatDeepSeek(model="deepseek-flash")
+
+class State(TypedDict, total=False):
+    clause: str
+    summary: str
+    advice: str
+
+def summarise(state: State):
+    return {"summary": fast.invoke(f"Summarise clause 8.1: {state['clause']}").content}
+
+def advise(state: State):
+    return {"advice": thinker.invoke(f"Advise on: {state['summary']}").content}
+
+g = StateGraph(State)
+g.add_node("summarise", summarise)
+g.add_node("advise", advise)
+g.add_edge(START, "summarise")
+g.add_edge("summarise", "advise")
+g.add_edge("advise", END)
+app = g.compile()
+
+def stream_text(app, inputs, node):
+    pass
+--- solution
+from typing import TypedDict
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END
+
+fast = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+thinker = ChatDeepSeek(model="deepseek-flash")
+
+class State(TypedDict, total=False):
+    clause: str
+    summary: str
+    advice: str
+
+def summarise(state: State):
+    return {"summary": fast.invoke(f"Summarise clause 8.1: {state['clause']}").content}
+
+def advise(state: State):
+    return {"advice": thinker.invoke(f"Advise on: {state['summary']}").content}
+
+g = StateGraph(State)
+g.add_node("summarise", summarise)
+g.add_node("advise", advise)
+g.add_edge(START, "summarise")
+g.add_edge("summarise", "advise")
+g.add_edge("advise", END)
+app = g.compile()
+
+def stream_text(app, inputs, node):
+    pieces = []
+    for chunk, metadata in app.stream(inputs, stream_mode="messages"):
+        if metadata["langgraph_node"] == node and chunk.content:
+            pieces.append(chunk.content)
+    return "".join(pieces), len(pieces)
+--- tests
+IN = {"clause": "Liability is unlimited."}
+FINAL = app.invoke(IN)
+expect("summarise 的文字和最终 state 一样", lambda: stream_text(app, IN, "summarise")[0], FINAL["summary"])
+expect("advise 的文字（思考片段被跳过）", lambda: stream_text(app, IN, "advise")[0], FINAL["advice"])
+expect("确实是一段一段来的", lambda: stream_text(app, IN, "summarise")[1], 5)
+expect("没有这个节点", lambda: stream_text(app, IN, "export"), ("", 0))
+def _thinking_chunks():
+    return sum(1 for chunk, meta in app.stream(IN, stream_mode="messages") if meta["langgraph_node"] == "advise" and not chunk.content)
+expect_true("advise 确实有空片段要跳过", lambda: _thinking_chunks() > 3)
+--- hints
+- 每个元素是 `(chunk, metadata)`：`for chunk, metadata in app.stream(inputs, stream_mode="messages"):`。
+- 两个条件都要满足：`metadata["langgraph_node"] == node and chunk.content`（空字符串为假）。
+- 片段先放进列表，最后 `"".join(pieces)` 和 `len(pieces)`。
+
+@@ item d34-16
+type: order
+title: 排代码：graph.py 的 run_graph
+level: 2
+--- prompt
+排出 `run_with_approval(app, inputs, thread_id, decide)`，和 `clausecheck/graph.py` 的 `run_graph` 做同样的事：运行到中断，把 payload 交给 `decide(payload)` 得到 True / False，再恢复；没有中断就直接返回结果。有两行干扰项。
+--- lines
+from langgraph.types import Command
+def run_with_approval(app, inputs, thread_id, decide):
+    cfg = {"configurable": {"thread_id": thread_id}}
+    result = app.invoke(inputs, cfg)
+    if "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        approved = decide(payload)
+        result = app.invoke(Command(resume=approved), cfg)
+    return result
+--- distractors
+        result = app.invoke({"approved": approved}, cfg)
+        payload = result["__interrupt__"].value
+--- tests
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt
+
+class State(TypedDict, total=False):
+    reviews: list[dict]
+    approved: bool
+    exported: list[str]
+
+def _route(state):
+    return "approve" if any(r["verdict"] == "redline" for r in state["reviews"]) else "export"
+def _approve(state):
+    pending = [r["clause_id"] for r in state["reviews"] if r["verdict"] == "redline"]
+    return {"approved": bool(interrupt({"redlines": pending}))}
+def _export(state):
+    return {"exported": ["report.json", "report.redlined.txt"] if state.get("approved") else ["report.json"]}
+_g = StateGraph(State)
+_g.add_node("approve", _approve)
+_g.add_node("export", _export)
+_g.add_conditional_edges(START, _route, ["approve", "export"])
+_g.add_edge("approve", "export")
+_g.add_edge("export", END)
+APP = _g.compile(checkpointer=InMemorySaver())
+SEEN = []
+def yes(payload):
+    SEEN.append(payload)
+    return True
+R = [{"clause_id": "8.1", "verdict": "redline"}, {"clause_id": "3.1", "verdict": "accept"}]
+expect("批准：导出两个文件", lambda: run_with_approval(APP, {"reviews": R}, "t1", yes)["exported"], ["report.json", "report.redlined.txt"])
+expect("拒绝：只导出报告", lambda: run_with_approval(APP, {"reviews": R}, "t2", lambda p: False)["exported"], ["report.json"])
+def _clean():
+    SEEN.clear()
+    out = run_with_approval(APP, {"reviews": R[1:]}, "t3", yes)
+    return [out["exported"], SEEN]
+expect("没有 redline：不问人", _clean, [["report.json"], []])
+--- hints
+- 先准备 config，再第一次 `invoke`，然后 `if "__interrupt__" in result:`。
+- `result["__interrupt__"]` 是一个列表，payload 在 `[0].value`。
+- 恢复用 `Command(resume=approved)`，不是一份新的输入。
+
+@@ item d34-17
+type: code
+title: 另一个进程看待批内容
+level: 2
+--- prompt
+仿照 `graph.py` 的 `pending_interrupt`，写 `pending_interrupt(app, thread_id)`：
+
+- `app.get_state({"configurable": {"thread_id": thread_id}})` 取出快照
+- 在 `snap.tasks` 里找第一个 `interrupts` 不为空的 task，返回它的 `interrupts[0].value`
+- 找不到（已经跑完、还没开始、根本没有这个 thread）：返回 `None`
+
+它**只看不恢复**：调用它之后，thread 还停在原处。
+--- starter
+def pending_interrupt(app, thread_id):
+    pass
+--- solution
+def pending_interrupt(app, thread_id):
+    snap = app.get_state({"configurable": {"thread_id": thread_id}})
+    for task in snap.tasks:
+        if task.interrupts:
+            return task.interrupts[0].value
+    return None
+--- tests
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+
+def _approve(state):
+    return {"approved": bool(interrupt({"question": "Apply?", "redlines": state["redlines"]}))}
+_g = StateGraph(State)
+_g.add_node("approve", _approve)
+_g.add_edge(START, "approve")
+_g.add_edge("approve", END)
+APP = _g.compile(checkpointer=InMemorySaver())
+APP.invoke({"redlines": ["8.1", "12"]}, {"configurable": {"thread_id": "waiting"}})
+APP.invoke({"redlines": ["9.1"]}, {"configurable": {"thread_id": "done"}})
+APP.invoke(Command(resume=True), {"configurable": {"thread_id": "done"}})
+expect("停着的 thread", lambda: pending_interrupt(APP, "waiting"), {"question": "Apply?", "redlines": ["8.1", "12"]})
+expect("已经批完的 thread", lambda: pending_interrupt(APP, "done"), None)
+expect("没有这个 thread", lambda: pending_interrupt(APP, "nobody"), None)
+expect("只看不恢复：看两次还在", lambda: [pending_interrupt(APP, "waiting")["redlines"], APP.get_state({"configurable": {"thread_id": "waiting"}}).next], [["8.1", "12"], ("approve",)])
+--- hints
+- 和 `graph.py` 一样：`for task in snap.tasks: if task.interrupts: return task.interrupts[0].value`。
+- 循环结束还没找到就 `return None`。不要调用 `invoke`，那会让图继续跑。
+
+@@ item d34-18
+type: testwrite
+title: 写测试：待批的 redline
+level: 2
+--- prompt
+被测函数 `pending_redlines(reviews)` 模仿 `graph.py` 里 `approve` 节点算 `pending` 的那段：只有 verdict 是 `"redline"`，**并且**有 redline 草稿、草稿在原文里定位到了（`located` 为 True），才交给人批准；保持原顺序。
+
+写测试函数（`def test_...():` 里用 `assert`），在正确的函数上全部通过，并抓住藏起来的有 bug 的版本。
+--- impl
+def pending_redlines(reviews):
+    return [
+        {"clause_id": r["clause_id"], "anchor": r["redline"]["matched_text"], "replacement": r["redline"]["replacement"]}
+        for r in reviews
+        if r["verdict"] == "redline" and r.get("redline") and r["redline"]["located"]
+    ]
+--- mutants
+===== 定位：没在原文里找到位置的草稿不能交给人
+def pending_redlines(reviews):
+    return [
+        {"clause_id": r["clause_id"], "anchor": r["redline"]["matched_text"], "replacement": r["redline"]["replacement"]}
+        for r in reviews
+        if r["verdict"] == "redline" and r.get("redline")
+    ]
+===== 只有 redline：flag 的条款不进待批清单
+def pending_redlines(reviews):
+    return [
+        {"clause_id": r["clause_id"], "anchor": r["redline"]["matched_text"], "replacement": r["redline"]["replacement"]}
+        for r in reviews
+        if r["verdict"] != "accept" and r.get("redline") and r["redline"]["located"]
+    ]
+===== 没有草稿：redline 为 None 的条款
+def pending_redlines(reviews):
+    return [
+        {"clause_id": r["clause_id"], "anchor": r["redline"]["matched_text"], "replacement": r["redline"]["replacement"]}
+        for r in reviews
+        if r["verdict"] == "redline" and r["redline"]["located"]
+    ]
+===== 顺序：按合同里的顺序，不是按编号字符串排序
+def pending_redlines(reviews):
+    found = [
+        {"clause_id": r["clause_id"], "anchor": r["redline"]["matched_text"], "replacement": r["redline"]["replacement"]}
+        for r in reviews
+        if r["verdict"] == "redline" and r.get("redline") and r["redline"]["located"]
+    ]
+    return sorted(found, key=lambda p: p["clause_id"])
+--- starter
+def draft(anchor, located=True):
+    return {"matched_text": anchor, "replacement": "capped at 12 months of fees", "located": located}
+
+def test_one_located_redline():
+    reviews = [{"clause_id": "8.1", "verdict": "redline", "redline": draft("unlimited")}]
+    assert pending_redlines(reviews) == [{"clause_id": "8.1", "anchor": "unlimited", "replacement": "capped at 12 months of fees"}]
+--- solution
+def draft(anchor, located=True):
+    return {"matched_text": anchor, "replacement": "capped at 12 months of fees", "located": located}
+
+def ids(reviews):
+    return [p["clause_id"] for p in pending_redlines(reviews)]
+
+def test_one_located_redline():
+    reviews = [{"clause_id": "8.1", "verdict": "redline", "redline": draft("unlimited")}]
+    assert pending_redlines(reviews) == [{"clause_id": "8.1", "anchor": "unlimited", "replacement": "capped at 12 months of fees"}]
+
+def test_not_located_is_skipped():
+    reviews = [{"clause_id": "8.1", "verdict": "redline", "redline": draft("unlimited", located=False)}]
+    assert pending_redlines(reviews) == []
+
+def test_flag_with_draft_is_skipped():
+    reviews = [{"clause_id": "9.2", "verdict": "flag", "redline": draft("without notice")}]
+    assert pending_redlines(reviews) == []
+
+def test_redline_without_draft_is_skipped():
+    reviews = [{"clause_id": "12", "verdict": "redline", "redline": None}]
+    assert pending_redlines(reviews) == []
+
+def test_keeps_contract_order():
+    reviews = [
+        {"clause_id": "8.1", "verdict": "redline", "redline": draft("a")},
+        {"clause_id": "12", "verdict": "redline", "redline": draft("b")},
+    ]
+    assert ids(reviews) == ["8.1", "12"]
+--- hints
+- 每个条件单独写一个测试：没定位到、是 flag、草稿是 `None`，都应该得到 `[]`。
+- 顺序：让 `"8.1"` 排在 `"12"` 前面。按字符串排序的话 `"12" < "8.1"`，顺序会反过来。
+
+@@ item d34-19
+type: choice
+title: 读 graph.py
+level: 2
+--- prompt
+关于 `clausecheck/graph.py`，下面哪个说法是对的？
+--- options
+- `approve` 节点恢复时从 `interrupt(...)` 那一行接着执行，`pending` 列表不会重新计算
+- `run_graph` 运行到中断时，检查点已经写进 SQLite；这时即使进程退出，另一个进程也能用 `pending_interrupt(thread_id)` 看到待批的 redline，再用 `resume(thread_id, True)` 继续
+- `resume` 必须和 `run_graph` 在同一个 Python 进程里调用，因为检查点存在内存里
+- 批准以后，模型会重新审一遍这些 redline，再决定要不要真的应用
+answer: 2
+--- explain
+`graph.py` 的三个函数各自 `with SqliteSaver.from_conn_string(...)` 打开同一个文件，所以跨进程没有问题，这正是这个项目用 LangGraph 的原因（`graph.py` 开头的注释：「pause for approval, resume hours later, from another process」）。恢复时 `approve` 从第一行重跑，`pending` 会重新算一遍，因为是纯计算，结果一样，所以没问题。批准后由 `export` 里的代码按清单应用 redline，模型不再参与。
+
+@@ item d34-e1
+type: scratch
+title: 闭卷：并行审查 + 汇总
+exam: yes
+level: 3
+--- prompt
+写 `review_contract(clauses)`，用 LangGraph 的 `Send` 并行审查：
+
+- `clauses`：`[{"id": "8.1", "text": "..."}, ...]`，可能为空
+- 模型：`ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).with_structured_output(ClauseReview)`，`ClauseReview` 如下（自己写进代码）：
+  ```python
+  class ClauseReview(BaseModel):
+      """Review of one contract clause."""
+      clause_id: str
+      verdict: Literal["accept", "flag", "redline"]
+      risk_level: Literal["low", "medium", "high"]
+  ```
+- 每条款一个 `review` 分支，prompt 为 `f"Review clause {id}: {text}"`；结果 `{"clause_id": 输入里的 id, "verdict": ..., "risk_level": ...}` 合并进 `reviews`（要有 reducer）
+- 所有分支之后 `summarise` 跑一次；没有条款时直接去 `summarise`
+- 返回 `{"reviews": [...按条款顺序], "counts": {"accept": n, "flag": n, "redline": n}, "high_risk": [risk_level 为 "high" 的 clause_id，按条款顺序]}`
+--- solution
+import operator
+from typing import Annotated, Literal, TypedDict
+from pydantic import BaseModel
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+class ClauseReview(BaseModel):
+    """Review of one contract clause."""
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    reviews: Annotated[list[dict], operator.add]
+    counts: dict
+    high_risk: list[str]
+
+def review_contract(clauses):
+    reviewer = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).with_structured_output(ClauseReview)
+
+    def fan_out(state: State):
+        if not state["clauses"]:
+            return "summarise"
+        return [Send("review", {"clause": c}) for c in state["clauses"]]
+
+    def review(state: dict):
+        c = state["clause"]
+        r = reviewer.invoke(f"Review clause {c['id']}: {c['text']}")
+        return {"reviews": [{"clause_id": c["id"], "verdict": r.verdict, "risk_level": r.risk_level}]}
+
+    def summarise(state: State):
+        reviews = state.get("reviews", [])
+        counts = {"accept": 0, "flag": 0, "redline": 0}
+        for r in reviews:
+            counts[r["verdict"]] += 1
+        return {"counts": counts, "high_risk": [r["clause_id"] for r in reviews if r["risk_level"] == "high"]}
+
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("summarise", summarise)
+    g.add_conditional_edges(START, fan_out, ["review", "summarise"])
+    g.add_edge("review", "summarise")
+    g.add_edge("summarise", END)
+    out = g.compile().invoke({"clauses": clauses})
+    return {"reviews": out.get("reviews", []), "counts": out["counts"], "high_risk": out["high_risk"]}
+--- tests
+CL = [
+    {"id": "8.1", "text": "Subject to Section 12, liability is capped."},
+    {"id": "9.2", "text": "Fees may change without notice."},
+    {"id": "10.1", "text": "Data may be processed in any country."},
+    {"id": "3.1", "text": "Invoices are payable within 30 days."},
+    {"id": "A-7", "text": "Each party keeps its own IP."},
+]
+expect("汇总和高风险", lambda: {k: v for k, v in review_contract(CL).items() if k != "reviews"}, {"counts": {"accept": 2, "flag": 2, "redline": 1}, "high_risk": ["8.1", "10.1"]})
+expect("结果按条款顺序，clause_id 用输入里的编号", lambda: [(r["clause_id"], r["verdict"]) for r in review_contract(CL)["reviews"]], [("8.1", "flag"), ("9.2", "flag"), ("10.1", "redline"), ("3.1", "accept"), ("A-7", "accept")])
+expect("没有条款", lambda: review_contract([]), {"reviews": [], "counts": {"accept": 0, "flag": 0, "redline": 0}, "high_risk": []})
+
+@@ item d34-e2
+type: scratch
+title: 闭卷：通知一次、可以修改的审批
+exam: yes
+level: 3
+--- prompt
+写 `approval_flow(redlines, answer, notify)`：
+
+- 图的 state：`redlines`（字符串列表）、`approved`（bool）、`exported`（列表）
+- 节点 `notify`：调用 `notify(f"{条数} redline(s) waiting")`；整个流程里 `notify` **只能被调用一次**
+- 节点 `approve`：`interrupt({"redlines": redlines})`；恢复值 `answer` 是字典：`{"action": "approve"}` → 批准；`{"action": "edit", "redlines": [...]}` → 批准，但清单只保留原清单里有的、按原顺序；其他任何回答 → 拒绝（`approved` 为 False）
+- 节点 `export`：批准时 `exported` 是（可能修改过的）清单，否则 `[]`
+- START → notify → approve → export → END；用 `InMemorySaver()` 编译，thread_id 为 `"exam"`
+- 流程：运行到中断 → 取出 payload → 用 `Command(resume=answer)` 恢复 → 返回 `{"payload": payload, "exported": 最终的 exported}`
+--- solution
+from typing import TypedDict
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command, interrupt
+
+class State(TypedDict, total=False):
+    redlines: list[str]
+    approved: bool
+    exported: list[str]
+
+def approval_flow(redlines, answer, notify):
+    def notify_node(state: State):
+        notify(f"{len(state['redlines'])} redline(s) waiting")
+        return {}
+
+    def approve(state: State):
+        pending = state["redlines"]
+        decision = interrupt({"redlines": pending})
+        action = decision.get("action") if isinstance(decision, dict) else None
+        if action == "approve":
+            return {"approved": True}
+        if action == "edit":
+            return {"approved": True, "redlines": [r for r in pending if r in decision.get("redlines", [])]}
+        return {"approved": False}
+
+    def export(state: State):
+        return {"exported": state["redlines"] if state["approved"] else []}
+
+    g = StateGraph(State)
+    g.add_node("notify", notify_node)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "notify")
+    g.add_edge("notify", "approve")
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    app = g.compile(checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "exam"}}
+    first = app.invoke({"redlines": redlines}, cfg)
+    payload = first["__interrupt__"][0].value
+    final = app.invoke(Command(resume=answer), cfg)
+    return {"payload": payload, "exported": final["exported"]}
+--- tests
+def _run(answer):
+    sent = []
+    result = approval_flow(["8.1", "12", "13"], answer, sent.append)
+    return [result, sent]
+expect("批准；通知只发一次", lambda: _run({"action": "approve"}), [{"payload": {"redlines": ["8.1", "12", "13"]}, "exported": ["8.1", "12", "13"]}, ["3 redline(s) waiting"]])
+expect("修改：只能删减，按原顺序", lambda: _run({"action": "edit", "redlines": ["13", "99", "8.1"]})[0]["exported"], ["8.1", "13"])
+expect("看不懂的回答按拒绝处理", lambda: _run("ok")[0]["exported"], [])
+expect("拒绝时通知也只发一次", lambda: _run({"action": "reject"})[1], ["3 redline(s) waiting"])
+
+@@ item d34-e3
+type: scratch
+title: 闭卷：带进度的分诊
+exam: yes
+level: 3
+--- prompt
+写 `stream_triage(clauses)`：
+
+- state：`clauses`（`[{"id", "text"}, ...]`）、`verdicts`（字典：编号 → 结论）、`status`（字符串）
+- 节点 `review_all`：按顺序，文字里（不分大小写）有 `unlimited` 判 `"redline"`，否则 `"accept"`；每判完一条用 `get_stream_writer()` 发事件 `{"clause_id": 编号, "verdict": 结论}`
+- 节点 `triage`：返回 `Command`：有 redline → `goto="escalate"`，`update={"status": "needs_approval"}`；否则 `goto="done"`，`update={"status": "clean"}`；写上返回类型标注
+- 节点 `escalate`：`status` 后面加上 `": sent to legal"`；节点 `done`：返回 `{}`
+- 边：START → review_all → triage；escalate → END；done → END
+- 用 `stream_mode=["custom", "updates"]` 运行，返回：
+  - `"events"`：每个自定义事件变成 `f"{clause_id}={verdict}"`
+  - `"nodes"`：`"updates"` 里依次出现的节点名
+  - `"status"`：最后一次出现在更新里的 `status`（注意：节点返回 `{}` 时，它在 updates 里的值是 `None`）
+--- solution
+from typing import Literal, TypedDict
+from langgraph.config import get_stream_writer
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
+
+class State(TypedDict, total=False):
+    clauses: list[dict]
+    verdicts: dict
+    status: str
+
+def review_all(state: State):
+    writer = get_stream_writer()
+    verdicts = {}
+    for c in state["clauses"]:
+        verdicts[c["id"]] = "redline" if "unlimited" in c["text"].lower() else "accept"
+        writer({"clause_id": c["id"], "verdict": verdicts[c["id"]]})
+    return {"verdicts": verdicts}
+
+def triage(state: State) -> Command[Literal["escalate", "done"]]:
+    if "redline" in state["verdicts"].values():
+        return Command(update={"status": "needs_approval"}, goto="escalate")
+    return Command(update={"status": "clean"}, goto="done")
+
+def escalate(state: State):
+    return {"status": state["status"] + ": sent to legal"}
+
+def done(state: State):
+    return {}
+
+def stream_triage(clauses):
+    g = StateGraph(State)
+    g.add_node("review_all", review_all)
+    g.add_node("triage", triage)
+    g.add_node("escalate", escalate)
+    g.add_node("done", done)
+    g.add_edge(START, "review_all")
+    g.add_edge("review_all", "triage")
+    g.add_edge("escalate", END)
+    g.add_edge("done", END)
+    app = g.compile()
+    events, nodes, status = [], [], None
+    for mode, data in app.stream({"clauses": clauses}, stream_mode=["custom", "updates"]):
+        if mode == "custom":
+            events.append(f"{data['clause_id']}={data['verdict']}")
+        else:
+            for node, update in data.items():
+                nodes.append(node)
+                if update and "status" in update:
+                    status = update["status"]
+    return {"events": events, "nodes": nodes, "status": status}
+--- tests
+CL = [{"id": "8.1", "text": "Liability is UNLIMITED."}, {"id": "3.1", "text": "Net 30."}]
+expect("有 redline", lambda: stream_triage(CL), {"events": ["8.1=redline", "3.1=accept"], "nodes": ["review_all", "triage", "escalate"], "status": "needs_approval: sent to legal"})
+expect("没有 redline", lambda: stream_triage(CL[1:]), {"events": ["3.1=accept"], "nodes": ["review_all", "triage", "done"], "status": "clean"})
+expect("没有条款", lambda: stream_triage([]), {"events": [], "nodes": ["review_all", "triage", "done"], "status": "clean"})

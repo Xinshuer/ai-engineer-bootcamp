@@ -218,9 +218,10 @@ def answer(question, chunks, llm):
     return llm(build_prompt(question, chunks))
 
 def deepseek_llm(prompt):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
     data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
+    # 思考模式默认开着：回答在 content，思考过程在 reasoning_content（这里只要回答）
     return data["choices"][0]["message"]["content"]
 
 seen = []

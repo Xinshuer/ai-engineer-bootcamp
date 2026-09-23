@@ -1,0 +1,1784 @@
+@@ day 33
+title: Agent 图：工具循环、记忆、检查点
+lang: py
+langchain: yes
+hours: 4–5 小时
+--- goal
+用 LangGraph 把 Agent 循环搭成一张图（model ⇄ ToolNode），给它上限（recursion_limit）、给它记忆（checkpointer + thread_id），会查看和修改每一步的状态（get_state、历史、update_state、时间旅行），用 SqliteSaver 让检查点在进程退出后还在，再用 Store 记住跨对话的客户偏好。这些正是第 17 天手写的循环、第 19 天手写的检查点，也是 `clausecheck/graph.py` 里 `SqliteSaver` 和 `thread_id` 在做的事。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过（本机任务选做）
+- 闭卷挑战 3 题
+- 能说清楚：`thread_id` 是什么、一个 thread 里存了哪些检查点、checkpointer（短期记忆）和 Store（长期记忆）各管什么
+
+@@ concept
+title: Agent 图：model ⇄ tools
+--- body
+第 17 天你手写过 Agent 循环，第 30 天用 LangChain 的消息又写了一遍，第 31 天 `create_agent` 替你做了。今天用 LangGraph 自己把它搭成图：两个节点、三条边。
+
+- `model` 节点：用 `model.bind_tools(tools)` 调一次模型，返回 `{"messages": [回复]}`
+- `tools` 节点：`ToolNode(tools)`，执行最后一条 AIMessage 里的**所有** tool_calls，每个调用返回一条 ToolMessage
+- `add_conditional_edges("model", tools_condition)`：最后一条消息有 tool_calls → `"tools"`，没有 → END
+- `add_edge("tools", "model")`：把工具结果送回模型。这条边就是「循环」
+
+`create_agent` 返回的图，节点也叫 `model` 和 `tools`。只需要一个标准的工具循环时，用它就够了；自己搭的好处是能在中间插入自己的节点（审批、记日志、预算检查）。
+
+模型一定要关掉思考：`extra_body={"thinking": {"type": "disabled"}}`。第 30 天讲过：思考模式下带 `tools` 的请求，之前每条 assistant 消息的 `reasoning_content` 都必须传回去，否则 DeepSeek 返回 400；ChatDeepSeek 不会传回，所以思考开着时，这张图第二次调模型就是 400。关掉还更快、少付输出 token。
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+PLAYBOOK = {"liability_cap": "PB-01: cap at 12 months of fees", "payment": "PB-04: net 30 days is fine"}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return PLAYBOOK.get(topic, "no rule for this topic")
+
+tools = [lookup_playbook]
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).bind_tools(tools)
+
+def call_model(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("model", call_model)
+g.add_node("tools", ToolNode(tools))
+g.add_edge(START, "model")
+g.add_conditional_edges("model", tools_condition)   # 有 tool_calls → "tools"，没有 → END
+g.add_edge("tools", "model")                        # 工具结果送回模型
+app = g.compile()
+
+out = app.invoke({"messages": [("user", "Review clause 8.1: Liability is unlimited.")]})
+for m in out["messages"]:
+    print(f"{type(m).__name__:<13}", m.content[:60])
+print("tool call:", out["messages"][1].tool_calls[0]["args"])
+print("model calls:", len(MOCK.calls), "| nodes:", list(app.get_graph().nodes))
+
+@@ concept
+title: ToolNode：错误也是消息
+--- body
+`ToolNode` 替你做了第 30 天的 `run_tools`：执行每个调用，按 `tool_call_id` 配好 ToolMessage。出错时分两种情况：
+
+- **模型的错**（工具名不存在、参数不对）：自动变成一条 `status="error"` 的 ToolMessage，模型下一轮能看到并改正。这就是第 17 天说的「错误是写给模型看的」
+- **你的工具自己抛异常**（比如 playbook 里没有这个 topic）：默认**直接抛出**，整个图崩掉，这份合同前面的审查全白做。这一点和你第 30 天写的 `run_tools` 不一样，那里出错也回一条消息
+- 加上 `handle_tool_errors=True`：异常也变成错误消息 `"Error: KeyError('payment')\n Please fix your mistakes."`；也可以传一个字符串或一个函数，自己决定模型看到什么
+
+另外，`ToolNode` 只能放在图里运行，单独调用它的 `invoke` 会报错。
+--- code
+from langchain_core.messages import AIMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode
+
+PLAYBOOK = {"liability_cap": "PB-01: cap at 12 months of fees"}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return PLAYBOOK[topic]          # 没有这个 topic 会抛 KeyError
+
+def run_tools(node, call):
+    g = StateGraph(MessagesState)
+    g.add_node("tools", node)
+    g.add_edge(START, "tools")
+    g.add_edge("tools", END)
+    out = g.compile().invoke({"messages": [AIMessage(content="", tool_calls=[call])]})
+    return out["messages"][-1]
+
+calls = {
+    "正常": {"name": "lookup_playbook", "args": {"topic": "liability_cap"}, "id": "c1"},
+    "工具名错": {"name": "lookup_rules", "args": {"topic": "liability_cap"}, "id": "c2"},
+    "参数名错": {"name": "lookup_playbook", "args": {"topik": "payment"}, "id": "c3"},
+}
+for label, call in calls.items():
+    msg = run_tools(ToolNode([lookup_playbook]), call)
+    print(label, msg.status, "|", msg.content.splitlines()[0])
+
+boom = {"name": "lookup_playbook", "args": {"topic": "payment"}, "id": "c4"}
+try:
+    run_tools(ToolNode([lookup_playbook]), boom)
+except KeyError as e:
+    print("工具自己抛错：整个图崩了", repr(e))
+msg = run_tools(ToolNode([lookup_playbook], handle_tool_errors=True), boom)
+print("handle_tool_errors=True:", msg.status, "|", msg.content.splitlines()[0])
+
+@@ concept
+title: recursion_limit：给循环一个上限
+--- body
+模型可能一直调工具、不肯给出最终回答（mock 里在问题中写 `[loop]` 来模拟）。LangGraph 用 `recursion_limit` 限制**超步**（superstep：同一轮一起跑的节点算一步）的数量。
+
+- 本页的 LangGraph 1.2 默认值是 **10007**！旧版本和很多教程写的是 25。不设的话，一个死循环要调几千次模型才停
+- 所以每次都传：`app.invoke(inputs, {"recursion_limit": 10})`
+- 超了会抛 `GraphRecursionError`（`from langgraph.errors import GraphRecursionError`）。抓住它，告诉用户「在限定步数内没有得到答案」，别让整个请求 500
+- 开头把输入写进 state 的那一步（`__start__`）也算一步：model → tools → model 实际占 4 步，上限设 3 会报错，设 4 才通过（下面的例子，本页版本实测）。别卡着设，留出余量
+
+对照第 17 天：你手写的 `max_steps` 就是它。
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import StateGraph, START, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees"
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).bind_tools([lookup_playbook])
+g = StateGraph(MessagesState)
+g.add_node("model", lambda state: {"messages": [model.invoke(state["messages"])]})
+g.add_node("tools", ToolNode([lookup_playbook]))
+g.add_edge(START, "model")
+g.add_conditional_edges("model", tools_condition)
+g.add_edge("tools", "model")
+app = g.compile()
+
+def run(question, limit):
+    MOCK.reset()
+    try:
+        out = app.invoke({"messages": [("user", question)]}, {"recursion_limit": limit})
+        return f"limit {limit}: ok after {len(MOCK.calls)} model call(s)"
+    except GraphRecursionError:
+        return f"limit {limit}: GraphRecursionError after {len(MOCK.calls)} model call(s)"
+
+print(run("Review clause 8.1: Liability is unlimited.", 3))
+print(run("Review clause 8.1: Liability is unlimited.", 4))
+print(run("[loop] Review clause 8.1: Liability is unlimited.", 10))
+
+@@ concept
+title: Checkpointer 和 thread_id
+--- body
+到现在为止，每次 `invoke` 都从空白开始。编译时加一个 **checkpointer**，图每跑完一步就把 state 存起来，按 `thread_id` 分开存：
+
+```python
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {"configurable": {"thread_id": "acme-msa"}}
+app.invoke({"messages": [("user", "Review clause 8.1")]}, cfg)
+app.invoke({"messages": [("user", "And clause 9.2?")]}, cfg)   # 接着上一轮
+```
+
+- 同一个 `thread_id` 再 invoke：先读出上次的 state，新消息经过 `add_messages` 追加进去，模型看到整段对话
+- 换一个 `thread_id`：全新的开始
+- 有 checkpointer 却不给 thread_id（或者拼错成 `threadId`）：`ValueError`。按文档和 `graph.py` 的写法，把它放在 `"configurable"` 里
+- `InMemorySaver` 存在进程内存里，进程一退出就没了，只适合开发和测试。它就是第 19 天你的 `run_id` + JSON 文件
+--- code
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def chat(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+app = g.compile(checkpointer=InMemorySaver())
+
+acme = {"configurable": {"thread_id": "acme-msa"}}
+globex = {"configurable": {"thread_id": "globex-msa"}}
+app.invoke({"messages": [("user", "Review clause 8.1")]}, acme)
+app.invoke({"messages": [("user", "And clause 9.2?")]}, acme)
+app.invoke({"messages": [("user", "And clause 9.2?")]}, globex)
+for call in MOCK.calls:
+    print("model saw:", [m["role"] for m in call["body"]["messages"]])
+try:
+    app.invoke({"messages": [("user", "hi")]})
+except ValueError as e:
+    print("ValueError:", str(e)[:70])
+
+@@ concept
+title: 看状态：get_state 和历史
+--- body
+有了检查点，就能看到图每一步的状态。调试「代理第 2 步到底看到了什么」全靠它：
+
+- `snap = app.get_state(cfg)`：最新的检查点。`snap.values` 是 state；`snap.next` 是接下来要跑的节点（一个元组），`()` 表示已经跑完
+- `app.get_state_history(cfg)`：这个 thread 的所有检查点，**最新的在前**，每个超步一个：`metadata["step"]` 从 -1（刚收到输入）开始，然后 0、1、2……
+- 不存在的 thread：`values` 是 `{}`，`next` 是 `()`
+- `snap.config` 里有 `checkpoint_id`，每次运行都不一样，别打印、别拿来比较
+
+界面用它显示进度，后台用它回答「哪些合同在等人批准」（`next` 不为空的 thread）。
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    return {"verdict": "redline"}
+
+def export(state: State):
+    return {"report": f"{state['clause']}: {state['verdict']}"}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_edge("review", "export")
+g.add_edge("export", END)
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {"configurable": {"thread_id": "t1"}}
+app.invoke({"clause": "8.1"}, cfg)
+
+snap = app.get_state(cfg)
+print("next:", snap.next, "| values:", snap.values)
+for s in app.get_state_history(cfg):          # 最新的在前
+    print("step", s.metadata["step"], "next", s.next, "keys", sorted(s.values))
+print(app.get_state({"configurable": {"thread_id": "nobody"}}).values)
+
+@@ concept
+title: 改状态：update_state 和时间旅行
+--- body
+第 19 天你让执行器停在某个节点前等人批准。LangGraph 的静态写法和改状态的办法：
+
+- `compile(..., interrupt_before=["export"])`：每次走到 `export` 之前停下。`invoke` 返回到目前为止的 state，**里面没有** `__interrupt__` 键，要看 `get_state(cfg).next`
+- 人来改：`app.update_state(cfg, {"verdict": "flag"})`。它就像一个节点返回了这个更新（照样经过 reducer），并新增一个检查点
+- 继续：`app.invoke(None, cfg)`。`None` 的意思是「没有新输入，从停下的地方接着跑」
+- **时间旅行**：从历史里挑一个旧快照，`app.invoke(None, 旧快照.config)` 从那里重跑；想先改个值，用 `update_state(旧快照.config, {...})`，它返回新的 config
+
+好处：只重跑后面几步，前面的审查不用重做，也就不用再付一次模型的钱。
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+g = StateGraph(State)
+g.add_node("review", lambda state: {"verdict": "redline"})
+g.add_node("export", lambda state: {"report": f"{state['clause']}: {state['verdict']}"})
+g.add_edge(START, "review")
+g.add_edge("review", "export")
+g.add_edge("export", END)
+app = g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+cfg = {"configurable": {"thread_id": "t2"}}
+
+print(app.invoke({"clause": "8.1"}, cfg))          # 停在 export 前
+print("next:", app.get_state(cfg).next)
+app.update_state(cfg, {"verdict": "flag"})          # 律师改判
+print(app.invoke(None, cfg))                        # None = 没有新输入，接着跑
+
+# 时间旅行：回到「export 之前、还没改判」的那个检查点，从那里重跑
+old = [s for s in app.get_state_history(cfg) if s.next == ("export",)][-1]
+print("old:", old.values)
+print(app.invoke(None, old.config))
+
+@@ concept
+title: SqliteSaver：进程退出也不丢
+--- body
+`InMemorySaver` 进程一退出就没了。`clausecheck/graph.py` 用的是 **SqliteSaver**：检查点写进 `data/checkpoints.sqlite`，律师第二天批准时，另一个进程用同一个 `thread_id` 接着跑。
+
+```python
+with SqliteSaver.from_conn_string("work/d33/cp.sqlite") as saver:
+    app = build_graph(checkpointer=saver)
+```
+
+- `with` 结束时连接自动关闭。两个 `with` 块就像两个进程：中间内存里的图全没了，只剩那个文件
+- 另一种写法：`SqliteSaver(sqlite3.connect(path, check_same_thread=False))`。**必须**加 `check_same_thread=False`：LangGraph 在后台线程里写检查点，不加的话在你自己的电脑上会报 `ProgrammingError: SQLite objects created in a thread can only be used in that same thread`。本页只有一个线程所以不报，更要记住
+- 生产环境多用 Postgres 版的 checkpointer（另一个包），思路一样：图不变，只换 checkpointer
+--- code
+import os
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def build(checkpointer):
+    g = StateGraph(State)
+    g.add_node("review", lambda state: {"verdict": "redline"})
+    g.add_node("export", lambda state: {"report": f"{state['clause']}: {state['verdict']}"})
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=checkpointer, interrupt_before=["export"])
+
+os.makedirs("work/d33", exist_ok=True)
+path = "work/d33/demo.sqlite"
+if os.path.exists(path):
+    os.remove(path)                                   # 每次运行都从空文件开始
+cfg = {"configurable": {"thread_id": "contract-42"}}
+
+with SqliteSaver.from_conn_string(path) as saver:     # 「进程 1」：审查，停在 export 前
+    print(build(saver).invoke({"clause": "8.1"}, cfg))
+
+with SqliteSaver.from_conn_string(path) as saver:     # 「进程 2」：律师第二天批准
+    app = build(saver)
+    print("next:", app.get_state(cfg).next)
+    print(app.invoke(None, cfg))
+print("file kept:", os.path.exists(path))
+
+@@ concept
+title: 长期记忆：Store
+--- body
+checkpointer 是**短期记忆**：一个 thread（一段对话、一份合同）里的 state。有些事要跨 thread 记住，比如「Acme 接受 24 个月的责任上限」，下周审 Acme 的另一份合同也要用。这是**长期记忆**：Store。
+
+- `store.put(("prefs", "acme"), "liability_cap", {"cap": "24 months"})`：namespace 是元组，key 是字符串，value 是字典；同一个 key 再 put 会覆盖
+- `store.get(ns, key)` 返回一个 Item（用 `.value`）或 `None`；`store.search(("prefs",))` 按前缀列出，**默认最多 10 条**，要更多就传 `limit=`
+- 节点里加一个参数 `runtime: Runtime[Ctx]`，用 `runtime.store`；编译时 `compile(store=store)`
+- 「这次是哪个客户」不放在 state 里：`StateGraph(State, context_schema=Ctx)` 声明，`invoke(..., context=Ctx(customer="acme"))` 传进来，节点里读 `runtime.context.customer`
+
+另外，thread 越聊越长，每轮都把整段历史发给模型。调模型前用 `trim_messages(..., strategy="last", include_system=True, start_on="human")` 只保留最后几条（练习里用 `token_counter=len` 按条数算）。
+--- code
+from dataclasses import dataclass
+from typing import TypedDict
+from langchain_core.messages import trim_messages
+from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
+from langgraph.store.memory import InMemoryStore
+
+@dataclass
+class Ctx:
+    customer: str
+
+class State(TypedDict, total=False):
+    clause: str
+    rule: str
+
+def load_rule(state: State, runtime: Runtime[Ctx]):
+    item = runtime.store.get(("prefs", runtime.context.customer), "liability_cap")
+    return {"rule": item.value["cap"] if item else "12 months (default)"}
+
+store = InMemoryStore()
+store.put(("prefs", "acme"), "liability_cap", {"cap": "24 months"})
+
+g = StateGraph(State, context_schema=Ctx)
+g.add_node("load_rule", load_rule)
+g.add_edge(START, "load_rule")
+g.add_edge("load_rule", END)
+app = g.compile(store=store)
+print(app.invoke({"clause": "8.1"}, context=Ctx(customer="acme")))
+print(app.invoke({"clause": "8.1"}, context=Ctx(customer="globex")))
+print([(item.namespace, item.key) for item in store.search(("prefs",))])
+
+history = [("system", "You review contracts."), ("user", "Review clause 1"), ("assistant", "accept"),
+           ("user", "Review clause 2"), ("assistant", "flag"), ("user", "Review clause 3")]
+kept = trim_messages(history, max_tokens=4, token_counter=len, strategy="last", include_system=True, start_on="human")
+print([m.content for m in kept])
+
+@@ item d33-01
+type: predict
+title: 复习：reducer 和消息
+level: 1
+--- prompt
+复习第 32 天。写出输出。`State` 在 `MessagesState` 的基础上加了两个键：`log` 用 `operator.add` 合并，`verdict` 没有 reducer。注意节点返回的是元组，`add_messages` 会把它变成什么。
+--- code
+import operator
+from typing import Annotated
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+class State(MessagesState):
+    log: Annotated[list, operator.add]
+    verdict: str
+
+def review(state: State):
+    return {"messages": [("assistant", "8.1 looks risky")], "log": ["review"], "verdict": "flag"}
+
+def decide(state: State):
+    n = len(state["messages"])
+    return {"messages": [("assistant", f"final: redline after {n} messages")], "log": ["decide"], "verdict": "redline"}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("decide", decide)
+g.add_edge(START, "review")
+g.add_edge("review", "decide")
+g.add_edge("decide", END)
+out = g.compile().invoke({"messages": [("user", "Review clause 8.1")], "log": ["start"], "verdict": ""})
+for m in out["messages"]:
+    print(type(m).__name__, "|", m.content)
+print(out["log"], out["verdict"])
+--- explain
+`messages` 的 reducer 是 `add_messages`：追加，并把 `("assistant", ...)` 这样的元组转换成 AIMessage。`log` 用 `operator.add`，三段列表连起来。`verdict` 没有 reducer，后写的覆盖先写的。今天的 Agent 图就建立在这个上面：每个节点只返回新消息，`add_messages` 负责接到后面。
+
+@@ item d33-02
+type: predict
+title: tools_condition 看哪条
+level: 1
+--- prompt
+写出输出。前两行是路由函数 `tools_condition` 的返回值；后面把一条带**两个** tool_calls 的 AIMessage 交给 ToolNode。
+--- code
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return f"rule for {topic}"
+
+call = {"name": "lookup_playbook", "args": {"topic": "payment"}, "id": "call_1"}
+print(tools_condition({"messages": [HumanMessage("hi"), AIMessage("", tool_calls=[call])]}))
+print(tools_condition({"messages": [AIMessage("", tool_calls=[call]), AIMessage("Done.")]}))
+
+g = StateGraph(MessagesState)
+g.add_node("tools", ToolNode([lookup_playbook]))
+g.add_edge(START, "tools")
+g.add_edge("tools", END)
+two = [call, {"name": "lookup_playbook", "args": {"topic": "liability_cap"}, "id": "call_2"}]
+out = g.compile().invoke({"messages": [AIMessage("", tool_calls=two)]})
+print(len(out["messages"]))
+for m in out["messages"][1:]:
+    print(type(m).__name__, m.tool_call_id, m.content)
+--- explain
+`tools_condition` 只看**最后一条**消息：有 tool_calls 就去 `"tools"`，没有就返回 `"__end__"`（也就是 `END`）。第二次调用里前面那条带 tool_calls 的消息不算。ToolNode 执行最后一条 AIMessage 的每一个调用，每个调用一条 ToolMessage，`tool_call_id` 对得上，这正是第 30 天你手写 `run_tools` 做的事。
+
+@@ item d33-03
+type: fill
+title: 填空：搭 Agent 图
+level: 1
+--- prompt
+补全 `build_agent(model, tools)`：`model` 节点调用绑了工具的模型，`tools` 节点执行工具，模型之后按有没有 tool_calls 分路，工具之后回到模型。
+--- template
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+def build_agent(model, tools):
+    bound = model.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        return {"messages": [bound.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", [[ToolNode(tools)]])
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", [[tools_condition]])
+    g.add_edge([["tools"]], [["model"]])
+    return g.compile()
+--- tests
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return {"liability_cap": "PB-01: cap at 12 months of fees"}.get(topic, "no rule")
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+def _run():
+    MOCK.reset()
+    return build_agent(MODEL, [lookup_playbook]).invoke({"messages": [("user", "Review clause 8.1: Liability is unlimited.")]})["messages"]
+expect("消息顺序：问 → 调工具 → 工具结果 → 回答", lambda: [type(m).__name__ for m in _run()], ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"])
+expect("最后的回答用上了工具结果", lambda: _run()[-1].content, "Based on the playbook: PB-01: cap at 12 months of fees")
+expect("模型调了 2 次", lambda: (_run(), len(MOCK.calls))[1], 2)
+--- hints
+- 工具节点就是 `ToolNode(...)`，把工具列表传进去。
+- 路由函数不用自己写：`tools_condition`。回到模型的那条边从 `"tools"` 指向 `"model"`。
+
+@@ item d33-04
+type: code
+title: 带 system prompt 的代理
+level: 2
+--- prompt
+写 `build_agent(model, tools, system_prompt)`，和上一题一样的 Agent 图，另外：
+
+- 每次调模型时，把 `SystemMessage(system_prompt)` 放在消息最前面：`[SystemMessage(system_prompt)] + state["messages"]`
+- system prompt **不存进 state**：`model` 节点只返回模型的回复。存进去的话，同一个 thread 每聊一轮就多一条 system 消息
+- `ToolNode` 里要有全部工具
+
+例：问 `"Use get_clause to read clause 12."` 时，模型会调用 `get_clause`，参数 `{"clause_id": "12"}`。
+--- starter
+from langchain_core.messages import SystemMessage
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+def build_agent(model, tools, system_prompt):
+    pass
+--- solution
+from langchain_core.messages import SystemMessage
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+def build_agent(model, tools, system_prompt):
+    bound = model.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        messages = [SystemMessage(system_prompt)] + state["messages"]
+        return {"messages": [bound.invoke(messages)]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", ToolNode(tools))
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", tools_condition)
+    g.add_edge("tools", "model")
+    return g.compile()
+--- tests
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+
+CLAUSES = {"12": "Notwithstanding Section 8, Customer's liability shall be unlimited."}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return {"liability_cap": "PB-01: cap at 12 months of fees"}.get(topic, "no rule")
+
+@tool
+def get_clause(clause_id: str) -> str:
+    """Return the full text of another clause of the same contract, e.g. 12."""
+    return CLAUSES.get(clause_id, "no such clause")
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You review SaaS contracts for Acme. Check cross-references."
+def _run(question):
+    MOCK.reset()
+    app = build_agent(MODEL, [lookup_playbook, get_clause], SYSTEM)
+    return app.invoke({"messages": [("user", question)]})["messages"]
+Q = "Review clause 8.1: Liability is unlimited."
+expect("第一次请求：system 在最前面", lambda: (_run(Q), [m["role"] for m in MOCK.calls[0]["body"]["messages"]])[1], ["system", "user"])
+expect("system 的内容", lambda: (_run(Q), MOCK.calls[0]["body"]["messages"][0]["content"])[1], SYSTEM)
+expect("第二次请求也带 system", lambda: (_run(Q), [m["role"] for m in MOCK.calls[1]["body"]["messages"]])[1], ["system", "user", "assistant", "tool"])
+expect("state 里没有 SystemMessage", lambda: [type(m).__name__ for m in _run(Q)], ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"])
+expect("点名的工具也在 ToolNode 里", lambda: _run("Use get_clause to read clause 12.")[-1].content, "Based on the playbook: " + CLAUSES["12"])
+expect("get_clause 的参数", lambda: _run("Use get_clause to read clause 12.")[1].tool_calls[0]["args"], {"clause_id": "12"})
+--- hints
+- 结构和上一题一样；只有 `call_model` 不同：先拼出 `messages = [SystemMessage(system_prompt)] + state["messages"]`，再 `bound.invoke(messages)`。
+- 返回值只放模型的回复：`{"messages": [reply]}`。把 SystemMessage 也放进返回值，它就会被 `add_messages` 存进 state。
+
+@@ item d33-05
+type: fix
+title: 修 bug：一个工具出错，整份审查崩掉
+level: 2
+--- prompt
+审查代理用 `lookup_playbook` 查规则。playbook 里没有的 topic（比如管辖法律）会让工具抛 `KeyError`，整个图跟着崩，这份合同前面的审查全白做。
+
+运行测试看报错，然后改成：工具出错时变成一条错误 ToolMessage 交给模型，让模型自己处理。**不要改 `lookup_playbook`**：真实项目里 playbook 可能是远程服务，任何工具都可能出错。只改一处。
+--- starter
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+PLAYBOOK = {
+    "liability_cap": "PB-01: cap at 12 months of fees",
+    "payment": "PB-04: net 30 days is acceptable",
+}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return PLAYBOOK[topic]
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def build_agent(tools):
+    bound = model.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        return {"messages": [bound.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", ToolNode(tools))
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", tools_condition)
+    g.add_edge("tools", "model")
+    return g.compile()
+
+app = build_agent([lookup_playbook])
+
+def review(text):
+    out = app.invoke({"messages": [("user", text)]}, {"recursion_limit": 10})
+    return out["messages"]
+--- solution
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+PLAYBOOK = {
+    "liability_cap": "PB-01: cap at 12 months of fees",
+    "payment": "PB-04: net 30 days is acceptable",
+}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return PLAYBOOK[topic]
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def build_agent(tools):
+    bound = model.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        return {"messages": [bound.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", tools_condition)
+    g.add_edge("tools", "model")
+    return g.compile()
+
+app = build_agent([lookup_playbook])
+
+def review(text):
+    out = app.invoke({"messages": [("user", text)]}, {"recursion_limit": 10})
+    return out["messages"]
+--- tests
+LAW = "Review clause 14: governed by the laws of Sweden."
+expect("有规则的 topic：正常回答", lambda: review("Review clause 8.1: Liability is unlimited.")[-1].content, "Based on the playbook: PB-01: cap at 12 months of fees")
+expect("没有规则的 topic：图不崩，照样走完", lambda: [type(m).__name__ for m in review(LAW)], ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"])
+expect("工具的错误变成 status=error 的 ToolMessage", lambda: review(LAW)[2].status, "error")
+expect_true("模型下一轮看到了这条错误消息", lambda: (lambda ms: ms[-1].content == "Based on the playbook: " + ms[2].content[:80])(review(LAW)))
+expect_raises("lookup_playbook 本身没改：没规则时还是抛 KeyError", lambda: lookup_playbook.invoke({"topic": "other"}), KeyError)
+--- hints
+- 报错来自工具内部，ToolNode 默认把这种异常直接抛出去。
+- ToolNode 有一个参数能把异常变成错误消息：`handle_tool_errors`。
+- `ToolNode(tools, handle_tool_errors=True)`。
+
+@@ item d33-06
+type: choice
+title: 没设 recursion_limit
+level: 2
+--- prompt
+你用本页的 LangGraph 版本（1.2）写了 Agent 图，调用时没有传 `recursion_limit`。某次模型一直调工具，不肯给出最终回答。会发生什么？
+--- options
+- 跑到第 25 步抛 `GraphRecursionError`，网上的教程都这么写
+- 这个版本的默认上限是 10007 步：要调几千次模型才会报错，钱先花掉了。所以每次调用都要自己传一个小的 `recursion_limit`
+- LangGraph 发现同一个工具被反复调用，会自动停下
+- 永远不会停：LangGraph 没有步数上限
+answer: 2
+--- explain
+上限一直都有，但默认值变过：旧版本是 25，本页的 1.2 版本是 10007（源码里 `DEFAULT_RECURSION_LIMIT`）。框架升级时这种默认值悄悄变化，只有自己显式传参才靠得住。LangGraph 不会去判断「是不是在重复调用同一个工具」；想按自己的规则停，就自己写路由函数（练习里的 `should_continue` 按工具轮数停）。面试时说「每次调用都显式传 recursion_limit，并把 GraphRecursionError 转成用户能看懂的结果」，比背默认值有用。
+
+@@ item d33-07
+type: code
+title: 给代理加上限
+level: 2
+--- prompt
+写 `ask(app, question, limit=10)`：
+
+- 用 `{"recursion_limit": limit}` 调用 `app`（一个 Agent 图，测试里已经搭好）
+- 正常：返回最后一条消息的 `content`
+- 抛 `GraphRecursionError`：返回 `f"stopped: no answer within {limit} steps"`
+
+例：`ask(app, "[loop] Review clause 8.1", limit=6)` → `"stopped: no answer within 6 steps"`
+
+注意：mock 在问题里看到 `[loop]` 就永远调工具。测试给图加了一个 30 步的安全网，但你自己在别处试的时候，别不传上限就跑 `[loop]`。
+--- starter
+from langgraph.errors import GraphRecursionError
+
+def ask(app, question, limit=10):
+    pass
+--- solution
+from langgraph.errors import GraphRecursionError
+
+def ask(app, question, limit=10):
+    try:
+        out = app.invoke({"messages": [("user", question)]}, {"recursion_limit": limit})
+    except GraphRecursionError:
+        return f"stopped: no answer within {limit} steps"
+    return out["messages"][-1].content
+--- tests
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees"
+
+_bound = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).bind_tools([lookup_playbook])
+_g = StateGraph(MessagesState)
+_g.add_node("model", lambda state: {"messages": [_bound.invoke(state["messages"])]})
+_g.add_node("tools", ToolNode([lookup_playbook]))
+_g.add_edge(START, "model")
+_g.add_conditional_edges("model", tools_condition)
+_g.add_edge("tools", "model")
+APP = _g.compile().with_config(recursion_limit=30)   # 安全网：忘了传 limit 也不会跑一万步
+def _calls(fn):
+    MOCK.reset()
+    fn()
+    return len(MOCK.calls)
+expect("正常回答", lambda: ask(APP, "Review clause 8.1: Liability is unlimited."), "Based on the playbook: PB-01: cap at 12 months of fees")
+expect("死循环：超过上限", lambda: ask(APP, "[loop] Review clause 8.1: Liability is unlimited.", limit=6), "stopped: no answer within 6 steps")
+expect("上限真的传进去了：6 步只调 3 次模型", lambda: _calls(lambda: ask(APP, "[loop] liability", limit=6)), 3)
+expect("默认上限是 10：调 5 次模型", lambda: _calls(lambda: ask(APP, "[loop] liability")), 5)
+--- hints
+- 第二个参数是 config 字典：`app.invoke(inputs, {"recursion_limit": limit})`。它不在 `"configurable"` 里面。
+- 用 `try: ... except GraphRecursionError: return ...` 包住 invoke。
+
+@@ item d33-08
+type: code
+title: 按 thread 记住对话
+level: 2
+--- prompt
+补全两处：
+
+1. `build_chat(model)`：编译时加上 `InMemorySaver()` 作为 checkpointer
+2. `say(app, thread_id, text)`：在这个 thread 上发一条用户消息，返回模型回复的 `content`
+
+例：同一个 thread 先 `say(app, "acme", "Review clause 8.1")`，再 `say(app, "acme", "And clause 9.2?")`，第二次模型收到的消息角色是 `["user", "assistant", "user"]`。
+--- starter
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+def build_chat(model):
+    def chat(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("chat", chat)
+    g.add_edge(START, "chat")
+    g.add_edge("chat", END)
+    return g.compile()
+
+def say(app, thread_id, text):
+    pass
+--- solution
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+def build_chat(model):
+    def chat(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("chat", chat)
+    g.add_edge(START, "chat")
+    g.add_edge("chat", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+def say(app, thread_id, text):
+    cfg = {"configurable": {"thread_id": thread_id}}
+    out = app.invoke({"messages": [("user", text)]}, cfg)
+    return out["messages"][-1].content
+--- tests
+from langchain_deepseek import ChatDeepSeek
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+def _roles():
+    return [m["role"] for m in MOCK.calls[-1]["body"]["messages"]]
+def _two_turns():
+    MOCK.reset()
+    app = build_chat(MODEL)
+    a = say(app, "acme", "Review clause 8.1")
+    b = say(app, "acme", "And clause 9.2?")
+    return [a, b, _roles()]
+expect("同一个 thread：第二轮带着上一轮", _two_turns, ["Mock reply: Review clause 8.1", "Mock reply: And clause 9.2?", ["user", "assistant", "user"]])
+def _other_thread():
+    MOCK.reset()
+    app = build_chat(MODEL)
+    say(app, "acme", "Review clause 8.1")
+    say(app, "globex", "And clause 9.2?")
+    return _roles()
+expect("另一个 thread：从头开始", _other_thread, ["user"])
+def _stored():
+    app = build_chat(MODEL)
+    say(app, "acme", "a")
+    say(app, "acme", "b")
+    return len(app.get_state({"configurable": {"thread_id": "acme"}}).values["messages"])
+expect("thread 里存了 4 条消息", _stored, 4)
+def _new_app():
+    MOCK.reset()
+    say(build_chat(MODEL), "acme", "Review clause 8.1")
+    say(build_chat(MODEL), "acme", "And clause 9.2?")
+    return _roles()
+expect("InMemorySaver 跟着图对象走：重新 build 的图不记得", _new_app, ["user"])
+--- hints
+- 编译那一行：`g.compile(checkpointer=InMemorySaver())`。
+- config 的形状：`{"configurable": {"thread_id": thread_id}}`，作为 `invoke` 的第二个参数。
+- 输入只放这一轮的新消息 `{"messages": [("user", text)]}`，以前的由 checkpointer 读出来，`add_messages` 接到后面。
+
+@@ item d33-09
+type: fix
+title: 修 bug：thread_id 放错了地方
+level: 1
+--- prompt
+每个客户一个 thread，`ask(customer, text)` 在客户自己的 thread 上聊天。这段代码是从一个 TypeScript 项目改过来的。运行测试，读报错信息，修好 `ask`。
+--- starter
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def chat(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+app = g.compile(checkpointer=InMemorySaver())
+
+def ask(customer, text):
+    cfg = {"configurable": {"threadId": customer}}
+    out = app.invoke({"messages": [("user", text)]}, cfg)
+    return out["messages"][-1].content
+--- solution
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def chat(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+app = g.compile(checkpointer=InMemorySaver())
+
+def ask(customer, text):
+    cfg = {"configurable": {"thread_id": customer}}
+    out = app.invoke({"messages": [("user", text)]}, cfg)
+    return out["messages"][-1].content
+--- tests
+expect("能回答", lambda: ask("acme-1", "Review clause 8.1"), "Mock reply: Review clause 8.1")
+def _memory():
+    ask("acme-2", "Review clause 8.1")
+    MOCK.reset()
+    ask("acme-2", "And clause 9.2?")
+    return len(MOCK.calls[-1]["body"]["messages"])
+expect("同一个客户：模型看到 3 条消息", _memory, 3)
+def _separate():
+    ask("globex-2", "Review clause 8.1")
+    MOCK.reset()
+    ask("initech-2", "And clause 9.2?")
+    return len(MOCK.calls[-1]["body"]["messages"])
+expect("不同客户互不相干", _separate, 1)
+--- hints
+- 报错列出了 checkpointer 认得的键名，逐个字母对一下。
+- TypeScript 习惯用驼峰命名 `threadId`，但 LangGraph 的键名是下划线的 `thread_id`（LangGraph.js 里也是 `thread_id`）：`{"configurable": {"thread_id": customer}}`。
+
+@@ item d33-10
+type: predict
+title: 停在 export 前的状态
+level: 2
+--- prompt
+写出输出。图编译时用了 `interrupt_before=["export"]`。注意第一次 `invoke` 的返回值里有没有 `__interrupt__`，以及历史的顺序。
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+g = StateGraph(State)
+g.add_node("review", lambda state: {"verdict": "redline"})
+g.add_node("export", lambda state: {"report": f"{state['clause']}: {state['verdict']}"})
+g.add_edge(START, "review")
+g.add_edge("review", "export")
+g.add_edge("export", END)
+app = g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+cfg = {"configurable": {"thread_id": "8.1"}}
+
+out = app.invoke({"clause": "8.1"}, cfg)
+print(out)
+print(app.get_state(cfg).next, "__interrupt__" in out)
+for s in app.get_state_history(cfg):
+    print(s.metadata["step"], s.next)
+out = app.invoke(None, cfg)
+print(out["report"], app.get_state(cfg).next)
+print(len(list(app.get_state_history(cfg))))
+--- explain
+`interrupt_before` 是「静态」中断：图停在 export 前，`invoke` 只返回目前的 state，没有 `__interrupt__` 键（明天的 `interrupt()` 才有），所以要用 `get_state(cfg).next` 判断停在哪。历史最新的在前，每个超步一个检查点，从 step -1（收到输入）开始。`invoke(None, cfg)` 接着跑完 export 后又多一个检查点，`next` 变成空元组。
+
+@@ item d33-11
+type: code
+title: 律师改判再导出
+level: 2
+--- prompt
+图（`build()` 已写好）审完一条款后停在 `export` 前，等律师确认。写 `correct_and_export(app, cfg, verdict=None)`：
+
+1. 这个 thread 不是停在 export 前（`app.get_state(cfg).next != ("export",)`）：`raise ValueError`
+2. `verdict` 不是 None：用 `app.update_state` 把 `"verdict"` 改掉；是 None 就**不要**调用 update_state（律师同意模型的结论）
+3. 接着跑完：`return app.invoke(None, cfg)`
+
+例：模型判 redline，律师改成 flag → 返回的 state 里 `report` 是 `"8.1 ... -> flag"`。
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": f"{state['clause']} -> {state['verdict']}"}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+
+def correct_and_export(app, cfg, verdict=None):
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": f"{state['clause']} -> {state['verdict']}"}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+
+def correct_and_export(app, cfg, verdict=None):
+    if app.get_state(cfg).next != ("export",):
+        raise ValueError("this thread is not waiting before export")
+    if verdict is not None:
+        app.update_state(cfg, {"verdict": verdict})
+    return app.invoke(None, cfg)
+--- tests
+def _paused(tid, clause="8.1 Liability is unlimited."):
+    app = build()
+    cfg = {"configurable": {"thread_id": tid}}
+    app.invoke({"clause": clause}, cfg)
+    return app, cfg
+expect("律师改判为 flag", lambda: correct_and_export(*_paused("a"), "flag")["report"], "8.1 Liability is unlimited. -> flag")
+expect("不改判：保留模型的结论", lambda: correct_and_export(*_paused("b"))["report"], "8.1 Liability is unlimited. -> redline")
+def _twice():
+    app, cfg = _paused("c")
+    correct_and_export(app, cfg, "flag")
+    return correct_and_export(app, cfg, "accept")
+expect_raises("已经导出过：不能再改", _twice, ValueError)
+expect_raises("没有这个 thread", lambda: correct_and_export(build(), {"configurable": {"thread_id": "nope"}}, "flag"), ValueError)
+def _sources(verdict):
+    app, cfg = _paused("d-" + str(verdict))
+    correct_and_export(app, cfg, verdict)
+    return [s.metadata["source"] for s in app.get_state_history(cfg)]
+expect("改判留下一个 update 检查点", lambda: _sources("flag"), ["loop", "update", "loop", "loop", "input"])
+expect("没改判就不调用 update_state", lambda: _sources(None), ["loop", "loop", "loop", "input"])
+--- hints
+- 第一步只看 `app.get_state(cfg).next`，它是一个元组，停在 export 前时等于 `("export",)`（注意逗号）。
+- 改判：`app.update_state(cfg, {"verdict": verdict})`。
+- 继续跑：`app.invoke(None, cfg)`，`None` 表示没有新输入。
+
+@@ item d33-12
+type: code
+title: 时间旅行：只重跑导出
+level: 3
+--- prompt
+报告模板改了（`TEMPLATE["text"]`），要重新导出，但**不想重新审查**：`review` 在真实项目里要调模型、要花钱（这里用 `CALLS` 计数）。
+
+写 `rerun_from(app, cfg, node)`：
+
+1. 在 `app.get_state_history(cfg)` 里找**最新的**一个 `next == (node,)` 的快照（历史是最新的在前，找到第一个就停）
+2. 找不到：`raise ValueError`
+3. 从那个快照重跑：`return app.invoke(None, 快照.config)`
+
+例：模板改成 `"[{verdict}] clause {clause}"` 后 `rerun_from(app, cfg, "export")` → 新报告，`CALLS["review"]` 还是 1。
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+CALLS = {"review": 0}
+TEMPLATE = {"text": "{clause}: {verdict}"}
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    CALLS["review"] += 1          # 真实项目里这里调模型
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": TEMPLATE["text"].format(clause=state["clause"], verdict=state["verdict"])}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+def rerun_from(app, cfg, node):
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+CALLS = {"review": 0}
+TEMPLATE = {"text": "{clause}: {verdict}"}
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    CALLS["review"] += 1          # 真实项目里这里调模型
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": TEMPLATE["text"].format(clause=state["clause"], verdict=state["verdict"])}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+def rerun_from(app, cfg, node):
+    for snap in app.get_state_history(cfg):
+        if snap.next == (node,):
+            return app.invoke(None, snap.config)
+    raise ValueError(f"no checkpoint before {node!r}")
+--- tests
+def _setup(tid):
+    CALLS["review"] = 0
+    TEMPLATE["text"] = "{clause}: {verdict}"
+    app = build()
+    cfg = {"configurable": {"thread_id": tid}}
+    app.invoke({"clause": "8.1 unlimited liability"}, cfg)
+    return app, cfg
+def _export_only():
+    app, cfg = _setup("r1")
+    TEMPLATE["text"] = "[{verdict}] clause {clause}"
+    out = rerun_from(app, cfg, "export")
+    return [out["report"], CALLS["review"]]
+expect("只重跑 export：review 不再调用", _export_only, ["[redline] clause 8.1 unlimited liability", 1])
+def _from_review():
+    app, cfg = _setup("r2")
+    rerun_from(app, cfg, "review")
+    return CALLS["review"]
+expect("从 review 重跑：review 再调用一次", _from_review, 2)
+def _twice():
+    app, cfg = _setup("r3")
+    TEMPLATE["text"] = "v2 {verdict}"
+    rerun_from(app, cfg, "export")
+    TEMPLATE["text"] = "v3 {verdict}"
+    out = rerun_from(app, cfg, "export")
+    return [out["report"], app.get_state(cfg).values["report"], CALLS["review"]]
+expect("重跑两次：thread 的最新状态是最后一次的结果", _twice, ["v3 redline", "v3 redline", 1])
+def _latest_wins():
+    app, cfg = _setup("r5")
+    old = [s for s in app.get_state_history(cfg) if s.next == ("export",)][0]
+    app.update_state(old.config, {"verdict": "flag"})   # 律师在旧快照上改判：多出一个更新的 export 前快照
+    TEMPLATE["text"] = "[{verdict}] clause {clause}"
+    return [rerun_from(app, cfg, "export")["report"], CALLS["review"]]
+expect("有好几个停在 export 前的快照：用最新的（改判后的）那个", _latest_wins, ["[flag] clause 8.1 unlimited liability", 1])
+expect_raises("没有这个节点", lambda: rerun_from(*_setup("r4"), "approve"), ValueError)
+--- hints
+- `for snap in app.get_state_history(cfg):` 从最新的开始遍历，`snap.next == (node,)` 时就是它。
+- 从旧快照继续跑，config 用快照自己的：`app.invoke(None, snap.config)`，它里面带着那个检查点的 id。
+- 循环结束还没 return，说明没找到：在循环后面 `raise ValueError(...)`。
+
+@@ item d33-13
+type: order
+title: 排代码：两个「进程」
+level: 2
+--- prompt
+排出 `pause_then_resume(build, path, thread_id, clause)`：删掉旧的检查点文件；第一个 `with` 里审查到 export 前停下；第二个 `with`（像另一个进程）从文件里接着跑完。返回 `(first, final)`。`build(saver)` 返回一个带 `interrupt_before=["export"]` 的编译好的图。有两行干扰项。
+--- lines
+import os
+from langgraph.checkpoint.sqlite import SqliteSaver
+def pause_then_resume(build, path, thread_id, clause):
+    if os.path.exists(path):
+        os.remove(path)
+    cfg = {"configurable": {"thread_id": thread_id}}
+    with SqliteSaver.from_conn_string(path) as saver:
+        first = build(saver).invoke({"clause": clause}, cfg)
+    with SqliteSaver.from_conn_string(path) as saver:
+        final = build(saver).invoke(None, cfg)
+    return first, final
+--- distractors
+        final = build(saver).invoke({"clause": clause}, cfg)
+    with SqliteSaver.from_conn_string(":memory:") as saver:
+--- tests
+import os
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def build(saver):
+    g = StateGraph(State)
+    g.add_node("review", lambda s: {"verdict": "redline" if "unlimited" in s["clause"] else "accept"})
+    g.add_node("export", lambda s: {"report": f"{s['clause']}: {s['verdict']}"})
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=saver, interrupt_before=["export"])
+
+os.makedirs("work/d33", exist_ok=True)
+P = "work/d33/order.sqlite"
+expect("第一个「进程」停在 export 前", lambda: pause_then_resume(build, P, "t1", "8.1 unlimited")[0], {"clause": "8.1 unlimited", "verdict": "redline"})
+expect("第二个「进程」从文件接着跑完", lambda: pause_then_resume(build, P, "t1", "8.1 unlimited")[1]["report"], "8.1 unlimited: redline")
+expect("每次都从空文件开始：上一次的 report 不会混进来", lambda: pause_then_resume(build, P, "t1", "3.1 net 30")[0], {"clause": "3.1 net 30", "verdict": "accept"})
+--- hints
+- 先删文件、再准备 config，然后是两个 `with` 块。
+- 第二次是「接着跑」，输入是 `None`，不是新的条款。
+- 两个「进程」要打开同一个文件；`":memory:"` 的数据库在连接关闭时就没了。
+
+@@ item d33-14
+type: code
+title: 哪些合同在等律师
+level: 3
+--- prompt
+所有合同的检查点都在同一个 SQLite 文件里，每份合同一个 thread。后台页面要列出「哪些合同停在 export 前、等律师批准」。
+
+写 `waiting_threads(path, build)`：
+
+1. `with SqliteSaver.from_conn_string(path) as saver:` 打开文件
+2. `saver.list(None)` 遍历文件里**所有** thread 的所有检查点；每个元素的 `.config["configurable"]["thread_id"]` 是它属于的 thread
+3. 对每个不同的 thread_id，用 `build(saver).get_state({"configurable": {"thread_id": ...}})` 看 `next`
+4. 返回 `next` 不为空的 thread_id 列表，按字母排序；文件里还没有任何 thread 时返回 `[]`
+
+例：`msa-1` 已经导出，`msa-2`、`msa-3` 停在 export 前 → `["msa-2", "msa-3"]`
+--- starter
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+def waiting_threads(path, build):
+    pass
+--- solution
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+def waiting_threads(path, build):
+    with SqliteSaver.from_conn_string(path) as saver:
+        thread_ids = {t.config["configurable"]["thread_id"] for t in saver.list(None)}
+        app = build(saver)
+        waiting = []
+        for tid in thread_ids:
+            if app.get_state({"configurable": {"thread_id": tid}}).next:
+                waiting.append(tid)
+    return sorted(waiting)
+--- tests
+import os
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def build(saver):
+    g = StateGraph(State)
+    g.add_node("review", lambda s: {"verdict": "redline" if "unlimited" in s["clause"] else "accept"})
+    g.add_node("export", lambda s: {"report": f"{s['clause']}: {s['verdict']}"})
+    g.add_edge(START, "review")
+    g.add_conditional_edges("review", lambda s: "export" if s["verdict"] == "redline" else END, ["export", END])
+    g.add_edge("export", END)
+    return g.compile(checkpointer=saver, interrupt_before=["export"])
+
+os.makedirs("work/d33", exist_ok=True)
+P = "work/d33/waiting.sqlite"
+def _fresh():
+    if os.path.exists(P):
+        os.remove(P)
+    with SqliteSaver.from_conn_string(P) as saver:
+        app = build(saver)
+        app.invoke({"clause": "8.1 unlimited liability"}, {"configurable": {"thread_id": "msa-2"}})
+        app.invoke({"clause": "3.1 net 30"}, {"configurable": {"thread_id": "msa-1"}})
+        app.invoke({"clause": "12 unlimited damages"}, {"configurable": {"thread_id": "msa-3"}})
+expect("两份在等", lambda: (_fresh(), waiting_threads(P, build))[1], ["msa-2", "msa-3"])
+def _after_approval():
+    _fresh()
+    with SqliteSaver.from_conn_string(P) as saver:
+        build(saver).invoke(None, {"configurable": {"thread_id": "msa-2"}})
+    return waiting_threads(P, build)
+expect("msa-2 批准导出后只剩 msa-3", _after_approval, ["msa-3"])
+def _empty():
+    if os.path.exists(P):
+        os.remove(P)
+    return waiting_threads(P, build)
+expect("空文件", _empty, [])
+--- hints
+- 先用集合收集 thread_id：`{t.config["configurable"]["thread_id"] for t in saver.list(None)}`，同一个 thread 有很多检查点，集合自动去重。
+- `get_state(...).next` 是元组，空元组为假，所以 `if ... .next:` 就是「还有下一步」。
+- 所有读取都要在 `with` 块里面做，出了 `with` 连接就关了。
+
+@@ item d33-15
+type: choice
+title: 记在哪里
+level: 2
+--- prompt
+Acme 的律师在一次审查里说：「我们接受 24 个月的责任上限」。下周审 Acme 的**另一份**合同（新的 thread）时，代理也应该知道这件事。存在哪里最合适？
+--- options
+- 就留在这次对话的 messages 里，checkpointer 会记住
+- 存进 Store：namespace `("prefs", "acme")`，key `"liability_cap"`；审任何一份 Acme 合同时，由节点通过 `runtime.store` 读出来
+- 所有 Acme 合同都用同一个 `thread_id`，这样历史就都在一起了
+- 写进 system prompt 的常量里
+answer: 2
+--- explain
+checkpointer 按 thread 存，新合同是新 thread，上一段对话看不到；所有合同共用一个 thread 的话，历史越来越长，每次都要把别的合同的对话发给模型，也分不清哪条消息属于哪份合同。写死在 system prompt 里会对所有客户生效，而且改一次要重新部署。Store 就是为「跨 thread、按用户或客户组织」的长期记忆设计的；在 Clause Check 里，这类偏好本来就该和 `data/playbook.json` 一样当作数据来管理。
+
+@@ item d33-16
+type: code
+title: 按客户读偏好
+level: 2
+--- prompt
+写两处：
+
+- `save_preference(store, customer, topic, rule)`：存到 namespace `("prefs", customer)`，key 是 `topic`，value 是 `{"rule": rule}`
+- `load_rule` 节点：从 `runtime.store` 读**这个客户**（`runtime.context.customer`）在 `state["topic"]` 上的偏好，返回 `{"rule": 那条 rule}`；没有就返回 `{"rule": DEFAULT}`
+
+例：`save_preference(store, "acme", "liability_cap", "24 months is acceptable")` 以后，用 `Ctx(customer="acme")` 调用图、`topic` 为 `"liability_cap"` → `rule` 是 `"24 months is acceptable"`；换成 globex → `DEFAULT`。
+--- starter
+from dataclasses import dataclass
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
+from langgraph.store.memory import InMemoryStore
+
+DEFAULT = "standard playbook"
+
+@dataclass
+class Ctx:
+    customer: str
+
+class State(TypedDict, total=False):
+    topic: str
+    rule: str
+
+def save_preference(store, customer, topic, rule):
+    pass
+
+def load_rule(state: State, runtime: Runtime[Ctx]):
+    return {"rule": DEFAULT}
+
+def build(store):
+    g = StateGraph(State, context_schema=Ctx)
+    g.add_node("load_rule", load_rule)
+    g.add_edge(START, "load_rule")
+    g.add_edge("load_rule", END)
+    return g.compile(store=store)
+--- solution
+from dataclasses import dataclass
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
+from langgraph.store.memory import InMemoryStore
+
+DEFAULT = "standard playbook"
+
+@dataclass
+class Ctx:
+    customer: str
+
+class State(TypedDict, total=False):
+    topic: str
+    rule: str
+
+def save_preference(store, customer, topic, rule):
+    store.put(("prefs", customer), topic, {"rule": rule})
+
+def load_rule(state: State, runtime: Runtime[Ctx]):
+    item = runtime.store.get(("prefs", runtime.context.customer), state["topic"])
+    if item is None:
+        return {"rule": DEFAULT}
+    return {"rule": item.value["rule"]}
+
+def build(store):
+    g = StateGraph(State, context_schema=Ctx)
+    g.add_node("load_rule", load_rule)
+    g.add_edge(START, "load_rule")
+    g.add_edge("load_rule", END)
+    return g.compile(store=store)
+--- tests
+def _rule(store, customer, topic):
+    return build(store).invoke({"topic": topic}, context=Ctx(customer=customer))["rule"]
+def _saved():
+    st = InMemoryStore()
+    save_preference(st, "acme", "liability_cap", "24 months is acceptable")
+    return st.get(("prefs", "acme"), "liability_cap").value
+expect("save_preference 存的位置和格式", _saved, {"rule": "24 months is acceptable"})
+def _lookup():
+    st = InMemoryStore()
+    save_preference(st, "acme", "liability_cap", "24 months is acceptable")
+    return [_rule(st, "acme", "liability_cap"), _rule(st, "acme", "payment"), _rule(st, "globex", "liability_cap")]
+expect("按客户、按 topic 读；没有就用默认", _lookup, ["24 months is acceptable", DEFAULT, DEFAULT])
+def _overwrite():
+    st = InMemoryStore()
+    save_preference(st, "acme", "payment", "net 45")
+    save_preference(st, "acme", "payment", "net 60")
+    return [_rule(st, "acme", "payment"), len(st.search(("prefs", "acme")))]
+expect("同一个 key 再存会覆盖", _overwrite, ["net 60", 1])
+--- hints
+- 存：`store.put(namespace, key, value)`，namespace 是元组 `("prefs", customer)`。
+- 读：`runtime.store.get(("prefs", runtime.context.customer), state["topic"])`，没有时返回 `None`。
+- 有的话值在 `item.value["rule"]`。
+
+@@ item d33-17
+type: fix
+title: 修 bug：裁剪后 API 报 400
+level: 3
+--- prompt
+为了省 token，`call_model` 只把最后几条消息发给模型。短对话没问题，但一段调用过工具的长对话一裁剪，DeepSeek（这里是 mock）就返回 400。
+
+运行测试，读 400 的错误信息，看看裁剪后第一条非 system 消息是什么。修好 `call_model`：保留的部分要从一条**用户消息**开始。只改 `trim_messages` 的参数。
+--- starter
+from langchain_core.messages import trim_messages
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def call_model(state: MessagesState):
+    recent = trim_messages(state["messages"], max_tokens=4, token_counter=len,
+                           strategy="last", include_system=True)
+    return {"messages": [model.invoke(recent)]}
+
+g = StateGraph(MessagesState)
+g.add_node("model", call_model)
+g.add_edge(START, "model")
+g.add_edge("model", END)
+app = g.compile()
+--- solution
+from langchain_core.messages import trim_messages
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def call_model(state: MessagesState):
+    recent = trim_messages(state["messages"], max_tokens=4, token_counter=len,
+                           strategy="last", include_system=True, start_on="human")
+    return {"messages": [model.invoke(recent)]}
+
+g = StateGraph(MessagesState)
+g.add_node("model", call_model)
+g.add_edge(START, "model")
+g.add_edge("model", END)
+app = g.compile()
+--- tests
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+TOOL_CHAT = [
+    SystemMessage("You review contracts for Acme."),
+    HumanMessage("Review clause 8.1"),
+    AIMessage("", tool_calls=[{"name": "lookup_playbook", "args": {"topic": "liability_cap"}, "id": "call_1"}]),
+    ToolMessage("PB-01: cap at 12 months of fees", tool_call_id="call_1"),
+    AIMessage("8.1 needs a redline."),
+    HumanMessage("Review clause 9.2"),
+]
+PLAIN_CHAT = [
+    SystemMessage("You review contracts for Acme."),
+    HumanMessage("Review clause 1"), AIMessage("accept"),
+    HumanMessage("Review clause 2"), AIMessage("flag"),
+    HumanMessage("Review clause 3"),
+]
+def _sent(messages):
+    MOCK.reset()
+    out = app.invoke({"messages": messages})
+    return [[m["role"] for m in MOCK.calls[-1]["body"]["messages"]], out["messages"][-1].content]
+expect("调过工具的长对话：从用户消息开始保留", lambda: _sent(TOOL_CHAT), [["system", "user"], "Mock reply: Review clause 9.2"])
+expect("普通长对话：保留最后 3 条", lambda: _sent(PLAIN_CHAT), [["system", "user", "assistant", "user"], "Mock reply: Review clause 3"])
+expect("短对话：原样发送", lambda: _sent(TOOL_CHAT[:2]), [["system", "user"], "Mock reply: Review clause 8.1"])
+expect("只裁发给模型的，state 里的历史一条不少", lambda: len(app.invoke({"messages": TOOL_CHAT})["messages"]), 7)
+--- hints
+- 400 的信息说 index 1 的 tool 消息找不到它回答的那个 tool call：它的 AIMessage 被裁掉了，只剩下半截。
+- `trim_messages` 有一个参数规定「保留的部分从哪种消息开始」。
+- 加上 `start_on="human"`。
+
+@@ item d33-18
+type: testwrite
+title: 写测试：继续还是停
+level: 2
+--- prompt
+被测函数 `should_continue(state, max_rounds=3)` 是一个自己写的路由函数，用来替代 `tools_condition`，多了一个「工具轮数」上限：
+
+- 没有消息，或最后一条不是带 tool_calls 的 AIMessage → `END`
+- 已经有**超过** `max_rounds` 条带 tool_calls 的 AIMessage → `"give_up"`
+- 否则 → `"tools"`
+
+写测试函数（`def test_...():` 里用 `assert`），在正确的函数上全部通过，并抓住藏起来的有 bug 的版本。消息可以直接构造：`AIMessage("", tool_calls=[{"name": "lookup_playbook", "args": {}, "id": "c1"}])`。
+--- impl
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    if not messages:
+        return END
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
+    if rounds > max_rounds:
+        return "give_up"
+    return "tools"
+--- mutants
+===== 边界：刚好第 max_rounds 轮时还应该去 tools
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    if not messages:
+        return END
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
+    if rounds >= max_rounds:
+        return "give_up"
+    return "tools"
+===== 最终回答：tool_calls 是空列表 [] 时应该结束
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    if not messages:
+        return END
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or last.tool_calls is None:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
+    if rounds > max_rounds:
+        return "give_up"
+    return "tools"
+===== 空的消息列表
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
+    if rounds > max_rounds:
+        return "give_up"
+    return "tools"
+===== 轮数：只数带 tool_calls 的 AIMessage，不数所有 AIMessage
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    if not messages:
+        return END
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage))
+    if rounds > max_rounds:
+        return "give_up"
+    return "tools"
+--- starter
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.graph import END
+
+def call(i):
+    return AIMessage("", tool_calls=[{"name": "lookup_playbook", "args": {}, "id": f"c{i}"}])
+
+def test_first_round_goes_to_tools():
+    state = {"messages": [HumanMessage("Review clause 8.1"), call(1)]}
+    assert should_continue(state) == "tools"
+--- solution
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.graph import END
+
+def call(i):
+    return AIMessage("", tool_calls=[{"name": "lookup_playbook", "args": {}, "id": f"c{i}"}])
+
+def rounds(n):
+    msgs = [HumanMessage("Review clause 8.1")]
+    for i in range(1, n + 1):
+        msgs.append(call(i))
+        if i < n:
+            msgs.append(ToolMessage("PB-01", tool_call_id=f"c{i}"))
+    return msgs
+
+def test_first_round_goes_to_tools():
+    assert should_continue({"messages": rounds(1)}) == "tools"
+
+def test_exactly_max_rounds_still_goes_to_tools():
+    assert should_continue({"messages": rounds(3)}) == "tools"
+
+def test_more_than_max_rounds_gives_up():
+    assert should_continue({"messages": rounds(4)}) == "give_up"
+
+def test_final_answer_ends():
+    msgs = [HumanMessage("Review clause 8.1"), AIMessage("8.1 needs a redline.")]
+    assert should_continue({"messages": msgs}) == END
+
+def test_empty_messages_end():
+    assert should_continue({"messages": []}) == END
+
+def test_earlier_plain_answers_are_not_rounds():
+    msgs = [HumanMessage("a"), AIMessage("ok"), HumanMessage("b"), AIMessage("ok"), HumanMessage("c"), AIMessage("ok"), HumanMessage("d"), call(1)]
+    assert should_continue({"messages": msgs}) == "tools"
+--- hints
+- 边界：正好 3 轮时应该还是 `"tools"`，4 轮才 `"give_up"`。写一个小函数造出 n 轮的消息列表。
+- 模型的最终回答是一条 `tool_calls` 为 `[]` 的 AIMessage，不是 `None`；还有空列表 `{"messages": []}`。
+- 多轮对话里，以前的普通回答（没有 tool_calls 的 AIMessage）不算工具轮数。
+
+@@ item d33-19
+type: local
+title: 本机任务（选做）：看真实的检查点文件
+level: 2
+--- prompt
+在真实项目里跑一次 LangGraph 版本的审查，然后直接查 SQLite 文件，看每个 thread 存了多少个检查点（免费：`--mode mock` 不调模型）。在 PowerShell 里：
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck review data/sample_contract.txt --mode mock --graph --approve yes --thread day33-1 --out data/day33.report.json
+python -c "import sqlite3; c = sqlite3.connect('data/checkpoints.sqlite'); print(c.execute('SELECT thread_id, COUNT(*) FROM checkpoints GROUP BY thread_id').fetchall())"
+```
+
+然后把**第一条命令再跑一次**（同一个 `--thread day33-1`），再跑第二条。`day33-1` 的数字变了吗？想一想：thread 是「一次运行」还是「一段历史」？
+
+把第一次两条命令的输出粘贴到下面（第一条的输出很长，从 `Interrupted before export` 开始粘贴也可以）。
+placeholder: 粘贴输出，应该有 approved=True 和 ('day33-1', 数字)
+verify: approved=True[\s\S]*\('day33-1', \d+\)
+--- hints
+- `No module named 'langgraph'`：先运行 `python -m pip install langgraph langgraph-checkpoint-sqlite`。
+- 同一个 thread 再跑一次，新的检查点接在旧的后面：thread 是一段历史，`get_state` 只返回最新的那个。
+- `data/checkpoints.sqlite` 和报告文件都在 `.gitignore` 里，随便跑不会弄脏仓库。
+
+@@ item d33-e1
+type: scratch
+title: 闭卷：有上限、不怕工具出错的代理
+exam: yes
+level: 3
+--- prompt
+写 `review_agent(question, tools, limit=10)`，搭一个审查代理并运行一次：
+
+- 模型：`ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})`（`from langchain_deepseek import ChatDeepSeek`），绑定 `tools`
+- 图：`MessagesState`；节点 `"model"`（调模型，返回 `{"messages": [回复]}`）和 `"tools"`（`ToolNode(tools, handle_tool_errors=True)`）；START → model；model 之后用 `tools_condition`；tools → model
+- 用 `InMemorySaver()` 编译；调用时 thread_id 是 `"exam"`，`recursion_limit` 是 `limit`
+- 正常结束：返回 `{"answer": 最后一条消息的 content, "tools_used": [...], "stopped": False}`，`tools_used` 是所有 AIMessage 的 tool_calls 里的工具名，按出现顺序
+- 超过上限（`GraphRecursionError`，在 `langgraph.errors`）：不要抛出。用 `get_state` 取出到目前为止的消息，返回 `{"answer": None, "tools_used": [...], "stopped": True}`
+
+测试里的工具被调用超过 20 次就会中止整个运行（安全网：上限没传进去时，不至于跑上万步）。
+--- solution
+from langchain_core.messages import AIMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import StateGraph, START, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+def review_agent(question, tools, limit=10):
+    model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", tools_condition)
+    g.add_edge("tools", "model")
+    app = g.compile(checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "exam"}}
+    stopped = False
+    try:
+        app.invoke({"messages": [("user", question)]}, {**cfg, "recursion_limit": limit})
+    except GraphRecursionError:
+        stopped = True
+    messages = app.get_state(cfg).values["messages"]
+    used = [c["name"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls]
+    answer = None if stopped else messages[-1].content
+    return {"answer": answer, "tools_used": used, "stopped": stopped}
+--- tests
+from langchain_core.tools import tool
+PLAYBOOK = {"liability_cap": "PB-01: cap at 12 months of fees"}
+class _SafetyNet(BaseException):   # 不是 Exception：handle_tool_errors 接不住它
+    pass
+_USED = {"n": 0}
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    _USED["n"] += 1
+    if _USED["n"] > 20:   # 安全网：上限没传进去时，别让 [loop] 跑上万步
+        raise _SafetyNet("the tool was called more than 20 times: did recursion_limit reach invoke?")
+    return PLAYBOOK[topic]
+def _agent(question, **kw):
+    _USED["n"] = 0
+    return review_agent(question, [lookup_playbook], **kw)
+expect("正常", lambda: _agent("Review clause 8.1: Liability is unlimited."), {"answer": "Based on the playbook: PB-01: cap at 12 months of fees", "tools_used": ["lookup_playbook"], "stopped": False})
+expect_true("工具抛错也不崩", lambda: _agent("Review clause 14: governed by Swedish law.")["answer"].startswith("Based on the playbook: Error"))
+expect("死循环：停下并报告调过的工具", lambda: _agent("[loop] Review clause 8.1 liability", limit=6), {"answer": None, "tools_used": ["lookup_playbook"] * 3, "stopped": True})
+
+@@ item d33-e2
+type: scratch
+title: 闭卷：导出前让律师改判
+exam: yes
+level: 3
+--- prompt
+写 `review_and_correct(clauses, corrections)`：
+
+- `clauses`：`[{"id": "8.1", "text": "..."}, ...]`；`corrections`：律师的改判 `{"8.1": "flag"}`，可能为空，也可能包含不存在的条款编号（忽略它们）
+- 用 LangGraph 搭图：state 有 `clauses`、`verdicts`（字典：编号 → 结论）、`report`（列表）
+- 节点 `review`：文字里（不分大小写）有 `unlimited` 的判 `"redline"`，否则 `"accept"`，写进 `verdicts`
+- 节点 `export`：`report` 是按 `clauses` 顺序的 `"编号: 结论"` 字符串列表
+- START → review → export → END；用 `InMemorySaver()` 编译，`interrupt_before=["export"]`；thread_id 随便取
+- 流程：运行到停下 → 读出停下时的 `verdicts` → 有有效改判时用 `update_state` 写入**合并后的完整字典** → `invoke(None, ...)` 跑完
+- 返回 `{"before": 停下时的 verdicts, "after": 最终 state 里的 verdicts, "report": 最终的 report}`
+--- solution
+from typing import TypedDict
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clauses: list
+    verdicts: dict
+    report: list
+
+def review(state: State):
+    return {"verdicts": {c["id"]: ("redline" if "unlimited" in c["text"].lower() else "accept") for c in state["clauses"]}}
+
+def export(state: State):
+    return {"report": [f"{c['id']}: {state['verdicts'][c['id']]}" for c in state["clauses"]]}
+
+def review_and_correct(clauses, corrections):
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    app = g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+    cfg = {"configurable": {"thread_id": "review"}}
+    app.invoke({"clauses": clauses}, cfg)
+    before = app.get_state(cfg).values["verdicts"]
+    valid = {k: v for k, v in corrections.items() if k in before}
+    if valid:
+        app.update_state(cfg, {"verdicts": {**before, **valid}})
+    final = app.invoke(None, cfg)
+    return {"before": before, "after": final["verdicts"], "report": final["report"]}
+--- tests
+CL = [{"id": "8.1", "text": "Liability is UNLIMITED."}, {"id": "3.1", "text": "Net 30."}, {"id": "12", "text": "Unlimited damages."}]
+V0 = {"8.1": "redline", "3.1": "accept", "12": "redline"}
+expect("没有改判", lambda: review_and_correct(CL, {}), {"before": V0, "after": V0, "report": ["8.1: redline", "3.1: accept", "12: redline"]})
+expect("改判一条，其他不变", lambda: review_and_correct(CL, {"12": "flag"})["report"], ["8.1: redline", "3.1: accept", "12: flag"])
+expect("不存在的编号被忽略，不会写进 verdicts", lambda: (lambda r: [r["after"], r["report"]])(review_and_correct(CL, {"99": "flag", "3.1": "flag"})), [{"8.1": "redline", "3.1": "flag", "12": "redline"}, ["8.1: redline", "3.1: flag", "12: redline"]])
+
+@@ item d33-e3
+type: scratch
+title: 闭卷：记得客户的助手
+exam: yes
+level: 3
+--- prompt
+写两个函数：
+
+- `save_note(store, customer, key, text)`：存到 Store 的 namespace `("notes", customer)`，key 为 `key`，value 为 `{"text": text}`
+- `build_assistant(model, store)`：返回编译好的图
+  - state 用 `MessagesState`；`context_schema` 是下面的 `Ctx`（`from dataclasses import dataclass`）：
+    ```python
+    @dataclass
+    class Ctx:
+        customer: str
+    ```
+  - 只有一个节点 `"answer"`（START → answer → END）。它用 `runtime.store.search(("notes", 客户), limit=100)` 取出这个客户的所有笔记（`search` 默认最多只给 10 条），**按 key 排序**后把 `text` 用 `"; "` 连起来，组成 system 消息 `"Customer notes: ..."`；没有笔记时是 `"Customer notes: none"`
+  - 调模型时发送 `[SystemMessage(那段文字)] + state["messages"]`，只把模型的回复存进 state
+  - 编译时同时传 `checkpointer=InMemorySaver()` 和 `store=store`
+
+调用方式：`app.invoke({"messages": [("user", "...")]}, {"configurable": {"thread_id": "t1"}}, context=Ctx(customer="acme"))`
+--- solution
+from dataclasses import dataclass
+from langchain_core.messages import SystemMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.runtime import Runtime
+
+@dataclass
+class Ctx:
+    customer: str
+
+def save_note(store, customer, key, text):
+    store.put(("notes", customer), key, {"text": text})
+
+def build_assistant(model, store):
+    def answer(state: MessagesState, runtime: Runtime[Ctx]):
+        items = sorted(runtime.store.search(("notes", runtime.context.customer), limit=100), key=lambda item: item.key)
+        notes = "; ".join(item.value["text"] for item in items) or "none"
+        reply = model.invoke([SystemMessage(f"Customer notes: {notes}")] + state["messages"])
+        return {"messages": [reply]}
+
+    g = StateGraph(MessagesState, context_schema=Ctx)
+    g.add_node("answer", answer)
+    g.add_edge(START, "answer")
+    g.add_edge("answer", END)
+    return g.compile(checkpointer=InMemorySaver(), store=store)
+--- tests
+from langchain_deepseek import ChatDeepSeek
+from langgraph.store.memory import InMemoryStore
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+def _run():
+    MOCK.reset()
+    st = InMemoryStore()
+    save_note(st, "acme", "b-renewal", "max 12 month renewals")
+    save_note(st, "acme", "a-liability", "24 month cap is fine")
+    app = build_assistant(MODEL, st)
+    t1 = {"configurable": {"thread_id": "t1"}}
+    app.invoke({"messages": [("user", "Review clause 8.1")]}, t1, context=Ctx(customer="acme"))
+    app.invoke({"messages": [("user", "And clause 9.2?")]}, t1, context=Ctx(customer="acme"))
+    second = MOCK.calls[-1]["body"]["messages"]
+    app.invoke({"messages": [("user", "Review clause 8.1")]}, {"configurable": {"thread_id": "t2"}}, context=Ctx(customer="globex"))
+    other = MOCK.calls[-1]["body"]["messages"]
+    state = app.get_state(t1).values["messages"]
+    return {"second": second, "other": other, "state": state}
+expect("笔记按 key 排序放进 system", lambda: _run()["second"][0]["content"], "Customer notes: 24 month cap is fine; max 12 month renewals")
+expect("同一个 thread 记得上一轮；state 里不存 system 消息", lambda: (lambda r: [[m["role"] for m in r["second"]], [type(m).__name__ for m in r["state"]]])(_run()), [["system", "user", "assistant", "user"], ["HumanMessage", "AIMessage", "HumanMessage", "AIMessage"]])
+expect("别的客户没有笔记、没有历史", lambda: [(m["role"], m["content"]) for m in _run()["other"]], [("system", "Customer notes: none"), ("user", "Review clause 8.1")])
+def _many():
+    MOCK.reset()
+    st = InMemoryStore()
+    for i in range(12):
+        save_note(st, "initech", f"n{i:02d}", f"note {i}")
+    build_assistant(MODEL, st).invoke({"messages": [("user", "hi")]}, {"configurable": {"thread_id": "t3"}}, context=Ctx(customer="initech"))
+    return MOCK.calls[-1]["body"]["messages"][0]["content"].count("note ")
+expect("12 条笔记一条不少", _many, 12)

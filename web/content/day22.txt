@@ -1,0 +1,637 @@
+@@ day 22
+title: SQL 基础：查询、过滤、排序、分组
+lang: sql
+dataset: clausecheck
+hours: 4–5 小时
+--- goal
+能像读「列表里装字典」一样读一张表，用 SELECT / WHERE / ORDER BY / GROUP BY / HAVING 回答问题，并且正确处理 NULL。几乎每场数据 / AI 工程师面试都会考 SQL；Clause Check 上线以后，审查记录、评测结果和费用就放在这样的表里（本周的样例库 `clausecheck`）。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每个例子都改一改再运行
+- 练习区全部通过
+- 闭卷挑战 3 题
+- 能用自己的话讲清楚：WHERE 和 HAVING 的区别；为什么 `= NULL` 一行也找不到
+
+@@ concept
+title: 为什么 AI 工程师要会 SQL
+--- body
+LLM 应用上线以后，最有用的数据都在数据库里：每次调用模型的记录（trace）、评测结果、费用、客户。有人问「哪个客户最费钱？」「v2 prompt 真的比 v1 好吗？」，答案都是一条 SQL。
+
+一张**表**就像第 2 天的「列表里装字典」：每一**行**是一个字典，每一**列**是一个固定的键，而且每列的类型是定好的。
+
+本周的样例库 `clausecheck`，就是 Clause Check 上线后可能有的几张表：
+
+- `customers`：6 个客户（国家、套餐）
+- `contracts`：10 份合同，`customer_id` 指向客户
+- `reviews`：65 条审查记录，一条条款一行：判定、风险、模型、token、延迟、费用（`model` 列里的 `deepseek-v4-flash` 是 flash 模型的旧名字，DeepSeek 现在还接受；新代码写 `deepseek-flash`）
+- `evals`：评测结果，8 个用例 × v1、v2 两版 prompt × 各跑 3 次
+- `tool_calls`：每次审查调了哪些工具
+
+本页在浏览器里用 **SQLite** 运行 SQL。今天的写法在 Postgres 和 BigQuery 里基本一样，不一样的地方会专门说明（比如 BigQuery 的表名要带上数据集：`clausecheck.reviews`，第 25 天再讲）。点「运行」看结果；下面的「表结构」可以展开看每张表的列名。
+--- code
+-- 一行一个客户。运行，再把 * 换成 name, country 试试
+SELECT * FROM customers;
+
+@@ concept
+title: SELECT、AS、LIMIT、DISTINCT
+--- body
+一条查询从 `SELECT` 开始：**要哪些列**，`FROM` **哪张表**。
+
+- 列名之间用逗号隔开；`AS` 给结果列起个名字（别名）
+- 列可以是算出来的：`prompt_tokens + completion_tokens AS total_tokens`，就像 Python 的 `r["prompt_tokens"] + r["completion_tokens"]`
+- `LIMIT 5`：最多返回 5 行
+- `SELECT DISTINCT model`：去掉重复的行，像第 8 天的 `set`。写两列就是去掉重复的「组合」
+- `SELECT *` 取全部列，只在探索数据时用；正式的查询把要的列写清楚（第 25 天会看到，在 BigQuery 里 `SELECT *` 还会多花钱）
+
+SQL 的关键字不分大小写，习惯上写成大写；结尾的分号可写可不写。
+--- code
+SELECT id,
+       clause_id,
+       prompt_tokens + completion_tokens AS total_tokens,
+       latency_ms / 1000.0 AS latency_s
+FROM reviews
+LIMIT 5;
+-- 再试试这一条（把上面整条换掉）：SELECT DISTINCT model, prompt_version FROM reviews;
+
+@@ concept
+title: WHERE：挑出需要的行
+--- body
+`WHERE` 后面写条件，只留下条件**成立**的行，相当于列表推导式里的 `if`：
+
+- 比较：`=`（只有一个等号）、`<>`（不等于，`!=` 也行）、`<`、`>=`
+- 组合：`AND`、`OR`、`NOT`。**`AND` 比 `OR` 先算**，两个混着用时一定加括号
+- `topic IN ('payment', 'termination')`：等于其中任何一个
+- `pages BETWEEN 5 AND 12`：包括两头的 5 和 12
+- `heading LIKE '%Renewal%'`：`%` 代表任意多个字符，`_` 代表一个字符
+- 文字用**单引号**。双引号在 Postgres 里表示列名，别混用
+
+方言差别：SQLite 的 `LIKE` 不分英文大小写，Postgres 和 BigQuery 的 `LIKE` 分（Postgres 另有 `ILIKE`）。这个库里的时间是 `'2026-09-05 13:17:04'` 这样的文字，文字比较正好就是按时间先后。
+--- code
+SELECT id, contract_id, clause_id, heading, risk
+FROM reviews
+WHERE (topic = 'payment' OR topic = 'termination')
+  AND risk <> 'low';
+
+@@ concept
+title: NULL：「不知道」
+--- body
+审查失败的两行（`id` 1047 和 1061），`verdict`、`risk`、`rule_ids` 都是 **NULL**：不是空字符串，也不是 0，而是「没有值 / 不知道」。
+
+- 任何值和 NULL 比较，结果还是「不知道」，而 WHERE 只留下**成立**的行。所以 `verdict = NULL` 永远一行也找不到，要写 `verdict IS NULL` 或 `IS NOT NULL`
+- 同样，`verdict <> 'accept'` 也**不会**返回失败的那两行；`NOT IN (...)` 一样
+- `COALESCE(verdict, 'failed')` 返回第一个不是 NULL 的值，用来给默认值。SQLite 和 BigQuery 还有 `IFNULL`，Postgres 没有；`COALESCE` 到处都能用
+
+Python 里 `None == None` 是 True，SQL 里 `NULL = NULL` 却不成立。这是面试最爱问的一点。
+--- code
+SELECT id,
+       clause_id,
+       verdict,
+       COALESCE(verdict, 'failed') AS verdict_or_failed,
+       error
+FROM reviews
+WHERE verdict IS NULL;
+
+@@ concept
+title: ORDER BY：排序和前 N 名
+--- body
+- `ORDER BY cost_usd DESC`：从大到小；不写或写 `ASC` 是从小到大
+- 多列：`ORDER BY contract_id, cost_usd DESC`：先按第一列排，第一列一样的再按第二列
+- 前 N 名 = `ORDER BY ... LIMIT N`。**没写 ORDER BY 的结果，顺序没有任何保证**，不要依赖它
+- NULL 排在哪头，各个数据库不一样（SQLite 和 BigQuery 从小到大时 NULL 在最前，Postgres 在最后）
+
+经典陷阱：`clause_id` 是**文字**，文字一个字符一个字符地比，`'10.1' < '8.1'`（因为 `'1' < '8'`），和 Python 的 `sorted(["8.1", "10.1"])` 一样。按数字排要先转成数字：`CAST(clause_id AS REAL)` 把 `'10.1'` 变成 10.1。这个办法只在小数点后面都是一位数时才对（`'8.10'` 会变成 8.1，排到 `'8.9'` 前面），更稳的做法是拆成两段整数分别排（`substr`、`instr` 是 SQLite 的字符串函数，Postgres 可以用 `split_part`）：
+
+```sql
+ORDER BY CAST(substr(clause_id, 1, instr(clause_id, '.') - 1) AS INTEGER),
+         CAST(substr(clause_id, instr(clause_id, '.') + 1) AS INTEGER)
+```
+--- code
+SELECT clause_id,
+       heading,
+       CAST(clause_id AS REAL) AS as_number
+FROM reviews
+WHERE contract_id = 101
+ORDER BY clause_id;
+-- 把 ORDER BY clause_id 改成 ORDER BY as_number 再运行，比较两次的顺序
+
+@@ concept
+title: 聚合：把很多行变成一个数
+--- body
+聚合函数把很多行「折叠」成一个值，像 Python 的 `len`、`sum`、`max`：
+
+- `COUNT(*)` 数**行**；`COUNT(verdict)` 只数 verdict **不是 NULL** 的行；`COUNT(DISTINCT topic)` 数有几种不同的值
+- `SUM`、`AVG`、`MIN`、`MAX` 都会**跳过 NULL**
+- `ROUND(x, 2)` 保留 2 位小数。平均数和钱都这样处理，结果才好读，也好比较（Postgres 的 `ROUND(x, 2)` 只接受 `numeric` 类型，钱一般就存成 `NUMERIC`；浮点数要先写 `x::numeric`）
+
+陷阱：**整数除以整数，结果还是整数**。SQLite 和 Postgres 里 `1 / 2` 是 0，所以两个 SUM 相除很容易得到 0。先乘 `1.0` 变成小数：`ROUND(1.0 * a / b, 3)`。BigQuery 不一样：它的 `/` 总是返回小数（`5 / 2 = 2.5`），整数除法要写 `DIV(5, 2)`。
+--- code
+SELECT COUNT(*) AS all_rows,
+       COUNT(verdict) AS with_verdict,
+       COUNT(DISTINCT topic) AS topics,
+       ROUND(AVG(latency_ms), 1) AS avg_latency_ms,
+       MAX(latency_ms) AS max_latency_ms,
+       ROUND(SUM(cost_usd), 4) AS total_cost_usd,
+       SUM(completion_tokens) / SUM(prompt_tokens) AS wrong_ratio,
+       ROUND(1.0 * SUM(completion_tokens) / SUM(prompt_tokens), 3) AS output_input_ratio
+FROM reviews;
+
+@@ concept
+title: GROUP BY 和 HAVING
+--- body
+`GROUP BY topic`：按 topic 把行分成几组，**每组输出一行**，聚合函数在每组里分别算。就像第 2 天用字典计数：`counts[topic] = counts.get(topic, 0) + 1`。
+
+- SELECT 里的每一列，要么写在 GROUP BY 里，要么包在聚合函数里。SQLite 允许你写一个两样都不是的列（悄悄取组里随便一行的值），Postgres 和 BigQuery 直接报错。**别这么写**
+- `WHERE` 在分组**之前**筛**行**；`HAVING` 在分组**之后**筛**组**。所以 `COUNT(*) >= 6` 只能写在 HAVING 里
+
+数据库执行的逻辑顺序和书写顺序不一样：
+
+FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY → LIMIT
+
+所以在 SELECT 里起的别名 `n`，ORDER BY 能用（它排在 SELECT 后面），WHERE 不能用（它排在前面）。HAVING 也排在 SELECT 前面：Postgres 的 HAVING 不认别名，要把 `COUNT(*)` 再写一遍，这样写在哪个数据库都能跑。SQLite 很宽松，WHERE、HAVING 里写别名它常常也接受，别被它惯坏了。
+--- code
+SELECT topic,
+       COUNT(*) AS n,
+       ROUND(AVG(latency_ms)) AS avg_latency_ms
+FROM reviews
+WHERE verdict IS NOT NULL
+GROUP BY topic
+HAVING COUNT(*) >= 6
+ORDER BY n DESC, topic;
+
+@@ concept
+title: CASE WHEN：贴标签、按条件计数
+--- body
+`CASE` 是 SQL 里的 if / elif / else：从上往下，第一个成立的 WHEN 生效；都不成立就用 ELSE，没写 ELSE 就是 NULL。
+
+```sql
+CASE WHEN latency_ms >= 5000 THEN 'slow'
+     WHEN latency_ms >= 2500 THEN 'ok'
+     ELSE 'fast' END
+```
+
+两种用法：
+
+- **贴标签**：放在 SELECT 里，生成新的一列，还可以按它分组
+- **按条件计数**：`SUM(CASE WHEN verdict = 'redline' THEN 1 ELSE 0 END)` 数出每组里有几条 redline。一条查询就能同时算好几种计数，不用查好几次
+
+Postgres 和 SQLite 还有更短的 `COUNT(*) FILTER (WHERE verdict = 'redline')`；BigQuery 里写 `COUNTIF(verdict = 'redline')`（第 25 天）。`SUM(CASE ...)` 哪里都能用，面试时写它最稳。
+--- code
+SELECT CASE WHEN latency_ms >= 5000 THEN 'slow'
+            WHEN latency_ms >= 2500 THEN 'ok'
+            ELSE 'fast' END AS speed,
+       COUNT(*) AS n,
+       SUM(CASE WHEN model = 'deepseek-v4-pro' THEN 1 ELSE 0 END) AS v4_pro,
+       COUNT(*) FILTER (WHERE verdict = 'redline') AS redlines
+FROM reviews
+GROUP BY speed
+ORDER BY MIN(latency_ms);
+
+@@ item d22-01
+type: choice
+title: 复习：Python 到 SQL
+level: 1
+lang: py
+--- prompt
+第 2 天你用下面这行代码从「列表里装字典」里挑数据。`reviews` 是字典列表，每个字典的键和今天 `reviews` 表的列名一样。哪一条 SQL 做的是同一件事？
+--- code
+high = [r["clause_id"] for r in reviews if r["risk"] == "high"]
+--- options
+- `SELECT clause_id FROM reviews WHERE risk = 'high'`
+- `SELECT clause_id FROM reviews IF risk == 'high'`
+- `SELECT * FROM reviews WHERE risk = 'high'`
+- `FROM reviews SELECT clause_id WHERE risk = 'high'`
+answer: 1
+--- explain
+列表推导式 `for` 前面的部分（`r["clause_id"]`）对应 `SELECT` 后面的列，`if` 对应 `WHERE`。SQL 比较用一个等号，文字用单引号。`SELECT *` 会返回整行的所有列，而 Python 版只取了 `clause_id`。SQL 的子句顺序是固定的：SELECT → FROM → WHERE，不能随便调换。
+
+@@ item d22-02
+type: sql
+title: 选列和算出来的列
+level: 1
+--- prompt
+律师大约每页要读 2 分钟。返回 `contracts` 表里的每一份合同，三列：`id`、`title`，以及 `review_minutes`（= `pages * 2`）。行的顺序不限。
+--- starter
+-- 还差 title 和 review_minutes 两列
+SELECT id
+FROM contracts;
+--- solution
+SELECT id, title, pages * 2 AS review_minutes
+FROM contracts;
+--- hints
+- 列之间用逗号隔开，最后一列后面不要逗号。
+- 算出来的列用 `AS` 起名字：`pages * 2 AS review_minutes`。
+
+@@ item d22-03
+type: sql
+title: 高风险又要改的
+level: 1
+--- prompt
+法务负责人想先看最严重的：`risk` 是 `high` **并且** `verdict` 是 `redline` 的审查。返回四列：`id`、`contract_id`、`clause_id`、`heading`。行的顺序不限。
+
+做完看看结果：这些条款都是关于什么的？
+--- starter
+SELECT id, contract_id, clause_id, heading
+FROM reviews;
+--- solution
+SELECT id, contract_id, clause_id, heading
+FROM reviews
+WHERE risk = 'high' AND verdict = 'redline';
+--- hints
+- 在 FROM 后面加 `WHERE`；两个条件都要成立，用 `AND` 连起来。
+- 文字用单引号，比较只用一个等号：`risk = 'high'`。
+
+@@ item d22-04
+type: choice
+title: BETWEEN 和时间
+level: 2
+--- prompt
+9 月 2 日有 3 条审查，9 月 5 日有 8 条，9 月 3 日和 4 日没有。`created_at` 是 `'2026-09-05 13:17:04'` 这样的文字。这条查询返回几行？
+--- code
+SELECT id, created_at
+FROM reviews
+WHERE created_at BETWEEN '2026-09-02' AND '2026-09-05';
+--- options
+- 11 行
+- 3 行
+- 8 行
+- 0 行：日期和带时间的文字不能比较
+answer: 2
+--- explain
+`BETWEEN a AND b` 等于 `>= a AND <= b`。`'2026-09-05 13:17:04'` 和 `'2026-09-05'` 前 10 个字符一样，但它更长，所以更大，9 月 5 日的 8 条全被排除了，只剩 9 月 2 日的 3 条。查「某天到某天，包括最后一天」的稳妥写法是**左闭右开**：`created_at >= '2026-09-02' AND created_at < '2026-09-06'`。Postgres 和 BigQuery 的真正时间类型也有同样的坑：`'2026-09-05'` 会被当成 9 月 5 日零点。
+
+@@ item d22-05
+type: sql
+title: 一段时间里的几类
+level: 2
+--- prompt
+9 月 2 日到 9 月 5 日（**包括 9 月 5 日全天**）创建的审查里，`topic` 是 `payment`、`liability_cap` 或 `data_processing` 的有哪些？返回三列：`id`、`topic`、`created_at`。行的顺序不限。
+--- solution
+SELECT id, topic, created_at
+FROM reviews
+WHERE topic IN ('payment', 'liability_cap', 'data_processing')
+  AND created_at >= '2026-09-02'
+  AND created_at < '2026-09-06';
+--- hints
+- 「等于三个值中的任何一个」：`topic IN ('payment', 'liability_cap', 'data_processing')`。
+- 上一题的坑：`<= '2026-09-05'` 会漏掉 9 月 5 日当天带时间的记录。
+- 左闭右开：`created_at >= '2026-09-02' AND created_at < '2026-09-06'`。
+
+@@ item d22-06
+type: sql
+title: 修 bug：少了括号
+level: 2
+--- prompt
+同事想找「和终止或续约有关、而且**不是** accept 的审查」：`heading` 里包含 `Termination` 或 `Renewal`，并且 `verdict` 不是 `accept`。可他的查询返回了好几行 accept。
+
+运行，看结果里的 `verdict` 列，修好它。返回的列不变：`id`、`heading`、`verdict`。
+--- starter
+SELECT id, heading, verdict
+FROM reviews
+WHERE heading LIKE '%Termination%'
+   OR heading LIKE '%Renewal%'
+  AND verdict <> 'accept';
+--- solution
+SELECT id, heading, verdict
+FROM reviews
+WHERE (heading LIKE '%Termination%' OR heading LIKE '%Renewal%')
+  AND verdict <> 'accept';
+--- hints
+- `AND` 比 `OR` 先算。所以现在的条件其实是：包含 Termination，**或者**（包含 Renewal 并且不是 accept）。
+- 把两个 LIKE 用括号括起来：`WHERE (... OR ...) AND verdict <> 'accept'`。
+
+@@ item d22-07
+type: sql
+title: 修 bug：找不到失败的
+level: 1
+--- prompt
+值班工程师要找出所有失败的审查（`verdict` 是 NULL），看看报错。下面的查询一行也没返回，可表里明明有失败的记录。修好它，返回 `id`、`contract_id`、`clause_id`、`error`。
+
+修好以后读一读两条 `error`：一条是模型的输出没通过校验（第 4 天的 Pydantic），一条是重试 3 次还是 429。
+--- starter
+SELECT id, contract_id, clause_id, error
+FROM reviews
+WHERE verdict = NULL;
+--- solution
+SELECT id, contract_id, clause_id, error
+FROM reviews
+WHERE verdict IS NULL;
+--- hints
+- 用 `=` 和 NULL 比较，结果是「不知道」，而 WHERE 只留下「成立」的行。
+- 改成 `verdict IS NULL`。
+
+@@ item d22-08
+type: choice
+title: NULL 和不等于
+level: 2
+--- prompt
+`reviews` 一共 65 行：accept 37 行、flag 14 行、redline 12 行，还有 2 行审查失败（`verdict` 是 NULL）。这条查询返回的数字是多少？
+--- code
+SELECT COUNT(*)
+FROM reviews
+WHERE verdict <> 'accept';
+--- options
+- 28
+- 26
+- 65
+- 0
+answer: 2
+--- explain
+失败那两行的 `verdict` 是 NULL，`NULL <> 'accept'` 的结果是「不知道」而不是「成立」，所以被 WHERE 丢掉了：14 + 12 = 26。如果你想要的是「所有需要人看的」（包括失败的），要写 `verdict <> 'accept' OR verdict IS NULL`。这种 bug 不报错，数字只是悄悄变少，所以面试官很爱问。
+
+@@ item d22-09
+type: sql
+title: 给失败的一个名字
+level: 2
+--- prompt
+要给客户生成一张状态表。返回合同 106 和 109 的所有审查，三列：`id`、`clause_id`、`status`。有 verdict 的，`status` 就是 verdict；审查失败（verdict 是 NULL）的，`status` 写 `'failed'`。行的顺序不限。
+--- solution
+SELECT id, clause_id, COALESCE(verdict, 'failed') AS status
+FROM reviews
+WHERE contract_id IN (106, 109);
+--- hints
+- 两份合同：`contract_id IN (106, 109)`。数字不加引号。
+- `COALESCE(verdict, 'failed')` 返回第一个不是 NULL 的值；别忘了 `AS status`。
+
+@@ item d22-10
+type: sql
+title: 最贵的 5 次审查
+level: 2
+ordered: yes
+--- prompt
+返回 `cost_usd` 最高的 5 条审查，六列：`id`、`contract_id`、`clause_id`、`model`、`cache_hit_tokens`、`cost_usd`，按费用从高到低。
+
+做完看看 `model` 和 `cache_hit_tokens` 这两列：前 3 条为什么最贵？后 2 条呢？（想想第 12 天的前缀缓存。）
+--- solution
+SELECT id, contract_id, clause_id, model, cache_hit_tokens, cost_usd
+FROM reviews
+ORDER BY cost_usd DESC
+LIMIT 5;
+--- hints
+- `ORDER BY cost_usd DESC` 从大到小，再 `LIMIT 5`。
+- 书写顺序：`SELECT … FROM … ORDER BY … LIMIT …`。
+- 前 3 条用的是大模型 `deepseek-v4-pro`：单价高得多（样例表按高峰价算，输出每百万 token 3.96 美元，flash 是 1.20，以官方价格页为准（2026-09）），输出的 token 也多，所以命中了缓存还是最贵。后 2 条是 flash，`cache_hit_tokens` 是 0：它们都是各自合同的**第一条**审查，而上一次请求已经是几天前的事：DeepSeek 的缓存不用了以后，一般几小时到几天就被清掉，所以这一次的输入全部按「未命中」的价格算。同一份合同后面的条款紧接着发，请求开头和上一次一样（第 12 天：不变的放前面），就便宜多了。
+
+@@ item d22-11
+type: sql
+title: 修 bug：10.1 排在最前
+level: 2
+ordered: yes
+--- prompt
+报告要列出合同 101 的审查：`clause_id`、`heading`、`verdict`，按条款编号的**数字**顺序（3.1、3.5、4.2 … 9.2、10.1、11.2 …）。下面的查询把 10.1 排到了最前面。运行，看看顺序，修好它。
+
+这份合同里，每个编号的小数点后面都只有一位数。
+--- starter
+SELECT clause_id, heading, verdict
+FROM reviews
+WHERE contract_id = 101
+ORDER BY clause_id;
+--- solution
+SELECT clause_id, heading, verdict
+FROM reviews
+WHERE contract_id = 101
+ORDER BY CAST(clause_id AS REAL);
+--- hints
+- `clause_id` 是文字，文字按字符比较：`'1' < '3'`，所以 `'10.1'` 排在 `'3.1'` 前面。
+- 按 `id` 排也不行：9.1 的审查（1008）比 10.1 的（1007）晚写进表里。
+- 排序时转成数字：`ORDER BY CAST(clause_id AS REAL)`。
+
+@@ item d22-12
+type: choice
+title: 三种 COUNT
+level: 2
+--- prompt
+合同 109 有 3 条审查：3.1 是 accept；8.1 第一次审查失败（verdict 是 NULL），重跑以后是 accept。这条查询返回什么？
+--- code
+SELECT COUNT(*), COUNT(verdict), COUNT(DISTINCT verdict)
+FROM reviews
+WHERE contract_id = 109;
+--- options
+- `3, 2, 1`
+- `3, 3, 2`
+- `3, 2, 2`
+- `2, 2, 1`
+answer: 1
+--- explain
+`COUNT(*)` 数行：3。`COUNT(verdict)` 只数 verdict 不是 NULL 的行：2。`COUNT(DISTINCT verdict)` 数不同的非 NULL 值：只有 accept 一种，所以是 1，NULL 不算一种。做报表时，「审查了几条」和「成功了几条」要分清用哪个 COUNT。
+
+@@ item d22-13
+type: sql
+title: 每种判定有几条
+level: 2
+ordered: yes
+--- prompt
+返回每种 `verdict` 各有几条审查，两列：`verdict`、`n`，按 `n` 从大到小。失败的审查（verdict 是 NULL）会自己成为一组，保留这一组。
+--- solution
+SELECT verdict, COUNT(*) AS n
+FROM reviews
+GROUP BY verdict
+ORDER BY n DESC;
+--- hints
+- `GROUP BY verdict`：每种 verdict 一行。
+- 用 `COUNT(*)`，不要用 `COUNT(verdict)`：后者在 NULL 那一组里是 0。
+- `ORDER BY n DESC`：SELECT 里起的别名，ORDER BY 可以直接用。
+
+@@ item d22-14
+type: sql
+title: 修 bug：命中率是 0
+level: 2
+ordered: yes
+--- prompt
+你想比较两个 prompt 版本的**缓存命中率**：命中缓存的输入 token ÷ 全部输入 token，也就是 `SUM(cache_hit_tokens) / SUM(prompt_tokens)`。下面的查询两个版本都算出了 0。
+
+运行，修好它：两列 `prompt_version`、`hit_ratio`，`hit_ratio` 保留 3 位小数，按 `prompt_version` 排序。
+--- starter
+SELECT prompt_version,
+       SUM(cache_hit_tokens) / SUM(prompt_tokens) AS hit_ratio
+FROM reviews
+GROUP BY prompt_version
+ORDER BY prompt_version;
+--- solution
+SELECT prompt_version,
+       ROUND(1.0 * SUM(cache_hit_tokens) / SUM(prompt_tokens), 3) AS hit_ratio
+FROM reviews
+GROUP BY prompt_version
+ORDER BY prompt_version;
+--- hints
+- 整数除以整数，SQLite 和 Postgres 会直接扔掉小数部分：37070 / 63146 = 0。
+- 先乘 `1.0` 变成小数再除，`1.0` 要放在最前面：`1.0 * SUM(cache_hit_tokens) / SUM(prompt_tokens)`。放在最后（`... / SUM(prompt_tokens) * 1.0`）就晚了，那时已经是 0。
+- 外面再包一层 `ROUND(..., 3)`。
+
+@@ item d22-15
+type: sql
+title: 找出重复的审查
+level: 2
+ordered: yes
+--- prompt
+同一份合同的同一条款，本来只应该审查一次。找出被审查了**不止一次**的「合同 + 条款」：三列 `contract_id`、`clause_id`、`n`（次数），按 `contract_id` 排序。
+
+找重复是面试 SQL 题的常客。明天会继续处理它们：每个条款只保留最新的那一次。
+--- solution
+SELECT contract_id, clause_id, COUNT(*) AS n
+FROM reviews
+GROUP BY contract_id, clause_id
+HAVING COUNT(*) > 1
+ORDER BY contract_id;
+--- hints
+- 按两列分组：`GROUP BY contract_id, clause_id`，每个「合同 + 条款」组合是一组。
+- 筛选**组**要用 `HAVING`：`HAVING COUNT(*) > 1`。
+
+@@ item d22-16
+type: choice
+title: WHERE 还是 HAVING
+level: 2
+--- prompt
+要算「每个主题里 high 风险的审查有几条，只列出至少 2 条的主题」。哪一条写得对，而且在 SQLite、Postgres、BigQuery 里都能用？
+--- options
+- `SELECT topic, COUNT(*) AS n FROM reviews WHERE risk = 'high' GROUP BY topic HAVING COUNT(*) >= 2`
+- `SELECT topic, COUNT(*) AS n FROM reviews WHERE risk = 'high' AND COUNT(*) >= 2 GROUP BY topic`
+- `SELECT topic, COUNT(*) AS n FROM reviews GROUP BY topic HAVING risk = 'high' AND COUNT(*) >= 2`
+- `SELECT topic, COUNT(*) AS n FROM reviews WHERE n >= 2 AND risk = 'high' GROUP BY topic`
+answer: 1
+--- explain
+执行顺序是 FROM → WHERE → GROUP BY → HAVING → SELECT。`risk = 'high'` 是对**行**的条件，放在 WHERE 里先把行筛掉；`COUNT(*) >= 2` 是对**组**的条件，分完组才知道，只能放在 HAVING 里。正确结果是 liability_cap 7 条、data_processing 2 条。
+
+第 2 条和第 4 条：WHERE 执行时还没有分组，不能用聚合函数，也还没有别名 `n`，报错。第 3 条最危险：`risk` 既没分组也没聚合，Postgres 和 BigQuery 会报错，SQLite 却悄悄拿组里随便一行的 risk 来判断，返回了 liability_cap 12 条（这是这个主题的全部条数），而且不报错。
+
+@@ item d22-17
+type: fill
+title: 填空：问题最多的主题
+level: 2
+ordered: yes
+--- prompt
+补全查询：只看 flag 和 redline 的审查，每个主题一行。`contracts` 是这个主题出现在几份**不同**的合同里，`problems` 是一共几条；只要至少 3 条的主题。
+--- template
+SELECT topic,
+       COUNT([[DISTINCT]] contract_id) AS contracts,
+       COUNT(*) AS problems
+FROM reviews
+WHERE verdict [[IN]] ('flag', 'redline')
+[[GROUP BY]] topic
+[[HAVING]] COUNT(*) >= 3
+ORDER BY problems DESC, topic;
+--- hints
+- 「几份不同的合同」：`COUNT(DISTINCT contract_id)`。
+- 「等于其中任何一个」用 `IN`。
+- 先分组，再筛组：`GROUP BY` 在前，`HAVING` 在后。
+
+@@ item d22-18
+type: order
+title: 排出一条完整的查询
+level: 2
+--- prompt
+排出这条查询：不算失败的审查，每个主题有几条；只要至少 5 条的主题；条数多的在前，一样多的按主题名排；只要前 3 个。有两行干扰项。
+--- lines
+SELECT topic, COUNT(*) AS n
+FROM reviews
+WHERE verdict IS NOT NULL
+GROUP BY topic
+HAVING COUNT(*) >= 5
+ORDER BY n DESC, topic
+LIMIT 3;
+--- distractors
+WHERE COUNT(*) >= 5
+GROUP BY n
+--- hints
+- 书写顺序固定：SELECT → FROM → WHERE → GROUP BY → HAVING → ORDER BY → LIMIT。
+- 聚合函数不能写在 WHERE 里，也不能按聚合出来的 `n` 分组。
+
+@@ item d22-19
+type: sql
+title: 每份合同的 redline 占比
+level: 3
+ordered: yes
+--- prompt
+每份合同一行，四列：
+
+- `contract_id`
+- `reviews`：审查条数（包括失败的）
+- `redlines`：其中 redline 的条数
+- `redline_share`：redlines ÷ reviews，保留 2 位小数
+
+按 `redline_share` 从高到低，一样的按 `contract_id` 从小到大。
+
+做完看看第一名：它一共只有几条审查？样本很小的时候，占比很容易大起大落，所以报表里最好同时给出条数。
+--- solution
+SELECT contract_id,
+       COUNT(*) AS reviews,
+       SUM(CASE WHEN verdict = 'redline' THEN 1 ELSE 0 END) AS redlines,
+       ROUND(1.0 * SUM(CASE WHEN verdict = 'redline' THEN 1 ELSE 0 END) / COUNT(*), 2) AS redline_share
+FROM reviews
+GROUP BY contract_id
+ORDER BY redline_share DESC, contract_id;
+--- hints
+- 按条件计数：`SUM(CASE WHEN verdict = 'redline' THEN 1 ELSE 0 END)`，或者 `COUNT(*) FILTER (WHERE verdict = 'redline')`。
+- 同一个 SELECT 里，别的列不能引用别名 `redlines`，所以算占比时要把 CASE 再写一遍。
+- 别忘了整数除法：`ROUND(1.0 * (redline 的条数) / COUNT(*), 2)`；最后 `ORDER BY redline_share DESC, contract_id`。
+
+@@ item d22-e1
+type: sql
+title: 闭卷：每个模型的用量
+exam: yes
+level: 3
+ordered: yes
+--- prompt
+用 `reviews` 表，每个模型（`model`）一行，四列：
+
+- `model`
+- `reviews`：审查条数
+- `avg_latency_ms`：平均 `latency_ms`，四舍五入到整数（用 `ROUND(x)`）
+- `total_cost`：`cost_usd` 之和，保留 6 位小数
+
+按 `avg_latency_ms` 从大到小。
+--- solution
+SELECT model,
+       COUNT(*) AS reviews,
+       ROUND(AVG(latency_ms)) AS avg_latency_ms,
+       ROUND(SUM(cost_usd), 6) AS total_cost
+FROM reviews
+GROUP BY model
+ORDER BY avg_latency_ms DESC;
+
+@@ item d22-e2
+type: sql
+title: 闭卷：有高风险条款的合同
+exam: yes
+level: 3
+ordered: yes
+--- prompt
+用 `reviews` 表，找出至少有一条 `risk` 为 `'high'` 的审查的合同。每份合同一行，三列：
+
+- `contract_id`
+- `reviews`：这份合同的**全部**审查条数
+- `high_risk`：其中 `risk` 为 `'high'` 的条数
+
+按 `high_risk` 从大到小，一样的按 `contract_id` 从小到大。
+--- solution
+SELECT contract_id,
+       COUNT(*) AS reviews,
+       SUM(CASE WHEN risk = 'high' THEN 1 ELSE 0 END) AS high_risk
+FROM reviews
+GROUP BY contract_id
+HAVING SUM(CASE WHEN risk = 'high' THEN 1 ELSE 0 END) >= 1
+ORDER BY high_risk DESC, contract_id;
+
+@@ item d22-e3
+type: sql
+title: 闭卷：待人工处理的队列
+exam: yes
+level: 3
+ordered: yes
+--- prompt
+用 `reviews` 表，列出需要人看的审查：`verdict` 是 `'flag'`，或者审查失败（`verdict` 是 NULL）。只要**最新的 5 条**，四列：
+
+- `id`
+- `clause_id`
+- `status`：审查失败的写 `'failed'`，其余就是 verdict
+- `created_at`
+
+按 `created_at` 从新到旧。
+--- solution
+SELECT id,
+       clause_id,
+       COALESCE(verdict, 'failed') AS status,
+       created_at
+FROM reviews
+WHERE verdict = 'flag' OR verdict IS NULL
+ORDER BY created_at DESC
+LIMIT 5;

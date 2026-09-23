@@ -77,20 +77,23 @@ for raw in ['{"clause_id": "8.1", "verdict": "flag"}', '{"clause_id": "8.1", "ve
 @@ concept
 title: Chat API 的请求和回答长什么样
 --- body
-几乎所有大模型接口（DeepSeek、OpenAI、LM Studio）都用同一种格式。
+几乎所有大模型接口（DeepSeek、OpenAI、LM Studio）都用同一种格式。DeepSeek 现在的模型名是 `deepseek-flash`（快、便宜，本课一直用它）和 `deepseek-v4-pro`（更大、更慢、更贵）。旧的模型名 `deepseek-chat` / `deepseek-reasoner` 已在 2026-07-24 停用，网上很多教程还在用它们。
 
 **请求**：POST 到 `.../chat/completions`，请求头带 `Authorization: Bearer <密钥>`，请求体：
 
 ```python
 {
-    "model": "deepseek-chat",
+    "model": "deepseek-flash",
     "messages": [
         {"role": "system", "content": "你是合同审查助手……"},
         {"role": "user", "content": "请审查这一条：……"},
     ],
+    "thinking": {"type": "disabled"},
     "temperature": 0.3,
 }
 ```
+
+**思考模式**：DeepSeek 默认先「想一想」再回答。回答照样在 `content` 里，思考过程在 `reasoning_content` 里；思考用掉的 token 按**输出**计费，而且这时 `temperature` 不起作用。审查条款这种调用加上 `"thinking": {"type": "disabled"}` 把它关掉：更快、更便宜、`temperature` 重新生效，判一条条款也用不着长篇推理。
 
 **回答**里最常用的三处：
 
@@ -104,7 +107,7 @@ messages = [
     {"role": "system", "content": "You review contract clauses."},
     {"role": "user", "content": "Review clause 8.1: liability is unlimited."},
 ]
-body = {"model": "deepseek-chat", "messages": messages, "temperature": 0.3}
+body = {"model": "deepseek-flash", "messages": messages, "thinking": {"type": "disabled"}, "temperature": 0.3}
 print(json.dumps(body, indent=2))
 
 @@ concept
@@ -123,17 +126,19 @@ data = resp.json() # 回答变成字典
 - `json=body` 会自动把字典转成 JSON 发出去
 - 密钥从环境变量读：`os.getenv("DEEPSEEK_API_KEY")`，**永远不要写进代码里**
 - 本页里 `requests` 连的是模拟服务器；在本机它连的就是真的 DeepSeek
+- 下面打招呼的例子没关思考模式，所以回答里多了 `reasoning_content`；`usage` 里 `completion_tokens_details` 的 `reasoning_tokens` 就是思考用掉的 token（已经算在 `completion_tokens` 里）
 --- code
 import os
 import requests
 
 URL = "https://api.deepseek.com/v1/chat/completions"
 key = os.getenv("DEEPSEEK_API_KEY")
-body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "Say hello"}]}
+body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "Say hello"}]}
 resp = requests.post(URL, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=60)
 print(resp.status_code)
 data = resp.json()
 print(data["choices"][0]["message"]["content"])
+print(data["choices"][0]["message"]["reasoning_content"])
 print(data["usage"])
 
 @@ concept
@@ -141,7 +146,7 @@ title: 状态码和重试
 mock: yes
 --- body
 - `200` 成功
-- `400` 请求写错了（字段缺了、模型名不对）：**不要重试**，改代码
+- `400` 请求写错了（字段缺了、模型名不对，包括抄了已停用的旧模型名）：**不要重试**，改代码
 - `401` 密钥不对或没带 `Bearer`：**不要重试**
 - `429` 请求太频繁、`500` / `503` 服务器问题：**可以重试**，等一下再来
 
@@ -154,7 +159,7 @@ import requests
 
 URL = "https://api.deepseek.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}
+body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]}
 
 MOCK.fail_next(429, 2)
 for attempt in range(1, 4):
@@ -182,7 +187,7 @@ message["tool_calls"] = [{"id": "call_1", "function": {"name": "lookup_playbook"
 2. `json.loads(arguments)` 得到参数，调用它
 3. 把模型那条消息和一条 `{"role": "tool", "tool_call_id": ..., "content": 结果}` 加进 messages，**再请求一次**
 
-模型看到工具结果后给出最终回答。这个「请求 → 调工具 → 再请求」的循环就是 Agent。
+模型看到工具结果后给出最终回答。这个「请求 → 调工具 → 再请求」的循环就是 Agent。例子里照样关掉了思考模式：Agent 要来回请求好几次，快和便宜更重要；而且开着思考模式时，第 3 步加回去的模型消息必须带着它的 `reasoning_content`，漏掉了真接口会返回 400。
 --- code
 import json
 import os
@@ -193,7 +198,7 @@ HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
 
 messages = [{"role": "user", "content": "Is unlimited liability acceptable?"}]
-data = requests.post(URL, headers=HEADERS, json={"model": "deepseek-chat", "messages": messages, "tools": TOOLS}).json()
+data = requests.post(URL, headers=HEADERS, json={"model": "deepseek-flash", "messages": messages, "tools": TOOLS, "thinking": {"type": "disabled"}}).json()
 choice = data["choices"][0]
 print("finish_reason:", choice["finish_reason"])
 call = choice["message"]["tool_calls"][0]
@@ -205,7 +210,7 @@ mock: yes
 --- body
 同一个输入，模型两次的回答可能不同。所以评估一个用到模型的函数时，要**跑 N 次看通过率**，而不是跑一次看对错。
 
-本页的模拟服务器会对「AS IS 免责声明」这类条款故意摇摆（约 60% 判 accept），就像真实模型一样。下面的例子数一数 10 次里有几次判 accept。
+本页的模拟服务器会对「AS IS 免责声明」这类条款故意摇摆（长期看约 60% 判 accept），就像真实模型一样。下面的例子数一数 10 次里有几次判 accept：只跑 10 次，结果离 60% 差得多也很正常，这正是要多跑、看通过率的原因。
 
 这就是 Clause Check `evals/run_evals.py` 的核心思想。
 --- code
@@ -218,7 +223,7 @@ HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 clause = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS".'
 results = []
 for _ in range(10):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
     results.append(json.loads(content)["verdict"])
 print(results)
@@ -374,19 +379,23 @@ type: code
 title: 组装请求体
 level: 1
 --- prompt
-写 `build_body(messages, model="deepseek-chat", temperature=0.3)`，返回请求体字典，有三个键：`model`、`messages`、`temperature`。
+写 `build_body(messages, model="deepseek-flash", temperature=0.3)`，返回请求体字典，有四个键：`model`、`messages`、`thinking`、`temperature`。
+
+`thinking` 固定是 `{"type": "disabled"}`：关掉思考模式，`temperature` 才起作用。
 --- starter
-def build_body(messages, model="deepseek-chat", temperature=0.3):
+def build_body(messages, model="deepseek-flash", temperature=0.3):
     pass
 --- solution
-def build_body(messages, model="deepseek-chat", temperature=0.3):
-    return {"model": model, "messages": messages, "temperature": temperature}
+def build_body(messages, model="deepseek-flash", temperature=0.3):
+    return {"model": model, "messages": messages, "thinking": {"type": "disabled"}, "temperature": temperature}
 --- tests
 msgs = [{"role": "user", "content": "hi"}]
-expect("默认值", lambda: build_body(msgs), {"model": "deepseek-chat", "messages": msgs, "temperature": 0.3})
+expect("默认值", lambda: build_body(msgs), {"model": "deepseek-flash", "messages": msgs, "thinking": {"type": "disabled"}, "temperature": 0.3})
+expect("关掉思考模式", lambda: build_body(msgs)["thinking"], {"type": "disabled"})
 expect("自定义温度", lambda: build_body(msgs, temperature=0)["temperature"], 0)
 --- hints
 - 默认参数已经写好，直接用它们拼字典。
+- `thinking` 的值本身也是一个字典：`{"type": "disabled"}`。
 
 @@ item d4-07
 type: code
@@ -398,8 +407,8 @@ mock: yes
 
 1. 用 `requests.post` 调 `API_URL`
 2. 请求头：`{"Authorization": f"Bearer {API_KEY}"}`
-3. 请求体：模型 `deepseek-chat`，messages 里只有一条 user 消息，内容是 `prompt`
-4. 返回模型回答的文字
+3. 请求体：模型 `deepseek-flash`，messages 里只有一条 user 消息，内容是 `prompt`
+4. 返回模型回答的文字（`content`，不是 `reasoning_content`）
 
 模拟服务器对普通问题的回答是 `"Mock reply: " + 你的问题`。
 --- starter
@@ -419,13 +428,13 @@ API_URL = "https://api.deepseek.com/v1/chat/completions"
 API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 def ask(prompt):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
     resp = requests.post(API_URL, headers={"Authorization": f"Bearer {API_KEY}"}, json=body, timeout=60)
     data = resp.json()
     return data["choices"][0]["message"]["content"]
 --- tests
 expect("回答", lambda: ask("hello"), "Mock reply: hello")
-expect("用的模型", lambda: MOCK.calls[-1]["body"]["model"], "deepseek-chat")
+expect("用的模型", lambda: MOCK.calls[-1]["body"]["model"], "deepseek-flash")
 expect("只有一条消息", lambda: MOCK.calls[-1]["body"]["messages"], [{"role": "user", "content": "hello"}])
 --- hints
 - `resp = requests.post(API_URL, headers=..., json=body)`，再 `data = resp.json()`。
@@ -446,7 +455,7 @@ API_URL = "https://api.deepseek.com/v1/chat/completions"
 API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 def ask(prompt):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
     resp = requests.post(API_URL, headers={"Authorization": API_KEY}, json=body)
     print(resp.status_code, resp.json())
     return resp.json()["choices"][0]["message"]["content"]
@@ -458,13 +467,13 @@ API_URL = "https://api.deepseek.com/v1/chat/completions"
 API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 def ask(prompt):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
     resp = requests.post(API_URL, headers={"Authorization": f"Bearer {API_KEY}"}, json=body)
     print(resp.status_code)
     return resp.json()["choices"][0]["message"]["content"]
 --- tests
 expect("修好后能拿到回答", lambda: ask("ping"), "Mock reply: ping")
-expect("请求头的格式", lambda: (ask("x"), MOCK.calls[-1]["body"]["model"])[1], "deepseek-chat")
+expect("请求体里的模型名没变", lambda: (ask("x"), MOCK.calls[-1]["body"]["model"])[1], "deepseek-flash")
 --- hints
 - 输出里的状态码是 401，服务器说了要什么格式的请求头。
 - 请求头应该是 `"Bearer " + 密钥`，中间有一个空格。
@@ -477,7 +486,7 @@ mock: yes
 --- prompt
 写 `ask_with_usage(prompt)`：返回 `{"text": 回答文字, "tokens": 这次用掉的 total_tokens}`。
 
-token 用量在回答的 `usage` 里。记录它是算成本的第一步。
+模型用 `deepseek-flash`。token 用量在回答的 `usage` 里，记录它是算成本的第一步。这里没关思考模式，思考用掉的 token 也算在里面（按输出计费）。
 --- starter
 import os
 import requests
@@ -495,13 +504,19 @@ API_URL = "https://api.deepseek.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 
 def ask_with_usage(prompt):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
     data = requests.post(API_URL, headers=HEADERS, json=body).json()
     return {"text": data["choices"][0]["message"]["content"], "tokens": data["usage"]["total_tokens"]}
 --- tests
 r = lambda: ask_with_usage("How much does this cost?")
 expect("text", lambda: r()["text"], "Mock reply: How much does this cost?")
 expect_true("tokens 是正整数", lambda: isinstance(r()["tokens"], int) and r()["tokens"] > 0)
+def _is_total():
+    import os, requests
+    out = r()
+    again = requests.post("https://api.deepseek.com/v1/chat/completions", headers={"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}, json=MOCK.calls[-1]["body"]).json()
+    return out["tokens"] == again["usage"]["total_tokens"]
+expect("是 total_tokens（不是 completion_tokens 或 reasoning_tokens）", _is_total, True)
 expect("只有两个键", lambda: sorted(r().keys()), ["text", "tokens"])
 --- hints
 - `data["usage"]["total_tokens"]`。
@@ -537,7 +552,7 @@ def call_api(body):
         raise RuntimeError(f"API error {resp.status_code}: {resp.json()['error']['message']}")
     return resp.json()
 --- tests
-GOOD = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}
+GOOD = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]}
 expect("成功返回字典", lambda: call_api(GOOD)["choices"][0]["message"]["content"], "Mock reply: hi")
 expect_raises("模型名写错 → RuntimeError", lambda: call_api({"model": "gpt-9", "messages": [{"role": "user", "content": "x"}]}), RuntimeError)
 def _message():
@@ -574,7 +589,7 @@ HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 RETRYABLE = (429, 500, 503)
 
 def ask_with_retry(prompt, max_attempts=3):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
     pass
 --- solution
 import os
@@ -585,7 +600,7 @@ HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 RETRYABLE = (429, 500, 503)
 
 def ask_with_retry(prompt, max_attempts=3):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
     for attempt in range(max_attempts):
         resp = requests.post(API_URL, headers=HEADERS, json=body)
         if resp.status_code == 200:
@@ -626,11 +641,12 @@ mock: yes
 --- prompt
 写 `classify(clause_text)`：
 
-1. 请求体里加 `"response_format": {"type": "json_object"}`（要求模型只返回 JSON）
-2. user 消息内容是 `clause_text`
-3. 用 `Verdict.model_validate_json(...)` 解析回答文字，返回 `Verdict` 对象
+1. 模型 `deepseek-flash`，请求体里加 `"response_format": {"type": "json_object"}`（要求模型只返回 JSON）
+2. 再加 `"thinking": {"type": "disabled"}` 关掉思考模式：判一条条款要快、要便宜，用不着长篇推理
+3. user 消息内容是 `clause_text`
+4. 用 `Verdict.model_validate_json(...)` 解析回答文字，返回 `Verdict` 对象
 
-模拟服务器会根据条款内容给出判定，比如含 `unlimited` 的判 `redline`。
+模拟服务器会根据条款内容给出判定，比如含 `unlimited` 的判 `redline`。真实的 DeepSeek 文档还要求 prompt 里写上「json」这个词并给一个输出样例（一般放在 system 消息里），不然真模型可能一直输出空白，直到 token 用完；模拟服务器不检查，这里先省略。
 --- starter
 import os
 from typing import Literal
@@ -665,9 +681,10 @@ class Verdict(BaseModel):
 
 def classify(clause_text):
     body = {
-        "model": "deepseek-chat",
+        "model": "deepseek-flash",
         "messages": [{"role": "user", "content": clause_text}],
         "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
     }
     data = requests.post(API_URL, headers=HEADERS, json=body).json()
     return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
@@ -677,7 +694,9 @@ expect("unlimited → redline", lambda: v().verdict, "redline")
 expect("编号", lambda: v().clause_id, "8.1")
 expect("返回的是 Verdict 对象", lambda: type(v()).__name__, "Verdict")
 expect("请求里带了 response_format", lambda: MOCK.calls[-1]["body"].get("response_format"), {"type": "json_object"})
+expect("关掉了思考模式", lambda: MOCK.calls[-1]["body"].get("thinking"), {"type": "disabled"})
 --- hints
+- 请求体是一个字典，四个键：`model`、`messages`、`response_format`、`thinking`。
 - 回答文字在 `["choices"][0]["message"]["content"]`，它是 JSON 字符串。
 - `Verdict.model_validate_json(那段文字)`。
 
@@ -778,7 +797,7 @@ class Verdict(BaseModel):
     rationale: str
 
 def classify(clause_text):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     data = requests.post(API_URL, headers=HEADERS, json=body).json()
     return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
 
@@ -800,7 +819,7 @@ class Verdict(BaseModel):
     rationale: str
 
 def classify(clause_text):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     data = requests.post(API_URL, headers=HEADERS, json=body).json()
     return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
 
@@ -829,7 +848,7 @@ mock: yes
 --- prompt
 把前面的都串起来。写 `mini_agent(question)`：
 
-1. 发请求，带上 `TOOLS`
+1. 发请求（模型 `deepseek-flash`），带上 `TOOLS`，并用 `"thinking": {"type": "disabled"}` 关掉思考模式
 2. 如果 `finish_reason == "tool_calls"`：执行第一个工具调用（用 `run_tool_call`）；把模型那条消息原样加进 `messages`，再加一条 `{"role": "tool", "tool_call_id": 调用的 id, "content": 工具结果}`；然后回到第 1 步
 3. 否则返回回答文字
 4. 最多请求 `max_steps` 次，超过就返回 `"STOPPED"`
@@ -871,7 +890,7 @@ def run_tool_call(call, tools):
 def mini_agent(question, max_steps=3):
     messages = [{"role": "user", "content": question}]
     for _ in range(max_steps):
-        body = {"model": "deepseek-chat", "messages": messages, "tools": TOOLS}
+        body = {"model": "deepseek-flash", "messages": messages, "tools": TOOLS, "thinking": {"type": "disabled"}}
         choice = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]
         message = choice["message"]
         if choice["finish_reason"] != "tool_calls":
@@ -887,6 +906,7 @@ def _run():
     return [mini_agent("Is unlimited liability acceptable?"), len(MOCK.calls)]
 expect("调了工具，拿到最终回答，一共请求 2 次", _run, ["Based on the playbook: rule for liability_cap: cap at 100% of annual fees", 2])
 expect("第二次请求里带着工具结果", lambda: MOCK.calls[-1]["body"]["messages"][-1]["role"], "tool")
+expect("每次请求都关了思考模式", lambda: [c["body"].get("thinking") for c in MOCK.calls], [{"type": "disabled"}, {"type": "disabled"}])
 expect("步数用完返回 STOPPED", lambda: mini_agent("Is unlimited liability acceptable?", max_steps=1), "STOPPED")
 --- hints
 - 结构：`for _ in range(max_steps):` 里发请求；不是 tool_calls 就 return；是就执行工具、往 messages 里加两条，然后继续下一轮。
@@ -898,13 +918,13 @@ title: 排代码：一次完整的调用
 level: 2
 mock: yes
 --- prompt
-排出 `ask_json(prompt)`：请求时要求 JSON 格式，返回解析后的字典。有一行干扰项。
+排出 `ask_json(prompt)`：请求时要求 JSON 格式、关掉思考模式，返回解析后的字典。有一行干扰项。
 --- lines
 import json, os, requests
 URL = "https://api.deepseek.com/v1/chat/completions"
 def ask_json(prompt):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     data = requests.post(URL, headers=headers, json=body).json()
     return json.loads(data["choices"][0]["message"]["content"])
 --- distractors
@@ -921,7 +941,7 @@ type: choice
 title: temperature 设成 0 就确定了吗
 level: 2
 --- prompt
-把请求里的 `temperature` 设成 0 以后：
+关掉思考模式（`"thinking": {"type": "disabled"}`），再把请求里的 `temperature` 设成 0 以后：
 --- options
 - 每次输出一定完全相同，测试跑一次就够了
 - 通常更稳定，但不保证每次相同；评估仍然要跑多次看通过率
@@ -929,7 +949,7 @@ level: 2
 - 输出会变得更有创意
 answer: 2
 --- explain
-temperature 越低输出越集中，但服务器端的批处理、浮点运算顺序、供应商更新模型都会让结果变化。而且生产用什么参数，测试就该用什么参数。所以「跑一次看对错」不可靠，要「跑 N 次看通过率」。
+temperature 越低输出越集中，但服务器端的批处理、浮点运算顺序、供应商更新模型都会让结果变化。而且生产用什么参数，测试就该用什么参数。所以「跑一次看对错」不可靠，要「跑 N 次看通过率」。另外记住：DeepSeek 开着思考模式时 temperature 根本不起作用，所以题目里先关掉了它。
 
 @@ item d4-19
 type: local
@@ -940,7 +960,7 @@ level: 2
 
 1. 确认 `G:\Contract Clause Reviewer\.env` 里有 `DEEPSEEK_API_KEY=sk-...`（这个文件不会进 git）
 2. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\my_first_call.py`
-3. 从空白手写：读 `.env`（`from dotenv import load_dotenv` 然后 `load_dotenv()`）、组请求、调 `https://api.deepseek.com/v1/chat/completions`、打印回答和 `total_tokens`
+3. 从空白手写：读 `.env`（`from dotenv import load_dotenv` 然后 `load_dotenv()`）、组请求（模型 `deepseek-flash`）、调 `https://api.deepseek.com/v1/chat/completions`、打印回答和 `total_tokens`
 4. 在终端运行：
 
 ```
@@ -951,11 +971,14 @@ python learn/my_first_call.py
 5. 把终端的完整输出粘贴到下面
 
 卡住了可以回到第 7、9 题看你自己写过的代码，但不要复制，照着理解重打一遍。
+
+可选：再打印 `usage` 里的 `completion_tokens_details`，看真模型的思考用了多少 token；然后在请求体里加 `"thinking": {"type": "disabled"}` 再跑一次，对比 `completion_tokens`。思考 token 按输出计费，打个招呼的花费差别很小，但批量审查几百条条款时就明显了。
 placeholder: 粘贴终端输出，应该包含模型的回答和 total_tokens
 verify: tokens?\D{0,30}\d+
 --- hints
 - 需要的包：`pip install requests python-dotenv`（已经装过就跳过）。
 - 如果看到 401：检查 `.env` 里的 key，以及请求头是不是 `Bearer ` 开头。
+- 如果看到 400 和 `Model Not Exist`：模型名写错了，或者抄了网上用旧模型名的教程，用 `deepseek-flash`。
 
 @@ item d4-e1
 type: scratch
@@ -992,20 +1015,21 @@ exam: yes
 level: 2
 mock: yes
 --- prompt
-写 `ask_json(prompt)`：调用 `https://api.deepseek.com/v1/chat/completions`（模型 `deepseek-chat`，密钥从环境变量 `DEEPSEEK_API_KEY` 读），要求 `json_object` 格式，返回解析后的字典。
+写 `ask_json(prompt)`：调用 `https://api.deepseek.com/v1/chat/completions`（模型 `deepseek-flash`，密钥从环境变量 `DEEPSEEK_API_KEY` 读），要求 `json_object` 格式并关掉思考模式，返回解析后的字典。
 --- solution
 import json
 import os
 import requests
 
 def ask_json(prompt):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
     data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
     return json.loads(data["choices"][0]["message"]["content"])
 --- tests
 expect("判定", lambda: ask_json("Review clause 10.1: data may be processed in any country")["verdict"], "redline")
 expect("主题", lambda: ask_json("Review clause 10.1: data may be processed in any country")["topic"], "data_processing")
+expect("关掉了思考模式", lambda: MOCK.calls[-1]["body"].get("thinking"), {"type": "disabled"})
 
 @@ item d4-e3
 type: scratch
@@ -1014,7 +1038,7 @@ exam: yes
 level: 2
 mock: yes
 --- prompt
-写 `total_tokens(prompts)`：对列表里的每个 prompt 各调用一次接口（模型 `deepseek-chat`），返回所有调用的 `total_tokens` 之和。空列表返回 0。
+写 `total_tokens(prompts)`：对列表里的每个 prompt 各调用一次接口（模型 `deepseek-flash`），返回所有调用的 `total_tokens` 之和。空列表返回 0。
 --- solution
 import os
 import requests
@@ -1023,7 +1047,7 @@ def total_tokens(prompts):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
     total = 0
     for p in prompts:
-        body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": p}]}
+        body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": p}]}
         data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
         total += data["usage"]["total_tokens"]
     return total

@@ -1,0 +1,1180 @@
+@@ day 24
+title: 数据库与 Python：建表、写入、事务、防注入
+lang: py
+langs: SQL + Python
+hours: 5 小时
+--- goal
+会设计一张表（主键、NOT NULL、UNIQUE、CHECK、外键），会用 INSERT / UPDATE / DELETE / UPSERT 改数据；会在 Python 里用 `sqlite3` 安全地读写：参数化查询防注入、`with conn:` 事务、`sqlite3.Row` 把行变成字典，把大模型的调用记录存进表；知道线上常用的 Postgres 和存向量的 pgvector 放在哪里。
+
+对应项目：`clausecheck/graph.py` 用 `SqliteSaver` 把 LangGraph 的检查点存在 SQLite 文件 `data/checkpoints.sqlite` 里；`models.py` 的 `ReviewTrace`（model、prompt_version、token、延迟）存进数据库，就是 `reviews` 表的一行。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每张都改一处再运行
+- 练习区全部通过（包括本机任务：只读打开项目里的检查点数据库）
+- 闭卷 3 题
+- 用自己的话说出：为什么 `with conn:` 能保证「半批数据」不会留在库里
+
+@@ concept
+title: CREATE TABLE：给数据立规矩
+lang: sql
+dataset: clausecheck
+--- body
+表不只是装数据的格子。建表时写下的**约束**，是坏数据进库前的最后一道关：模型偶尔会返回 `risk_level: "critical"`（样例数据里 1047 那条失败就是这样），这种值就不该进库。下面是律师反馈表 `feedback`，已经建好了：
+
+```sql
+CREATE TABLE feedback (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL REFERENCES reviews(id),
+  reviewer TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline')),
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (review_id, reviewer)
+);
+```
+
+- 类型：`INTEGER`、`TEXT`、`REAL`（小数）
+- `PRIMARY KEY`：每行的唯一编号。SQLite 里 `INTEGER PRIMARY KEY` 不给值时自动取下一个号（Postgres 不会，要写 `BIGINT GENERATED ALWAYS AS IDENTITY` 或 `BIGSERIAL`）
+- `NOT NULL` 必须有值；`DEFAULT` 不给时用默认值；`UNIQUE` 不能重复（可以是几列的组合）；`CHECK (...)` 值必须满足条件
+- `REFERENCES reviews(id)`：**外键**，必须指向 reviews 里真实存在的一行
+- 一种东西一张表：客户、合同、审查、反馈各一张，用 id 连起来（昨天的 JOIN）
+
+SQLite 的两个坑：外键默认**不检查**，要先执行 `PRAGMA foreign_keys = ON`；类型也很宽松，往 INTEGER 列里放 `'abc'` 也能存进去。Postgres 两样都严格。
+
+运行下面的插入，再把 `'accept'` 改成 `'maybe'`，或者把 `reviewer` 这一列连同它的值 `'anna'` 一起删掉，再运行，读读报错。
+--- schema
+CREATE TABLE feedback (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL REFERENCES reviews(id),
+  reviewer TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline')),
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (review_id, reviewer)
+);
+--- code
+INSERT INTO feedback (review_id, reviewer, verdict, note)
+VALUES (1005, 'anna', 'accept', 'A 12-month cap is fine for this customer')
+RETURNING *;
+
+@@ concept
+title: INSERT、UPDATE、DELETE：先 SELECT 再动手
+lang: sql
+dataset: clausecheck
+--- body
+三条改数据的语句：
+
+```sql
+INSERT INTO customers (name, country, plan, signed_up)
+VALUES ('Oslo Maritime AS', 'NO', 'pro', '2026-09-20');
+UPDATE contracts SET status = 'reviewed' WHERE id = 109;
+DELETE FROM reviews WHERE id = 1061;
+```
+
+- INSERT **永远写出列名**，不要依赖表里列的顺序；没写的列取 DEFAULT，没有默认值就是 NULL。一次插多行：`VALUES (...), (...)`；也可以从查询插入：`INSERT INTO 表 (列) SELECT ...`
+- UPDATE / DELETE 最危险的错误是**忘了写 WHERE**：整张表都被改掉、删掉
+- 好习惯：先写 `SELECT * FROM contracts WHERE id = 109`，看清选中的是哪几行，再把前半句换成 `UPDATE ... SET ...` 或 `DELETE`
+- 末尾加 `RETURNING 列`，把改过的行直接返回来看（Postgres 和 SQLite 都支持）
+
+合同 109 的 8.1 条后来重试成功了（1065 那条），下面把合同状态从 failed 改回 reviewed。本页每次运行都从一份全新的样例数据开始，放心改：试试去掉 WHERE 那一行，看 RETURNING 返回几行。
+--- code
+UPDATE contracts
+SET status = 'reviewed'
+WHERE id = 109
+RETURNING id, title, status;
+
+@@ concept
+title: UPSERT：重跑也不怕
+lang: sql
+dataset: clausecheck
+--- body
+worker 崩溃后重跑一份合同（第 17 天的幂等）：同一个条款的结果会再写一次。表 `latest_verdicts` 以 `(contract_id, clause_id)` 为主键，普通 INSERT 第二次就会撞上 `UNIQUE constraint failed`。
+
+**UPSERT**：不存在就插入，已经存在就更新。
+
+```sql
+INSERT INTO 表 (列...) VALUES (...)
+ON CONFLICT (主键或 UNIQUE 的列) DO UPDATE SET 列 = excluded.列;
+```
+
+- `excluded.verdict` 指「这次想插入、但撞车了的那一行」的值
+- `ON CONFLICT (...)` 里写的列，必须正好是一个 PRIMARY KEY 或 UNIQUE 约束，否则报错
+- `ON CONFLICT (...) DO NOTHING`：已经有了就跳过
+- 这是 Postgres 的写法，SQLite 照着学的，两边一样能用；BigQuery 里对应的是 `MERGE`
+
+表里已经有 `(103, '8.1', 'redline', 1022)`，下面用 1064 那次重审的结果更新它。把 `'8.1'` 改成 `'8.2'` 再运行：这次是插入新行。
+--- schema
+CREATE TABLE latest_verdicts (
+  contract_id INTEGER NOT NULL,
+  clause_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  review_id INTEGER NOT NULL,
+  PRIMARY KEY (contract_id, clause_id)
+);
+INSERT INTO latest_verdicts VALUES (103, '8.1', 'redline', 1022);
+--- code
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (103, '8.1', 'flag', 1064)
+ON CONFLICT (contract_id, clause_id) DO UPDATE SET
+  verdict = excluded.verdict,
+  review_id = excluded.review_id
+RETURNING *;
+
+@@ concept
+title: sqlite3：在 Python 里用数据库
+dataset: clausecheck
+--- body
+Python 自带 `sqlite3`，不用安装。
+
+- `conn = sqlite3.connect("app.db")` 打开一个数据库文件（没有就新建）；`":memory:"` 是只在内存里的库
+- `conn.execute(sql)` 返回一个游标：`.fetchall()` 取出所有行（元组组成的列表），`.fetchone()` 取一行，没有行时是 `None`
+- `conn.row_factory = sqlite3.Row` 以后，行可以按列名取值：`row["verdict"]`，`dict(row)` 变成字典。在建好连接后马上设
+- 改了数据（INSERT / UPDATE / DELETE）要 `conn.commit()`，改动才真正写进文件，别的连接（别的程序）才看得到。没提交就退出，改动就丢了
+
+本页的 `fresh_db()` 每次给你一个装好样例数据的新内存库。今天写的函数都把 `conn` 当参数传进来（依赖注入），测试就能传一个新库进去，生产代码传真正的库。
+
+下面最后一段用两个连接打开同一个文件，看看 commit 前后的区别。
+--- code
+import sqlite3
+from pathlib import Path
+
+conn = fresh_db()
+rows = conn.execute("SELECT id, clause_id, verdict FROM reviews WHERE contract_id = 108").fetchall()
+print(rows)
+print(conn.execute("SELECT MAX(latency_ms) FROM reviews").fetchone())
+
+conn.row_factory = sqlite3.Row
+row = conn.execute("SELECT id, heading, risk FROM reviews WHERE id = 1022").fetchone()
+print(row["heading"], row[0], dict(row))
+
+Path("work/d24").mkdir(parents=True, exist_ok=True)
+a = sqlite3.connect("work/d24/app.db")
+a.execute("CREATE TABLE IF NOT EXISTS notes (text TEXT)")
+a.execute("DELETE FROM notes")
+a.commit()
+a.execute("INSERT INTO notes VALUES ('8.1 needs a lawyer')")
+b = sqlite3.connect("work/d24/app.db")
+print("before commit:", b.execute("SELECT COUNT(*) FROM notes").fetchone())
+a.commit()
+print("after commit: ", b.execute("SELECT COUNT(*) FROM notes").fetchone())
+
+@@ concept
+title: 参数化查询和 SQL 注入
+dataset: clausecheck
+--- body
+客户名、主题、筛选条件，都来自用户或者模型。第 12 天的提示注入是骗模型，**SQL 注入**是骗数据库。
+
+用 f-string 把值拼进 SQL，值里的 `'` 就变成了 SQL 的一部分：`O'Brien Legal` 让语句语法错误；`x' OR '1'='1` 让 WHERE 永远为真，拿到所有客户。有的驱动允许一次执行好几条语句（比如 Postgres 的 psycopg），那连 `'; DROP TABLE customers; --` 这种「删表」都能混进去；Python 的 `sqlite3` 的 `execute` 一次只执行一条，挡住了删表，但上面两种照样中招。
+
+**参数化**：SQL 里只写占位符，值单独交给数据库。数据库把值永远只当数据，不会当成 SQL 去执行：
+
+- `?` 配元组：`conn.execute("... WHERE name = ?", (name,))`。只有一个值也要写成 `(name,)`，`(name)` 只是一个字符串
+- `:name` 配字典：`conn.execute("... WHERE contract_id = :cid", {"cid": 103})`
+- 占位符只能代替**值**。表名、列名、`ASC` / `DESC` 不能用参数，只能先检查它在白名单里，再拼进 SQL
+- Postgres 的 psycopg 占位符写 `%s`，BigQuery 写 `@name`，道理完全一样
+--- code
+conn = fresh_db()
+
+def find_unsafe(name):
+    sql = f"SELECT id, name FROM customers WHERE name = '{name}'"
+    return conn.execute(sql).fetchall()
+
+def find(name):
+    return conn.execute("SELECT id, name FROM customers WHERE name = ?", (name,)).fetchall()
+
+print(find_unsafe("Nordlys AB"))
+print(len(find_unsafe("x' OR '1'='1")), "rows: injected!")
+try:
+    find_unsafe("O'Brien Legal")
+except Exception as e:
+    print(type(e).__name__, e)
+
+print(find("x' OR '1'='1"))
+conn.execute("INSERT INTO customers (name, country, plan, signed_up) VALUES (?, ?, ?, ?)", ("O'Brien Legal", "IE", "pro", "2026-09-22"))
+print(find("O'Brien Legal"))
+print(conn.execute("SELECT id FROM reviews WHERE contract_id = :cid AND risk = :risk", {"cid": 101, "risk": "high"}).fetchall())
+
+@@ concept
+title: 事务：要么全成，要么全不
+dataset: clausecheck
+--- body
+一份合同 12 条审查结果，写到第 7 条时出错：库里留下 6 条「半份报告」，比一条都没写还糟，因为看起来像是审完了。
+
+**事务**把一组改动绑在一起：要么全部生效，要么全部撤销。
+
+- `with conn:` 块里全部成功 → 自动 `commit`；抛出异常 → 自动 `rollback`，异常继续往外抛
+- `with conn:` **不会关闭连接**，这和 `with open(...)` 不一样，是最常见的误会
+- 不用 `with` 也可以：成功后 `conn.commit()`，出错时 `conn.rollback()`
+- `executemany(sql, 很多组参数)` 用同一条 SQL 插很多行。中途失败时，前面几行其实已经执行了，只是没提交：不回滚的话，同一个连接里还能看到它们，下次 commit 就一起写进去了
+
+下面第一批里有一条坏数据（`maybe` 不在 CHECK 允许的值里），整批撤销；第二批只有好数据，写入成功。
+--- code
+import sqlite3
+
+conn = fresh_db()
+conn.execute("CREATE TABLE feedback (review_id INTEGER NOT NULL, reviewer TEXT NOT NULL, verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline')))")
+rows = [
+    (1062, "anna", "accept"),
+    (1063, "anna", "flag"),
+    (1064, "anna", "maybe"),
+]
+
+try:
+    with conn:
+        conn.executemany("INSERT INTO feedback VALUES (?, ?, ?)", rows)
+except sqlite3.IntegrityError as e:
+    print("rolled back:", e)
+print("rows:", conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0])
+
+with conn:
+    conn.executemany("INSERT INTO feedback VALUES (?, ?, ?)", rows[:2])
+print("rows:", conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0])
+
+@@ concept
+title: JSON 列：json_extract 和 json_each
+lang: sql
+dataset: clausecheck
+--- body
+样例数据里有两列存的是 JSON 文字：`reviews.rule_ids` 像 `'["PB-01", "PB-02"]'`，`tool_calls.args` 像 `'{"topic": "payment"}'`。SQLite 能直接读它们：
+
+- `json_extract(args, '$.topic')`（或 `args ->> '$.topic'`）取出一个字段
+- `json_array_length(rule_ids)`：数组有几个元素
+- `json_each(rule_ids)` 把数组「炸开」成多行，每个元素一行，值在 `value` 列。它写在 FROM 里，用法像 JOIN 另一张表：`FROM reviews AS r, json_each(r.rule_ids) AS j`。BigQuery 里同样的事叫 `UNNEST`
+
+什么时候不该用 JSON 列，而是拆成单独一张表（比如 `review_rules(review_id, rule_id)`，每个引用一行）？要按它**筛选、统计、JOIN**，要加**约束**（每个 rule_id 必须真的存在），要加**索引**。只是整块存、整块读的东西（模型的完整回复、工具参数），JSON 列就很合适。
+
+下面把合同 101 每条审查引用的规则展开：1005 引用了两条规则，所以出现两次。
+--- code
+SELECT r.id, r.clause_id, j.value AS rule_id
+FROM reviews AS r, json_each(r.rule_ids) AS j
+WHERE r.contract_id = 101
+ORDER BY r.id;
+
+@@ concept
+title: 生产环境：Postgres、pgvector 和索引
+dataset: clausecheck
+--- body
+SQLite 是一个文件，适合单机、测试和小工具（项目的检查点就用它）。线上应用的数据库通常是 **Postgres**：很多服务同时读写、有权限和备份。今天的 SQL 在 Postgres 里几乎原样能用，区别是类型严格、外键总是检查、自增主键写 `GENERATED ALWAYS AS IDENTITY`、`LIKE` 区分大小写、JSON 用 `JSONB`、带时区的时间用 `TIMESTAMPTZ`。Python 里用 psycopg（占位符 `%s`）或 SQLAlchemy；TypeScript 里用 Prisma、Drizzle 或 node-postgres（占位符 `$1`）。
+
+**pgvector** 是 Postgres 的扩展，能存 embedding，把第 11 天的 RAG 搬进数据库：
+
+```sql
+CREATE EXTENSION vector;
+CREATE TABLE chunks (id BIGSERIAL PRIMARY KEY, text TEXT, embedding vector(1536));
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+SELECT id, text FROM chunks ORDER BY embedding <=> %s LIMIT 5;
+```
+
+`<=>` 是**余弦距离**（1 − 余弦相似度，越小越像）；1536 是 `text-embedding-3-small` 向量的长度。`%s` 传进去的是问题的 embedding：Python 里先装 `pgvector` 包，对连接调用一次 `register_vector(conn)`（`from pgvector.psycopg import register_vector`），psycopg 才认识向量类型（以 pgvector 文档为准）。
+
+**索引**像书后面的目录：没有索引时按 `contract_id` 找要把整张表扫一遍（SCAN），有了索引就直接跳过去（SEARCH ... USING INDEX）。代价是写入稍慢、多占空间。`EXPLAIN QUERY PLAN`（Postgres 里是 `EXPLAIN`）告诉你数据库打算怎么查。
+--- code
+conn = fresh_db()
+q = "SELECT id, verdict FROM reviews WHERE contract_id = ?"
+
+def plan():
+    return [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + q, (103,))]
+
+print(plan())
+conn.execute("CREATE INDEX idx_reviews_contract ON reviews (contract_id)")
+print(plan())
+print(conn.execute(q, (103,)).fetchall()[:3])
+
+@@ item d24-01
+type: sql
+title: 复习：redline 多的合同
+level: 2
+lang: sql
+dataset: clausecheck
+ordered: yes
+--- prompt
+复习第 22、23 天：找出 redline **至少 2 条**的合同。返回四列：`contract_id`、`title`、`customer`（客户名）、`redlines`（redline 条数），按 redlines 从多到少，同样多的按 contract_id 从小到大。
+--- solution
+SELECT c.id AS contract_id, c.title, cu.name AS customer, COUNT(*) AS redlines
+FROM reviews AS r
+JOIN contracts AS c ON c.id = r.contract_id
+JOIN customers AS cu ON cu.id = c.customer_id
+WHERE r.verdict = 'redline'
+GROUP BY c.id, c.title, cu.name
+HAVING COUNT(*) >= 2
+ORDER BY redlines DESC, contract_id;
+--- hints
+- reviews → contracts → customers 两个 JOIN；先用 WHERE 只留下 redline 的行。
+- 按合同分组（SELECT 里的非聚合列都放进 GROUP BY），「至少 2 条」是对分组的条件，写在 HAVING 里。
+- 最后 `ORDER BY redlines DESC, contract_id`。
+
+@@ item d24-02
+type: sql
+title: 建 playbook 规则表
+level: 1
+lang: sql
+dataset: clausecheck
+ordered: yes
+check: SELECT p.name, upper(p.type) AS type, (p."notnull" OR p.pk > 0) AS required, p.pk, p.dflt_value, (SELECT sql LIKE '%CHECK%severity%' AND sql LIKE '%''low''%' AND sql LIKE '%''medium''%' AND sql LIKE '%''high''%' FROM sqlite_master WHERE name = 'playbook_rules') AS has_check FROM pragma_table_info('playbook_rules') AS p ORDER BY p.cid
+--- prompt
+把 playbook 的规则也放进数据库。写一条 `CREATE TABLE playbook_rules`，列按这个顺序：
+
+- `id`：TEXT，主键（值像 `'PB-01'`。SQLite 有个历史遗留的坑：不是 INTEGER 的主键默认允许 NULL；想更稳可以再加 `NOT NULL`，判题两种都认）
+- `topic`：TEXT，不能为空
+- `title`：TEXT，不能为空
+- `severity`：TEXT，不能为空，只能是 `'low'`、`'medium'`、`'high'` 之一（用 CHECK）
+- `active`：INTEGER，不能为空，默认值 1
+
+判题会在你的语句运行后读 `pragma_table_info('playbook_rules')`（SQLite 自带的「表结构」查询），按顺序逐列比对名字、类型、是否必填、是否主键、默认值，再看 CHECK 有没有管住 `severity` 的三个值。
+--- solution
+CREATE TABLE playbook_rules (
+  id TEXT PRIMARY KEY,
+  topic TEXT NOT NULL,
+  title TEXT NOT NULL,
+  severity TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high')),
+  active INTEGER NOT NULL DEFAULT 1
+);
+--- hints
+- 格式：`CREATE TABLE 表名 (列名 类型 约束, 列名 类型 约束, ...);`，最后一列后面没有逗号。
+- 限定取值：`severity TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high'))`。
+- 默认值写在约束里：`active INTEGER NOT NULL DEFAULT 1`。想看自己建出来的结构，点「只运行看看」：下面显示的就是判题读出来的那张表结构。
+
+@@ item d24-03
+type: code
+title: 约束挡住坏数据
+level: 2
+dataset: clausecheck
+--- prompt
+第 18 天的工作流里，律师要批准或驳回每一条 redline。把决定存进表 `approvals`：在字符串 `SCHEMA` 里写建表语句，要求：
+
+- `id`：INTEGER，主键
+- `review_id`：INTEGER，必填，外键指向 `reviews(id)`；**每条审查只能有一个决定**（UNIQUE）
+- `decision`：TEXT，必填，只能是 `'approved'` 或 `'rejected'`
+- `approver`：TEXT，必填
+- `decided_at`：TEXT，必填，默认 `CURRENT_TIMESTAMP`
+
+测试会在一个装好样例数据的新库里先执行 `PRAGMA foreign_keys = ON`，再执行你的 `SCHEMA`，然后插入一行好数据和各种坏数据：坏数据必须被数据库拒绝（抛出 `sqlite3.IntegrityError`）。起始代码的表能建出来，但什么都挡不住。
+--- starter
+SCHEMA = """
+CREATE TABLE approvals (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER,
+  decision TEXT,
+  approver TEXT,
+  decided_at TEXT
+);
+"""
+--- solution
+SCHEMA = """
+CREATE TABLE approvals (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id),
+  decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+  approver TEXT NOT NULL,
+  decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+--- tests
+import sqlite3
+def _db():
+    conn = fresh_db()
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA)
+    return conn
+def _ins(conn, review_id, decision, approver):
+    conn.execute("INSERT INTO approvals (review_id, decision, approver) VALUES (?, ?, ?)", (review_id, decision, approver))
+def _try(review_id, decision, approver, first=None):
+    conn = _db()
+    if first:
+        _ins(conn, *first)
+    try:
+        _ins(conn, review_id, decision, approver)
+    except sqlite3.IntegrityError:
+        return "rejected"
+    return "accepted"
+def _good():
+    conn = _db()
+    _ins(conn, 1005, "approved", "anna")
+    return conn.execute("SELECT review_id, decision, approver, decided_at IS NOT NULL FROM approvals").fetchall()
+expect("好数据能插入，decided_at 自动填上", _good, [(1005, "approved", "anna", 1)])
+expect("decision 不在允许的值里", lambda: _try(1005, "maybe", "anna"), "rejected")
+expect("decision 是空的（CHECK 放过 NULL，要靠 NOT NULL）", lambda: _try(1005, None, "anna"), "rejected")
+expect("approver 是空的（NULL）", lambda: _try(1005, "approved", None), "rejected")
+expect("review_id 是空的（外键和 UNIQUE 都放过 NULL）", lambda: _try(None, "approved", "anna"), "rejected")
+expect("同一条审查第二个决定", lambda: _try(1005, "rejected", "ben", first=(1005, "approved", "anna")), "rejected")
+expect("review_id 在 reviews 里不存在（外键）", lambda: _try(9999, "approved", "anna"), "rejected")
+expect("另一条审查的决定可以插入", lambda: _try(1022, "rejected", "ben", first=(1005, "approved", "anna")), "accepted")
+--- hints
+- 一列可以有好几个约束，挨着写：`review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id)`。
+- 取值限制用 `CHECK (decision IN ('approved', 'rejected'))`；默认值用 `DEFAULT CURRENT_TIMESTAMP`。
+- 外键只有在 `PRAGMA foreign_keys = ON` 时才检查，测试已经替你打开了。注意 NULL：`CHECK`、`UNIQUE`、外键都不管 NULL，「必填」只能靠 `NOT NULL`。
+
+@@ item d24-04
+type: sql
+title: 修 bug：UPDATE 一行没改
+level: 2
+lang: sql
+dataset: clausecheck
+check: SELECT id, verdict, risk FROM reviews ORDER BY id
+--- prompt
+失败的审查（`error` 不是 NULL）不能被当成「没问题」。团队规定：失败的行一律标成 `verdict = 'flag'`、`risk = 'high'`，让律师人工看。
+
+下面的 UPDATE 运行不报错，可是一行都没改。修好它。判题会比对整张 reviews 表每一行的 verdict 和 risk，所以也**不能多改**。
+
+这类改数据的题，「只运行看看」显示的是判题读的那张表（运行你的脚本之后的样子），你自己写的 SELECT 或 RETURNING 的结果不会显示。想先用 SELECT 试试条件，就到上面「INSERT、UPDATE、DELETE」那张知识卡片的编辑器里运行。
+--- starter
+UPDATE reviews
+SET verdict = 'flag', risk = 'high'
+WHERE error = NULL;
+--- solution
+UPDATE reviews
+SET verdict = 'flag', risk = 'high'
+WHERE error IS NOT NULL;
+--- hints
+- 在知识卡片的编辑器里试试：`SELECT id, error FROM reviews WHERE error = NULL;` 返回几行？
+- 和 NULL 比较要用 `IS NULL` / `IS NOT NULL`（第 22 天）。`= NULL` 的结果永远不是真。
+- 条件是「error 不是 NULL」：`WHERE error IS NOT NULL`，正好选中 1047 和 1061 两行。写成 `IS NULL` 会把其他 63 行全改掉。
+
+@@ item d24-05
+type: sql
+title: 删掉测试数据
+level: 2
+lang: sql
+dataset: clausecheck
+check: SELECT c.id, c.title, COUNT(r.id) AS reviews FROM contracts AS c LEFT JOIN reviews AS r ON r.contract_id = c.id GROUP BY c.id, c.title ORDER BY c.id
+--- prompt
+有人做测试时往库里插了几份假合同，标题都以 `TEST: ` 开头（注意有冒号和空格），它们还带着几条审查。写一个脚本（两条 DELETE）把这些**测试合同和它们的审查**都删掉，真实数据一行都不能动。
+
+这个库打开了外键检查（`PRAGMA foreign_keys = ON`）。小心：有一份真合同的标题也以 Test 开头。判题会检查剩下的每份合同和它的审查条数；「只运行看看」显示的就是这张表，先随便写一句 `SELECT 1;` 运行，能看到删之前所有合同的标题。
+--- schema
+PRAGMA foreign_keys = ON;
+INSERT INTO contracts VALUES (901, 5, 'TEST: smoke contract', '2026-09-20 08:00:00', 1, 'reviewed');
+INSERT INTO contracts VALUES (902, 5, 'TEST: empty file', '2026-09-20 08:05:00', 0, 'failed');
+INSERT INTO contracts VALUES (903, 5, 'Testing Services Agreement', '2026-09-21 09:00:00', 11, 'in_review');
+INSERT INTO reviews VALUES (1901, 901, '1.1', 'Definitions', 'other', 'accept', 'low', '[]', 'deepseek-v4-flash', 'v2', 100, 10, 0, 500, 0.000042, NULL, '2026-09-20 08:01:00');
+INSERT INTO reviews VALUES (1902, 901, '8.1', 'Cap on Liability', 'liability_cap', 'redline', 'high', '["PB-01"]', 'deepseek-v4-flash', 'v2', 100, 10, 0, 500, 0.000042, NULL, '2026-09-20 08:01:05');
+INSERT INTO reviews VALUES (1903, 903, '3.1', 'Fees', 'payment', 'accept', 'low', '[]', 'deepseek-v4-flash', 'v2', 2012, 148, 1210, 2104, 0.000425, NULL, '2026-09-21 09:02:00');
+--- solution
+DELETE FROM reviews
+WHERE contract_id IN (SELECT id FROM contracts WHERE title LIKE 'TEST: %');
+DELETE FROM contracts
+WHERE title LIKE 'TEST: %';
+--- hints
+- 标题以 Test 开头的有 3 份：901、902 是测试数据，903 `Testing Services Agreement` 是真合同。`LIKE 'TEST%'` 会把 903 也选中（SQLite 的 LIKE 不分大小写；Postgres 的 LIKE 分），所以条件要带上冒号和空格：`'TEST: %'`。
+- 外键打开时，还有审查指向的合同删不掉（FOREIGN KEY constraint failed）：先删子表 reviews，再删父表 contracts。
+- 删审查时用子查询选合同：`WHERE contract_id IN (SELECT id FROM contracts WHERE ...)`。
+
+@@ item d24-06
+type: sql
+title: 修 bug：重跑就撞车
+level: 2
+lang: sql
+dataset: clausecheck
+check: SELECT * FROM latest_verdicts ORDER BY contract_id, clause_id
+--- prompt
+`latest_verdicts` 保存每个条款最新的结论，主键是 `(contract_id, clause_id)`；`note` 是律师手写的备注。表里已经有 `(103, '8.1', 'redline', 1022, 'anna: ask for a 12-month cap')` 和 `(109, '3.1', 'accept', 1060, NULL)`。
+
+下面的脚本想写入两次新的审查结果：1064 是 103 的 8.1 重审（这一行已经存在），1065 是 109 的 8.1（还没有）。运行它会报 `UNIQUE constraint failed`。把两条语句都改成 UPSERT：不存在就插入；已经存在就**只**把 `verdict` 和 `review_id` 更新成新值，律师的 `note` 要留着。这样同一个脚本不管行在不在，都能得到正确结果。
+--- schema
+CREATE TABLE latest_verdicts (
+  contract_id INTEGER NOT NULL,
+  clause_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  review_id INTEGER NOT NULL,
+  note TEXT,
+  PRIMARY KEY (contract_id, clause_id)
+);
+INSERT INTO latest_verdicts VALUES (103, '8.1', 'redline', 1022, 'anna: ask for a 12-month cap');
+INSERT INTO latest_verdicts VALUES (109, '3.1', 'accept', 1060, NULL);
+--- starter
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (103, '8.1', 'flag', 1064);
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (109, '8.1', 'accept', 1065);
+--- solution
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (103, '8.1', 'flag', 1064)
+ON CONFLICT (contract_id, clause_id) DO UPDATE SET
+  verdict = excluded.verdict,
+  review_id = excluded.review_id;
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (109, '8.1', 'accept', 1065)
+ON CONFLICT (contract_id, clause_id) DO UPDATE SET
+  verdict = excluded.verdict,
+  review_id = excluded.review_id;
+--- hints
+- 在每条 INSERT 的 VALUES 后面加 `ON CONFLICT (contract_id, clause_id) DO UPDATE SET ...`，分号挪到最后。
+- 新值从 `excluded` 里取：`verdict = excluded.verdict, review_id = excluded.review_id`。
+- 你也许见过 `INSERT OR REPLACE`：它是先删掉旧行再插入新行，没写到的列（这里的 `note`）会丢掉旧值，判题能看出来。UPSERT 只改你点名的列，更安全。
+
+@@ item d24-07
+type: predict
+title: fetchone 和 fetchall
+level: 1
+dataset: clausecheck
+--- prompt
+写出输出。注意：只有一列时，一行长什么样？没有行时 `fetchone()` 和 `fetchall()` 各返回什么？数据库里的 NULL 到了 Python 里是什么？
+--- code
+import sqlite3
+
+conn = fresh_db()
+print(conn.execute("SELECT COUNT(*) FROM reviews WHERE error IS NOT NULL").fetchone())
+print(conn.execute("SELECT id, verdict FROM reviews WHERE contract_id = 110").fetchall())
+print(conn.execute("SELECT id FROM reviews WHERE contract_id = 999").fetchone())
+print(conn.execute("SELECT id FROM reviews WHERE contract_id = 999").fetchall())
+
+conn.row_factory = sqlite3.Row
+row = conn.execute("SELECT clause_id, risk FROM reviews WHERE id = 1047").fetchone()
+print(row["clause_id"], row[1], dict(row))
+--- explain
+每一行都是元组，只有一列也是 `(2,)`，要取数字得写 `[0]`。`fetchone()` 没有行时返回 `None`，`fetchall()` 返回空列表 `[]`：写 `conn.execute(...).fetchone()[0]` 之前要想好「会不会一行都没有」。数据库的 NULL 到 Python 里就是 `None`（1047 是失败的审查，risk 是 NULL）。设了 `sqlite3.Row` 后，按列名、按位置都能取，`dict(row)` 最方便交给 JSON 或 Pydantic。
+
+@@ item d24-08
+type: code
+title: 一份合同的审查
+level: 2
+dataset: clausecheck
+--- prompt
+写 `reviews_for(conn, contract_id)`：返回这份合同的所有审查，**按 id 从小到大**，每行是一个字典，键是 `id`、`clause_id`、`verdict`、`risk`。合同不存在时返回 `[]`。
+
+- `contract_id` 用 `?` 参数传，不要拼字符串
+- 用 `sqlite3.Row` 把行变成字典
+
+例：`reviews_for(conn, 110)` → `[{"id": 1062, "clause_id": "4.2", "verdict": "redline", "risk": "medium"}, {"id": 1063, "clause_id": "15.4", "verdict": "accept", "risk": "low"}]`
+--- starter
+import sqlite3
+
+def reviews_for(conn, contract_id):
+    pass
+--- solution
+import sqlite3
+
+def reviews_for(conn, contract_id):
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, clause_id, verdict, risk FROM reviews WHERE contract_id = ? ORDER BY id",
+        (contract_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+--- tests
+expect("合同 110", lambda: reviews_for(fresh_db(), 110), [
+    {"id": 1062, "clause_id": "4.2", "verdict": "redline", "risk": "medium"},
+    {"id": 1063, "clause_id": "15.4", "verdict": "accept", "risk": "low"},
+])
+expect("失败的审查：verdict 和 risk 是 None", lambda: reviews_for(fresh_db(), 106)[2], {"id": 1047, "clause_id": "10.1", "verdict": None, "risk": None})
+expect("按 id 排序，不是按 clause_id（1064 是后来重审的）", lambda: [r["id"] for r in reviews_for(fresh_db(), 103)][-3:], [1028, 1029, 1064])
+def _shuffled_db():
+    conn = fresh_db()
+    conn.execute("PRAGMA reverse_unordered_selects = ON")  # 没写 ORDER BY 的查询，结果故意倒过来
+    return conn
+expect("写了 ORDER BY：没排序的结果顺序没有保证", lambda: [r["id"] for r in reviews_for(_shuffled_db(), 110)], [1062, 1063])
+expect("合同不存在", lambda: reviews_for(fresh_db(), 999), [])
+expect("参数：奇怪的值只会查不到，不会变成 SQL", lambda: reviews_for(fresh_db(), "110 OR 1=1"), [])
+--- hints
+- 先 `conn.row_factory = sqlite3.Row`，再 `conn.execute("SELECT ... WHERE contract_id = ? ORDER BY id", (contract_id,))`。
+- 不写 ORDER BY 时，数据库可以按任何顺序返回：这里碰巧是 id 顺序，换个数据库、加个索引就可能变。有一个测试专门把没排序的结果倒过来。
+- `fetchall()` 拿到的每一行用 `dict(row)` 变成字典：`return [dict(row) for row in rows]`。
+
+@@ item d24-09
+type: fix
+title: 修 bug：撇号和注入
+level: 2
+dataset: clausecheck
+--- prompt
+`customer_ids(conn, name)` 按客户名找 id（按 id 排序）。它有两个毛病：名字里有撇号（`O'Brien Legal`）就报错；有人输入 `x' OR '1'='1`，就拿到了所有客户的 id。
+
+运行，看测试里的报错和「实际」结果，然后改成参数化查询。
+--- starter
+def customer_ids(conn, name):
+    sql = f"SELECT id FROM customers WHERE name = '{name}' ORDER BY id"
+    return [row[0] for row in conn.execute(sql).fetchall()]
+--- solution
+def customer_ids(conn, name):
+    sql = "SELECT id FROM customers WHERE name = ? ORDER BY id"
+    return [row[0] for row in conn.execute(sql, (name,)).fetchall()]
+--- tests
+def _db():
+    conn = fresh_db()
+    conn.execute("INSERT INTO customers (id, name, country, plan, signed_up) VALUES (7, 'O''Brien Legal', 'IE', 'pro', '2026-09-22')")
+    return conn
+expect("普通名字", lambda: customer_ids(_db(), "Nordlys AB"), [1])
+expect("名字里有撇号", lambda: customer_ids(_db(), "O'Brien Legal"), [7])
+expect("注入：只是一个查不到的怪名字", lambda: customer_ids(_db(), "x' OR '1'='1"), [])
+expect("查不到", lambda: customer_ids(_db(), "Nobody AB"), [])
+--- hints
+- 看第二个测试的报错：`O'Brien` 里的 `'` 把 SQL 里的字符串提前结束了，后面的 `Brien Legal'` 成了语法错误。
+- SQL 里写 `WHERE name = ?`（不要引号），值作为第二个参数传：`conn.execute(sql, (name,))`。注意 `(name,)` 里的逗号。
+
+@@ item d24-10
+type: choice
+title: 列名能用 ? 吗
+level: 2
+dataset: clausecheck
+--- prompt
+下面的函数想按调用方给的列从大到小排序，于是把列名也写成了 `?`。`top_reviews(conn, "cost_usd")` 会怎样？
+--- code
+def top_reviews(conn, column):
+    sql = "SELECT id, cost_usd FROM reviews ORDER BY ? DESC LIMIT 3"
+    return conn.execute(sql, (column,)).fetchall()
+
+top_reviews(conn, "cost_usd")
+--- options
+- 返回最贵的 3 条审查
+- 报错：列名不能用参数
+- 不报错，但 `?` 被当成一个固定的字符串值 `'cost_usd'`，每行都一样，等于没排序，返回的是表里最前面的 3 行
+- 数据库把 `cost_usd` 当成注入攻击，拒绝执行
+answer: 3
+--- explain
+参数永远只是「值」。在 SQLite 里 `ORDER BY ?` 等于按常量 `'cost_usd'` 排序，每行都相等，顺序就不变，而且不报错，最难发现（实际返回 1001、1002、1003）。换成 Postgres，很多驱动会直接报错；不管哪种，都排不了序。表名、列名、`ASC` / `DESC` 这些属于 SQL 的**结构**，不能参数化：先检查它在白名单里，再拼进字符串。后面「写测试」那题就是这样一个函数。
+
+@@ item d24-11
+type: fill
+title: 填空：命名参数
+level: 2
+dataset: clausecheck
+--- prompt
+补全 `risky_clauses(conn, contract_id, risk="high")`：用**命名参数**（`:名字`）查出这份合同里指定风险等级的条款，按 id 排序，返回字典列表，每个字典有 `clause_id` 和 `verdict`。
+
+例：`risky_clauses(conn, 101)` → `[{"clause_id": "8.1", "verdict": "redline"}, {"clause_id": "8.2", "verdict": "flag"}]`
+--- template
+import sqlite3
+
+def risky_clauses(conn, contract_id, risk="high"):
+    conn.row_factory = sqlite3.[[Row]]
+    rows = conn.execute(
+        "SELECT clause_id, verdict FROM reviews WHERE contract_id = [[:cid]] AND risk = [[:risk]] ORDER BY id",
+        {"cid": contract_id, "risk": risk},
+    ).[[fetchall()]]
+    return [dict(row) for row in rows]
+--- tests
+expect("合同 101 的高风险条款", lambda: risky_clauses(fresh_db(), 101), [{"clause_id": "8.1", "verdict": "redline"}, {"clause_id": "8.2", "verdict": "flag"}])
+expect("换一个风险等级", lambda: risky_clauses(fresh_db(), 103, "medium"), [{"clause_id": "3.4", "verdict": "flag"}, {"clause_id": "6.2", "verdict": "redline"}, {"clause_id": "10.3", "verdict": "flag"}, {"clause_id": "11.3", "verdict": "flag"}])
+expect("没有匹配", lambda: risky_clauses(fresh_db(), 108), [])
+--- hints
+- 占位符的名字要和字典的键一样：字典里是 `"cid"` 和 `"risk"`，SQL 里就写 `:cid` 和 `:risk`。
+- 按列名取值的行类型是 `sqlite3.Row`；取出所有行用 `fetchall()`。
+
+@@ item d24-12
+type: code
+title: 把一次调用记进表
+level: 2
+--- prompt
+每次调用大模型都记一行追踪数据（第 13 天的 span，这次存进数据库）。表结构在起始代码的 `SCHEMA` 里，`init_db(conn)` 负责建表。写 `log_call(conn, call)`：
+
+- `call` 是字典，一定有 `review_id`、`model`、`prompt_tokens`、`completion_tokens`、`latency_ms`；`error` 可能没有（没有就存 NULL）；也可能有别的键（忽略它们）
+- 用**命名参数**插入一行，然后 `commit`，返回新行的 id（`cur.lastrowid`，`cur` 是 `conn.execute(...)` 返回的游标）
+
+例：往空表里第一次调用返回 `1`，第二次返回 `2`。
+--- starter
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_calls (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL,
+  completion_tokens INTEGER NOT NULL,
+  latency_ms INTEGER NOT NULL,
+  error TEXT
+);
+"""
+
+def init_db(conn):
+    conn.executescript(SCHEMA)
+
+def log_call(conn, call):
+    pass
+--- solution
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_calls (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL,
+  completion_tokens INTEGER NOT NULL,
+  latency_ms INTEGER NOT NULL,
+  error TEXT
+);
+"""
+
+def init_db(conn):
+    conn.executescript(SCHEMA)
+
+def log_call(conn, call):
+    params = {"error": None, **call}
+    cur = conn.execute(
+        "INSERT INTO llm_calls (review_id, model, prompt_tokens, completion_tokens, latency_ms, error) "
+        "VALUES (:review_id, :model, :prompt_tokens, :completion_tokens, :latency_ms, :error)",
+        params,
+    )
+    conn.commit()
+    return cur.lastrowid
+--- tests
+import sqlite3
+from pathlib import Path
+CALL = {"review_id": 1062, "model": "deepseek-flash", "prompt_tokens": 1915, "completion_tokens": 222, "latency_ms": 3348}
+def _mem():
+    conn = sqlite3.connect(":memory:")
+    init_db(conn)
+    return conn
+def _two_ids():
+    conn = _mem()
+    return [log_call(conn, CALL), log_call(conn, CALL)]
+expect("返回新行的 id", _two_ids, [1, 2])
+def _stored(call):
+    conn = _mem()
+    log_call(conn, call)
+    return conn.execute("SELECT review_id, model, prompt_tokens, completion_tokens, latency_ms, error FROM llm_calls").fetchone()
+expect("没有 error 键：存 NULL", lambda: _stored(CALL), (1062, "deepseek-flash", 1915, 222, 3348, None))
+expect("error 里有引号也没问题", lambda: _stored({**CALL, "error": "ValidationError: risk_level 'critical' is not allowed"})[5], "ValidationError: risk_level 'critical' is not allowed")
+expect("多余的键被忽略", lambda: _stored({**CALL, "trace_id": "t-42", "cost_usd": 0.0006}), (1062, "deepseek-flash", 1915, 222, 3348, None))
+def _committed():
+    Path("work/d24").mkdir(parents=True, exist_ok=True)
+    Path("work/d24/calls.db").unlink(missing_ok=True)
+    writer = sqlite3.connect("work/d24/calls.db")
+    init_db(writer)
+    log_call(writer, CALL)
+    reader = sqlite3.connect("work/d24/calls.db")
+    return reader.execute("SELECT COUNT(*) FROM llm_calls").fetchone()[0]
+expect("提交了：另一个连接也能看到", _committed, 1)
+--- hints
+- 缺的键先补上默认值：`params = {"error": None, **call}`（`**call` 在后面，call 里有 error 时会覆盖 None）。
+- SQL 里写 `VALUES (:review_id, :model, ...)`，第二个参数传字典；字典里多出来的键不会碍事。
+- `cur = conn.execute(...)`，然后 `conn.commit()`，最后 `return cur.lastrowid`。
+
+@@ item d24-13
+type: order
+title: 排代码：主题统计
+level: 2
+dataset: clausecheck
+--- prompt
+排出 `topic_counts(conn, min_n)`：返回审查条数**至少** `min_n` 的主题，列表里是 `(topic, n)` 元组，按 n 从大到小、同样多的按 topic 字母顺序。SQL 被拆成了几段字符串（Python 会把挨着的字符串自动接起来），它们的顺序也要排对。有两行干扰项。
+--- lines
+def topic_counts(conn, min_n):
+    sql = (
+        "SELECT topic, COUNT(*) AS n FROM reviews "
+        "GROUP BY topic "
+        "HAVING COUNT(*) >= ? "
+        "ORDER BY n DESC, topic"
+    )
+    rows = conn.execute(sql, (min_n,)).fetchall()
+    return rows
+--- distractors
+        "WHERE COUNT(*) >= ? "
+    rows = conn.execute(sql, min_n).fetchall()
+--- tests
+expect("至少 7 条", lambda: topic_counts(fresh_db(), 7), [("liability_cap", 12), ("payment", 10), ("data_processing", 8), ("confidentiality", 7)])
+expect("同样多的按字母顺序", lambda: topic_counts(fresh_db(), 6)[4:], [("auto_renewal", 6), ("governing_law", 6), ("other", 6)])
+expect("门槛太高", lambda: topic_counts(fresh_db(), 13), [])
+--- hints
+- SQL 子句的顺序：SELECT … FROM → GROUP BY → HAVING → ORDER BY（第 22 天）。对分组计数的条件只能写在 HAVING 里，WHERE 里不能用 COUNT。
+- 参数要放在元组里：`(min_n,)`。只传 `min_n` 会报「parameters are of unsupported type」。
+
+@@ item d24-14
+type: testwrite
+title: 为 ORDER BY 白名单写测试
+level: 3
+--- prompt
+看板要让用户选「按什么排序」。列名不能用 `?` 参数（前面的选择题），所以 `order_by(column, direction="desc")` 用白名单生成一段安全的 ORDER BY：
+
+- `column` 必须在 `SORTABLE` 里，否则 `raise ValueError`
+- `direction` 不分大小写，只能是 asc 或 desc，否则 `raise ValueError`；不传时是 desc
+- 返回像 `"ORDER BY cost_usd DESC"` 这样的字符串（方向是大写）
+
+为它写测试：每个 `test_` 函数测一种情况。你的测试要在正确版本上全部通过，并且能抓住每一个故意埋了 bug 的版本。
+--- impl
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="desc"):
+    if column not in SORTABLE:
+        raise ValueError(f"cannot sort by {column!r}")
+    d = direction.upper()
+    if d not in ("ASC", "DESC"):
+        raise ValueError(f"bad direction {direction!r}")
+    return f"ORDER BY {column} {d}"
+--- mutants
+===== 白名单：不在白名单里的列（比如一段注入）
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="desc"):
+    d = direction.upper()
+    if d not in ("ASC", "DESC"):
+        raise ValueError(f"bad direction {direction!r}")
+    return f"ORDER BY {column} {d}"
+===== 方向：不认识的方向被悄悄当成 DESC
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="desc"):
+    if column not in SORTABLE:
+        raise ValueError(f"cannot sort by {column!r}")
+    d = "ASC" if direction.upper() == "ASC" else "DESC"
+    return f"ORDER BY {column} {d}"
+===== 大小写：小写的 "asc"
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="DESC"):
+    if column not in SORTABLE:
+        raise ValueError(f"cannot sort by {column!r}")
+    if direction not in ("ASC", "DESC"):
+        raise ValueError(f"bad direction {direction!r}")
+    return f"ORDER BY {column} {direction}"
+===== 默认值：不传方向的时候
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="asc"):
+    if column not in SORTABLE:
+        raise ValueError(f"cannot sort by {column!r}")
+    d = direction.upper()
+    if d not in ("ASC", "DESC"):
+        raise ValueError(f"bad direction {direction!r}")
+    return f"ORDER BY {column} {d}"
+--- starter
+import pytest
+
+def test_sort_by_cost():
+    assert order_by("cost_usd", "DESC") == "ORDER BY cost_usd DESC"
+--- solution
+import pytest
+
+def test_sort_by_cost():
+    assert order_by("cost_usd", "DESC") == "ORDER BY cost_usd DESC"
+
+def test_default_is_desc():
+    assert order_by("latency_ms") == "ORDER BY latency_ms DESC"
+
+def test_lowercase_direction():
+    assert order_by("created_at", "asc") == "ORDER BY created_at ASC"
+
+def test_unknown_column_rejected():
+    with pytest.raises(ValueError):
+        order_by("cost_usd; DROP TABLE reviews")
+
+def test_bad_direction_rejected():
+    with pytest.raises(ValueError):
+        order_by("cost_usd", "sideways")
+--- hints
+- 一个 `test_` 函数测一种情况：正常、不传方向、小写方向、不在白名单的列、不认识的方向。
+- 安全函数最重要的测试是「坏输入必须被拒绝」：`with pytest.raises(ValueError):` 下面一行传一段注入，比如 `"cost_usd; DROP TABLE reviews"`。
+- 别只用大写的 `"DESC"` 测：真实调用方传来的常常是小写。
+
+@@ item d24-15
+type: fix
+title: 修 bug：留下了半批数据
+level: 3
+--- prompt
+`insert_batch(conn, rows)` 把一批律师反馈写进 `feedback` 表，应该**要么全部写入，要么一条都不写**：
+
+- `rows` 是字典列表，键是 `review_id`、`reviewer`、`verdict`；成功时返回写入的条数，空列表返回 `0`
+- 有一条坏数据被数据库拒绝时：`sqlite3.IntegrityError` 继续往外抛，库里不能留下这一批的任何一行
+
+现在的写法一条一条插入，遇到坏数据时前面几行留在了连接里（还没提交，但同一个连接看得到，下次 commit 就一起写进去了）。运行测试，然后用 `with conn:` 加 `executemany` 改好它。
+--- starter
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS feedback (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  reviewer TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline'))
+);
+"""
+
+def insert_batch(conn, rows):
+    for row in rows:
+        conn.execute(
+            "INSERT INTO feedback (review_id, reviewer, verdict) VALUES (:review_id, :reviewer, :verdict)",
+            row,
+        )
+    conn.commit()
+    return len(rows)
+--- solution
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS feedback (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  reviewer TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline'))
+);
+"""
+
+def insert_batch(conn, rows):
+    with conn:
+        conn.executemany(
+            "INSERT INTO feedback (review_id, reviewer, verdict) VALUES (:review_id, :reviewer, :verdict)",
+            rows,
+        )
+    return len(rows)
+--- tests
+import sqlite3
+def _db():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    return conn
+def _count(conn):
+    return conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+GOOD = [{"review_id": 1005, "reviewer": "anna", "verdict": "accept"}, {"review_id": 1006, "reviewer": "anna", "verdict": "flag"}]
+BAD = GOOD + [{"review_id": 1007, "reviewer": "anna", "verdict": "maybe"}]
+expect("好的一批：返回条数", lambda: insert_batch(_db(), GOOD), 2)
+def _good_rows():
+    conn = _db()
+    insert_batch(conn, GOOD)
+    return _count(conn)
+expect("好的一批：库里有 2 行", _good_rows, 2)
+expect_raises("坏数据：IntegrityError 继续抛出", lambda: insert_batch(_db(), BAD), sqlite3.IntegrityError)
+def _after_bad():
+    conn = _db()
+    insert_batch(conn, GOOD[:1])
+    try:
+        insert_batch(conn, BAD)
+    except sqlite3.IntegrityError:
+        pass
+    return _count(conn)
+expect("坏的一批一行都不留（之前成功的那批还在）", _after_bad, 1)
+expect("空列表", lambda: insert_batch(_db(), []), 0)
+--- hints
+- 看第四个测试：库里本该只有 1 行，实际多出了坏批次里前面的好行。它们没有被撤销。
+- `with conn:` 块里出异常会自动 rollback，异常照样往外抛，正是我们想要的。
+- `conn.executemany(同一条 SQL, rows)` 一次插入整批，字典列表可以直接传给命名参数。
+
+@@ item d24-16
+type: sql
+title: 每条规则被引用几次
+level: 2
+lang: sql
+dataset: clausecheck
+ordered: yes
+--- prompt
+`reviews.rule_ids` 是 JSON 数组文字。统计每个规则 id 在所有审查里一共被引用了几次。返回两列：`rule_id`、`n`，按 n 从多到少，同样多的按 rule_id。
+
+失败的审查 `rule_ids` 是 NULL，`json_each(NULL)` 不产生任何行，不用单独处理。看看结果：被引用最多的是哪条规则？
+--- solution
+SELECT j.value AS rule_id, COUNT(*) AS n
+FROM reviews AS r, json_each(r.rule_ids) AS j
+GROUP BY j.value
+ORDER BY n DESC, rule_id;
+--- hints
+- 用知识卡片里的写法把数组展开：`FROM reviews AS r, json_each(r.rule_ids) AS j`，每个引用一行，规则 id 在 `j.value`。
+- 然后就是普通的分组计数：`GROUP BY j.value`，再 `ORDER BY n DESC, rule_id`。
+- 最多的是 PB-00（「普通套话直接 accept」那条规则）：说明合同里大部分条款是套话，v2 prompt 专门处理它是值得的。
+
+@@ item d24-17
+type: choice
+title: JSON 列还是拆表
+level: 2
+--- prompt
+法务团队提了三个新需求：① 统计每条规则每个月被引用几次；② 保证审查里引用的规则 id 一定存在于 `playbook_rules` 表；③ 按规则 id 很快地查出所有相关审查。`rule_ids` 继续存成 JSON 文字，还是换一种存法？
+--- options
+- 继续用 JSON 列：json_each 什么都能查，没必要改
+- 拆成一张 `review_rules(review_id, rule_id)` 表，每个引用一行：rule_id 可以加外键指向 playbook_rules，也可以加索引
+- 把 rule_ids 拆成 `rule_1`、`rule_2`、`rule_3` 三列
+- 存成逗号分隔的字符串 `'PB-01,PB-02'`，查询时用 `LIKE '%PB-01%'`
+answer: 2
+--- explain
+① 用 json_each 也能做，但 ② 的外键约束只能加在真正的列上，③ 的索引也要建在列上，所以拆表（这叫**规范化**）。三列的写法遇到第 4 条规则就放不下；LIKE 的写法 `'%PB-01%'` 还会匹配到将来的 `PB-010`。JSON 列适合「整块存、整块读」的东西，比如模型的完整回复、工具参数。今天的闭卷第 3 题就是把 rule_ids 拆成这张表。
+
+@@ item d24-18
+type: choice
+title: pgvector 这句在做什么
+level: 2
+lang: sql
+--- prompt
+Clause Check 把 playbook 片段的 embedding 存进了 Postgres（pgvector）。`%s` 是 psycopg 的参数占位符，传进去的是用户问题的 embedding。下面这条查询在做什么？
+--- code
+SELECT id, text
+FROM playbook_chunks
+ORDER BY embedding <=> %s
+LIMIT 5;
+--- options
+- 找出和问题最相似（余弦距离最小）的 5 个片段：第 11 天的 top-k 检索，只是在数据库里算
+- 找出和问题最不相似的 5 个片段，因为是从小到大排
+- 把前 5 个片段的 embedding 改成问题的 embedding
+- 把问题的 embedding 插入表里，最多 5 次
+answer: 1
+--- explain
+`<=>` 是余弦**距离** = 1 − 余弦相似度：越像，距离越小，所以从小到大排、取前 5 个就是 top-5。结果和第 11 天 Python 里「算每个余弦、排序、取前 k 个」一样，但不用把所有向量读进内存。数据多了就加 HNSW 索引：它是**近似**最近邻，快很多，代价是极少数时候会漏掉真正最近的那个。
+
+@@ item d24-19
+type: local
+title: 本机任务：打开项目里的数据库
+level: 2
+--- prompt
+项目里已经有一个真正的 SQLite 数据库：LangGraph 的检查点文件 `data/checkpoints.sqlite`（`clausecheck/graph.py` 里的 `SqliteSaver` 写的）。用今天学的 `sqlite3` **只读**打开它看看。
+
+**第 1 步**：在 VS Code 里新建文件 `work\d24_peek.py`（`work` 文件夹第 10 天建过；没有就先建），内容：
+
+```python
+import sqlite3
+
+# mode=ro：只读打开，不会改动检查点文件
+conn = sqlite3.connect("file:data/checkpoints.sqlite?mode=ro", uri=True)
+tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+for name in tables:
+    # 表名来自数据库自己（不是用户输入），而且表名不能用 ? 参数，所以这里拼字符串是安全的
+    count = conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+    print(name, count)
+print(conn.execute("SELECT thread_id, COUNT(*) FROM checkpoints GROUP BY thread_id").fetchall())
+```
+
+**第 2 步**：在 VS Code 的终端（PowerShell）里，从项目根目录运行：
+
+```
+cd "G:\Contract Clause Reviewer"
+python work\d24_peek.py
+```
+
+**第 3 步**：把输出粘贴到下面。想一想：每个 `thread_id` 是一条独立的运行记录（命令行的 `--thread` 参数，默认 `cli-1`），第 18 天说的「中断以后从检查点恢复」，读的就是这张表。
+placeholder: 粘贴输出：应该能看到 checkpoints 和 writes 两张表的行数
+verify: ^(?=[\s\S]*checkpoints)(?=[\s\S]*writes)
+--- hints
+- `unable to open database file`：你不在项目根目录，或者还没生成过检查点。先 `cd "G:\Contract Clause Reviewer"`；还不行就跑一次图：`python -m clausecheck review data/sample_contract.txt --mode mock --graph --approve yes --out work/graph.report.json`，再运行本题的脚本。
+- `no such table: checkpoints`：文件存在但是空的，同样先跑一次上面的图命令。
+
+@@ item d24-e1
+type: scratch
+title: 闭卷：批量保存最新结论
+exam: yes
+level: 3
+--- prompt
+库里已经有这张表（测试会建好，你不用建）：
+
+```sql
+CREATE TABLE latest_verdicts (
+  contract_id INTEGER NOT NULL,
+  clause_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  risk TEXT NOT NULL,
+  review_id INTEGER NOT NULL,
+  PRIMARY KEY (contract_id, clause_id)
+);
+```
+
+写 `save_reviews(conn, reviews)`：
+
+- `reviews` 是字典列表，键是 `contract_id`、`clause_id`、`verdict`、`risk`、`review_id`
+- 每一条都写进表：`(contract_id, clause_id)` 不存在就插入，已经存在就把 `verdict`、`risk`、`review_id` 更新成新值；同一批里同一个条款出现两次，以后一次为准
+- 整批在**一个事务**里：有任何一条被数据库拒绝（比如 verdict 是 None），这一批一条都不留，`sqlite3.IntegrityError` 继续抛出
+- 值一律用参数传；返回 `len(reviews)`
+--- solution
+import sqlite3
+
+SQL = (
+    "INSERT INTO latest_verdicts (contract_id, clause_id, verdict, risk, review_id) "
+    "VALUES (:contract_id, :clause_id, :verdict, :risk, :review_id) "
+    "ON CONFLICT (contract_id, clause_id) DO UPDATE SET "
+    "verdict = excluded.verdict, risk = excluded.risk, review_id = excluded.review_id"
+)
+
+def save_reviews(conn, reviews):
+    with conn:
+        conn.executemany(SQL, reviews)
+    return len(reviews)
+--- tests
+import sqlite3
+def _db():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE latest_verdicts (contract_id INTEGER NOT NULL, clause_id TEXT NOT NULL, verdict TEXT NOT NULL, risk TEXT NOT NULL, review_id INTEGER NOT NULL, PRIMARY KEY (contract_id, clause_id))")
+    conn.execute("INSERT INTO latest_verdicts VALUES (103, '8.1', 'redline', 'high', 1022)")
+    conn.commit()
+    return conn
+def _rows(conn):
+    return conn.execute("SELECT * FROM latest_verdicts ORDER BY contract_id, clause_id").fetchall()
+BATCH = [
+    {"contract_id": 103, "clause_id": "8.1", "verdict": "flag", "risk": "high", "review_id": 1064},
+    {"contract_id": 109, "clause_id": "8.1", "verdict": "accept", "risk": "low", "review_id": 1065},
+]
+AFTER = [(103, "8.1", "flag", "high", 1064), (109, "8.1", "accept", "low", 1065)]
+def _once():
+    conn = _db()
+    n = save_reviews(conn, BATCH)
+    return n, _rows(conn)
+expect("已有的更新、没有的插入", _once, (2, AFTER))
+def _twice():
+    conn = _db()
+    save_reviews(conn, BATCH)
+    save_reviews(conn, BATCH)
+    return _rows(conn)
+expect("同一批存两次，结果一样（幂等）", _twice, AFTER)
+def _dup():
+    conn = _db()
+    save_reviews(conn, [BATCH[1], {**BATCH[1], "verdict": "flag", "risk": "medium", "review_id": 1070}])
+    return _rows(conn)[1]
+expect("同一批里同一个条款两次：后一次为准", _dup, (109, "8.1", "flag", "medium", 1070))
+def _bad():
+    conn = _db()
+    bad = BATCH + [{"contract_id": 110, "clause_id": "4.2", "verdict": None, "risk": "medium", "review_id": 1062}]
+    try:
+        save_reviews(conn, bad)
+    except sqlite3.IntegrityError:
+        return _rows(conn)
+    return "没有抛出 IntegrityError"
+expect("有一条坏数据：整批不写，原来的行不变", _bad, [(103, "8.1", "redline", "high", 1022)])
+
+@@ item d24-e2
+type: scratch
+title: 闭卷：可选条件的搜索
+exam: yes
+level: 3
+dataset: clausecheck
+--- prompt
+写 `search_reviews(conn, topic=None, risk=None, limit=20)`，在 `reviews` 表里搜索，返回审查 id 的列表（整数），按 id 从小到大，最多 `limit` 条：
+
+- `topic` 不是 None：只要这个主题；`risk` 不是 None：只要这个风险等级；两个都给就同时满足；都是 None 就不筛选。**只有 None 才表示不筛选**，空字符串 `""` 也是一个要匹配的值
+- `limit` 必须是大于等于 1 的整数，否则 `raise ValueError`
+- 所有值（包括 limit）都用 `?` 参数传，SQL 字符串里只拼接固定的片段
+
+例：`search_reviews(conn, topic="termination")` → `[1010, 1027, 1033, 1043, 1053]`
+--- solution
+def search_reviews(conn, topic=None, risk=None, limit=20):
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    where = []
+    params = []
+    if topic is not None:
+        where.append("topic = ?")
+        params.append(topic)
+    if risk is not None:
+        where.append("risk = ?")
+        params.append(risk)
+    sql = "SELECT id FROM reviews"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id LIMIT ?"
+    params.append(limit)
+    return [row[0] for row in conn.execute(sql, params).fetchall()]
+--- tests
+def _shuffled_db():
+    conn = fresh_db()
+    conn.execute("PRAGMA reverse_unordered_selects = ON")  # 没写 ORDER BY 的查询，结果故意倒过来
+    return conn
+expect("两个条件", lambda: search_reviews(fresh_db(), topic="liability_cap", risk="high"), [1005, 1006, 1022, 1023, 1046, 1051, 1064])
+expect("只按风险，最多 3 条（按 id 排序以后的前 3 条）", lambda: search_reviews(_shuffled_db(), risk="high", limit=3), [1005, 1006, 1013])
+expect("不筛选：前 20 条", lambda: search_reviews(fresh_db()), list(range(1001, 1021)))
+expect("注入字符串只是查不到", lambda: search_reviews(fresh_db(), topic="x' OR '1'='1"), [])
+expect("空字符串也是一个条件", lambda: search_reviews(fresh_db(), topic=""), [])
+expect_raises("limit 是 0", lambda: search_reviews(fresh_db(), limit=0), ValueError)
+
+@@ item d24-e3
+type: sql
+title: 闭卷：把 JSON 拆成表
+exam: yes
+level: 3
+lang: sql
+dataset: clausecheck
+check: SELECT rule_id, COUNT(*) AS n, MIN(review_id) AS first_review, (SELECT COUNT(*) FROM pragma_table_info('review_rules') WHERE pk > 0) AS pk_columns, (SELECT SUM("notnull") FROM pragma_table_info('review_rules')) AS required_columns, (SELECT COUNT(*) FROM pragma_foreign_key_list('review_rules') WHERE "table" = 'reviews' AND "from" = 'review_id') AS fk_to_reviews FROM review_rules GROUP BY rule_id ORDER BY rule_id
+--- prompt
+把 `reviews.rule_ids`（JSON 数组文字）规范化成一张表。写一个脚本：
+
+1. 建表 `review_rules`，两列：`review_id` INTEGER，必填，外键指向 `reviews(id)`；`rule_id` TEXT，必填。`(review_id, rule_id)` 两列合起来是主键
+2. 用**一条** `INSERT INTO ... SELECT ...`，把每条审查引用的每个规则拆成一行插进去（失败的审查没有规则，自然不产生行）
+
+判题会检查：每个 rule_id 有几行、最小的 review_id 是多少，以及主键是不是两列、两列是不是都必填、`review_id` 有没有外键指向 `reviews`。
+--- solution
+CREATE TABLE review_rules (
+  review_id INTEGER NOT NULL REFERENCES reviews(id),
+  rule_id TEXT NOT NULL,
+  PRIMARY KEY (review_id, rule_id)
+);
+INSERT INTO review_rules (review_id, rule_id)
+SELECT r.id, j.value
+FROM reviews AS r, json_each(r.rule_ids) AS j;

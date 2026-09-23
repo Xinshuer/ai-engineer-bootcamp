@@ -1,0 +1,1152 @@
+@@ day 29
+title: LangChain：模型、消息、提示词、LCEL
+lang: py
+langchain: yes
+hours: 4–5 小时
+--- goal
+用 LangChain 调 DeepSeek，并且清楚它替你发出去的到底是什么（`MOCK.calls[-1]["body"]`，对照第 4 天手写的 `requests.post`）；会用消息类、提示词模板和 `prompt | model | parser` 管道，会流式和批量调用；会把模型当参数传进函数，用假模型不联网地测试一条链。
+
+对应项目：Clause Check 的 `review.py` 是手写的调用（和第 4 天一样），`graph.py` 用的是 LangGraph。这一周学的就是这两个框架：先 LangChain（今天、明天、第 31 天），再 LangGraph。本页运行的是**真正的** LangChain / LangGraph，只有网络是模拟的 DeepSeek，所以这里能跑通的代码，拿到本机也一样能跑。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每张改一处再运行（第一次运行要加载 LangChain，需要几秒）
+- 练习区全部通过（本机任务选做）
+- 闭卷 3 题
+- 不看代码，说出 `prompt | model | StrOutputParser()` 里每一步的输入和输出分别是什么类型
+
+@@ concept
+title: 为什么要框架（以及什么时候不要）
+--- body
+第 4 天你亲手写过一次调用：拼 URL、带 `Authorization` 请求头、组 JSON 请求体、从 `choices[0]["message"]["content"]` 取回答。LangChain 把这些包进一个**聊天模型对象**：
+
+```python
+model = ChatDeepSeek(model="deepseek-flash")
+reply = model.invoke("Review clause 3.1 ...")   # 返回 AIMessage
+```
+
+好处：换供应商基本只换这一行（`ChatOpenAI`、`ChatAnthropic` 用法一样）；消息、模板、重试、流式、token 统计、工具、结构化输出都有统一的写法。代价：多了好几层，报错的 Traceback 很长；而且变得快：2025 年 10 月发布 1.0，旧教程里的 `LLMChain`、`langchain.chains` 在 1.x 的 `langchain` 包里已经没有了（1.0 把很多旧模块挪进了 `langchain-classic`）。
+
+Clause Check 的选择（见 README）：审查流程是线性的，plain Python 就够；只有「暂停等人批准、换个进程再继续」才用了 LangGraph。
+
+下面两段代码发出的是同一个请求（LangChain 只多写了一个 `"stream": False`）。`MOCK.calls[-1]["body"]` 就是 LangChain 真正发出去的 JSON，这一周会经常看它。
+--- code
+import os
+import requests
+import langchain
+import langchain_core
+from langchain_deepseek import ChatDeepSeek
+
+question = "Review clause 3.1: Fees are due in 30 days."
+
+# 第 4 天：手写
+URL = "https://api.deepseek.com/v1/chat/completions"
+headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": question}]}
+data = requests.post(URL, headers=headers, json=body).json()
+print("requests: ", data["choices"][0]["message"]["content"])
+
+# LangChain：地址、请求头、密钥（读环境变量 DEEPSEEK_API_KEY）、解析，都由它做
+model = ChatDeepSeek(model="deepseek-flash")
+reply = model.invoke(question)
+print("LangChain:", reply.content)
+print("它发出的请求体：", MOCK.calls[-1]["body"])
+print("版本：langchain-core", langchain_core.__version__, "| langchain", langchain.__version__)
+
+@@ concept
+title: AIMessage 和思考模式
+--- body
+`invoke` 返回 `AIMessage`，常用的几处：
+
+- `.content`：回答文字
+- `.usage_metadata`：`input_tokens`、`output_tokens`、`total_tokens`，还有 `input_token_details["cache_read"]`（命中缓存的输入）和 `output_token_details` 里的 `"reasoning"`（思考用掉的 token；没有思考时这个字典可能是空的，所以用 `.get("reasoning", 0)`）
+- `.response_metadata["finish_reason"]`：为什么停
+
+DeepSeek V4 的**思考模式默认是开着的**：回答之前先想，想的过程放在 `additional_kwargs["reasoning_content"]`，**按输出 token 收费**，而且这时 `temperature` 不起作用。审查、分类这种短任务通常把它关掉，更快也更便宜：
+
+```python
+ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+```
+
+`extra_body` 里的内容会原样放进请求体（本页用的 langchain-deepseek 1.1 没有专门的思考参数）。`temperature=0` 只有关掉思考以后才有意义。
+
+模型名：`deepseek-chat`、`deepseek-reasoner` 在 2026-07-24 停用了，再用会得到 400 `Model Not Exist`（旧教程和项目的 `config.py` 里还写着它）。现在用 `deepseek-flash`（便宜、快）或 `deepseek-v4-pro`。也可以按字符串选供应商：`init_chat_model("deepseek:deepseek-flash")`，得到的同样是 `ChatDeepSeek`。
+--- code
+from langchain_deepseek import ChatDeepSeek
+
+QUESTION = "Review clause 8.1: Customer's liability shall be unlimited."
+default = ChatDeepSeek(model="deepseek-flash")
+fast = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}, temperature=0)
+
+msg = default.invoke(QUESTION)
+print(type(msg).__name__, "|", msg.content)
+print("finish_reason:", msg.response_metadata["finish_reason"])
+print("thinking:", msg.additional_kwargs["reasoning_content"])
+for name, model in [("thinking on ", default), ("thinking off", fast)]:
+    u = model.invoke(QUESTION).usage_metadata
+    print(f"{name}: output {u['output_tokens']} tokens, of which reasoning {u['output_token_details'].get('reasoning', 0)}")
+print("sent:", {k: v for k, v in MOCK.calls[-1]["body"].items() if k != "messages"})
+
+@@ concept
+title: 消息
+--- body
+第 4 天的 `role` 变成了类：`SystemMessage`（system）、`HumanMessage`（user）、`AIMessage`（assistant），明天还有 `ToolMessage`。`invoke` 也接受简写：`[("system", "..."), ("user", "...")]`，或者第 4 天那样的字典。
+
+**多轮对话**：模型自己什么都不记得，每一轮都要把**整段历史**发过去。做法：把模型回的 `AIMessage` 原样 append 进列表，再 append 下一条 `HumanMessage`。历史越长，每次请求的 token 越多（第 33 天学怎么裁剪）。
+
+模型返回的每条 `AIMessage` 都带一个随机的 `id`（`lc_run--...`），每次运行都不一样（自己新建的消息 `id` 是 `None`）。所以测试里比较 `.content` 和 `type(m).__name__`，不要比较整条消息。
+--- code
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_deepseek import ChatDeepSeek
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+history = [
+    SystemMessage("You review contract clauses for the Customer."),
+    HumanMessage("Review clause 8.1: liability is unlimited."),
+]
+first = model.invoke(history)
+history.append(first)                                   # 模型的回答原样放回去
+history.append(HumanMessage("Now clause 9.2: fees are due in 30 days."))
+second = model.invoke(history)
+
+for m in history + [second]:
+    print(f"{type(m).__name__:<14}{m.content}")
+print("roles sent:", [m["role"] for m in MOCK.calls[-1]["body"]["messages"]])
+print("shorthand:", model.invoke([("system", "You review contracts."), ("user", "Hi")]).content)
+print("id:", first.id[:8] + "...（后面每次都不同）")
+
+@@ concept
+title: ChatPromptTemplate
+--- body
+第 12 天用 `str.format` 写过模板。LangChain 的模板是**一组消息模板**：
+
+```python
+prompt = ChatPromptTemplate.from_messages([("system", "You review clauses for the {party}."), ("user", "{text}")])
+prompt.invoke({"party": "Customer", "text": "..."}).to_messages()
+```
+
+- `.invoke(字典)` 返回 `ChatPromptValue`，`.to_messages()` 取出消息列表
+- `input_variables`：需要哪些变量（按字母排好序）。少给一个 → `KeyError`，信息里写着缺哪个
+- 模板里要写 JSON 示例时，大括号写两遍 `{{ }}`，和第 12 天一样；**变量的值**里有大括号没关系，值不会再被当成模板
+- `MessagesPlaceholder("history")`：在这个位置插进一整段历史消息
+- `.partial(party="Customer")`：先填好一部分，返回一个新模板
+--- code
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+review = ChatPromptTemplate.from_messages([
+    ("system", 'You review clauses for the {party}. Reply as JSON like {{"verdict": "accept"}}.'),
+    ("user", "Review clause {clause_id}: {text}"),
+])
+print(review.input_variables)
+value = review.invoke({"party": "Customer", "clause_id": "8.1", "text": "Pay {net 30}."})
+print(type(value).__name__)
+for m in value.to_messages():
+    print(" ", type(m).__name__, "->", m.content)
+
+try:
+    review.invoke({"party": "Customer", "clause_id": "8.1"})
+except KeyError as e:
+    print("KeyError:", e.args[0].split(".")[0])
+
+print(review.partial(party="Customer").input_variables)
+
+chat = ChatPromptTemplate.from_messages([
+    ("system", "You answer questions about one contract."),
+    MessagesPlaceholder("history"),
+    ("user", "{question}"),
+])
+msgs = chat.invoke({"history": [("user", "What is clause 8.1?"), ("assistant", "A liability cap.")], "question": "Is it mutual?"}).to_messages()
+print([type(m).__name__ for m in msgs])
+
+@@ concept
+title: LCEL：用 | 串成一条链
+--- body
+LangChain 里几乎每个零件都是 **Runnable**：都有 `invoke`（一个输入）、`batch`（一批）、`stream`（流式）。`|` 把它们串成一条链，前一个的输出就是后一个的输入：
+
+```
+dict --prompt--> ChatPromptValue --model--> AIMessage --StrOutputParser()--> str
+```
+
+管道里放一个普通函数，它会被自动包成 `RunnableLambda`。整条链本身也是 Runnable，所以同样能 batch、stream、带回调。
+
+运行下面的例子会看到 `StrOutputParser` 输出的类型名是 `TextAccessor`：它是 `str` 的子类（1.0 为了兼容旧写法加的），当普通字符串用就行，`==`、`.strip()`、`isinstance(x, str)` 都照常。
+
+经典错误：顺序放反，比如 parser 放到了 model 前面。它收到的是 ChatPromptValue 而不是 AIMessage，报一个看不太懂的 `ValidationError`。**排错时看每一步的输入和输出类型**，下面的例子一步一步走给你看。
+--- code
+from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.from_messages([("system", "You summarise clauses in one sentence."), ("user", "{text}")])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt | model | StrOutputParser() | (lambda s: s.upper())
+
+print(type(chain).__name__, [type(s).__name__ for s in chain.steps])
+value = {"text": "Fees are due in 30 days."}
+for step in chain.steps:           # 手动走一遍管道，看每一步输出什么类型
+    value = step.invoke(value)
+    print(f"  {type(step).__name__:<19}-> {type(value).__name__}")
+print(chain.invoke({"text": "Fees are due in 30 days."}))
+
+text = StrOutputParser().invoke(AIMessage("accept"))
+print(type(text).__name__, isinstance(text, str), text == "accept")
+
+@@ concept
+title: stream 和 batch
+--- body
+- `chain.stream(输入)`：一块一块地给你，界面上就是打字机效果。链的最后是 `StrOutputParser` 时，每块是字符串。有些块是**空字符串**：开头（只带角色）和结尾（只带结束原因、用量）本来就有；思考模式开着时，前面还会多出一长串（思考的内容不属于回答）。显示时要跳过
+- `chain.batch([输入1, 输入2, ...])`：结果的顺序和输入一样
+- `return_exceptions=True`：出错的那一个位置放异常对象，其他照常返回（第 28 天的「单条失败不拖垮」）。不加的话，一个出错整批都抛异常
+- `config={"max_concurrency": 3}`：最多同时 3 个请求。本页浏览器里没有线程，是一个接一个跑的；在本机上是真的并发
+
+真实的 Web 服务里一般用异步版本：`await chain.ainvoke(...)`、`astream`、`abatch`。本页不能运行 asyncio，这里只提一下。
+--- code
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.from_messages([("user", "{text}")])
+off = prompt | ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}) | StrOutputParser()
+on = prompt | ChatDeepSeek(model="deepseek-flash") | StrOutputParser()
+
+print(list(off.stream({"text": "Summarise clause 9.2 on fees"})))
+pieces = list(on.stream({"text": "Summarise clause 9.2 on fees"}))
+print(len(pieces), "pieces with thinking on,", pieces.count(""), "of them empty")
+
+inputs = [{"text": "Fees are due in 30 days."}, {"text": "Liability is unlimited."}, {"wrong_key": "x"}]
+print(off.batch(inputs[:2]))
+results = off.batch(inputs, return_exceptions=True, config={"max_concurrency": 2})
+print(["ok" if isinstance(r, str) else type(r).__name__ for r in results])
+
+@@ concept
+title: Runnable 小积木
+--- body
+- `RunnableLambda(fn)`：把函数变成 Runnable（管道里的普通函数会自动包）
+- `RunnableParallel(summary=链1, risk=链2)`，或者直接写字典 `{"summary": 链1, "risk": 链2}`：**同一个输入**同时交给几条链，结果合成一个字典
+- `RunnablePassthrough.assign(words=fn)`：输入的字典原样保留，再加一个键（值可以是函数，也可以是一条链）
+
+典型用法：一条条款同时要摘要和风险等级，两个请求互不依赖，可以并行。
+
+提醒：不要为了用而用。一个普通的 Python 函数能写清楚的事，套三层 Runnable 只会让 Traceback 更长。
+--- code
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
+from langchain_deepseek import ChatDeepSeek
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+summary = ChatPromptTemplate.from_messages([("user", "Summarise: {text}")]) | model | StrOutputParser()
+risk = ChatPromptTemplate.from_messages([("user", "Risk level of: {text}")]) | model | StrOutputParser()
+
+brief = RunnableParallel(summary=summary, risk=risk)
+print(brief.invoke({"text": "Liability is unlimited."}))
+
+count = RunnablePassthrough.assign(words=lambda d: len(d["text"].split()))
+print(count.invoke({"text": "Liability is unlimited."}))
+
+pipeline = count | RunnableLambda(lambda d: f"{d['words']} words: {d['text']}")
+print(pipeline.invoke({"text": "Fees are due in 30 days."}))
+
+@@ concept
+title: 测链不联网：假模型
+--- body
+第 19 天学过依赖注入：**把模型当参数传进来**（`build_chain(model)`），测试时传一个假的：
+
+- `FakeListChatModel(responses=["a", "b"])`：按顺序返回，用完了从头再来
+- `GenericFakeChatModel(messages=iter([AIMessage(...)]))`：用完就抛 `StopIteration`；stream 时按空格切块
+- 任何 Runnable 都能当模型用：`RunnableLambda(fn)`，`fn` 拿到的是 ChatPromptValue，可以**根据输入决定回答**，还能顺便检查 prompt 对不对
+
+限制：假模型不支持 `bind_tools`（`NotImplementedError`），明天测工具时用模拟服务器。
+
+测什么：链里**你自己写的逻辑**（模板、解析、清洗）。模型答得好不好，是评测（第 13 天）的事。
+--- code
+from langchain_core.language_models.fake_chat_models import FakeListChatModel, GenericFakeChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+
+def build_chain(model):
+    prompt = ChatPromptTemplate.from_messages([("system", "Answer with one word: accept, flag or redline."), ("user", "{text}")])
+    return prompt | model | StrOutputParser() | (lambda s: s.strip().lower())
+
+chain = build_chain(FakeListChatModel(responses=[" Redline\n", "accept"]))
+print([chain.invoke({"text": "x"}) for _ in range(3)])
+
+def by_rule(prompt_value):
+    text = prompt_value.to_messages()[-1].content
+    return AIMessage("redline" if "unlimited" in text else "accept")
+
+chain = build_chain(RunnableLambda(by_rule))
+print(chain.batch([{"text": "Liability is unlimited."}, {"text": "Fees are due."}]))
+print("requests to the server:", len(MOCK.calls))
+
+g = GenericFakeChatModel(messages=iter([AIMessage("flag this clause")]))
+print([chunk.content for chunk in g.stream("x")])
+try:
+    FakeListChatModel(responses=["x"]).bind_tools([])
+except NotImplementedError:
+    print("bind_tools: NotImplementedError")
+
+@@ item d29-01
+type: choice
+title: 复习：框架替你做了什么
+level: 1
+--- prompt
+复习第 4 天。你手写过：
+
+```python
+resp = requests.post(URL, headers={"Authorization": f"Bearer {key}"}, json=body)
+text = resp.json()["choices"][0]["message"]["content"]
+```
+
+换成 `ChatDeepSeek(model="deepseek-flash").invoke(...)` 以后，下面哪件事**仍然要你自己负责**？
+--- options
+- 拼出 `https://api.deepseek.com/v1/chat/completions` 这个地址
+- 写 `Authorization: Bearer ...` 请求头
+- 从 `choices[0]["message"]["content"]` 里取出回答
+- 把密钥放进环境变量 `DEEPSEEK_API_KEY`（或 `.env`），不写进代码
+answer: 4
+--- explain
+`ChatDeepSeek` 替你拼地址（默认 `https://api.deepseek.com/v1`）、加请求头、把回答解析成 `AIMessage.content`。但密钥从哪里来仍然是你的事：它默认读环境变量 `DEEPSEEK_API_KEY`，你要保证它在那里，而且永远不进代码和 git。面试时可以这样说：框架省掉的是样板代码，不是安全责任。
+
+@@ item d29-02
+type: code
+title: 第一次用 ChatDeepSeek
+level: 1
+--- prompt
+写 `ask(question)`：用 `ChatDeepSeek` 调 `deepseek-flash`，**关掉思考模式**，返回回答文字（字符串，不是 AIMessage）。
+
+模拟服务器对普通问题的回答是 `"Mock reply: " + 问题`。
+
+模型对象建一次就行，放在函数外面；每次调用 `ask` 都新建一个也能跑，只是没必要。
+--- starter
+from langchain_deepseek import ChatDeepSeek
+
+def ask(question):
+    pass
+--- solution
+from langchain_deepseek import ChatDeepSeek
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def ask(question):
+    return model.invoke(question).content
+--- tests
+expect("回答", lambda: ask("Is clause 3.1 fine?"), "Mock reply: Is clause 3.1 fine?")
+expect("返回的是字符串，不是 AIMessage", lambda: isinstance(ask("x"), str), True)
+expect("模型名", lambda: (ask("x"), MOCK.calls[-1]["body"]["model"])[1], "deepseek-flash")
+expect("关掉了思考", lambda: (ask("x"), MOCK.calls[-1]["body"].get("thinking"))[1], {"type": "disabled"})
+--- hints
+- `ChatDeepSeek(model="deepseek-flash", extra_body=...)`：`extra_body` 里的字典会原样放进请求体，值是 `{"thinking": {"type": "disabled"}}`。
+- `model.invoke(question)` 返回 AIMessage，文字在 `.content`。
+
+@@ item d29-03
+type: code
+title: 思考用了多少 token
+level: 2
+--- prompt
+写 `token_report(model, question)`：用 `model` 回答一次 `question`，返回字典：
+
+- `"answer"`：回答文字
+- `"output"`：输出 token 总数（`usage_metadata["output_tokens"]`）
+- `"reasoning"`：其中思考用掉的 token（`usage_metadata["output_token_details"]["reasoning"]`）
+- `"thinking"`：回答里有没有思考过程（`additional_kwargs` 里有 `"reasoning_content"` 这个键就是 `True`）
+
+数字不一定都在：思考关掉时回答里可能没有思考的 token 数（本页的模拟服务器这时就不发），`output_token_details` 是空字典；有些模型根本不报用量（比如测试用的假模型），`usage_metadata` 是 `None`。规则：`usage_metadata` 是 `None` 时 `output` 和 `reasoning` 都是 0；没有 `output_token_details` 或其中没有 `"reasoning"` 时，`reasoning` 是 0。
+
+例：思考模式开着时，`token_report(model, "Review clause 3.1: fees.")` → `{"answer": "Mock reply: Review clause 3.1: fees.", "output": 68, "reasoning": 54, "thinking": True}`
+--- starter
+def token_report(model, question):
+    msg = model.invoke(question)
+    return {}
+--- solution
+def token_report(model, question):
+    msg = model.invoke(question)
+    usage = msg.usage_metadata or {}
+    details = usage.get("output_token_details") or {}
+    return {
+        "answer": msg.content,
+        "output": usage.get("output_tokens", 0),
+        "reasoning": details.get("reasoning", 0),
+        "thinking": "reasoning_content" in msg.additional_kwargs,
+    }
+--- tests
+from langchain_core.language_models.fake_chat_models import FakeListChatModel, GenericFakeChatModel
+from langchain_core.messages import AIMessage
+from langchain_deepseek import ChatDeepSeek
+ON = ChatDeepSeek(model="deepseek-flash")
+OFF = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+expect("思考开着：大部分输出是思考", lambda: token_report(ON, "Review clause 3.1: fees."), {"answer": "Mock reply: Review clause 3.1: fees.", "output": 68, "reasoning": 54, "thinking": True})
+expect("思考关掉：同一个回答，便宜很多", lambda: token_report(OFF, "Review clause 3.1: fees."), {"answer": "Mock reply: Review clause 3.1: fees.", "output": 14, "reasoning": 0, "thinking": False})
+expect("假模型不报用量：usage_metadata 是 None", lambda: token_report(FakeListChatModel(responses=["accept"]), "x"), {"answer": "accept", "output": 0, "reasoning": 0, "thinking": False})
+USAGE = {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+expect("有用量但没有 output_token_details", lambda: token_report(GenericFakeChatModel(messages=iter([AIMessage("flag", usage_metadata=USAGE)])), "x"), {"answer": "flag", "output": 7, "reasoning": 0, "thinking": False})
+--- hints
+- 先 `usage = msg.usage_metadata or {}`：是 None 的话就换成空字典，后面统一用 `.get(键, 0)`。
+- `details = usage.get("output_token_details") or {}`，然后 `details.get("reasoning", 0)`。
+- 有没有某个键：`"reasoning_content" in msg.additional_kwargs`。
+
+@@ item d29-04
+type: predict
+title: 多轮对话发了什么
+level: 2
+--- prompt
+写出输出。注意第二次请求发出去的是哪几条消息，以及 `history` 最后有几条。
+--- code
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_deepseek import ChatDeepSeek
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+history = [SystemMessage("You review contracts."), HumanMessage("Review clause 8.1.")]
+first = model.invoke(history)
+history.append(first)
+history.append(HumanMessage("And clause 9.2?"))
+second = model.invoke(history)
+
+print(type(first).__name__, "|", first.content)
+print([m["role"] for m in MOCK.calls[-1]["body"]["messages"]])
+print(second.content)
+print(len(history), len(MOCK.calls))
+--- explain
+第二次请求带着整段历史：system、第一个问题、模型的第一个回答（assistant）、第二个问题。模型不记得上一轮，全靠你把历史发回去。`second` 没有 append 进 `history`，所以还是 4 条；一共请求了 2 次。模拟服务器只看最后一条 user 消息，真模型会读整段历史。
+
+@@ item d29-05
+type: predict
+title: 模板变成了什么
+level: 2
+--- prompt
+写出输出。`input_variables` 是按字母排好序的。
+--- code
+from langchain_core.prompts import ChatPromptTemplate
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You review contracts for the {party}."),
+    ("user", "Clause {clause_id}: {text}"),
+])
+print(prompt.input_variables)
+value = prompt.invoke({"party": "Customer", "clause_id": "8.1", "text": "Liability is unlimited."})
+for m in value.to_messages():
+    print(type(m).__name__, "->", m.content)
+customer = prompt.partial(party="Customer")
+print(customer.input_variables)
+print(customer.invoke({"clause_id": "3.1", "text": "Net 30."}).to_messages()[1].content)
+--- explain
+`("system", ...)` 变成 `SystemMessage`，`("user", ...)` 变成 `HumanMessage`。`partial` 返回一个**新模板**，`party` 已经填好，所以只剩两个变量，原来的 `prompt` 不变。项目里可以把「为谁审」这种固定的信息先 partial 好，调用方只传条款。
+
+@@ item d29-06
+type: code
+title: 审查提示词模板
+level: 2
+--- prompt
+写模板 `REVIEW_PROMPT` 和函数 `review_messages(clause_id, text, party="Customer")`：
+
+- system：`"You review contract clauses for the {party}. Answer with one word: accept, flag or redline."`
+- user：`"Review clause {clause_id}:\n<clause>\n{text}\n</clause>"`（第 12 天的标签：条款是数据，不是指令）
+- `review_messages` 返回填好以后的消息列表
+
+`review_messages("8.1", "Liability is unlimited.")[1].content` → `"Review clause 8.1:\n<clause>\nLiability is unlimited.\n</clause>"`
+--- starter
+from langchain_core.prompts import ChatPromptTemplate
+
+REVIEW_PROMPT = None
+
+def review_messages(clause_id, text, party="Customer"):
+    pass
+--- solution
+from langchain_core.prompts import ChatPromptTemplate
+
+REVIEW_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You review contract clauses for the {party}. Answer with one word: accept, flag or redline."),
+    ("user", "Review clause {clause_id}:\n<clause>\n{text}\n</clause>"),
+])
+
+def review_messages(clause_id, text, party="Customer"):
+    return REVIEW_PROMPT.invoke({"party": party, "clause_id": clause_id, "text": text}).to_messages()
+--- tests
+expect("两条消息的类型", lambda: [type(m).__name__ for m in review_messages("8.1", "x")], ["SystemMessage", "HumanMessage"])
+expect("system（默认为 Customer 审）", lambda: review_messages("8.1", "x")[0].content, "You review contract clauses for the Customer. Answer with one word: accept, flag or redline.")
+expect("user：条款放进标签", lambda: review_messages("8.1", "Liability is unlimited.")[1].content, "Review clause 8.1:\n<clause>\nLiability is unlimited.\n</clause>")
+expect("换成为 Provider 审", lambda: review_messages("3.1", "x", party="Provider")[0].content.split(".")[0], "You review contract clauses for the Provider")
+expect("条款里有大括号也没关系", lambda: review_messages("3.1", "Pay {net 30}.")[1].content, "Review clause 3.1:\n<clause>\nPay {net 30}.\n</clause>")
+expect("模板需要的变量", lambda: REVIEW_PROMPT.input_variables, ["clause_id", "party", "text"])
+--- hints
+- `ChatPromptTemplate.from_messages([("system", "..."), ("user", "...")])`，占位符写 `{party}` 这样。
+- `REVIEW_PROMPT.invoke({...})` 得到 ChatPromptValue，再 `.to_messages()`。
+- user 模板里的 `\n` 就是换行，直接写在字符串里。
+
+@@ item d29-07
+type: fix
+title: 修 bug：JSON 示例的大括号
+level: 2
+--- prompt
+同事想在 system 里给模型看一个 JSON 示例。运行一下：先看打印出来的 `input_variables`，再看报错说缺了哪个变量。修好它，要求模型看到的 system 文字里**还是**那个完整的 JSON 示例。
+--- starter
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", 'You review contract clauses. Reply in JSON like {"verdict": "flag", "risk_level": "medium"}.'),
+    ("user", "Review clause {clause_id}: {text}"),
+])
+
+def build(clause_id, text):
+    return PROMPT.invoke({"clause_id": clause_id, "text": text}).to_messages()
+
+print(PROMPT.input_variables)
+print(build("8.1", "Liability is unlimited.")[0].content)
+--- solution
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", 'You review contract clauses. Reply in JSON like {{"verdict": "flag", "risk_level": "medium"}}.'),
+    ("user", "Review clause {clause_id}: {text}"),
+])
+
+def build(clause_id, text):
+    return PROMPT.invoke({"clause_id": clause_id, "text": text}).to_messages()
+
+print(PROMPT.input_variables)
+print(build("8.1", "Liability is unlimited.")[0].content)
+--- tests
+expect("只需要两个变量", lambda: PROMPT.input_variables, ["clause_id", "text"])
+expect("system 里是完整的 JSON 示例", lambda: build("8.1", "x")[0].content, 'You review contract clauses. Reply in JSON like {"verdict": "flag", "risk_level": "medium"}.')
+expect("user", lambda: build("8.1", "Liability is unlimited.")[1].content, "Review clause 8.1: Liability is unlimited.")
+--- hints
+- `input_variables` 里出现了 `'"verdict"'`：模板把 `{"verdict": ...}` 里的大括号当成了占位符。
+- 想要字面上的大括号，就写两遍：`{{` 和 `}}`。只改 JSON 示例那一处，`{clause_id}` 这些真变量不要动。
+
+@@ item d29-08
+type: code
+title: 带历史的对话
+level: 2
+--- prompt
+做一个记得上下文的问答助手。
+
+1. 在 `PROMPT` 的 system 和 user 之间加上 `MessagesPlaceholder("history")`
+2. 写 `chat(history, question)`：用 `{"history": history, "question": question}` 调 `chain` 拿到回答文字；**然后**把这一轮加进 `history`：先 `HumanMessage(question)`，再 `AIMessage(回答)`；返回回答
+
+注意顺序：要是先把问题 append 进 `history` 再调用，这个问题会在请求里出现两次。
+--- starter
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_deepseek import ChatDeepSeek
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You answer questions about one contract for the Customer."),
+    ("user", "{question}"),
+])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = PROMPT | model | StrOutputParser()
+
+def chat(history, question):
+    pass
+--- solution
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_deepseek import ChatDeepSeek
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You answer questions about one contract for the Customer."),
+    MessagesPlaceholder("history"),
+    ("user", "{question}"),
+])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = PROMPT | model | StrOutputParser()
+
+def chat(history, question):
+    answer = chain.invoke({"history": history, "question": question})
+    history.append(HumanMessage(question))
+    history.append(AIMessage(answer))
+    return answer
+--- tests
+def _two_turns():
+    MOCK.reset()
+    h = []
+    a1 = chat(h, "What does clause 8.1 say?")
+    a2 = chat(h, "And clause 9.2?")
+    return [a1, a2, [type(m).__name__ for m in h]]
+expect("两轮：回答和历史", _two_turns, ["Mock reply: What does clause 8.1 say?", "Mock reply: And clause 9.2?", ["HumanMessage", "AIMessage", "HumanMessage", "AIMessage"]])
+expect("第一次请求：问题只出现一次", lambda: [m["role"] for m in MOCK.calls[0]["body"]["messages"]], ["system", "user"])
+expect("第二次请求带着上一轮", lambda: [m["role"] for m in MOCK.calls[1]["body"]["messages"]], ["system", "user", "assistant", "user"])
+expect("历史里存的是回答文字", lambda: MOCK.calls[1]["body"]["messages"][2]["content"], "Mock reply: What does clause 8.1 say?")
+--- hints
+- 模板里加一行 `MessagesPlaceholder("history"),`，放在 system 和 user 中间。
+- `chain.invoke({...})` 已经是字符串了（最后一步是 StrOutputParser），直接 `AIMessage(answer)`。
+- 先 invoke，再 append 两条，最后 return。
+
+@@ item d29-09
+type: fill
+title: 填空：第一条链
+level: 1
+--- prompt
+填空，完成一条「提示词 → 模型 → 文字」的链，和一个调用它的函数。
+--- template
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.[[from_messages]]([
+    ("system", "You summarise contract clauses in one sentence."),
+    ("user", "{text}"),
+])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt [[|]] model | [[StrOutputParser()]]
+
+def summarise(text):
+    return chain.[[invoke]]({"text": text})
+--- tests
+expect("返回文字", lambda: summarise("Fees are due in 30 days."), "Mock reply: Fees are due in 30 days.")
+expect("发出去的消息", lambda: [m["role"] for m in MOCK.calls[-1]["body"]["messages"]], ["system", "user"])
+expect("system 的内容", lambda: MOCK.calls[-1]["body"]["messages"][0]["content"], "You summarise contract clauses in one sentence.")
+--- hints
+- 从一组 `(角色, 模板)` 建模板的方法叫 `from_messages`。
+- 把 AIMessage 变成字符串的零件是 `StrOutputParser()`（注意有括号，要的是一个对象）；调用一次用 `invoke`。
+
+@@ item d29-10
+type: fix
+title: 修 bug：零件的顺序
+level: 2
+--- prompt
+这条链一调用就报错。运行测试，读报错的最后几行：`Generation` 的 `text` 期望一个字符串，实际收到的是什么类型？对照卡片里「每一步的输入和输出类型」找到原因，改好。
+--- starter
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.from_messages([("system", "Answer with one word."), ("user", "{question}")])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt | StrOutputParser() | model
+
+def one_word(question):
+    return chain.invoke({"question": question}).strip()
+--- solution
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.from_messages([("system", "Answer with one word."), ("user", "{question}")])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt | model | StrOutputParser()
+
+def one_word(question):
+    return chain.invoke({"question": question}).strip()
+--- tests
+expect("能拿到回答", lambda: one_word("Is clause 8.1 acceptable?"), "Mock reply: Is clause 8.1 acceptable?")
+expect("发出去的是两条消息", lambda: [m["role"] for m in MOCK.calls[-1]["body"]["messages"]], ["system", "user"])
+expect("链的三步", lambda: [type(s).__name__ for s in chain.steps], ["ChatPromptTemplate", "ChatDeepSeek", "StrOutputParser"])
+--- hints
+- 报错说 `input_type=ChatPromptValue`：StrOutputParser 收到的是提示词，不是模型的回答。
+- StrOutputParser 的工作是把 **AIMessage** 变成字符串，所以它只能放在 model 后面。
+
+@@ item d29-11
+type: order
+title: 排代码：建一条链
+level: 2
+--- prompt
+排出 `one_word(question)`：用一条 `prompt | model | parser` 链回答，返回去掉首尾空白的文字。有两行干扰项。
+--- lines
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+prompt = ChatPromptTemplate.from_messages([("system", "Answer in one word."), ("user", "{question}")])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt | model | StrOutputParser()
+def one_word(question):
+    return chain.invoke({"question": question}).strip()
+--- distractors
+chain = model | prompt | StrOutputParser()
+    return chain.invoke(question).strip()
+--- tests
+expect("回答", lambda: one_word("Is clause 3.1 fine?"), "Mock reply: Is clause 3.1 fine?")
+expect("system 消息在前", lambda: MOCK.calls[-1]["body"]["messages"][0], {"content": "Answer in one word.", "role": "system"})
+--- hints
+- 先导入，再建三个对象（prompt、model、chain），最后是函数。chain 要用到前两个，所以放在它们后面。
+- 模板要的是字典 `{"question": ...}`；链的第一个零件必须是 prompt。
+
+@@ item d29-12
+type: predict
+title: batch 和出错的那一个
+level: 2
+--- prompt
+写出输出。`RunnableLambda` 把普通函数变成 Runnable，所以它也有 `invoke` 和 `batch`。
+--- code
+from langchain_core.runnables import RunnableLambda
+
+def word_count(clause):
+    if not clause.strip():
+        raise ValueError("empty clause")
+    return len(clause.split())
+
+counter = RunnableLambda(word_count)
+print(counter.invoke("Fees are due."))
+print(counter.batch(["Liability is unlimited.", "Fees are due within 30 days"]))
+results = counter.batch(["a b", " ", "c"], return_exceptions=True)
+print([type(r).__name__ for r in results])
+print(results[1])
+try:
+    counter.batch(["a", " "])
+except ValueError as e:
+    print("without return_exceptions:", e)
+--- explain
+`batch` 的结果和输入一一对应，顺序不变。加了 `return_exceptions=True`，出错的那一个位置放的是异常对象本身（`print` 它就是错误信息），其他照常；不加的话整批抛出异常，前面成功的结果也拿不到。审一份合同时，一条条款失败不该让整份报告作废，所以批量审查几乎总是加 `return_exceptions=True`，再把异常记成「这一条出错」。
+
+@@ item d29-13
+type: code
+title: 批量打标签
+level: 2
+--- prompt
+写 `label_clauses(chain, texts)`：
+
+- `chain` 的输入是 `{"text": 条款文字}`，输出一个字符串
+- 用**一次** `chain.batch(...)` 处理所有条款，一条出错不能拖垮整批
+- 返回和 `texts` 一样顺序的列表：成功的是 chain 的输出；出错的是 `"ERROR: " + 异常的类名`
+
+`label_clauses(chain, ["Fees are due.", ""])` → `["accept", "ERROR: ValueError"]`（假设空条款会让 chain 抛 ValueError）
+--- starter
+def label_clauses(chain, texts):
+    results = []
+    return results
+--- solution
+def label_clauses(chain, texts):
+    results = chain.batch([{"text": t} for t in texts], return_exceptions=True)
+    return [f"ERROR: {type(r).__name__}" if isinstance(r, Exception) else r for r in results]
+--- tests
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+def fake(d):
+    if not d["text"]:
+        raise ValueError("empty clause")
+    return "redline" if "unlimited" in d["text"] else "accept"
+FAKE = RunnableLambda(fake)
+expect("顺序和输入一样", lambda: label_clauses(FAKE, ["Liability is unlimited.", "Fees are due.", "Data stays in the EU."]), ["redline", "accept", "accept"])
+expect("一条出错不拖垮整批", lambda: label_clauses(FAKE, ["Fees are due.", "", "Liability is unlimited."]), ["accept", "ERROR: ValueError", "redline"])
+expect("空列表", lambda: label_clauses(FAKE, []), [])
+class OnlyBatch:
+    # 只有 batch 方法的替身：记下每次 batch 收到几条输入、有没有 return_exceptions=True
+    def __init__(self):
+        self.calls = []
+    def batch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        self.calls.append([len(inputs), return_exceptions])
+        return ["accept" if d["text"] else ValueError("empty clause") for d in inputs]
+def _only_batch():
+    spy = OnlyBatch()
+    return [label_clauses(spy, ["Fees are due.", ""]), spy.calls]
+expect("只调用一次 batch，并且带上 return_exceptions=True", _only_batch, [["accept", "ERROR: ValueError"], [[2, True]]])
+REAL =ChatPromptTemplate.from_messages([("user", "{text}")]) | ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}) | StrOutputParser()
+def _real():
+    MOCK.reset()
+    out = label_clauses(REAL, ["Fees are due.", "Liability is unlimited."])
+    return [out, len(MOCK.calls)]
+expect("接真的链：每条一个请求", _real, [["Mock reply: Fees are due.", "Mock reply: Liability is unlimited."], 2])
+--- hints
+- 先把每条文字变成链要的字典：`[{"text": t} for t in texts]`，再 `chain.batch(那个列表, return_exceptions=True)`。
+- 结果里的异常可以用 `isinstance(r, Exception)` 认出来，类名是 `type(r).__name__`。
+
+@@ item d29-14
+type: code
+title: 流式显示，跳过空块
+level: 2
+--- prompt
+写 `stream_answer(chain, inputs, show)`：
+
+- 用 `chain.stream(inputs)` 一块一块地拿回答（链的最后是 StrOutputParser，每块是字符串）
+- 每拿到一个**非空**的块，就调用一次 `show(块)`（真实应用里它会把字显示到界面上）；空字符串跳过
+- 最后返回完整的回答（所有块拼起来）
+
+开头和结尾本来就有空块，思考模式开着时回答前还会多出一长串；界面上不能因为它们闪一下。
+--- starter
+def stream_answer(chain, inputs, show):
+    pass
+--- solution
+def stream_answer(chain, inputs, show):
+    parts = []
+    for piece in chain.stream(inputs):
+        if piece:
+            show(piece)
+            parts.append(piece)
+    return "".join(parts)
+--- tests
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+PROMPT = ChatPromptTemplate.from_messages([("user", "{question}")])
+ON = PROMPT | ChatDeepSeek(model="deepseek-flash") | StrOutputParser()
+OFF = PROMPT | ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}) | StrOutputParser()
+def _run(chain, question):
+    shown = []
+    text = stream_answer(chain, {"question": question}, shown.append)
+    return [text, shown]
+expect("思考关：完整回答 + 按顺序显示的块", lambda: _run(OFF, "Summarise clause 9.2 on fees"), ["Mock reply: Summarise clause 9.2 on fees", ["Mock reply: ", "Summarise cl", "ause 9.2 on ", "fees"]])
+expect("思考开：空块一个都没显示", lambda: _run(ON, "Summarise clause 9.2 on fees"), ["Mock reply: Summarise clause 9.2 on fees", ["Mock reply: ", "Summarise cl", "ause 9.2 on ", "fees"]])
+expect("发的是流式请求", lambda: (_run(OFF, "hi"), MOCK.calls[-1]["body"]["stream"])[1], True)
+--- hints
+- `for piece in chain.stream(inputs):`，循环里 `if piece:` 就能跳过空字符串。
+- 用一个列表收集非空的块，最后 `"".join(列表)`。
+
+@@ item d29-15
+type: code
+title: 一次拿到摘要和风险
+level: 2
+--- prompt
+写 `build_brief(model)`，返回一个 Runnable：
+
+- 输入 `{"text": 条款}`，输出 `{"text": 原文, "summary": 摘要, "risk": 风险等级}`
+- `summary` 来自 `SUMMARY | model | StrOutputParser()`
+- `risk` 来自 `RISK | model | StrOutputParser()`，再去掉首尾空白、转成小写
+
+两条小链互不依赖，用 `RunnablePassthrough.assign(...)` 把它们挂在原来的字典上（它会保留 `text`）。
+--- starter
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+SUMMARY = ChatPromptTemplate.from_messages([("user", "Summarise in one sentence: {text}")])
+RISK = ChatPromptTemplate.from_messages([("user", "Risk level (low, medium or high) of: {text}")])
+
+def build_brief(model):
+    pass
+--- solution
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+SUMMARY = ChatPromptTemplate.from_messages([("user", "Summarise in one sentence: {text}")])
+RISK = ChatPromptTemplate.from_messages([("user", "Risk level (low, medium or high) of: {text}")])
+
+def build_brief(model):
+    summary = SUMMARY | model | StrOutputParser()
+    risk = RISK | model | StrOutputParser() | (lambda s: s.strip().lower())
+    return RunnablePassthrough.assign(summary=summary, risk=risk)
+--- tests
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+def fake(prompt_value):
+    text = prompt_value.to_messages()[-1].content
+    return AIMessage("Customer bears unlimited liability." if text.startswith("Summarise") else " HIGH\n")
+expect("三个键", lambda: build_brief(RunnableLambda(fake)).invoke({"text": "Liability is unlimited."}), {"text": "Liability is unlimited.", "summary": "Customer bears unlimited liability.", "risk": "high"})
+def _mock():
+    MOCK.reset()
+    out = build_brief(ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})).invoke({"text": "Fees are due."})
+    sent = sorted(c["body"]["messages"][0]["content"] for c in MOCK.calls)
+    return [out["summary"], sent]
+expect("真的模型：两个请求", _mock, ["Mock reply: Summarise in one sentence: Fees are due.", ["Risk level (low, medium or high) of: Fees are due.", "Summarise in one sentence: Fees are due."]])
+--- hints
+- 先建两条小链：`summary = SUMMARY | model | StrOutputParser()`；risk 那条最后再接一个 `lambda s: s.strip().lower()`。
+- `RunnablePassthrough.assign(summary=summary, risk=risk)`：键名就是输出字典里的新键。
+
+@@ item d29-16
+type: code
+title: 把模型当参数传进来
+level: 2
+--- prompt
+写 `build_chain(model)`，返回 `PROMPT | model | StrOutputParser() | 清理`。清理这一步：把回答里连续的空白（空格、换行）合并成一个空格，并去掉首尾空白，`" ".join(s.split())` 一行就行。
+
+**一定要用传进来的 `model`**，不要在函数里自己建 `ChatDeepSeek`：测试会传假模型进来，整个测试一次都不联网。
+--- starter
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Summarise the clause in one short sentence."),
+    ("user", "Clause {clause_id}: {text}"),
+])
+
+def build_chain(model):
+    pass
+--- solution
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Summarise the clause in one short sentence."),
+    ("user", "Clause {clause_id}: {text}"),
+])
+
+def build_chain(model):
+    return PROMPT | model | StrOutputParser() | (lambda s: " ".join(s.split()))
+--- tests
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
+IN = {"clause_id": "8.1", "text": "Liability is unlimited."}
+expect("清理空白", lambda: build_chain(FakeListChatModel(responses=["  Customer's liability\n  has no cap. "])).invoke(IN), "Customer's liability has no cap.")
+seen = []
+def spy(prompt_value):
+    seen.append([(type(m).__name__, m.content) for m in prompt_value.to_messages()])
+    return AIMessage("ok")
+expect("模型收到的消息", lambda: (build_chain(RunnableLambda(spy)).invoke(IN), seen[-1])[1], [("SystemMessage", "Summarise the clause in one short sentence."), ("HumanMessage", "Clause 8.1: Liability is unlimited.")])
+expect("完全没有联网", lambda: (MOCK.reset(), build_chain(FakeListChatModel(responses=["a"])).invoke(IN), len(MOCK.calls))[2], 0)
+expect("返回的是 Runnable，也能 batch", lambda: build_chain(FakeListChatModel(responses=["a  b"])).batch([IN]), ["a b"])
+--- hints
+- 函数体就一行：`return PROMPT | model | StrOutputParser() | (lambda s: ...)`。
+- `s.split()` 不带参数时按任意空白切开，还会丢掉首尾的空白；再用 `" ".join(...)` 拼回去。
+
+@@ item d29-17
+type: testwrite
+title: 写测试：清洗模型的回答
+level: 3
+--- prompt
+被测函数 `label(model, text, default="flag")` 让模型只回答一个词，再把回答清洗成 `accept` / `flag` / `redline` 之一；看不懂的回答返回 `default`（交给人看，而不是放行）。
+
+用 `FakeListChatModel` 当模型写测试（`def test_...():` 里用 `assert`）：在正确的函数上全部通过，同时能抓住几个藏起来的有 bug 的版本。起始代码只有一个测试，太弱了。想一想真模型会怎样「不听话」：多空格、换行、大小写、句号、答非所问。
+--- impl
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="flag"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.strip().lower().rstrip(".")
+    return word if word in VALID else default
+--- mutants
+===== 空白：模型的回答前后带空格或换行
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="flag"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.lower().rstrip(".")
+    return word if word in VALID else default
+===== 大小写：模型回答 Redline
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="flag"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.strip().rstrip(".")
+    return word if word in VALID else default
+===== 句号：模型回答 redline.
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="flag"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.strip().lower()
+    return word if word in VALID else default
+===== 看不懂的回答：应该交给人，而不是放行
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="accept"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.strip().lower().rstrip(".")
+    return word if word in VALID else default
+--- starter
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+def test_plain_answer():
+    model = FakeListChatModel(responses=["accept"])
+    assert label(model, "Fees are due in 30 days.") == "accept"
+--- solution
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+def fake(reply):
+    return FakeListChatModel(responses=[reply])
+
+def test_plain_answer():
+    assert label(fake("accept"), "Fees are due in 30 days.") == "accept"
+
+def test_whitespace_around_answer():
+    assert label(fake(" redline\n"), "Liability is unlimited.") == "redline"
+
+def test_upper_case():
+    assert label(fake("Redline"), "Liability is unlimited.") == "redline"
+
+def test_trailing_period():
+    assert label(fake("redline."), "Liability is unlimited.") == "redline"
+
+def test_unknown_answer_goes_to_a_human():
+    assert label(fake("I think it is fine"), "x") == "flag"
+
+def test_custom_default():
+    assert label(fake("??"), "x", default="redline") == "redline"
+--- hints
+- 写一个小工具 `def fake(reply): return FakeListChatModel(responses=[reply])`，每个测试一行就能造出一种「不听话」的回答。
+- 一个测试只测一件事：前后空白、大写、句号、答非所问，各写一个。
+- 答非所问时期望的是 `"flag"`：默认值写错成 `"accept"` 的版本，就靠这个测试抓出来。
+
+@@ item d29-18
+type: choice
+title: 为什么没全换成框架
+level: 2
+--- prompt
+Clause Check 的 `review.py` 直接用 `requests` 调 DeepSeek，只有 `graph.py` 用了 LangGraph。面试官问：「为什么不把整个项目都换成 LangChain？」哪个回答最好？
+--- options
+- LangChain 不支持 DeepSeek，所以只能手写
+- LangChain 每次调用比 requests 慢很多，影响性能
+- 审查流程是固定的线性步骤，plain Python 已经够用、好调试、依赖少；真正需要框架的是「暂停等人批准、换个进程恢复」，那一段才用 LangGraph。以后要换模型供应商、加流式或统一的回调时，再评估 LangChain
+- 框架越多越专业，应该全部换掉，面试官喜欢看到框架
+answer: 3
+--- explain
+选项 1 不对：今天用的 `langchain-deepseek` 就是官方集成。选项 2 不对：框架那几层 Python 的开销和几秒钟的模型调用比起来可以忽略，真正的代价是多出来的抽象和依赖（Traceback 更长、版本变化快）。按需引入、说得出每个框架解决了哪个具体问题，才是面试官想听的。这正是 README 里 "Why LangGraph was not the first choice" 那一段。
+
+@@ item d29-19
+type: local
+title: 本机任务（选做）：本机跑一题
+level: 1
+--- prompt
+把今天的一道题拿到自己电脑上跑，确认同样的代码在真正的 Python 里也能运行（不需要 API key，也不花钱）。
+
+1. 安装（只需要一次）：
+
+```
+python -m pip install langchain langgraph langchain-deepseek langchain-openai langchain-text-splitters langgraph-checkpoint-sqlite numpy
+```
+
+2. 做完第 2 题（`ask`）并通过后，点「复制为本机文件」，在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\d29-02.py`，粘贴保存
+3. 在 PowerShell 里运行：
+
+```
+cd "G:\Contract Clause Reviewer\learn"
+python d29-02.py
+```
+
+4. 把终端输出粘贴到下面，最后一行应该是 `4/4 通过`
+
+文件里带着模拟服务器，所以不需要 key。如果你装了 LM Studio 并加载了模型，可以再试一步（不用粘贴）：删掉文件里「模拟 DeepSeek 服务器」和「LangChain 环境」那两段，把模型那一行换成 `ChatOpenAI(model="qwen38", base_url="http://127.0.0.1:1234/v1", api_key="lm-studio")`（先 `from langchain_openai import ChatOpenAI`），再运行一次。第一条测试后面「得到 ...」里就是本机模型真正的回答；测试会失败（回答不再是 `Mock reply`，文件里也没有 `MOCK` 了），这是正常的：换模型只改了一行，这正是 LangChain 的好处。
+placeholder: 粘贴终端输出，最后一行是「4/4 通过」这样的
+verify: (\d+)/\1\s*通过
+--- hints
+- 提示找不到 `pip`：用 `python -m pip ...`，保证装进的是你运行文件的那个 Python。
+- 报 `ModuleNotFoundError`：先运行 `python -c "import langchain; print(langchain.__version__)"` 确认装好了。
+
+@@ item d29-e1
+type: scratch
+title: 闭卷：判定链
+exam: yes
+level: 3
+--- prompt
+写 `make_label_chain(model)`，返回一条链：输入 `{"clause_id": ..., "text": ...}`，输出一个判定词（字符串）。
+
+1. 提示词两条消息：system 是 `"You review contract clauses for the {party}. Answer with one word: accept, flag or redline."`，user 是 `"Clause {clause_id}: {text}"`；`party` 预先填成 `"Customer"`，调用方不用传
+2. 接上 `model` 和 `StrOutputParser()`
+3. 最后一步：去掉首尾空白、转小写、去掉末尾的句号；结果不是 `accept` / `flag` / `redline` 之一时返回 `"flag"`
+
+例：模型回答 `" Redline.\n"` 时，链的输出是 `"redline"`。导入：`from langchain_core.prompts import ChatPromptTemplate`、`from langchain_core.output_parsers import StrOutputParser`。
+--- solution
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You review contract clauses for the {party}. Answer with one word: accept, flag or redline."),
+    ("user", "Clause {clause_id}: {text}"),
+]).partial(party="Customer")
+
+def to_label(text):
+    word = text.strip().lower().rstrip(".")
+    return word if word in ("accept", "flag", "redline") else "flag"
+
+def make_label_chain(model):
+    return PROMPT | model | StrOutputParser() | to_label
+--- tests
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+IN = {"clause_id": "8.1", "text": "Liability is unlimited."}
+expect("清洗回答", lambda: make_label_chain(FakeListChatModel(responses=[" Redline.\n"])).invoke(IN), "redline")
+expect("看不懂的回答 → flag", lambda: make_label_chain(FakeListChatModel(responses=["It depends."])).invoke(IN), "flag")
+seen = []
+def spy(prompt_value):
+    seen.append([m.content for m in prompt_value.to_messages()])
+    return AIMessage("accept")
+expect("模型收到的两条消息（party 已填好）", lambda: (make_label_chain(RunnableLambda(spy)).invoke(IN), seen[-1])[1], ["You review contract clauses for the Customer. Answer with one word: accept, flag or redline.", "Clause 8.1: Liability is unlimited."])
+expect("接模拟服务器：回答不是一个词 → flag", lambda: make_label_chain(ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})).invoke(IN), "flag")
+
+@@ item d29-e2
+type: scratch
+title: 闭卷：批量审查
+exam: yes
+level: 3
+--- prompt
+写 `review_batch(chain, clauses)`：
+
+- `clauses` 是字典列表，每个字典有 `"clause_id"` 和 `"text"`；`chain` 的输入就是这样一个字典，输出一个字符串
+- 只调用**一次** `chain.batch(...)`，带上 `return_exceptions=True` 和 `config={"max_concurrency": 4}`
+- 返回字典 `{clause_id: 结果}`；出错的条款，结果写成 `"ERROR: " + 异常的类名`
+- `clauses` 是空列表：返回 `{}`，不调用 chain
+
+例：第二条抛了 ValueError → `{"3.1": "accept", "5.2": "ERROR: ValueError", "8.1": "redline"}`
+--- solution
+def review_batch(chain, clauses):
+    if not clauses:
+        return {}
+    results = chain.batch(clauses, config={"max_concurrency": 4}, return_exceptions=True)
+    out = {}
+    for clause, result in zip(clauses, results):
+        out[clause["clause_id"]] = f"ERROR: {type(result).__name__}" if isinstance(result, Exception) else result
+    return out
+--- tests
+from langchain_core.runnables import RunnableLambda
+def fake(d):
+    if not d["text"].strip():
+        raise ValueError("empty clause")
+    return "redline" if "unlimited" in d["text"] else "accept"
+CLAUSES = [{"clause_id": "3.1", "text": "Fees are due."}, {"clause_id": "5.2", "text": " "}, {"clause_id": "8.1", "text": "Liability is unlimited."}]
+expect("一条出错不拖垮", lambda: review_batch(RunnableLambda(fake), CLAUSES), {"3.1": "accept", "5.2": "ERROR: ValueError", "8.1": "redline"})
+class Spy:
+    def __init__(self):
+        self.calls = []
+    def batch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        self.calls.append((len(inputs), (config or {}).get("max_concurrency"), return_exceptions))
+        return ["accept"] * len(inputs)
+def _spy():
+    s = Spy()
+    review_batch(s, CLAUSES)
+    return s.calls
+expect("只调一次 batch，两个选项都带上", _spy, [(3, 4, True)])
+def _empty():
+    s = Spy()
+    return [review_batch(s, []), s.calls]
+expect("空列表：不调用", _empty, [{}, []])
+
+@@ item d29-e3
+type: scratch
+title: 闭卷：有记忆的会话
+exam: yes
+level: 3
+--- prompt
+写类 `ChatSession`：
+
+- `ChatSession(model, max_history=4)`：`self.history` 一开始是空列表
+- 用到的链：提示词是 system `"You answer questions about one contract for the Customer."` → `MessagesPlaceholder("history")` → user `"{question}"`，接 `model` 和 `StrOutputParser()`
+- `ask(question)`：只把 `self.history` 的**最后 `max_history` 条**放进 history 的位置（`max_history=0` 表示一条都不带），调用链拿到回答；然后把 `HumanMessage(question)` 和 `AIMessage(回答)` 追加进 `self.history`（这里存完整的历史，不裁剪）；返回回答
+
+小心：`lst[-0:]` 是整个列表，不是空列表。
+
+导入：`langchain_core.messages` 里的 `AIMessage`、`HumanMessage`，`langchain_core.prompts` 里的 `ChatPromptTemplate`、`MessagesPlaceholder`，`langchain_core.output_parsers` 里的 `StrOutputParser`。
+--- solution
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You answer questions about one contract for the Customer."),
+    MessagesPlaceholder("history"),
+    ("user", "{question}"),
+])
+
+class ChatSession:
+    def __init__(self, model, max_history=4):
+        self.chain = PROMPT | model | StrOutputParser()
+        self.max_history = max_history
+        self.history = []
+
+    def ask(self, question):
+        recent = self.history[-self.max_history:] if self.max_history > 0 else []
+        answer = self.chain.invoke({"history": recent, "question": question})
+        self.history.append(HumanMessage(question))
+        self.history.append(AIMessage(answer))
+        return answer
+--- tests
+from langchain_deepseek import ChatDeepSeek
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+def _roles(max_history, turns):
+    s = ChatSession(MODEL, max_history=max_history)
+    for i in range(turns):
+        s.ask(f"Question {i + 1} about clause 8.1?")
+    return [[m["role"] for m in MOCK.calls[-1]["body"]["messages"]], len(s.history)]
+expect("三轮，只带最后 2 条", lambda: _roles(2, 3), [["system", "user", "assistant", "user"], 6])
+expect("三轮，最多 4 条", lambda: _roles(4, 3), [["system", "user", "assistant", "user", "assistant", "user"], 6])
+expect("max_history=0：不带历史", lambda: _roles(0, 3), [["system", "user"], 6])
+expect("回答", lambda: ChatSession(MODEL).ask("What does clause 8.1 say?"), "Mock reply: What does clause 8.1 say?")

@@ -69,6 +69,8 @@ mock: yes
 3. 再一块一块加：重试、汇总、写报告、命令行参数
 
 每加一块就运行一次。这样出错时，你只需要看**刚加的那几行**。今天的 P1–P7 就是按这个顺序排的。
+
+今天所有审查请求都带着第 12 天的 `"thinking": {"type": "disabled"}`：逐条审查用不着长推理，关掉思考模式更快、更便宜，`temperature` 也重新起作用。
 --- code
 import os
 import requests
@@ -85,9 +87,10 @@ class Verdict(BaseModel):
 
 def review_one(clause_id, text):
     body = {
-        "model": "deepseek-chat",
+        "model": "deepseek-flash",
         "messages": [{"role": "user", "content": f"Review clause {clause_id}: {text}"}],
         "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
     }
     data = requests.post(API_URL, headers=HEADERS, json=body, timeout=60).json()
     return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
@@ -395,7 +398,8 @@ RETRYABLE = (429, 500, 503)
 
 def call_model(messages, max_attempts=3):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
     for _ in range([[max_attempts]]):
         resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
         if resp.status_code == 200:
@@ -488,7 +492,8 @@ SYSTEM = ("You review one contract clause for the customer. Reply with a JSON ob
 
 def call_model(messages, max_attempts=3):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
     for _ in range(max_attempts):
         resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
         if resp.status_code == 200:
@@ -540,7 +545,8 @@ SYSTEM = ("You review one contract clause for the customer. Reply with a JSON ob
 
 def call_model(messages, max_attempts=3):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
     for _ in range(max_attempts):
         resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
         if resp.status_code == 200:
@@ -1253,7 +1259,8 @@ SYSTEM = ("You review one contract clause for the customer. Reply with a JSON ob
 
 def call_model(messages, max_attempts=3):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
     for _ in range(max_attempts):
         resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
         if resp.status_code == 200:
@@ -1389,7 +1396,8 @@ SYSTEM = ("You review one contract clause for the customer. Reply with a JSON ob
 
 def call_model(messages, max_attempts=3):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
     for _ in range(max_attempts):
         resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
         if resp.status_code == 200:
@@ -1529,16 +1537,28 @@ level: 3
 2. 把第 15 题里每一段 `# ===== xxx.py =====` 下面的代码放进对应的文件（最好照着理解重打一遍），`main` 用你自己写的版本
 3. 每个文件顶部补上它自己用到的 `import`。包内互相导入要加点，比如 `cli.py` 里写 `from .pipeline import review_contract, write_report` 和 `from .review import review_clause`
 4. `review.py` 顶部再加三行，读仓库根目录的 `.env`（只有本机需要，网页里的模拟服务器不用）：`from pathlib import Path`、`from dotenv import load_dotenv`、`load_dotenv(Path(__file__).resolve().parents[2] / ".env")`
-5. 在终端运行你的工具，再运行真实项目（两个报告都写在 `data/` 里，`.gitignore` 已经忽略了 `*.report.json`）：
+5. 真实项目是照着 DeepSeek 旧的接口写的，跑之前先补一处代码（第 13 天的本机任务做过的话，已经补好了）：打开 `clausecheck/review.py`，找到 `OpenAICompatBackend` 的 `_post`；如果 `body` 里还没有 `"thinking"`，就在 `r = self.requests.post(...)` 那一行**上面**加两行，缩进和 `r =` 对齐：
+
+```
+        if self.settings.mode == "deepseek":
+            body["thinking"] = {"type": "disabled"}
+```
+
+原因：DeepSeek 默认开着思考模式，这时带着 `tools` 的对话要把回答里的 `reasoning_content` 传回去，否则返回 400；项目的工具循环没传，模型一调工具就失败。关掉思考模式最简单，也更快、更便宜。
+
+6. 在终端运行你的工具，再运行真实项目（两个报告都写在 `data/` 里，`.gitignore` 已经忽略了 `*.report.json`）：
 
 ```
 cd "G:\Contract Clause Reviewer\learn"
 python -m minicheck ..\data\sample_contract.txt --out ..\data\mini.report.json
 cd "G:\Contract Clause Reviewer"
+$env:CLAUSECHECK_DEEPSEEK_MODEL = "deepseek-flash"
 python -m clausecheck review data/sample_contract.txt --mode deepseek --out data/ds.report.json
 ```
 
-6. 把两边输出里 `counts=` 开头的那一行都粘贴到下面
+`$env:` 那一行是因为项目 `config.py` 里默认的 DeepSeek 模型名是旧的，已经被 DeepSeek 停用了，要用环境变量换成 `deepseek-flash`。两边都关了思考模式，按 `deepseek-flash` 现在的价格（高峰时段输入 0.30、输出 1.20 美元每百万 token，非高峰时段减半；以官方价格页为准（2026-09）），两边加起来一般不到 0.2 美元。真实项目输出里的 `est_cost` 会显示 0：项目的旧价格表里没有 `deepseek-flash` 这一行（想看真实数字，可以自己在 `config.py` 的 `PRICES` 里加上）。
+
+7. 把两边输出里 `counts=` 开头的那一行都粘贴到下面
 
 两边的数字不一样很正常：真实项目有 playbook、工具调用和长得多的 prompt。对比一下两边的 `needs_attention`：哪几条只有一边标了？你觉得为什么？
 placeholder: 粘贴两行 counts=…（你的 minicheck 一行，真实项目一行）
@@ -1547,6 +1567,7 @@ verify: counts=\{[\s\S]*counts=\{
 - `ModuleNotFoundError: No module named 'minicheck'`：确认你是在 `learn` 文件夹里运行的（第一个 `cd`），而且 `minicheck` 文件夹里有 `__init__.py`。
 - `ImportError: attempted relative import with no known parent package`：不要直接 `python cli.py`，要用 `python -m minicheck`。
 - 401：`.env` 里的 key 不对，或者 `load_dotenv` 那一行的路径不对。在那一行下面 `print(Path(__file__).resolve().parents[2])` 看看是不是仓库根目录。
+- 真实项目输出的最后有 `errors on clauses: [...]`：打开 `data/ds.report.json`，看那几条 `rationale` 里的错误。有 `Model Not Exist`：`$env:CLAUSECHECK_DEEPSEEK_MODEL` 那一行没在这个终端窗口里运行过；是别的 `HTTP 400`：多半是第 5 步那两行没加上，或者加在了发请求那一行的下面。
 
 @@ item d14-17
 type: local
@@ -1746,7 +1767,7 @@ mock: yes
 
 写 `review(clause_text)`：
 
-- POST 到 `https://api.deepseek.com/v1/chat/completions`，请求头 `Authorization: Bearer <环境变量 DEEPSEEK_API_KEY>`，模型 `deepseek-chat`，`response_format` 为 `{"type": "json_object"}`；messages 一开始只有一条 user 消息，内容就是 `clause_text`
+- POST 到 `https://api.deepseek.com/v1/chat/completions`，请求头 `Authorization: Bearer <环境变量 DEEPSEEK_API_KEY>`，模型 `deepseek-flash`，`response_format` 为 `{"type": "json_object"}`，关掉思考模式（`"thinking": {"type": "disabled"}`）；messages 一开始只有一条 user 消息，内容就是 `clause_text`
 - 状态码 429：再请求一次；其他不是 200 的状态码：`raise RuntimeError`
 - 200：用 `Verdict.model_validate_json` 校验回答文字，合法就返回 `Verdict` 对象；不合法就把模型的回答（role `assistant`）和一条说明错误、要求只回 JSON 的 user 消息追加到 messages，再请求一次
 - 一共最多请求 3 次（429 和校验失败都算一次），还没成功就 `raise RuntimeError`
@@ -1767,7 +1788,8 @@ def review(clause_text):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
     messages = [{"role": "user", "content": clause_text}]
     for _ in range(3):
-        body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+        body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+                "thinking": {"type": "disabled"}}
         resp = requests.post(URL, headers=headers, json=body, timeout=60)
         if resp.status_code == 429:
             continue
@@ -1784,8 +1806,8 @@ def review(clause_text):
 def _normal():
     MOCK.reset()
     v = review("Review clause 8.1: Customer's liability shall be unlimited.")
-    return [type(v).__name__, v.clause_id, v.verdict, v.risk_level, len(MOCK.calls)]
-expect("正常：一次请求", _normal, ["Verdict", "8.1", "redline", "high", 1])
+    return [type(v).__name__, v.clause_id, v.verdict, v.risk_level, len(MOCK.calls), MOCK.calls[-1]["body"].get("thinking")]
+expect("正常：一次请求，关掉了思考模式", _normal, ["Verdict", "8.1", "redline", "high", 1, {"type": "disabled"}])
 def _bad():
     MOCK.reset()
     v = review("Review clause 3.2: Late fees apply without notice. [bad-json]")

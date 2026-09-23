@@ -755,7 +755,7 @@ EMBED_URL = "https://api.openai.com/v1/embeddings"
 
 def embed(text):
     headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
-    body = {"model": "deepseek-chat", "input": text}
+    body = {"model": "deepseek-flash", "input": text}
     resp = requests.post(EMBED_URL, headers=headers, json=body)
     print(resp.status_code, resp.json())
     return resp.json()["data"][0]["embedding"]
@@ -776,7 +776,7 @@ expect("返回 256 个小数", lambda: len(embed("Either party may terminate thi
 expect("和模拟接口算的一样", lambda: embed("Fees are payable within 30 days.") == MOCK.embed("Fees are payable within 30 days."), True)
 expect("请求里用的是 embedding 模型", lambda: (embed("x"), "embedding" in MOCK.calls[-1]["body"]["model"])[1], True)
 --- hints
-- 状态码 400，错误信息说模型不存在：`deepseek-chat` 是聊天模型。**DeepSeek 没有 embeddings 接口**，这里要用 embedding 模型。
+- 状态码 400，错误信息说模型不存在：`deepseek-flash` 是聊天模型。**DeepSeek 没有 embeddings 接口**，这里要用 embedding 模型。
 - 把 `"model"` 改成 `"text-embedding-3-small"`；再把 print 改成只打印状态码（成功时回答里有 256 个小数，太长了）。
 
 @@ item d11-15

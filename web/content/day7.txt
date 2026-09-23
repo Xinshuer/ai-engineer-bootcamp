@@ -137,6 +137,8 @@ mock: yes
     "needs_attention": [非 accept 的编号，high 在前、medium 其次、low 最后，同级保持原顺序],
 }
 ```
+
+`classify` 里用的是 `deepseek-flash`，并且关掉了思考模式（`"thinking": {"type": "disabled"}`）：批量审查要快、要便宜，判一条条款用不着长篇推理。
 --- starter
 import json
 import os
@@ -147,7 +149,7 @@ HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 def classify(text):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     data = requests.post(API_URL, headers=HEADERS, json=body).json()
     return json.loads(data["choices"][0]["message"]["content"])
 
@@ -163,7 +165,7 @@ HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
 RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 def classify(text):
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     data = requests.post(API_URL, headers=HEADERS, json=body).json()
     return json.loads(data["choices"][0]["message"]["content"])
 
@@ -199,10 +201,12 @@ level: 2
 --- prompt
 写 `estimate_cost(usage, price)`：
 
-- `usage`：`{"prompt_cache_hit_tokens": 命中缓存的输入, "prompt_cache_miss_tokens": 未命中的输入, "completion_tokens": 输出}`
+- `usage`：`{"prompt_cache_hit_tokens": 命中缓存的输入, "prompt_cache_miss_tokens": 未命中的输入, "completion_tokens": 输出}`，可能还有 `completion_tokens_details`
 - `price`：每百万 token 的美元价格 `{"input": ..., "cache": ..., "output": ...}`
 
 返回美元费用，保留 6 位小数（用 `round(x, 6)`）。公式：未命中 × input + 命中 × cache + 输出 × output，再除以 1,000,000。
+
+测试用的是 `deepseek-flash` 的高峰价，以官方价格页为准（2026-09）：未命中 $0.30、命中缓存 $0.006、输出 $1.20，非高峰时段半价。思考模式的思考 token（`completion_tokens_details.reasoning_tokens`）**已经包含在** `completion_tokens` 里，不要再加一遍。
 --- starter
 def estimate_cost(usage, price):
     pass
@@ -215,12 +219,14 @@ def estimate_cost(usage, price):
     ) / 1_000_000
     return round(cost, 6)
 --- tests
-PRICE = {"input": 0.28, "cache": 0.028, "output": 0.42}
-expect("没有缓存", lambda: estimate_cost({"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1000000, "completion_tokens": 0}, PRICE), 0.28)
-expect("一次真实调用", lambda: estimate_cost({"prompt_cache_hit_tokens": 2944, "prompt_cache_miss_tokens": 166, "completion_tokens": 120}, PRICE), 0.000179)
-expect("全命中缓存便宜十倍", lambda: estimate_cost({"prompt_cache_hit_tokens": 1000000, "prompt_cache_miss_tokens": 0, "completion_tokens": 0}, PRICE), 0.028)
+PRICE = {"input": 0.30, "cache": 0.006, "output": 1.20}
+expect("没有缓存", lambda: estimate_cost({"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1000000, "completion_tokens": 0}, PRICE), 0.3)
+expect("一次关了思考模式的调用", lambda: estimate_cost({"prompt_cache_hit_tokens": 2944, "prompt_cache_miss_tokens": 166, "completion_tokens": 120}, PRICE), 0.000211)
+expect("开着思考：思考 token 已经在 completion_tokens 里", lambda: estimate_cost({"prompt_cache_hit_tokens": 2944, "prompt_cache_miss_tokens": 166, "completion_tokens": 620, "completion_tokens_details": {"reasoning_tokens": 500}}, PRICE), 0.000811)
+expect("全命中缓存便宜 50 倍", lambda: estimate_cost({"prompt_cache_hit_tokens": 1000000, "prompt_cache_miss_tokens": 0, "completion_tokens": 0}, PRICE), 0.006)
 --- hints
 - 三项相乘相加，再除以 `1_000_000`（下划线只是为了好读）。
+- 只用 `completion_tokens` 算输出，`completion_tokens_details` 不用管。
 
 @@ item d7-04
 type: code
@@ -285,7 +291,7 @@ const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
 const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
 async function classify(text: string): Promise<{ verdict: string; risk_level: string }> {
-  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }) });
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }) });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content);
 }
@@ -300,7 +306,7 @@ const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
 const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
 async function classify(text: string): Promise<{ verdict: string; risk_level: string }> {
-  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }) });
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }) });
   const data = await res.json();
   return JSON.parse(data.choices[0].message.content);
 }
@@ -341,7 +347,7 @@ title: 综合六：Agent 循环（TypeScript）
 level: 3
 lang: ts
 --- prompt
-把第 4 天的 `mini_agent` 翻译成 TypeScript 的 `miniAgent(question, maxSteps = 3)`：带 `TOOLS` 请求；`finish_reason` 是 `"tool_calls"` 就执行第一个工具，把模型那条消息和 `{ role: "tool", tool_call_id, content }` 加进 messages 再请求；否则返回回答；步数用完返回 `"STOPPED"`。
+把第 4 天的 `mini_agent` 翻译成 TypeScript 的 `miniAgent(question, maxSteps = 3)`：带 `TOOLS` 请求（模型 `deepseek-flash`，和第 4 天一样关掉思考模式）；`finish_reason` 是 `"tool_calls"` 就执行第一个工具，把模型那条消息和 `{ role: "tool", tool_call_id, content }` 加进 messages 再请求；否则返回回答；步数用完返回 `"STOPPED"`。
 --- starter
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
@@ -365,7 +371,7 @@ const IMPL: Record<string, (args: any) => string> = {
 async function miniAgent(question: string, maxSteps = 3): Promise<string> {
   const messages: any[] = [{ role: "user", content: question }];
   for (let step = 0; step < maxSteps; step++) {
-    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }) });
     const choice = (await res.json()).choices[0];
     if (choice.finish_reason !== "tool_calls") {
       return choice.message.content;
@@ -383,6 +389,11 @@ expectAsync("最终回答，请求 2 次", async () => {
   const answer = await miniAgent("Is unlimited liability acceptable?");
   return [answer, MOCK.calls.length];
 }, ["Based on the playbook: rule for liability_cap: cap at 100% of annual fees", 2]);
+expectAsync("每次请求都关了思考模式", async () => {
+  MOCK.reset();
+  await miniAgent("Is unlimited liability acceptable?");
+  return MOCK.calls.map((c) => c.body.thinking);
+}, [{ type: "disabled" }, { type: "disabled" }]);
 expectAsync("步数用完", () => miniAgent("Is unlimited liability acceptable?", 1), "STOPPED");
 --- hints
 - `for (let step = 0; step < maxSteps; step++) { ... }`，不是 tool_calls 就 return。
@@ -485,14 +496,28 @@ type: local
 title: 本机任务：用 DeepSeek 跑一次评测
 level: 2
 --- prompt
-用真实模型跑一次项目的评测，看看你的规则在真模型下表现如何：
+用真实模型跑一次项目的评测，看看你的规则在真模型下表现如何。项目是在 DeepSeek 改版之前写的，跑之前先做两处准备。
+
+**模型名**：`clausecheck/config.py` 默认还是停用的旧名字，下面的命令用环境变量换成 `deepseek-flash`（也可以把 `CLAUSECHECK_DEEPSEEK_MODEL=deepseek-flash` 写进 `.env`，或者自己改掉 config.py 里的默认值）。
+
+**思考模式**：项目的后端没关它。开着思考模式时，带工具的请求必须把模型上一轮的 `reasoning_content` 原样传回去，否则真接口返回 400；而 `review.py` 回传模型消息时只留了 `role`、`content`、`tool_calls`。所以打开 `clausecheck/review.py`，在 `OpenAICompatBackend._post` 里 `body = {...}` 这个字典后面、`r = self.requests.post(...)` 前面加两行（和 `body` 对齐缩进）：
+
+```python
+        if self.settings.mode == "deepseek":
+            body["thinking"] = {"type": "disabled"}
+```
+
+只对 DeepSeek 生效，LM Studio 的本地模式不受影响。关掉以后还更快、更便宜，`temperature` 0.3 也重新生效。然后运行：
 
 ```
 cd "G:\Contract Clause Reviewer"
+$env:CLAUSECHECK_DEEPSEEK_MODEL="deepseek-flash"
 python evals/run_evals.py --mode deepseek --runs 3
 ```
 
-大约 3–5 分钟，花费几分钱。把最后的通过率表粘贴到下面，然后回答自己三个问题：
+11 条用例 × 3 次 = 33 次审查，大约几分钟。按项目之前一次真实运行（`data/deepseek.report.json`）每条条款的 token 量估算，花费大约几美分（`deepseek-flash` 高峰价：未命中缓存的输入 $0.30、输出 $1.20 / 百万 token，非高峰半价，以官方价格页为准（2026-09））。
+
+把最后的通过率表粘贴到下面，然后回答自己三个问题：
 
 - 哪条用例不是 3/3？它的失败原因是什么（看 `most common failure` 那一列）？
 - 这是检索、推理、格式还是工具问题？
@@ -501,6 +526,8 @@ placeholder: 粘贴通过率表
 verify: high-risk recall
 --- hints
 - 看到 401：`.env` 里的 `DEEPSEEK_API_KEY` 不对。
+- 每条都失败、原因里有 `Model Not Exist`：模型名没换过来。`$env:...` 那一行要和 `python ...` 在同一个终端窗口里运行，第一行输出里的 `model=` 应该是 `deepseek-flash`。
+- 失败原因是 `trace error: api_error: HTTP 400`，但不是 `Model Not Exist`：多半是思考模式没关掉。检查 `_post` 里那两行是不是在 `r = self.requests.post(...)` 前面。
 
 @@ item d7-e1
 type: scratch
@@ -580,7 +607,7 @@ exam: yes
 level: 3
 mock: yes
 --- prompt
-写 `classify_all(texts)`：对每段文字调用 DeepSeek（`https://api.deepseek.com/v1/chat/completions`，模型 `deepseek-chat`，`json_object` 格式，密钥读环境变量 `DEEPSEEK_API_KEY`），返回每段的 `verdict` 组成的列表。
+写 `classify_all(texts)`：对每段文字调用 DeepSeek（`https://api.deepseek.com/v1/chat/completions`，模型 `deepseek-flash`，`json_object` 格式，关掉思考模式，密钥读环境变量 `DEEPSEEK_API_KEY`），返回每段的 `verdict` 组成的列表。
 
 每次调用遇到 429 要重试，同一段最多尝试 3 次，还不行就 `raise RuntimeError`。
 --- solution
@@ -592,7 +619,7 @@ URL = "https://api.deepseek.com/v1/chat/completions"
 
 def classify_one(text):
     headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
     for _ in range(3):
         resp = requests.post(URL, headers=headers, json=body)
         if resp.status_code == 200:
@@ -606,6 +633,7 @@ def classify_all(texts):
 --- tests
 TEXTS = ["Review clause 8.1: liability is unlimited", "Review clause 3.1: fees within thirty days"]
 expect("两段", lambda: classify_all(TEXTS), ["redline", "accept"])
+expect("关掉了思考模式", lambda: MOCK.calls[-1]["body"].get("thinking"), {"type": "disabled"})
 def _retry():
     MOCK.reset()
     MOCK.fail_next(429, 2)
@@ -694,12 +722,12 @@ exam: yes
 level: 3
 lang: ts
 --- prompt
-写 `classifyAll(texts: string[]): Promise<string[]>`，规则和闭卷 3 一样：按顺序逐段调用，429 重试，同一段最多 3 次，失败就 throw。
+写 `classifyAll(texts: string[]): Promise<string[]>`，规则和闭卷 3 一样（同一个 URL，`deepseek-flash`，`json_object` 格式，关掉思考模式，密钥 `process.env.DEEPSEEK_API_KEY`）：按顺序逐段调用，429 重试，同一段最多 3 次，失败就 throw。
 --- solution
 const URL_ = "https://api.deepseek.com/v1/chat/completions";
 
 async function classifyOne(text: string): Promise<string> {
-  const body = JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } });
+  const body = JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } });
   for (let i = 0; i < 3; i++) {
     const res = await fetch(URL_, { method: "POST", headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` }, body });
     if (res.status === 200) {
@@ -721,5 +749,6 @@ async function classifyAll(texts: string[]): Promise<string[]> {
 --- tests
 const TEXTS = ["Review clause 8.1: liability is unlimited", "Review clause 3.1: fees within thirty days"];
 expectAsync("两段", () => classifyAll(TEXTS), ["redline", "accept"]);
+expectAsync("关掉了思考模式", async () => { await classifyAll(TEXTS.slice(0, 1)); return MOCK.calls[MOCK.calls.length - 1].body.thinking; }, { type: "disabled" });
 expectAsync("429 两次后成功", async () => { MOCK.reset(); MOCK.failNext(429, 2); return classifyAll(TEXTS.slice(0, 1)); }, ["redline"]);
 expectRejects("三次都 429", async () => { MOCK.reset(); MOCK.failNext(429, 3); return classifyAll(TEXTS.slice(0, 1)); });

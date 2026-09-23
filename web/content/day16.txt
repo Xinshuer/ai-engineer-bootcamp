@@ -24,7 +24,7 @@ title: class 基础
 
 ```ts
 class Client {
-  constructor(private readonly apiKey: string, readonly model = "deepseek-chat") {}
+  constructor(private readonly apiKey: string, readonly model = "deepseek-flash") {}
 }
 ```
 
@@ -43,7 +43,7 @@ class VerdictCounter {
 }
 
 class Client {
-  constructor(private readonly apiKey: string, readonly model = "deepseek-chat") {}
+  constructor(private readonly apiKey: string, readonly model = "deepseek-flash") {}
 
   describe(): string {
     return `${this.model} with key ${this.apiKey.slice(0, 3)}...`;
@@ -562,7 +562,7 @@ class Budget {
 
 class Client {
   private apiKey = "sk-123";
-  model = "deepseek-chat";
+  model = "deepseek-flash";
 }
 
 const a = new Budget(100);
@@ -1155,7 +1155,7 @@ level: 3
 --- prompt
 写 `DeepSeekClient` 的 `review(clauseText)` 方法，返回 `Promise<Result<string>>`：
 
-- POST 到 `API_URL`：请求头 `Authorization: Bearer <apiKey>`，模型 `deepseek-chat`，一条 user 消息，`response_format: { type: "json_object" }`
+- POST 到 `API_URL`：请求头 `Authorization: Bearer <apiKey>`，模型 `deepseek-flash`，一条 user 消息，`response_format: { type: "json_object" }`，`thinking: { type: "disabled" }`（关掉默认开着的思考模式：只要一个判定，用不着长推理，关掉更快、更便宜）
 - 状态码不是 200 → `{ ok: false, error: "http 429" }` 这样
 - 成功 → 把回答内容 `JSON.parse`，返回 `{ ok: true, value: 它的 verdict 字段 }`
 
@@ -1193,9 +1193,10 @@ class DeepSeekClient {
       method: "POST",
       headers: { Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "deepseek-chat",
+        model: "deepseek-flash",
         messages: [{ role: "user", content: clauseText }],
         response_format: { type: "json_object" },
+        thinking: { type: "disabled" },
       }),
     });
     if (res.status !== 200) {
@@ -1222,8 +1223,8 @@ expectAsync("假 fetch：请求内容", async () => {
   const f = fakeFetch(200, '{"verdict": "accept"}');
   await new DeepSeekClient("sk-test", f.fn).review("hello");
   const s = f.seen[0];
-  return [s.url, s.auth, s.body.model, s.body.messages[0].content, s.body.response_format.type];
-}, ["https://api.deepseek.com/v1/chat/completions", "Bearer sk-test", "deepseek-chat", "hello", "json_object"]);
+  return [s.url, s.auth, s.body.model, s.body.messages[0].content, s.body.response_format.type, s.body.thinking?.type];
+}, ["https://api.deepseek.com/v1/chat/completions", "Bearer sk-test", "deepseek-flash", "hello", "json_object", "disabled"]);
 expectAsync("假 fetch：429", async () => {
   const f = fakeFetch(429, "");
   return new DeepSeekClient("sk-test", f.fn).review("x");
@@ -1380,9 +1381,9 @@ level: 2
 
 1. 在 `G:\Contract Clause Reviewer\learn` 下新建文件夹 `ts16`，放三个文件：
    - `types.ts`：`export type Result<T> = ...`
-   - `client.ts`：第一行 `import type { Result } from "./types";`，然后 `export class DeepSeekClient`（照 d16-15 写，不看答案；默认用全局 `fetch`）
+   - `client.ts`：第一行 `import type { Result } from "./types";`，然后 `export class DeepSeekClient`（照 d16-15 写，不看答案；默认用全局 `fetch`；模型 `deepseek-flash`，思考模式关掉）
    - `main.ts`：开头 `import { DeepSeekClient } from "./client";`，然后 `process.loadEnvFile();`（读取当前目录的 `.env`）。再写一个 async 的 `main()`：创建客户端（密钥 `process.env.DEEPSEEK_API_KEY ?? ""`），审查一条条款，`console.log` 结果；最后一行调用 `main();`（和第 6 天一样，不要在最外层直接写 await）
-2. DeepSeek 的 JSON 模式要求提示里出现 json 这个词，所以条款文字这样写：`Reply in JSON with the key verdict (accept, flag or redline). Clause 8.1: The Customer's liability under this Agreement shall be unlimited.`
+2. DeepSeek 的 JSON 模式要求提示里出现 json 这个词，最好再给一个 JSON 的例子，所以条款文字这样写：`Reply in JSON like {"verdict": "flag"} (verdict is accept, flag or redline). Clause 8.1: The Customer's liability under this Agreement shall be unlimited.`
 3. 在项目根目录运行：
 
 ```
@@ -1391,12 +1392,14 @@ npx tsx learn/ts16/main.ts
 ```
 
 4. 把输出粘贴到下面，应该看到 `ok: true` 和一个判定。
+
+花费：关掉思考模式后，这一次请求只有几十个输入 token、十几个输出 token，不到 0.0001 美元。如果忘了关，思考的 token 会按输出价计费（`deepseek-flash` 高峰时段每百万输出 token 1.20 美元，闲时半价，以官方价格页为准（2026-09）），也还是很少，但回答会慢不少。
 placeholder: 粘贴终端输出，例如 { ok: true, value: 'redline' }
 verify: ok\W{0,4}true[\s\S]{0,60}(accept|flag|redline)
 --- hints
 - `Cannot find module './client'`：检查文件名和路径，三个文件要在同一个文件夹里。`TransformError`：多半是在最外层写了 await，把它放进 async 的 `main()` 里。
 - 看到 `http 401`：`.env` 里的密钥不对，或者没有在项目根目录运行（`loadEnvFile` 读的是当前目录的 `.env`）。
-- 看到 `http 400`：多半是提示里没有 json 这个词。
+- 看到 `http 400`：多半是提示里没有 json 这个词，或者模型名写错了（应为 `deepseek-flash`）。
 
 @@ item d16-e1
 type: scratch
