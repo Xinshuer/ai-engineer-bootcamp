@@ -1,0 +1,684 @@
+@@ day 3
+title: Python 进阶：JSON、异常、正则、类
+lang: py
+hours: 4–5 小时
+--- goal
+能把模型返回的 JSON 文本变成字典并安全地处理格式错误；会用 try/except 和 raise；会用正则找出「Section 12」这种引用；会写一个简单的类。这些是读懂 Clause Check 里 `split.py`、`tools.py`、`models.py` 的前置知识。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过
+- 闭卷挑战 3 题
+- 打开项目里的 `clausecheck/split.py`，找到 `XREF` 这个正则，说出它匹配什么
+
+@@ concept
+title: import：用别人写好的代码
+--- body
+Python 自带很多「标准库」模块，用之前先 `import`：
+
+- `import json` 然后写 `json.loads(...)`
+- `from pathlib import Path` 只拿其中一个名字，之后直接写 `Path(...)`
+- `import re` 正则表达式
+
+第三方库（比如 `pydantic`、`requests`）要先 `pip install`，用法一样。import 一般写在文件最上面。
+--- code
+import json
+import math
+from pathlib import Path
+
+print(json.dumps({"verdict": "accept"}))
+print(math.ceil(2.1))
+print(Path("data/playbook.json").name)
+
+@@ concept
+title: JSON：文字和字典之间的桥
+--- body
+模型返回的是**文字**，程序要用的是**字典**。JSON 是两者之间的格式。
+
+- `json.loads(文字)` → 字典/列表（s 代表 string）
+- `json.dumps(对象)` → 文字；加 `ensure_ascii=False` 中文不转义，`indent=2` 缩进好看
+
+对照记：JSON 的 `true` / `false` / `null` 对应 Python 的 `True` / `False` / `None`；JSON 字符串**只能用双引号**。
+--- code
+import json
+
+raw = '{"clause_id": "8.1", "verdict": "flag", "ok": true, "note": null}'
+data = json.loads(raw)
+print(type(data), data["verdict"], data["ok"], data["note"])
+
+back = json.dumps({"verdict": "accept", "high": False}, indent=2)
+print(back)
+
+@@ concept
+title: try / except：预料到的错误要接住
+--- body
+有些错误不是 bug，而是**外部输入不可靠**：模型返回的 JSON 格式坏了、字典里缺字段。这时用 try/except 接住它，给出合理的结果，而不是让整个程序崩掉。
+
+```python
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    data = None
+```
+
+- 只写你**预料到**的错误类型，不要写光秃秃的 `except:`，它会把真正的 bug 也藏起来
+- `except SomeError as e:` 可以拿到错误对象，`str(e)` 是错误信息
+--- code
+import json
+
+for raw in ['{"verdict": "flag"}', "Sure! {bad json"]:
+    try:
+        data = json.loads(raw)
+        print("ok:", data["verdict"])
+    except json.JSONDecodeError as e:
+        print("bad json:", e)
+
+@@ concept
+title: raise：主动报错
+--- body
+当函数收到它处理不了的输入时，与其悄悄返回一个错的值，不如**主动报错**：
+
+```python
+if risk not in ("low", "medium", "high"):
+    raise ValueError(f"unknown risk: {risk}")
+```
+
+调用方可以用 try/except 接住它。「早点大声失败」比「悄悄算错」好排查得多。
+--- code
+def parse_risk(text):
+    risk = text.strip().lower()
+    if risk not in ("low", "medium", "high"):
+        raise ValueError(f"unknown risk: {text}")
+    return risk
+
+print(parse_risk(" HIGH "))
+try:
+    parse_risk("urgent")
+except ValueError as e:
+    print("caught:", e)
+
+@@ concept
+title: 读懂多层的 Traceback
+error_demo: yes
+--- body
+函数调用函数时，报错会列出**整条调用链**，从外到内：最上面是入口，**最下面是真正出错的那一行**。
+
+读法不变：先看最后一行的错误类型，再看它上面紧挨着的 `File "main.py", line N, in 函数名`，那就是出事的地方。更上面的几层告诉你「是谁调用了它」。
+
+运行下面的代码，找出是哪个函数的哪一行出错。
+--- code
+def summarise(clauses):
+    counts = {}
+    for c in clauses:
+        counts[c["verdict"]] += 1
+    return counts
+
+clauses = [{"verdict": "flag"}]
+print(summarise(clauses))
+
+@@ concept
+title: 正则入门：在文字里找模式
+--- body
+正则表达式描述「长什么样的文字」。最常用的几个符号：
+
+- `\d` 一个数字，`\d+` 一个或多个数字
+- `\.` 字面上的点（单独的 `.` 表示「任意字符」）
+- `( )` 分组：只把括号里的部分拿出来
+- `?` 前面的东西可有可无
+
+`re.findall(模式, 文字)` 返回所有匹配；`re.search` 返回第一个匹配（找不到是 `None`），用 `.group(1)` 取第一个括号里的内容。模式字符串前加 `r`，让反斜杠保持原样。
+--- code
+import re
+
+text = "Subject to Section 12, see also Section 4.2. Pay within 30 days."
+print(re.findall(r"\d+", text))
+print(re.findall(r"Section (\d+(?:\.\d+)?)", text))
+m = re.search(r"(\d+) days", text)
+print(m.group(1) if m else None)
+
+@@ concept
+title: 类：把数据和操作放在一起
+--- body
+类是自己定义的「类型」。一个条款有编号、标题、正文，还有一些相关的操作，可以写成：
+
+```python
+class Clause:
+    def __init__(self, clause_id, heading, text):
+        self.clause_id = clause_id
+        self.heading = heading
+        self.text = text
+
+    def is_title(self):
+        return self.text.strip() == ""
+```
+
+- `__init__` 在创建对象时自动运行，负责存数据；`self` 指「这个对象自己」
+- `Clause("8.1", "Cap", "...")` 创建一个对象；`c.heading` 读属性；`c.is_title()` 调方法
+- 方法的第一个参数永远是 `self`
+--- code
+class Clause:
+    def __init__(self, clause_id, heading, text):
+        self.clause_id = clause_id
+        self.heading = heading
+        self.text = text
+
+    def is_title(self):
+        return self.text.strip() == ""
+
+    def label(self):
+        return f"{self.clause_id} {self.heading}"
+
+c = Clause("8.1", "Cap on Liability", "Each party's liability ...")
+t = Clause("8", "Limitation of Liability", "")
+print(c.label(), c.is_title())
+print(t.label(), t.is_title())
+
+@@ concept
+title: 类型标注：写给人和工具看的说明
+--- body
+```python
+def risk_score(risk: str) -> int:
+```
+
+意思是「参数 risk 应该是字符串，返回整数」。常见写法：`list[str]`、`dict[str, int]`、`str | None`（可能是 None）。
+
+**Python 运行时不检查这些标注**，传错类型也照样运行。它的价值在于：读代码的人一眼知道该传什么；编辑器能提示；**Pydantic 会读这些标注来校验数据**（明天的内容）。TypeScript 则会在运行前真正检查（第 5 天）。
+--- code
+def risk_score(risk: str) -> int:
+    scores: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
+    return scores.get(risk, 0)
+
+def first_id(ids: list[str]) -> str | None:
+    return ids[0] if ids else None
+
+print(risk_score("high"), risk_score("urgent"))
+print(first_id(["3.1", "8.1"]), first_id([]))
+
+@@ item d3-01
+type: predict
+title: json.loads
+level: 1
+--- prompt
+写出输出。注意 JSON 的 `true` / `null` 变成了什么。
+--- code
+import json
+
+raw = '{"clause_id": "8.1", "verdict": "flag", "ok": true, "note": null}'
+data = json.loads(raw)
+print(type(data))
+print(data["verdict"])
+print(data["ok"], data["note"])
+print(sorted(data.keys()))
+
+@@ item d3-02
+type: predict
+title: json.dumps
+level: 1
+--- prompt
+写出输出。注意 Python 的 `False` / `None` 变成了什么，以及引号。
+--- code
+import json
+
+v = {"verdict": "accept", "high": False, "refs": ["12"], "note": None}
+print(json.dumps(v))
+print(json.dumps(v["refs"]))
+
+@@ item d3-03
+type: code
+title: 从 JSON 里取判定
+level: 1
+--- prompt
+模型返回了一段 JSON 文字，例如 `'{"clause_id": "8.1", "verdict": "flag"}'`。
+
+写 `verdict_of(raw)`，返回其中 `verdict` 字段的值。
+--- starter
+import json
+
+def verdict_of(raw):
+    pass
+--- solution
+import json
+
+def verdict_of(raw):
+    data = json.loads(raw)
+    return data["verdict"]
+--- tests
+expect("flag", lambda: verdict_of('{"clause_id": "8.1", "verdict": "flag"}'), "flag")
+expect("accept", lambda: verdict_of('{"verdict": "accept", "risk_level": "low"}'), "accept")
+--- hints
+- 先 `json.loads(raw)` 得到字典，再按键取值。
+
+@@ item d3-04
+type: code
+title: 安全地解析
+level: 2
+--- prompt
+模型偶尔会返回坏掉的 JSON。写 `safe_parse(raw)`：能解析就返回字典；格式不对就返回 `None`，**不要让程序崩溃**。
+--- starter
+import json
+
+def safe_parse(raw):
+    pass
+--- solution
+import json
+
+def safe_parse(raw):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+--- tests
+expect("正常 JSON", lambda: safe_parse('{"verdict": "flag"}'), {"verdict": "flag"})
+expect("坏 JSON 返回 None", lambda: safe_parse("Sure! Here you go: {verdict"), None)
+expect("空字符串返回 None", lambda: safe_parse(""), None)
+--- hints
+- 把 `json.loads` 放进 `try:` 里。
+- 格式错误的异常叫 `json.JSONDecodeError`。
+
+@@ item d3-05
+type: fix
+title: 修 bug：接错了异常
+level: 2
+--- prompt
+这个函数想在 JSON 坏掉时返回 `None`，但遇到坏 JSON 时还是崩了。运行，看报错的类型，修好它。
+--- starter
+import json
+
+def parse_or_none(raw):
+    try:
+        return json.loads(raw)
+    except KeyError:
+        return None
+--- solution
+import json
+
+def parse_or_none(raw):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+--- tests
+expect("正常", lambda: parse_or_none('{"a": 1}'), {"a": 1})
+expect("坏 JSON", lambda: parse_or_none("{oops"), None)
+--- hints
+- except 只会接住你写的那种错误。报错最后一行写的是什么类型？
+- 把 `KeyError` 换成 `json.JSONDecodeError`。
+
+@@ item d3-06
+type: code
+title: 缺字段用默认值
+level: 2
+--- prompt
+写 `field(data, key, default)`：`data` 里有这个键就返回它的值，没有就返回 `default`。
+
+用 try/except 写一遍（练习异常）；写完想想还有什么更短的写法。
+--- starter
+def field(data, key, default):
+    pass
+--- solution
+def field(data, key, default):
+    try:
+        return data[key]
+    except KeyError:
+        return default
+--- tests
+expect("有这个键", lambda: field({"verdict": "flag"}, "verdict", "accept"), "flag")
+expect("没有这个键", lambda: field({"verdict": "flag"}, "risk", "low"), "low")
+expect("值是 None 也要原样返回", lambda: field({"note": None}, "note", "x"), None)
+--- hints
+- 字典取不存在的键会抛 `KeyError`。
+- 更短的写法是 `data.get(key, default)`。
+
+@@ item d3-07
+type: choice
+title: 读多层报错
+level: 2
+--- prompt
+下面的报错里，应该去改哪一行？
+--- code
+Traceback (most recent call last):
+  File "main.py", line 9, in <module>
+    print(summarise(clauses))
+  File "main.py", line 5, in summarise
+    counts[c["verdict"]] += 1
+KeyError: 'flag'
+--- options
+- 第 9 行：调用 summarise 的方式不对
+- 第 5 行：counts 里还没有 'flag' 这个键，应该用 counts.get(..., 0) + 1
+- 数据里不应该有 flag
+- 第 9 行的 print 应该删掉
+answer: 2
+--- explain
+多层报错的**最下面一层**是真正出错的地方：`summarise` 函数的第 5 行。`KeyError: 'flag'` 说明字典里还没有这个键。第 9 行只是「谁调用了它」，本身没问题。
+
+@@ item d3-08
+type: code
+title: 找出交叉引用
+level: 2
+--- prompt
+条款里常写「Subject to Section 12」。写 `find_refs(text)`：返回文字中所有被引用的章节号（字符串），按出现顺序。章节号可能带小数点，如 `4.2`。
+
+```python
+find_refs("Subject to Section 12 and Section 4.2")
+# → ["12", "4.2"]
+```
+
+这正是项目 `split.py` 里 `XREF` 做的事。
+--- starter
+import re
+
+def find_refs(text):
+    pass
+--- solution
+import re
+
+def find_refs(text):
+    return re.findall(r"Section (\d+(?:\.\d+)?)", text)
+--- tests
+expect("两个引用", lambda: find_refs("Subject to Section 12 and Section 4.2"), ["12", "4.2"])
+expect("没有引用", lambda: find_refs("Fees are payable within 30 days"), [])
+expect("一个引用", lambda: find_refs("as set out in Section 9.1."), ["9.1"])
+--- hints
+- 模式可以这样起步：`r"Section (\d+)"`，先让 12 匹配上。
+- 可选的「点加数字」写成 `(?:\.\d+)?`：`(?:...)` 是不单独捕获的分组，`?` 表示可有可无。完整模式：`r"Section (\d+(?:\.\d+)?)"`。
+
+@@ item d3-09
+type: predict
+title: re.findall 和 re.search
+level: 2
+--- prompt
+写出输出。`\d+` 会把 `4.2` 拆成几个数字？
+--- code
+import re
+
+text = "Pay within 30 days; interest 3 percent; see Section 4.2"
+print(re.findall(r"\d+", text))
+m = re.search(r"(\d+) days", text)
+print(m.group(1))
+print(re.search(r"\d+ weeks", text))
+
+@@ item d3-10
+type: code
+title: 第一个数字
+level: 2
+--- prompt
+写 `first_number(text)`：返回文字中出现的第一个整数（`int` 类型）；没有数字返回 `None`。
+
+`first_number("Pay within 30 days")` → `30`
+--- starter
+import re
+
+def first_number(text):
+    pass
+--- solution
+import re
+
+def first_number(text):
+    m = re.search(r"\d+", text)
+    if m is None:
+        return None
+    return int(m.group())
+--- tests
+expect("30", lambda: first_number("Pay within 30 days"), 30)
+expect("返回的是 int", lambda: type(first_number("a 7 b")).__name__, "int")
+expect("没有数字", lambda: first_number("no digits here"), None)
+--- hints
+- `re.search` 找不到时返回 `None`，先判断再取值。
+- `m.group()` 是匹配到的文字（字符串），用 `int(...)` 转成数字。
+
+@@ item d3-11
+type: code
+title: 写一个 Clause 类
+level: 2
+--- prompt
+写类 `Clause`：
+
+- 创建时接收 `clause_id`、`heading`、`text` 三个参数并保存为同名属性
+- 方法 `is_title()`：正文去掉空白后为空就返回 `True`（这是章节标题，不是条款）
+- 方法 `label()`：返回 `"8.1 Cap on Liability"` 这样的字符串
+--- starter
+class Clause:
+    def __init__(self, clause_id, heading, text):
+        pass
+--- solution
+class Clause:
+    def __init__(self, clause_id, heading, text):
+        self.clause_id = clause_id
+        self.heading = heading
+        self.text = text
+
+    def is_title(self):
+        return self.text.strip() == ""
+
+    def label(self):
+        return f"{self.clause_id} {self.heading}"
+--- tests
+c = Clause("8.1", "Cap on Liability", "Each party's liability shall not exceed ...")
+t = Clause("8", "Limitation of Liability", "   ")
+expect("属性 heading", lambda: c.heading, "Cap on Liability")
+expect("正文不空", lambda: c.is_title(), False)
+expect("只有空白算标题", lambda: t.is_title(), True)
+expect("label", lambda: c.label(), "8.1 Cap on Liability")
+--- hints
+- `__init__` 里写 `self.clause_id = clause_id`，三个属性都要存。
+- 方法要写在 class 里面（缩进 4 格），第一个参数是 `self`，用 `self.text` 读属性。
+
+@@ item d3-12
+type: code
+title: 判定计数器类
+level: 3
+--- prompt
+写类 `VerdictTally`：
+
+- 创建时不需要参数，内部用一个字典记次数
+- `add(verdict)`：记一次
+- `count(verdict)`：返回这个判定记了几次，没记过返回 0
+- `most_common()`：返回次数最多的判定；并列时返回**先出现**的那个；一个都没记过返回 `None`
+--- starter
+class VerdictTally:
+    def __init__(self):
+        self.counts = {}
+--- solution
+class VerdictTally:
+    def __init__(self):
+        self.counts = {}
+
+    def add(self, verdict):
+        self.counts[verdict] = self.counts.get(verdict, 0) + 1
+
+    def count(self, verdict):
+        return self.counts.get(verdict, 0)
+
+    def most_common(self):
+        best = None
+        for v, n in self.counts.items():
+            if best is None or n > self.counts[best]:
+                best = v
+        return best
+--- tests
+def _make(*vs):
+    t = VerdictTally()
+    for v in vs:
+        t.add(v)
+    return t
+expect("count", lambda: _make("flag", "accept", "flag").count("flag"), 2)
+expect("没记过是 0", lambda: _make("flag").count("redline"), 0)
+expect("最多的", lambda: _make("accept", "flag", "flag").most_common(), "flag")
+expect("并列取先出现的", lambda: _make("redline", "accept").most_common(), "redline")
+expect("空的返回 None", lambda: VerdictTally().most_common(), None)
+--- hints
+- `add` 和 `count` 就是计数写法，只是字典变成了 `self.counts`。
+- `most_common`：遍历 `self.counts.items()`，记住目前最大的那个；只有「严格大于」才替换，这样并列时保留先出现的。
+
+@@ item d3-13
+type: choice
+title: 类型标注会被检查吗
+level: 1
+--- prompt
+`def risk_score(risk: str) -> int:` 这样定义后，调用 `risk_score(123)` 会怎样？
+--- options
+- Python 在运行前报类型错误
+- 照样运行；标注只是说明，Python 本身不检查
+- 自动把 123 转成字符串
+- 语法错误
+answer: 2
+--- explain
+Python 的类型标注在运行时不做检查，函数照常执行（可能在里面因为类型不对而出别的错）。标注的价值在于给人和工具看：编辑器提示、类型检查工具，以及 **Pydantic 会依据标注校验数据**。TypeScript 不一样，它会在运行前检查类型。
+
+@@ item d3-14
+type: order
+title: 排代码：安全取判定
+level: 2
+--- prompt
+排出 `load_verdict(raw)`：JSON 坏了返回 `None`，否则返回其中的 `verdict`（没有这个字段也返回 `None`）。有一行干扰项。
+--- lines
+import json
+def load_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data.get("verdict")
+--- distractors
+    catch json.JSONDecodeError:
+--- tests
+expect("正常", lambda: load_verdict('{"verdict": "flag"}'), "flag")
+expect("坏 JSON", lambda: load_verdict("{oops"), None)
+expect("缺字段", lambda: load_verdict("{}"), None)
+--- hints
+- Python 里是 `except`，不是 `catch`（那是 JavaScript/TypeScript 的写法，第 6 天会学）。
+
+@@ item d3-15
+type: code
+title: 手写一个校验器
+level: 3
+--- prompt
+模型返回的字典不一定可靠。写 `validate_verdict(data)`，返回问题列表（字符串），没有问题返回 `[]`：
+
+- 缺 `clause_id` → `"missing clause_id"`
+- 缺 `verdict` → `"missing verdict"`
+- `verdict` 存在但不是 `accept` / `flag` / `redline` 之一 → `"bad verdict: X"`（X 是实际的值）
+
+按上面的顺序检查，全部问题都列出来。写完你会发现这很繁琐，明天的 Pydantic 就是用来替代它的。
+--- starter
+ALLOWED = ("accept", "flag", "redline")
+
+def validate_verdict(data):
+    problems = []
+    return problems
+--- solution
+ALLOWED = ("accept", "flag", "redline")
+
+def validate_verdict(data):
+    problems = []
+    if "clause_id" not in data:
+        problems.append("missing clause_id")
+    if "verdict" not in data:
+        problems.append("missing verdict")
+    elif data["verdict"] not in ALLOWED:
+        problems.append(f"bad verdict: {data['verdict']}")
+    return problems
+--- tests
+expect("没问题", lambda: validate_verdict({"clause_id": "8.1", "verdict": "flag"}), [])
+expect("缺两个字段", lambda: validate_verdict({}), ["missing clause_id", "missing verdict"])
+expect("判定不合法", lambda: validate_verdict({"clause_id": "1", "verdict": "HIGH"}), ["bad verdict: HIGH"])
+expect("缺编号且判定不合法", lambda: validate_verdict({"verdict": "maybe"}), ["missing clause_id", "bad verdict: maybe"])
+--- hints
+- 每个检查都是独立的 `if`（不是 elif），这样才能把所有问题都列出来。
+- 「verdict 存在但不合法」要在「verdict 存在」的前提下判断：可以用 `elif`。
+
+@@ item d3-16
+type: code
+title: 主动报错
+level: 2
+--- prompt
+写 `parse_risk(text)`：去掉首尾空白并转小写；结果是 `low` / `medium` / `high` 之一就返回它；否则 `raise ValueError`（信息写 `"unknown risk: 原始输入"`）。
+--- starter
+def parse_risk(text):
+    pass
+--- solution
+def parse_risk(text):
+    risk = text.strip().lower()
+    if risk not in ("low", "medium", "high"):
+        raise ValueError(f"unknown risk: {text}")
+    return risk
+--- tests
+expect("正常", lambda: parse_risk(" HIGH "), "high")
+expect_raises("不认识的值要报 ValueError", lambda: parse_risk("urgent"), ValueError)
+def _message():
+    try:
+        parse_risk("x")
+    except ValueError as e:
+        return str(e)
+expect("报错信息", _message, "unknown risk: x")
+--- hints
+- `raise ValueError("...")` 会立刻结束函数并报错。
+- 先判断「不合法就 raise」，最后再 return 合法的值。
+
+@@ item d3-e1
+type: scratch
+title: 闭卷：取所有规则编号
+exam: yes
+level: 2
+--- prompt
+写 `rule_ids(raw)`：`raw` 是这样的 JSON 文字：
+
+`'{"rules": [{"id": "PB-01", "topic": "payment"}, {"id": "PB-02", "topic": "renewal"}]}'`
+
+返回所有规则的 `id` 组成的列表。
+--- solution
+import json
+
+def rule_ids(raw):
+    data = json.loads(raw)
+    return [r["id"] for r in data["rules"]]
+--- tests
+expect("两条", lambda: rule_ids('{"rules": [{"id": "PB-01", "topic": "payment"}, {"id": "PB-02", "topic": "renewal"}]}'), ["PB-01", "PB-02"])
+expect("没有规则", lambda: rule_ids('{"rules": []}'), [])
+
+@@ item d3-e2
+type: scratch
+title: 闭卷：解析结果
+exam: yes
+level: 2
+--- prompt
+写 `parse_result(raw)`：
+
+- JSON 正常：返回 `{"ok": True, "data": 解析出的对象}`
+- JSON 格式错误：返回 `{"ok": False, "error": "invalid json"}`
+--- solution
+import json
+
+def parse_result(raw):
+    try:
+        return {"ok": True, "data": json.loads(raw)}
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "invalid json"}
+--- tests
+expect("正常", lambda: parse_result('{"a": 1}'), {"ok": True, "data": {"a": 1}})
+expect("坏的", lambda: parse_result("nope"), {"ok": False, "error": "invalid json"})
+
+@@ item d3-e3
+type: scratch
+title: 闭卷：Rule 类
+exam: yes
+level: 2
+--- prompt
+写类 `Rule`：创建时接收 `rule_id`、`topic`、`severity` 并保存为同名属性；方法 `is_high()` 在 `severity` 为 `"high"` 时返回 `True`；方法 `summary()` 返回 `"PB-01 (payment, high)"` 这样的字符串。
+--- solution
+class Rule:
+    def __init__(self, rule_id, topic, severity):
+        self.rule_id = rule_id
+        self.topic = topic
+        self.severity = severity
+
+    def is_high(self):
+        return self.severity == "high"
+
+    def summary(self):
+        return f"{self.rule_id} ({self.topic}, {self.severity})"
+--- tests
+r = Rule("PB-01", "payment", "high")
+expect("is_high", lambda: r.is_high(), True)
+expect("summary", lambda: r.summary(), "PB-01 (payment, high)")
+expect("属性", lambda: Rule("PB-02", "renewal", "low").topic, "renewal")

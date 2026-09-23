@@ -1,0 +1,881 @@
+@@ day 6
+title: TypeScript 做 AI：async、fetch、Zod、重试
+lang: ts
+hours: 5 小时
+--- goal
+把第 4 天的 Python AI 代码全部用 TypeScript 再写一遍：async/await 调接口、try/catch 处理错误、Zod 校验模型输出、重试、工具分发、通过率。Zod 就是 TypeScript 世界的 Pydantic，Mastra 的工具参数就是用 Zod 定义的。
+--- checklist
+- 先清空复习区
+- 读完 7 张知识卡片并改动运行
+- 练习区全部通过（包括最后的本机任务：用 TypeScript 真的调一次 DeepSeek）
+- 闭卷挑战 3 题
+- 对比第 4 天和今天同名的函数（ask、classify、passRate），说出每一处写法差异
+
+@@ concept
+title: async / await：等网络的时候不卡住
+--- body
+网络请求要等。TypeScript 用 **Promise** 表示「将来才有的结果」：
+
+```ts
+async function ask(prompt: string): Promise<string> {
+  const res = await fetch(URL, ...);   // 在这里等，等到了再往下
+  const data = await res.json();       // json() 也要等
+  return data.choices[0].message.content;
+}
+```
+
+- 函数前加 `async`，返回类型写成 `Promise<真正的类型>`
+- 在 async 函数里用 `await` 等一个 Promise 完成
+- **最常见的 bug：忘了 await**，拿到的是一个还没完成的 Promise，而不是结果
+- 调用 async 函数也要 `await`：`const text = await ask("hi");`
+--- code
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function review(id: string): Promise<string> {
+  console.log("start", id);
+  await wait(10);
+  return `done ${id}`;
+}
+
+async function main() {
+  const r = await review("8.1");
+  console.log(r);
+  const p = review("4.2");
+  console.log("without await:", p);
+  console.log("after await:", await p);
+}
+main();
+
+@@ concept
+title: fetch：TypeScript 里的 requests.post
+--- body
+```ts
+const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+  method: "POST",
+  headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-chat", messages }),
+});
+res.status;             // 状态码
+res.ok;                 // 200–299 为 true
+const data = await res.json();
+```
+
+和 Python 的三个不同：要写 `method: "POST"`；请求体要自己 `JSON.stringify`；`res.json()` 要 await。
+
+`process.env.DEEPSEEK_API_KEY` 读环境变量，和 `os.getenv` 一样。本页连的是模拟服务器，本机连的就是真的。
+--- code
+async function main() {
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: "Say hello" }] }),
+  });
+  console.log(res.status, res.ok);
+  const data = await res.json();
+  console.log(data.choices[0].message.content);
+  console.log(data.usage.total_tokens);
+}
+main();
+
+@@ concept
+title: try / catch / throw
+--- body
+```ts
+try {
+  const data = JSON.parse(raw);
+} catch (e) {
+  console.log("bad json:", e instanceof Error ? e.message : String(e));
+}
+```
+
+- Python 的 `except` → `catch`；`raise ValueError("...")` → `throw new Error("...")`
+- TypeScript 里 `catch (e)` 的 `e` 类型是 `unknown`（谁都可能被 throw），用之前先判断 `e instanceof Error`
+- async 函数里 throw 的错误，调用方 `await` 时会在 try/catch 里接住
+--- code
+function parseRisk(text: string): string {
+  const risk = text.trim().toLowerCase();
+  if (!["low", "medium", "high"].includes(risk)) {
+    throw new Error(`unknown risk: ${text}`);
+  }
+  return risk;
+}
+console.log(parseRisk(" HIGH "));
+try {
+  parseRisk("urgent");
+} catch (e) {
+  console.log("caught:", e instanceof Error ? e.message : String(e));
+}
+try {
+  JSON.parse("{oops");
+} catch (e) {
+  console.log("bad json:", e instanceof Error ? e.name : "?");
+}
+
+@@ concept
+title: Zod：TypeScript 的 Pydantic
+--- body
+```ts
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  confidence: z.number().default(0.5),
+});
+```
+
+- `z.enum([...])` 就是 `Literal[...]`；`z.object({...})` 就是 `BaseModel`
+- `Schema.parse(data)`：合法就返回数据，不合法 **throw**
+- `Schema.safeParse(data)`：不 throw，返回 `{ success: true, data }` 或 `{ success: false, error }`，错误在 `error.issues`
+- 注意 Zod 校验的是**对象**，模型给的文字要先 `JSON.parse`
+--- code
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  confidence: z.number().default(0.5),
+});
+
+console.log(VerdictSchema.parse({ clause_id: "8.1", verdict: "flag" }));
+const bad = VerdictSchema.safeParse({ clause_id: "8.1", verdict: "HIGH" });
+if (!bad.success) {
+  console.log(bad.error.issues[0].path, bad.error.issues[0].message);
+}
+
+@@ concept
+title: z.infer：一份定义，两处使用
+--- body
+Pydantic 的类本身就是类型。Zod 的 schema 是一个**值**，要用 `z.infer` 从它得到**类型**：
+
+```ts
+type Verdict = z.infer<typeof VerdictSchema>;
+// { clause_id: string; verdict: "accept" | "flag" | "redline"; confidence: number }
+```
+
+这样运行时的校验（schema）和编译时的类型（type）永远一致，不用写两遍。Clause Check 里 Pydantic 同时生成给模型看的 JSON Schema，也是同一个思路。
+--- code
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function describe(v: Verdict): string {
+  return `${v.clause_id}: ${v.verdict}`;
+}
+const v: Verdict = VerdictSchema.parse(JSON.parse('{"clause_id": "8.1", "verdict": "redline"}'));
+console.log(describe(v));
+
+@@ concept
+title: 工具分发：名字到函数的表
+--- body
+模型说「调用 lookup_playbook，参数 {"topic": "payment"}」。代码要按名字找到函数：
+
+```ts
+const tools: Record<string, (args: any) => string> = {
+  lookup_playbook: (args) => `rule for ${args.topic}`,
+};
+const result = tools[name](JSON.parse(argumentsText));
+```
+
+`Record<string, 函数类型>` 就是 Python 里 `{"名字": 函数}` 的字典。`(args: any) => string` 是函数类型：接收一个参数，返回字符串。
+--- code
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+const tools: Record<string, (args: any) => string> = {
+  lookup_playbook: (args) => `rule for ${args.topic}`,
+  word_count: (args) => String(args.text.split(" ").length),
+};
+const call: ToolCall = { id: "call_1", function: { name: "lookup_playbook", arguments: '{"topic": "payment"}' } };
+console.log(tools[call.function.name](JSON.parse(call.function.arguments)));
+console.log(Object.keys(tools));
+
+@@ concept
+title: import / export 和 Mastra 长什么样
+--- body
+真实项目里代码分在多个文件：一个文件 `export function classify(...)`，另一个文件 `import { classify } from "./review"`。本页每题只有一个文件，但会用到 `import { z } from "zod"`。
+
+Mastra 的工具定义大致是这个形状（示意，具体写法以 mastra.ai 官方文档为准）：
+
+```ts
+const lookupPlaybook = createTool({
+  id: "lookup_playbook",
+  description: "Return the customer's rule for one topic. Call before deciding.",
+  inputSchema: z.object({ topic: z.enum(["payment", "liability_cap"]) }),
+  execute: async (...) => { ... },
+});
+```
+
+你已经能读懂它的每一部分：Zod 定义参数（等于 Pydantic）、description 写「何时用」、execute 是 async 函数。Python 的 `@tool + Pydantic` 和 Mastra 的 `createTool + Zod` 是同一个概念。面试时说：「概念一样，我在 Python 里做过的每件事在 Mastra 里都有对应物。」
+--- code
+import { z } from "zod";
+
+const ToolInput = z.object({ topic: z.enum(["payment", "liability_cap"]) });
+type ToolInput = z.infer<typeof ToolInput>;
+
+async function execute(input: ToolInput): Promise<string> {
+  return `rule for ${input.topic}`;
+}
+
+async function main() {
+  const raw = JSON.parse('{"topic": "payment"}');
+  console.log(await execute(ToolInput.parse(raw)));
+  console.log(ToolInput.safeParse({ topic: "gdpr" }).success);
+}
+main();
+
+@@ item d6-01
+type: choice
+title: await 做了什么
+level: 1
+--- prompt
+在 async 函数里写 `const data = res.json();`（忘了 await），`data` 是什么？
+--- options
+- 解析好的对象
+- 一个还没完成的 Promise，`data.choices` 会报类型错误
+- undefined
+- 字符串
+answer: 2
+--- explain
+`res.json()` 返回的是 `Promise<any>`。不 await，拿到的就是 Promise 本身；TypeScript 会报 `Property 'choices' does not exist on type 'Promise<any>'`。看到这句报错，第一反应就是：是不是少了 await。
+
+@@ item d6-02
+type: predict
+title: 异步的执行顺序
+level: 2
+--- prompt
+写出输出。关键：`.then` 里的回调要等当前这一段同步代码全部跑完才执行。
+--- code
+async function review(): Promise<string> {
+  console.log("B: start review");
+  return "done";
+}
+console.log("A");
+review().then((r) => console.log("C:", r));
+console.log("D");
+
+@@ item d6-03
+type: code
+title: 组装请求体（TS 版）
+level: 1
+--- prompt
+写 `buildBody(messages, model, temperature)`：`model` 默认 `"deepseek-chat"`，`temperature` 默认 `0.3`，返回有这三个键的对象。
+--- starter
+type Message = { role: "system" | "user" | "assistant"; content: string };
+
+function buildBody(messages: Message[]) {
+  return {};
+}
+--- solution
+type Message = { role: "system" | "user" | "assistant"; content: string };
+
+function buildBody(messages: Message[], model = "deepseek-chat", temperature = 0.3) {
+  return { model, messages, temperature };
+}
+--- tests
+const msgs: Message[] = [{ role: "user", content: "hi" }];
+expect("默认值", () => buildBody(msgs), { model: "deepseek-chat", messages: msgs, temperature: 0.3 });
+expect("自定义", () => buildBody(msgs, "deepseek-reasoner", 0).model, "deepseek-reasoner");
+--- hints
+- `{ model, messages, temperature }` 是 `{ model: model, ... }` 的简写。
+
+@@ item d6-04
+type: code
+title: 第一次调接口（TS 版）
+level: 2
+--- prompt
+写 `ask(prompt)`：POST 到 `API_URL`，请求头带 `Bearer` 密钥，模型 `deepseek-chat`，一条 user 消息，返回回答文字。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const API_KEY = process.env.DEEPSEEK_API_KEY;
+
+async function ask(prompt: string): Promise<string> {
+  return "";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const API_KEY = process.env.DEEPSEEK_API_KEY;
+
+async function ask(prompt: string): Promise<string> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = await res.json();
+  return data.choices[0].message.content;
+}
+--- tests
+expectAsync("回答", () => ask("hello"), "Mock reply: hello");
+expectAsync("用的模型", async () => { await ask("x"); return MOCK.calls[MOCK.calls.length - 1].body.model; }, "deepseek-chat");
+--- hints
+- `fetch(API_URL, { method: "POST", headers: {...}, body: JSON.stringify({...}) })`，前面加 await。
+- `const data = await res.json();` 然后取 `data.choices[0].message.content`。
+
+@@ item d6-05
+type: fix
+title: 修 bug：忘了 await
+level: 2
+--- prompt
+类型检查报错了。读报错，修好它。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+async function ask(prompt: string): Promise<string> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = res.json();
+  return data.choices[0].message.content;
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+async function ask(prompt: string): Promise<string> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = await res.json();
+  return data.choices[0].message.content;
+}
+--- tests
+expectAsync("修好后", () => ask("ping"), "Mock reply: ping");
+expectAsync("另一个问题", () => ask("pong"), "Mock reply: pong");
+--- hints
+- 报错说 `Promise<any>` 上没有 `choices`：`data` 是个 Promise。
+
+@@ item d6-06
+type: code
+title: 顺便记下 token（TS 版）
+level: 2
+--- prompt
+写 `askWithUsage(prompt)`，返回 `{ text, tokens }`：回答文字和本次 `total_tokens`。返回类型已经写好。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function askWithUsage(prompt: string): Promise<{ text: string; tokens: number }> {
+  return { text: "", tokens: 0 };
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function askWithUsage(prompt: string): Promise<{ text: string; tokens: number }> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = await res.json();
+  return { text: data.choices[0].message.content, tokens: data.usage.total_tokens };
+}
+--- tests
+expectAsync("text", async () => (await askWithUsage("cost?")).text, "Mock reply: cost?");
+expectTrueAsync("tokens 是正数", async () => (await askWithUsage("cost?")).tokens > 0);
+--- hints
+- `data.usage.total_tokens`。
+
+@@ item d6-07
+type: code
+title: 状态码不对就 throw
+level: 2
+--- prompt
+写 `callApi(body)`：发请求；`res.ok` 为 true 就返回解析后的数据；否则 `throw new Error(\`API error ${状态码}: ${错误信息}\`)`，错误信息在 `(await res.json()).error.message`。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function callApi(body: object): Promise<any> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  return res.json();
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function callApi(body: object): Promise<any> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${data.error.message}`);
+  }
+  return data;
+}
+--- tests
+const GOOD = { model: "deepseek-chat", messages: [{ role: "user", content: "hi" }] };
+expectAsync("成功", async () => (await callApi(GOOD)).choices[0].message.content, "Mock reply: hi");
+expectRejects("模型名写错", () => callApi({ model: "gpt-9", messages: [{ role: "user", content: "x" }] }));
+expectAsync("错误信息格式", async () => {
+  MOCK.failNext(500);
+  try { await callApi(GOOD); return "没有报错"; } catch (e) { return e instanceof Error ? e.message : String(e); }
+}, "API error 500: Internal server error");
+--- hints
+- 先 `const data = await res.json();`，再判断 `if (!res.ok) { throw ... }`。
+
+@@ item d6-08
+type: code
+title: 失败就重试（TS 版）
+level: 3
+--- prompt
+写 `askWithRetry(prompt, maxAttempts = 3)`：200 返回文字；429 / 500 / 503 重试；其他状态码直接 throw；次数用完 throw。规则和第 4 天一样。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const RETRYABLE = [429, 500, 503];
+
+async function askWithRetry(prompt: string, maxAttempts = 3): Promise<string> {
+  const body = JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] });
+  return "";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const RETRYABLE = [429, 500, 503];
+
+async function askWithRetry(prompt: string, maxAttempts = 3): Promise<string> {
+  const body = JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }] });
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body });
+    if (res.status === 200) {
+      const data = await res.json();
+      return data.choices[0].message.content;
+    }
+    if (!RETRYABLE.includes(res.status)) {
+      throw new Error(`not retryable: ${res.status}`);
+    }
+  }
+  throw new Error(`gave up after ${maxAttempts} attempts`);
+}
+--- tests
+expectAsync("两次 429 后成功，共请求 3 次", async () => {
+  MOCK.reset(); MOCK.failNext(429, 2);
+  const text = await askWithRetry("hi");
+  return [text, MOCK.calls.length];
+}, ["Mock reply: hi", 3]);
+expectAsync("一直 503：throw，且只请求 3 次", async () => {
+  MOCK.reset(); MOCK.failNext(503, 5);
+  try { await askWithRetry("hi"); return "没有报错"; } catch { return MOCK.calls.length; }
+}, 3);
+expectAsync("401 不重试", async () => {
+  MOCK.reset(); MOCK.failNext(401);
+  try { await askWithRetry("hi"); return "没有报错"; } catch { return MOCK.calls.length; }
+}, 1);
+--- hints
+- `for (let attempt = 1; attempt <= maxAttempts; attempt++) { ... }`
+- 判断可重试：`RETRYABLE.includes(res.status)`。循环外面 throw「次数用完」。
+
+@@ item d6-09
+type: code
+title: 用 Zod 解析模型输出
+level: 2
+--- prompt
+补全 `VerdictSchema`（`clause_id` 字符串，`verdict` 为三选一），再写 `parseVerdict(raw)`：
+
+- 合法：返回解析后的对象
+- JSON 格式坏了：返回 `"INVALID: bad json"`
+- 字段不合法：返回 `"INVALID: " + 第一个 issue 的 message`
+--- starter
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function parseVerdict(raw: string): Verdict | string {
+  return "";
+}
+--- solution
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function parseVerdict(raw: string): Verdict | string {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return "INVALID: bad json";
+  }
+  const result = VerdictSchema.safeParse(data);
+  if (!result.success) {
+    return "INVALID: " + result.error.issues[0].message;
+  }
+  return result.data;
+}
+--- tests
+expect("合法", () => parseVerdict('{"clause_id": "8.1", "verdict": "flag"}'), { clause_id: "8.1", verdict: "flag" });
+expect("坏 JSON", () => parseVerdict("Sure! {"), "INVALID: bad json");
+expectTrue("判定不合法", () => String(parseVerdict('{"clause_id": "8.1", "verdict": "HIGH"}')).startsWith("INVALID: "));
+expectTrue("缺字段", () => String(parseVerdict('{"verdict": "flag"}')).startsWith("INVALID: "));
+--- hints
+- `verdict: z.enum(["accept", "flag", "redline"])`。
+- JSON.parse 放在 try/catch 里；Zod 用 `safeParse`，不合法时看 `result.error.issues[0].message`。
+
+@@ item d6-10
+type: predict
+title: safeParse 的结果
+level: 2
+--- prompt
+写出输出。`default(0.5)` 会在缺字段时补上默认值。
+--- code
+import { z } from "zod";
+
+const Verdict = z.object({
+  verdict: z.enum(["accept", "flag", "redline"]),
+  confidence: z.number().default(0.5),
+});
+const a = Verdict.safeParse({ verdict: "flag" });
+console.log(a.success, a.data);
+const b = Verdict.safeParse({ verdict: "maybe" });
+console.log(b.success, b.error?.issues[0].path);
+
+@@ item d6-11
+type: code
+title: 结构化判定（TS 版）
+level: 3
+--- prompt
+写 `classify(clauseText)`：请求时加 `response_format: { type: "json_object" }`，把回答文字 `JSON.parse` 后用 `VerdictSchema.parse` 校验，返回 `Verdict`。
+--- starter
+import { z } from "zod";
+
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  risk_level: z.enum(["low", "medium", "high"]),
+  rationale: z.string(),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+async function classify(clauseText: string): Promise<Verdict> {
+  throw new Error("not implemented");
+}
+--- solution
+import { z } from "zod";
+
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  risk_level: z.enum(["low", "medium", "high"]),
+  rationale: z.string(),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+async function classify(clauseText: string): Promise<Verdict> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: clauseText }],
+      response_format: { type: "json_object" },
+    }),
+  });
+  const data = await res.json();
+  return VerdictSchema.parse(JSON.parse(data.choices[0].message.content));
+}
+--- tests
+const TEXT = "Review clause 8.1: Customer's liability shall be unlimited.";
+expectAsync("unlimited → redline", async () => (await classify(TEXT)).verdict, "redline");
+expectAsync("编号", async () => (await classify(TEXT)).clause_id, "8.1");
+expectAsync("带了 response_format", async () => { await classify(TEXT); return MOCK.calls[MOCK.calls.length - 1].body.response_format; }, { type: "json_object" });
+--- hints
+- 请求体里多一个键：`response_format: { type: "json_object" }`。
+- 回答文字 → `JSON.parse(...)` → `VerdictSchema.parse(...)`。
+
+@@ item d6-12
+type: code
+title: 执行工具调用（TS 版）
+level: 2
+--- prompt
+写 `runToolCall(call, tools)`：按 `call.function.name` 在 `tools` 里找到函数，把 `arguments`（JSON 文字）解析后传进去，返回结果。找不到返回 `"UNKNOWN_TOOL: 名字"`。
+--- starter
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type Tools = Record<string, (args: any) => string>;
+
+function runToolCall(call: ToolCall, tools: Tools): string {
+  return "";
+}
+--- solution
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type Tools = Record<string, (args: any) => string>;
+
+function runToolCall(call: ToolCall, tools: Tools): string {
+  const fn = tools[call.function.name];
+  if (!fn) {
+    return `UNKNOWN_TOOL: ${call.function.name}`;
+  }
+  return fn(JSON.parse(call.function.arguments));
+}
+--- tests
+const TOOLS: Tools = {
+  lookup_playbook: (args) => `rule for ${args.topic}`,
+  add: (args) => String(args.a + args.b),
+};
+const mk = (name: string, args: string): ToolCall => ({ id: "c", function: { name, arguments: args } });
+expect("查 playbook", () => runToolCall(mk("lookup_playbook", '{"topic": "payment"}'), TOOLS), "rule for payment");
+expect("两个参数", () => runToolCall(mk("add", '{"a": 2, "b": 3}'), TOOLS), "5");
+expect("不存在", () => runToolCall(mk("delete_all", "{}"), TOOLS), "UNKNOWN_TOOL: delete_all");
+--- hints
+- 先取函数 `tools[call.function.name]`，不存在时它是 `undefined`，用 `if (!fn)` 判断。
+
+@@ item d6-13
+type: code
+title: 通过率（TS 版）
+level: 2
+--- prompt
+写 `passRate(text, expected, n)`：调用 `classify(text)` 共 `n` 次（**一次一次按顺序 await**），返回判定等于 `expected` 的比例。`classify` 已经写好。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function classify(text: string): Promise<{ verdict: string }> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function passRate(text: string, expected: string, n: number): Promise<number> {
+  return 0;
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function classify(text: string): Promise<{ verdict: string }> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function passRate(text: string, expected: string, n: number): Promise<number> {
+  let hits = 0;
+  for (let i = 0; i < n; i++) {
+    const v = await classify(text);
+    if (v.verdict === expected) {
+      hits += 1;
+    }
+  }
+  return hits / n;
+}
+--- tests
+const UNLIMITED = "Review clause 8.1: Customer's liability shall be unlimited.";
+const AS_IS = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS".';
+expectAsync("稳定的条款", () => passRate(UNLIMITED, "redline", 5), 1);
+expectAsync("判错的期望", () => passRate(UNLIMITED, "accept", 3), 0);
+expectTrueAsync("摇摆的条款介于 0 和 1", async () => { const r = await passRate(AS_IS, "accept", 20); return r > 0 && r < 1; });
+--- hints
+- 循环里 `const v = await classify(text);`，对了就 `hits += 1`。
+
+@@ item d6-14
+type: translate
+title: 翻译：ask
+level: 2
+--- prompt
+把第 4 天的 Python `ask` 翻译成 TypeScript。注意三处差异：`method: "POST"`、`JSON.stringify`、两个 `await`。
+--- source
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+def ask(prompt):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    data = requests.post(API_URL, headers=headers, json=body).json()
+    return data["choices"][0]["message"]["content"]
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+async function ask(prompt: string): Promise<string> {
+  return "";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+async function ask(prompt: string): Promise<string> {
+  const headers = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+  const body = { model: "deepseek-chat", messages: [{ role: "user", content: prompt }] };
+  const res = await fetch(API_URL, { method: "POST", headers, body: JSON.stringify(body) });
+  const data = await res.json();
+  return data.choices[0].message.content;
+}
+--- tests
+expectAsync("回答", () => ask("translate me"), "Mock reply: translate me");
+expectAsync("消息", async () => { await ask("m"); return MOCK.calls[MOCK.calls.length - 1].body.messages; }, [{ role: "user", content: "m" }]);
+--- hints
+- `os.getenv('X')` → `process.env.X`；f-string → 模板字符串。
+
+@@ item d6-15
+type: order
+title: 排代码：要 JSON 的调用（TS 版）
+level: 2
+--- prompt
+排出 `askJson`。对象字面量里 `method`、`headers`、`body` 三行的顺序可以互换。有一行干扰项。
+--- lines
+async function askJson(prompt: string): Promise<any> {
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" } }),
+  });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+--- distractors
+  const data = res.json();
+--- tests
+expectAsync("判定", async () => (await askJson("Review clause 6.2: survives in perpetuity")).verdict, "redline");
+expectAsync("主题", async () => (await askJson("Review clause 6.2: survives in perpetuity")).topic, "confidentiality");
+--- hints
+- 干扰项少了 await。
+
+@@ item d6-16
+type: choice
+title: z.infer 的作用
+level: 2
+--- prompt
+`type Verdict = z.infer<typeof VerdictSchema>;` 这一行的作用是？
+--- options
+- 运行时校验数据
+- 从 Zod schema 推导出 TypeScript 类型，让校验规则和类型只写一遍
+- 把对象转成 JSON
+- 让 VerdictSchema 变成可选
+answer: 2
+--- explain
+Zod schema 是运行时的一个值，负责校验；`z.infer` 在编译时从它推导出类型。这样改 schema 时类型自动跟着变，不会出现「校验放行了、类型却不对」的情况。Pydantic 里类本身同时是校验器和类型，所以不需要这一步。
+
+@@ item d6-17
+type: choice
+title: Python 和 Mastra 的对应
+level: 1
+--- prompt
+Mastra 用 `createTool({ inputSchema: z.object({...}) })` 定义工具参数。在 Python / Clause Check 里，对应的是什么？
+--- options
+- `json.dumps`
+- 用 Pydantic 模型定义参数，再用 `model_json_schema()` 生成给模型看的 JSON Schema
+- `requests.post`
+- `print`
+answer: 2
+--- explain
+两边是同一个概念：用一个「schema 对象」同时做两件事，(1) 生成给模型看的参数说明，(2) 校验模型传来的参数。Python 里是 Pydantic，TypeScript 里是 Zod。Clause Check 的 `tools.py` 就是这么做的。
+
+@@ item d6-18
+type: local
+title: 本机任务：用 TypeScript 调一次 DeepSeek
+level: 2
+--- prompt
+**不看这个页面**，手写一次 TypeScript 的真实调用。
+
+1. 在 `G:\Contract Clause Reviewer\learn` 下新建 `my_first_call.ts`
+2. 第一行写 `process.loadEnvFile();`（Node 自带，读取当前目录的 `.env`）
+3. 手写一个 async 的 `main()`：fetch DeepSeek，打印回答和 `total_tokens`，最后调用 `main()`
+4. 在项目根目录运行（这样 `.env` 能被找到）：
+
+```
+cd "G:\Contract Clause Reviewer"
+npx tsx learn/my_first_call.ts
+```
+
+5. 把输出粘贴到下面
+
+第一次运行 `npx tsx` 会询问是否安装，输入 y。
+placeholder: 粘贴终端输出，应该包含回答和 total_tokens
+verify: tokens?\D{0,30}\d+
+--- hints
+- 看到 `fetch is not defined`：Node 版本太旧，需要 18 以上（你的是 22，没问题）。
+- 看到 401：检查 `.env` 和 `Bearer ` 前缀。
+
+@@ item d6-e1
+type: scratch
+title: 闭卷：Rule schema
+exam: yes
+level: 2
+--- prompt
+用 Zod 定义 `RuleSchema`：`id` 字符串、`topic` 字符串、`severity` 为 `low` / `medium` / `high` 之一。再写 `loadRule(raw: string)`：合法返回解析后的对象，JSON 坏了或字段不合法都返回 `null`。
+--- solution
+import { z } from "zod";
+
+const RuleSchema = z.object({
+  id: z.string(),
+  topic: z.string(),
+  severity: z.enum(["low", "medium", "high"]),
+});
+type Rule = z.infer<typeof RuleSchema>;
+
+function loadRule(raw: string): Rule | null {
+  try {
+    const result = RuleSchema.safeParse(JSON.parse(raw));
+    return result.success ? result.data : null;
+  } catch {
+    return null;
+  }
+}
+--- tests
+expect("合法", () => loadRule('{"id": "PB-01", "topic": "liability_cap", "severity": "high"}')?.severity, "high");
+expect("不合法", () => loadRule('{"id": "PB-01", "topic": "x", "severity": "urgent"}'), null);
+expect("坏 JSON", () => loadRule("{"), null);
+
+@@ item d6-e2
+type: scratch
+title: 闭卷：要 JSON 的调用（TS）
+exam: yes
+level: 2
+--- prompt
+写 `askJson(prompt: string): Promise<any>`：调用 `https://api.deepseek.com/v1/chat/completions`（模型 `deepseek-chat`，密钥 `process.env.DEEPSEEK_API_KEY`），要求 `json_object` 格式，返回解析后的对象。
+--- solution
+async function askJson(prompt: string): Promise<any> {
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" } }),
+  });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+--- tests
+expectAsync("判定", async () => (await askJson("Review clause 10.1: processed in any country")).verdict, "redline");
+expectAsync("主题", async () => (await askJson("Review clause 10.1: processed in any country")).topic, "data_processing");
+
+@@ item d6-e3
+type: scratch
+title: 闭卷：一共多少 token（TS）
+exam: yes
+level: 2
+--- prompt
+写 `countTokens(prompts: string[]): Promise<number>`：对每个 prompt 按顺序各调用一次接口，返回 `total_tokens` 之和，空数组返回 0。
+--- solution
+async function countTokens(prompts: string[]): Promise<number> {
+  let total = 0;
+  for (const p of prompts) {
+    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: p }] }),
+    });
+    const data = await res.json();
+    total += data.usage.total_tokens;
+  }
+  return total;
+}
+--- tests
+expectTrueAsync("两次大于一次", async () => (await countTokens(["a", "b"])) > (await countTokens(["a"])));
+expectAsync("空数组", () => countTokens([]), 0);
+expectAsync("调用次数", async () => { MOCK.reset(); await countTokens(["x", "y", "z"]); return MOCK.calls.length; }, 3);

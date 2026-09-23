@@ -1,0 +1,697 @@
+@@ day 2
+title: Python 核心：循环、字典、函数、推导式
+lang: py
+hours: 4–5 小时
+--- goal
+能遍历「装着字典的列表」这种真实数据，做计数、筛选、分组、排序；函数会用默认参数和提前 return。这一天的内容就是 Clause Check 里 `summarise()` 的全部原理。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过
+- 闭卷挑战 3 题
+- 在 VS Code 里从空白写一遍 `count_verdicts` 和 `group_by_topic`，不看任何参考
+
+@@ concept
+title: for 循环
+--- body
+`for 变量 in 列表:` 把列表里的元素一个一个拿出来，每次执行一遍下面缩进的代码。
+
+`range(n)` 生成 0 到 n-1 的数字，`range(1, 4)` 是 1、2、3（不含结尾）。
+
+循环变量的名字随便起，但要有意义：遍历条款就叫 `clause` 或 `c`，不要叫 `x`。
+--- code
+ids = ["3.1", "4.2", "8.1"]
+for cid in ids:
+    print("reviewing", cid)
+
+for i in range(3):
+    print("attempt", i + 1)
+
+@@ concept
+title: 累加：在循环外准备，在循环里更新
+--- body
+几乎所有「统计」都是同一个形状：
+
+1. 循环**之前**准备一个初始值（`0`、空列表 `[]`、空字典 `{}`）
+2. 循环**里面**更新它
+3. 循环**之后** return 它
+
+最常见的 bug：把初始值写进了循环里，每一轮都被清零。
+--- code
+lengths = [120, 45, 300]
+total = 0
+for n in lengths:
+    total = total + n
+print("total", total)
+
+long_ones = []
+for n in lengths:
+    if n > 100:
+        long_ones.append(n)
+print(long_ones)
+
+@@ concept
+title: 字典：用名字找值
+--- body
+字典 `{键: 值, ...}` 按「键」找「值」，就像查表。
+
+- `d["8.1"]` 取值，键不存在会报 `KeyError`
+- `d.get("4.2")` 键不存在时返回 `None`；`d.get("4.2", "unknown")` 返回你给的默认值
+- `d["4.2"] = "low"` 新增或修改
+- `"3.1" in d` 判断键在不在
+- `for k, v in d.items():` 同时遍历键和值
+
+模型返回的 JSON、playbook 规则、统计结果，在 Python 里都是字典。
+--- code
+risk = {"8.1": "high", "3.1": "low"}
+print(risk["8.1"])
+print(risk.get("4.2"), risk.get("4.2", "unknown"))
+risk["4.2"] = "medium"
+for cid, level in risk.items():
+    print(cid, "->", level)
+
+@@ concept
+title: 计数的标准写法
+--- body
+统计每种判定出现几次，是这个项目里最常见的操作。标准写法：
+
+```python
+counts = {}
+for v in verdicts:
+    counts[v] = counts.get(v, 0) + 1
+```
+
+`counts.get(v, 0)` 的意思是「之前数到几了，没数过就当 0」。直接写 `counts[v] += 1` 会在第一次遇到某个值时报 `KeyError`。
+--- code
+verdicts = ["accept", "flag", "accept", "redline", "accept"]
+counts = {}
+for v in verdicts:
+    counts[v] = counts.get(v, 0) + 1
+print(counts)
+
+@@ concept
+title: 列表里装字典：真实数据的样子
+--- body
+一份合同审完，结果就是一个列表，每个元素是一条条款的字典：
+
+```python
+clauses = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "8.1", "verdict": "flag", "risk": "high"},
+]
+```
+
+遍历时 `c` 是一个字典，用 `c["risk"]` 取字段。读这种代码时，在脑子里问：「这个变量现在是列表、字典，还是字符串？」
+--- code
+clauses = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "8.1", "verdict": "flag", "risk": "high"},
+    {"id": "10.1", "verdict": "redline", "risk": "high"},
+]
+for c in clauses:
+    if c["risk"] == "high":
+        print(c["id"], c["verdict"])
+
+@@ concept
+title: 函数：默认参数和提前 return
+--- body
+- **默认参数**：`def label(cid, prefix="Clause"):`，调用时不传 `prefix` 就用默认值
+- **提前 return**：找到答案就立刻 `return`，函数马上结束；循环走完都没找到，再在最后 `return None`
+
+「找一个东西」的标准形状：
+
+```python
+def find(items, target):
+    for x in items:
+        if x == target:
+            return x
+    return None
+```
+
+注意最后那行 `return None` 和 `for` 对齐，不在循环里面。
+--- code
+def label(cid, prefix="Clause"):
+    return f"{prefix} {cid}"
+
+def first_high(clauses):
+    for c in clauses:
+        if c["risk"] == "high":
+            return c["id"]
+    return None
+
+print(label("8.1"), label("8.1", "Section"))
+print(first_high([{"id": "3.1", "risk": "low"}, {"id": "8.1", "risk": "high"}]))
+print(first_high([]))
+
+@@ concept
+title: 列表推导式：一行写完筛选和变换
+--- body
+`[表达式 for 变量 in 列表 if 条件]` 等价于「准备空列表 → 循环 → 满足条件就 append」。
+
+```python
+ids = [c["id"] for c in clauses if c["risk"] == "high"]
+```
+
+先把普通 for 循环写熟，再用推导式。两种写法测试都认，看得懂就行，面试时写哪种都可以。
+--- code
+clauses = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "10.1", "risk": "high"},
+]
+print([c["id"] for c in clauses])
+print([c["id"] for c in clauses if c["risk"] == "high"])
+print([len(c["id"]) for c in clauses])
+
+@@ concept
+title: 排序和 while
+--- body
+**排序**：`sorted(列表)` 返回排好序的新列表。按字段排序用 `key=`：
+
+```python
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+sorted(clauses, key=lambda c: RISK_ORDER[c["risk"]])
+```
+
+`lambda c: ...` 是一个没有名字的小函数：给它一条条款，它返回用来比较的值。`sorted` 是稳定的：比较值相同的元素保持原来的顺序。
+
+**while**：条件成立就一直循环，适合「不知道要循环几次」的情况，比如接口失败时重试。一定要确保循环里有东西在变，否则就是死循环。
+--- code
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+clauses = [{"id": "3.1", "risk": "low"}, {"id": "8.1", "risk": "high"}, {"id": "4.2", "risk": "medium"}]
+for c in sorted(clauses, key=lambda c: RISK_ORDER[c["risk"]]):
+    print(c["id"], c["risk"])
+
+attempt = 1
+while attempt <= 3:
+    print("try", attempt)
+    attempt = attempt + 1
+
+@@ item d2-01
+type: predict
+title: for 和 range
+level: 1
+--- prompt
+写出输出。
+--- code
+for i in range(3):
+    print(i)
+for cid in ["3.1", "8.1"]:
+    print("clause", cid)
+
+@@ item d2-02
+type: predict
+title: 字典取值的三种方式
+level: 1
+--- prompt
+写出输出。注意 `get` 在键不存在时返回什么。
+--- code
+risk = {"8.1": "high", "3.1": "low"}
+print(risk["8.1"])
+print(risk.get("4.2"))
+print(risk.get("4.2", "unknown"))
+print("3.1" in risk)
+print(len(risk))
+
+@@ item d2-03
+type: code
+title: 总字数
+level: 1
+--- prompt
+写 `total_length(texts)`：`texts` 是字符串列表，返回所有字符串长度之和。空列表返回 `0`。
+
+用 for 循环写（今天要练的就是累加）。
+--- starter
+def total_length(texts):
+    total = 0
+    # 遍历 texts，把每个的长度加到 total 上
+    return total
+--- solution
+def total_length(texts):
+    total = 0
+    for t in texts:
+        total = total + len(t)
+    return total
+--- tests
+expect("两段", lambda: total_length(["abc", "de"]), 5)
+expect("空列表", lambda: total_length([]), 0)
+expect("三段", lambda: total_length(["Cap", " on ", "Liability"]), 16)
+--- hints
+- `for t in texts:` 然后 `total = total + len(t)`。
+- `return total` 要和 `for` 对齐，写在循环外面。
+
+@@ item d2-04
+type: code
+title: 统计每种判定
+level: 2
+--- prompt
+写 `count_verdicts(verdicts)`：输入判定列表，返回每种判定出现的次数。
+
+```python
+count_verdicts(["accept", "flag", "accept"])
+# → {"accept": 2, "flag": 1}
+```
+--- starter
+def count_verdicts(verdicts):
+    pass
+--- solution
+def count_verdicts(verdicts):
+    counts = {}
+    for v in verdicts:
+        counts[v] = counts.get(v, 0) + 1
+    return counts
+--- tests
+expect("基本", lambda: count_verdicts(["accept", "flag", "accept"]), {"accept": 2, "flag": 1})
+expect("三种都有", lambda: count_verdicts(["redline", "accept", "flag", "redline"]), {"redline": 2, "accept": 1, "flag": 1})
+expect("空列表", lambda: count_verdicts([]), {})
+--- hints
+- 循环前 `counts = {}`，循环里更新，循环后 `return counts`。
+- 更新那一行：`counts[v] = counts.get(v, 0) + 1`。
+
+@@ item d2-05
+type: code
+title: 取出所有编号
+level: 1
+--- prompt
+写 `ids_of(clauses)`：`clauses` 是字典列表（每个有 `"id"` 键），按原顺序返回所有编号组成的列表。
+--- starter
+def ids_of(clauses):
+    pass
+--- solution
+def ids_of(clauses):
+    result = []
+    for c in clauses:
+        result.append(c["id"])
+    return result
+--- tests
+expect("三条", lambda: ids_of([{"id": "3.1"}, {"id": "8.1"}, {"id": "12"}]), ["3.1", "8.1", "12"])
+expect("空", lambda: ids_of([]), [])
+--- hints
+- 准备 `result = []`，循环里 `result.append(c["id"])`。
+- 或者一行推导式：`[c["id"] for c in clauses]`。
+
+@@ item d2-06
+type: code
+title: 高风险条款
+level: 2
+--- prompt
+写 `high_risk_ids(clauses)`：返回 `risk` 为 `"high"` 的条款编号列表，保持原顺序。
+--- starter
+def high_risk_ids(clauses):
+    pass
+--- solution
+def high_risk_ids(clauses):
+    return [c["id"] for c in clauses if c["risk"] == "high"]
+--- tests
+CLAUSES = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "4.2", "risk": "medium"},
+    {"id": "10.1", "risk": "high"},
+]
+expect("两条高风险", lambda: high_risk_ids(CLAUSES), ["8.1", "10.1"])
+expect("没有高风险", lambda: high_risk_ids([{"id": "1", "risk": "low"}]), [])
+--- hints
+- 循环里加一个 `if c["risk"] == "high":` 再 append。
+- 推导式：`[c["id"] for c in clauses if ...]`。
+
+@@ item d2-07
+type: code
+title: 按编号找条款
+level: 2
+--- prompt
+写 `find_clause(clauses, clause_id)`：返回编号等于 `clause_id` 的那个字典；找不到返回 `None`。
+--- starter
+def find_clause(clauses, clause_id):
+    pass
+--- solution
+def find_clause(clauses, clause_id):
+    for c in clauses:
+        if c["id"] == clause_id:
+            return c
+    return None
+--- tests
+DATA = [{"id": "3.1", "risk": "low"}, {"id": "8.1", "risk": "high"}]
+expect("找到 8.1", lambda: find_clause(DATA, "8.1"), {"id": "8.1", "risk": "high"})
+expect("找不到返回 None", lambda: find_clause(DATA, "99"), None)
+expect("空列表", lambda: find_clause([], "1"), None)
+--- hints
+- 找到就立刻 `return c`。
+- 最后一行 `return None` 要和 `for` 对齐（循环全部走完才执行）。
+
+@@ item d2-08
+type: fix
+title: 修 bug：只打印不返回
+level: 1
+--- prompt
+这个函数「看起来」算对了（运行时能看到输出），测试却全部失败。为什么？修好它。
+--- starter
+def count_high(clauses):
+    total = 0
+    for c in clauses:
+        if c["risk"] == "high":
+            total = total + 1
+    print(total)
+--- solution
+def count_high(clauses):
+    total = 0
+    for c in clauses:
+        if c["risk"] == "high":
+            total = total + 1
+    return total
+--- tests
+expect("两条", lambda: count_high([{"risk": "high"}, {"risk": "low"}, {"risk": "high"}]), 2)
+expect("零条", lambda: count_high([{"risk": "low"}]), 0)
+--- hints
+- 测试报的「得到」是什么？`None` 说明函数没有 return 任何东西。
+- `print` 只是显示，把它换成 `return`。
+
+@@ item d2-09
+type: fix
+title: 修 bug：KeyError
+level: 2
+--- prompt
+运行测试会报 `KeyError`。读报错，修好这个计数函数。
+--- starter
+def count_topics(topics):
+    counts = {}
+    for t in topics:
+        counts[t] += 1
+    return counts
+--- solution
+def count_topics(topics):
+    counts = {}
+    for t in topics:
+        counts[t] = counts.get(t, 0) + 1
+    return counts
+--- tests
+expect("基本", lambda: count_topics(["payment", "payment", "liability_cap"]), {"payment": 2, "liability_cap": 1})
+expect("空", lambda: count_topics([]), {})
+--- hints
+- 第一次遇到 `"payment"` 时，字典里还没有这个键，`counts[t] += 1` 读不到旧值就报错。
+- 用 `counts.get(t, 0) + 1`。
+
+@@ item d2-10
+type: choice
+title: print 和 return
+level: 1
+--- prompt
+关于 `print` 和 `return`，哪个说法是对的？
+--- options
+- 两者一样，都能把结果交给调用者
+- `return` 把值交给调用者并结束函数；`print` 只是显示在屏幕上
+- 函数里只能用其中一个
+- `print` 之后函数就结束了
+answer: 2
+--- explain
+`return` 是函数的「输出口」：调用 `x = f()` 时，`x` 拿到的是 return 的值；执行到 return 函数立即结束。`print` 只影响屏幕，不影响程序拿到的值。一个没有 return 的函数，调用结果是 `None`。
+
+@@ item d2-11
+type: predict
+title: 列表推导式
+level: 2
+--- prompt
+写出输出。
+--- code
+clauses = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "10.1", "risk": "high"},
+]
+print([c["id"] for c in clauses])
+print([c["id"] for c in clauses if c["risk"] == "high"])
+print(len([c for c in clauses if c["risk"] != "high"]))
+
+@@ item d2-12
+type: code
+title: 按风险排序
+level: 3
+--- prompt
+律师想先看高风险。写 `attention_order(clauses)`：返回条款编号列表，排序规则是 `"high"` 在前，`"medium"` 其次，`"low"` 最后；风险相同的保持原来的顺序。
+
+这正是 Clause Check 里 `needs_attention` 的排序方式。
+--- starter
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def attention_order(clauses):
+    pass
+--- solution
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def attention_order(clauses):
+    ordered = sorted(clauses, key=lambda c: RISK_ORDER[c["risk"]])
+    return [c["id"] for c in ordered]
+--- tests
+DATA = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "4.2", "risk": "medium"},
+    {"id": "10.1", "risk": "high"},
+]
+expect("高 → 中 → 低，同级保持原顺序", lambda: attention_order(DATA), ["8.1", "10.1", "4.2", "3.1"])
+expect("空", lambda: attention_order([]), [])
+--- hints
+- `sorted(clauses, key=lambda c: RISK_ORDER[c["risk"]])` 得到排好序的字典列表。
+- 然后再取出编号。`sorted` 是稳定排序，同级不会打乱。
+
+@@ item d2-13
+type: order
+title: 排代码：数高风险
+level: 2
+--- prompt
+排出 `count_high(clauses)`：返回高风险条款的数量。注意有两行干扰项。
+--- lines
+def count_high(clauses):
+    total = 0
+    for c in clauses:
+        if c["risk"] == "high":
+            total = total + 1
+    return total
+--- distractors
+        total = 0
+    for c in range(clauses):
+--- tests
+expect("两条", lambda: count_high([{"risk": "high"}, {"risk": "low"}, {"risk": "high"}]), 2)
+expect("零条", lambda: count_high([]), 0)
+--- hints
+- 初始值 `total = 0` 放在循环外面（缩进 4 格那一行）。
+- `range(clauses)` 是错的：range 要的是数字，这里直接遍历列表。
+
+@@ item d2-14
+type: code
+title: 按主题分组
+level: 3
+--- prompt
+写 `group_by_topic(clauses)`：返回字典，键是主题，值是这个主题下的条款编号列表（保持原顺序）。
+
+```python
+group_by_topic([
+    {"id": "3.1", "topic": "payment"},
+    {"id": "8.1", "topic": "liability_cap"},
+    {"id": "3.2", "topic": "payment"},
+])
+# → {"payment": ["3.1", "3.2"], "liability_cap": ["8.1"]}
+```
+--- starter
+def group_by_topic(clauses):
+    pass
+--- solution
+def group_by_topic(clauses):
+    groups = {}
+    for c in clauses:
+        if c["topic"] not in groups:
+            groups[c["topic"]] = []
+        groups[c["topic"]].append(c["id"])
+    return groups
+--- tests
+DATA = [
+    {"id": "3.1", "topic": "payment"},
+    {"id": "8.1", "topic": "liability_cap"},
+    {"id": "3.2", "topic": "payment"},
+]
+expect("两组", lambda: group_by_topic(DATA), {"payment": ["3.1", "3.2"], "liability_cap": ["8.1"]})
+expect("空", lambda: group_by_topic([]), {})
+--- hints
+- 值是列表：第一次遇到某个主题时，先放一个空列表 `groups[topic] = []`。
+- 然后 `groups[topic].append(c["id"])`。
+
+@@ item d2-15
+type: code
+title: 汇总报告
+level: 3
+--- prompt
+写 `summarise(clauses)`，返回这样的字典：
+
+```python
+{
+    "total": 条款总数,
+    "counts": {每种判定: 次数},
+    "needs_attention": [判定不是 "accept" 的编号, 按原顺序],
+}
+```
+
+这就是 Clause Check `pipeline.py` 里 `summarise()` 的核心。可以在函数里写循环，也可以用推导式。
+--- starter
+def summarise(clauses):
+    pass
+--- solution
+def summarise(clauses):
+    counts = {}
+    for c in clauses:
+        counts[c["verdict"]] = counts.get(c["verdict"], 0) + 1
+    return {
+        "total": len(clauses),
+        "counts": counts,
+        "needs_attention": [c["id"] for c in clauses if c["verdict"] != "accept"],
+    }
+--- tests
+DATA = [
+    {"id": "3.1", "verdict": "accept"},
+    {"id": "8.1", "verdict": "flag"},
+    {"id": "4.2", "verdict": "redline"},
+    {"id": "14", "verdict": "accept"},
+]
+expect("完整汇总", lambda: summarise(DATA), {"total": 4, "counts": {"accept": 2, "flag": 1, "redline": 1}, "needs_attention": ["8.1", "4.2"]})
+expect("空合同", lambda: summarise([]), {"total": 0, "counts": {}, "needs_attention": []})
+--- hints
+- 分三步：先算 counts（昨天的计数写法），再算 needs_attention，最后拼成字典 return。
+- 字典可以跨多行写，每个键值对后面加逗号。
+
+@@ item d2-16
+type: code
+title: 第几次成功
+level: 2
+skip_starter: yes
+--- prompt
+接口会失败，重试时要知道第几次成功了。写 `first_success(statuses)`：`statuses` 是每次调用返回的状态码，按顺序排列。返回第一个 `200` 出现在第几次（从 1 开始数）；一直没有 200 就返回 `-1`。
+
+试着用 `while` 写。
+--- starter
+def first_success(statuses):
+    i = 0
+    while i < len(statuses):
+        # 判断 statuses[i]，别忘了让 i 变化
+        pass
+    return -1
+--- solution
+def first_success(statuses):
+    i = 0
+    while i < len(statuses):
+        if statuses[i] == 200:
+            return i + 1
+        i = i + 1
+    return -1
+--- tests
+expect("第三次成功", lambda: first_success([429, 429, 200]), 3)
+expect("第一次就成功", lambda: first_success([200, 500]), 1)
+expect("一直失败", lambda: first_success([500, 503]), -1)
+expect("空列表", lambda: first_success([]), -1)
+--- hints
+- 起始代码里的 while 会死循环：`i` 永远不变。点运行试试，看 10 秒后被强制停止的提示。
+- 找到 200 就 `return i + 1`（下标从 0 开始，次数从 1 开始）；否则 `i = i + 1`。
+
+@@ item d2-17
+type: choice
+title: range 的范围
+level: 1
+--- prompt
+`list(range(1, 4))` 的结果是？
+--- options
+- `[1, 2, 3, 4]`
+- `[1, 2, 3]`
+- `[0, 1, 2, 3]`
+- `[2, 3, 4]`
+answer: 2
+--- explain
+`range(开始, 结束)` 包含开始、**不包含**结束。和切片 `ids[1:4]` 的规则一样。
+
+@@ item d2-18
+type: fill
+title: 填空：计数模板
+level: 1
+--- prompt
+把计数模板补完整。
+--- template
+def count_risks(risks):
+    counts = {}
+    for r in risks:
+        counts[r] = counts.[[get]](r, [[0]]) + 1
+    return [[counts]]
+--- tests
+expect("基本", lambda: count_risks(["high", "low", "high"]), {"high": 2, "low": 1})
+expect("空", lambda: count_risks([]), {})
+--- hints
+- 字典的「取不到就用默认值」方法叫什么？
+
+@@ item d2-19
+type: code
+title: 默认参数
+level: 1
+--- prompt
+写 `label(clause_id, prefix="Clause")`：返回 `"Clause 8.1"`；如果调用时给了 `prefix`，就用给的，比如 `label("8.1", "Section")` 返回 `"Section 8.1"`。
+--- starter
+def label(clause_id, prefix="Clause"):
+    pass
+--- solution
+def label(clause_id, prefix="Clause"):
+    return f"{prefix} {clause_id}"
+--- tests
+expect("默认前缀", lambda: label("8.1"), "Clause 8.1")
+expect("自定义前缀", lambda: label("8.1", "Section"), "Section 8.1")
+expect("按名字传参", lambda: label("12", prefix="Art."), "Art. 12")
+--- hints
+- 默认值已经写在参数里了，函数体只需要用 `prefix` 拼字符串。
+
+@@ item d2-e1
+type: scratch
+title: 闭卷：数单词
+exam: yes
+level: 2
+--- prompt
+写 `count_words(text)`：把文字按空白切开，统一转小写后统计每个单词出现的次数，返回字典。
+
+`count_words("Fees and fees")` → `{"fees": 2, "and": 1}`
+--- solution
+def count_words(text):
+    counts = {}
+    for w in text.lower().split():
+        counts[w] = counts.get(w, 0) + 1
+    return counts
+--- tests
+expect("大小写合并", lambda: count_words("Fees and fees"), {"fees": 2, "and": 1})
+expect("多个空格", lambda: count_words("a  b a"), {"a": 2, "b": 1})
+expect("空字符串", lambda: count_words(""), {})
+
+@@ item d2-e2
+type: scratch
+title: 闭卷：按判定取编号
+exam: yes
+level: 1
+--- prompt
+写 `clauses_by_verdict(clauses, verdict)`：返回判定等于 `verdict` 的条款编号列表（每个条款是有 `"id"` 和 `"verdict"` 的字典），保持原顺序。
+--- solution
+def clauses_by_verdict(clauses, verdict):
+    return [c["id"] for c in clauses if c["verdict"] == verdict]
+--- tests
+DATA = [{"id": "3.1", "verdict": "accept"}, {"id": "8.1", "verdict": "flag"}, {"id": "9.1", "verdict": "flag"}]
+expect("flag", lambda: clauses_by_verdict(DATA, "flag"), ["8.1", "9.1"])
+expect("redline 没有", lambda: clauses_by_verdict(DATA, "redline"), [])
+
+@@ item d2-e3
+type: scratch
+title: 闭卷：三档风险计数
+exam: yes
+level: 2
+--- prompt
+写 `risk_counts(clauses)`：返回 `{"high": 数量, "medium": 数量, "low": 数量}`。**三个键必须都在**，没有的就是 0；其他风险值忽略。
+--- solution
+def risk_counts(clauses):
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for c in clauses:
+        if c["risk"] in counts:
+            counts[c["risk"]] += 1
+    return counts
+--- tests
+expect("混合", lambda: risk_counts([{"risk": "high"}, {"risk": "low"}, {"risk": "high"}]), {"high": 2, "medium": 0, "low": 1})
+expect("空列表三个键都是 0", lambda: risk_counts([]), {"high": 0, "medium": 0, "low": 0})
+expect("忽略未知值", lambda: risk_counts([{"risk": "urgent"}, {"risk": "medium"}]), {"high": 0, "medium": 1, "low": 0})

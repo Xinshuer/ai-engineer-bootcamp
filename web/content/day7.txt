@@ -1,0 +1,725 @@
+@@ day 7
+title: 综合：从零写出 Clause Check 的核心
+lang: py
+langs: Python + TypeScript
+hours: 5–6 小时
+--- goal
+不靠提示，用两种语言各写一遍 Clause Check 的核心流水线：拆条款 → 逐条调模型 → 校验 → 汇总；再在真实项目里做一次「加规则 → 加用例 → 跑测试」的完整改动。最后是 6 题 72 分钟的毕业闭卷。
+--- checklist
+- 复习区清零
+- 综合题全部通过（Python 和 TypeScript 各三题）
+- 两个本机任务：改真实项目并跑测试；用 DeepSeek 跑一次评测
+- 毕业闭卷：6 题至少过 4 题
+- 准备面试口述：用 2 分钟讲清楚你写过的每一段代码在 Clause Check 里对应哪个文件
+
+@@ concept
+title: 拿到一道新题的五步
+--- body
+面试现场或者 take-home，别急着写代码：
+
+1. **读题，找输入和输出**：参数是什么类型？返回什么？空的时候返回什么？
+2. **写函数签名**：名字、参数、返回类型先写出来
+3. **手写两三个例子**：包括一个边界情况（空列表、找不到、格式错误）。下面的代码展示怎么用 `assert` 给自己写测试
+4. **写最简单的能跑的版本**，运行
+5. **再处理边界情况**，每改一次就运行一次
+
+大声说出你在想什么，面试官看的是这个过程。
+--- code
+def section_of(clause_id: str) -> str:
+    return clause_id.split(".")[0]
+
+assert section_of("8.1") == "8"
+assert section_of("12") == "12"
+assert section_of("10.2.1") == "10"
+print("all good")
+
+@@ concept
+title: 读 Clause Check 的路线图
+--- body
+你这七天写过的每一类代码，在项目里都有对应的文件。按这个顺序读：
+
+- `clausecheck/split.py`：正则拆条款、找交叉引用 ← 第 3 天正则、今天第 1 题
+- `clausecheck/models.py`：Pydantic 模型 ← 第 4 天
+- `clausecheck/tools.py`：工具定义和分发，校验失败回传 ← 第 3 天异常、第 4 天工具调用
+- `clausecheck/review.py`：有上限的调用循环 ← 第 4 天 mini_agent
+- `clausecheck/pipeline.py`：`summarise` 计数和排序 ← 第 2 天
+- `evals/harness.py`、`evals/run_evals.py`：跑 N 次看通过率 ← 第 4 天 pass_rate
+
+读的时候对每个函数问三个问题：输入是什么，输出是什么，哪一行调用了模型。
+--- code
+routes = {
+    "split.py": "regex, day 3 + day 7",
+    "models.py": "pydantic, day 4",
+    "tools.py": "tool dispatch, day 4",
+    "review.py": "bounded loop, day 4",
+    "pipeline.py": "counting + sorting, day 2",
+}
+for f, what in routes.items():
+    print(f"{f:<12} {what}")
+
+@@ concept
+title: 面试现场写代码
+--- body
+- **先说再写**：「我先确认一下输入输出……我打算先写一个不处理边界的版本」
+- **变量名要有意义**：`clause`、`verdict`、`counts`，而不是 `x`、`d`
+- **遇到不会的 API 就说出来**：「我记得 Zod 有 safeParse，具体签名我会查文档」比硬猜好得多
+- **写完主动测**：说「我用空列表和一个坏 JSON 试一下」
+- **诚实说水平**：「我系统学编程的时间不长，但这个项目的每一行我都能解释，也能现场改」。面试官追问两句就知道真假，诚实本身是加分项
+--- code
+def needs_attention(verdicts: list[str]) -> list[int]:
+    # 返回需要人看的下标；先写最简单的版本
+    return [i for i, v in enumerate(verdicts) if v != "accept"]
+
+print(needs_attention(["accept", "flag", "redline", "accept"]))
+print(needs_attention([]))
+
+@@ item d7-01
+type: code
+title: 综合一：拆条款（Python）
+level: 3
+--- prompt
+写 `split_clauses(text)`：合同文字里，**单独成行**、以编号开头、后面跟空格和大写字母开头标题的行是条款标题，比如 `8.1 Cap on Liability`、`12 Exclusions`。标题下面直到下一个标题之前的行是正文。
+
+返回列表，每项是 `{"id": 编号, "heading": 标题, "text": 正文}`，正文是这些行用 `"\n"` 连起来再去掉首尾空白。第一个标题之前的内容忽略。
+--- starter
+import re
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z].*)$")
+
+def split_clauses(text):
+    clauses = []
+    return clauses
+--- solution
+import re
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z].*)$")
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = {"id": m.group(1), "heading": m.group(2), "lines": []}
+            clauses.append(current)
+        elif current is not None:
+            current["lines"].append(line)
+    return [{"id": c["id"], "heading": c["heading"], "text": "\n".join(c["lines"]).strip()} for c in clauses]
+--- tests
+DOC = """CLOUDNOTES AGREEMENT
+Preamble text.
+8 Limitation of Liability
+8.1 Cap on Liability
+Subject to Section 12, liability shall not exceed the fees.
+It applies to both parties.
+12 Exclusions
+The limitations in Section 8 shall not apply to Customer."""
+expect("条数", lambda: len(split_clauses(DOC)), 3)
+expect("章节标题的正文为空", lambda: split_clauses(DOC)[0], {"id": "8", "heading": "Limitation of Liability", "text": ""})
+expect("多行正文", lambda: split_clauses(DOC)[1]["text"], "Subject to Section 12, liability shall not exceed the fees.\nIt applies to both parties.")
+expect("最后一条", lambda: split_clauses(DOC)[2]["id"], "12")
+expect("没有标题", lambda: split_clauses("just text\nmore"), [])
+--- hints
+- 逐行扫描，用 `HEAD.match(line.strip())` 判断是不是标题。是标题就开一条新的，不是就把这行加到「当前这条」的正文里。
+- 先把正文行收集在列表里，最后再 `"\n".join(...).strip()`。
+
+@@ item d7-02
+type: code
+title: 综合二：批量审查并汇总（Python）
+level: 3
+mock: yes
+--- prompt
+写 `review_all(clauses)`：`clauses` 是上一题的输出格式。对每一条调用 `classify(f"Review clause {id}: {text}")`（已写好），返回：
+
+```python
+{
+    "counts": {判定: 次数},
+    "needs_attention": [非 accept 的编号，high 在前、medium 其次、low 最后，同级保持原顺序],
+}
+```
+--- starter
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def classify(text):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return json.loads(data["choices"][0]["message"]["content"])
+
+def review_all(clauses):
+    pass
+--- solution
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def classify(text):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return json.loads(data["choices"][0]["message"]["content"])
+
+def review_all(clauses):
+    results = []
+    for c in clauses:
+        v = classify(f"Review clause {c['id']}: {c['text']}")
+        results.append({"id": c["id"], "verdict": v["verdict"], "risk": v["risk_level"]})
+    counts = {}
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    flagged = [r for r in results if r["verdict"] != "accept"]
+    ordered = sorted(flagged, key=lambda r: RISK_ORDER[r["risk"]])
+    return {"counts": counts, "needs_attention": [r["id"] for r in ordered]}
+--- tests
+CLAUSES = [
+    {"id": "3.1", "heading": "Invoicing", "text": "Fees are payable within thirty days."},
+    {"id": "6.2", "heading": "Duration", "text": "Obligations survive in perpetuity."},
+    {"id": "8.1", "heading": "Cap", "text": "Customer's liability shall be unlimited."},
+    {"id": "10.1", "heading": "Location", "text": "Data may be processed in any country."},
+]
+expect("计数", lambda: review_all(CLAUSES)["counts"], {"accept": 1, "redline": 3})
+expect("高风险在前，同级保持原顺序", lambda: review_all(CLAUSES)["needs_attention"], ["8.1", "10.1", "6.2"])
+expect("每条调用一次模型", lambda: (MOCK.reset(), review_all(CLAUSES), len(MOCK.calls))[2], 4)
+--- hints
+- 先把每条的 `{id, verdict, risk}` 收集到一个列表，再分别计数和排序。
+- 模拟服务器返回的风险字段叫 `risk_level`。
+
+@@ item d7-03
+type: code
+title: 综合三：估算费用
+level: 2
+--- prompt
+写 `estimate_cost(usage, price)`：
+
+- `usage`：`{"prompt_cache_hit_tokens": 命中缓存的输入, "prompt_cache_miss_tokens": 未命中的输入, "completion_tokens": 输出}`
+- `price`：每百万 token 的美元价格 `{"input": ..., "cache": ..., "output": ...}`
+
+返回美元费用，保留 6 位小数（用 `round(x, 6)`）。公式：未命中 × input + 命中 × cache + 输出 × output，再除以 1,000,000。
+--- starter
+def estimate_cost(usage, price):
+    pass
+--- solution
+def estimate_cost(usage, price):
+    cost = (
+        usage["prompt_cache_miss_tokens"] * price["input"]
+        + usage["prompt_cache_hit_tokens"] * price["cache"]
+        + usage["completion_tokens"] * price["output"]
+    ) / 1_000_000
+    return round(cost, 6)
+--- tests
+PRICE = {"input": 0.28, "cache": 0.028, "output": 0.42}
+expect("没有缓存", lambda: estimate_cost({"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1000000, "completion_tokens": 0}, PRICE), 0.28)
+expect("一次真实调用", lambda: estimate_cost({"prompt_cache_hit_tokens": 2944, "prompt_cache_miss_tokens": 166, "completion_tokens": 120}, PRICE), 0.000179)
+expect("全命中缓存便宜十倍", lambda: estimate_cost({"prompt_cache_hit_tokens": 1000000, "prompt_cache_miss_tokens": 0, "completion_tokens": 0}, PRICE), 0.028)
+--- hints
+- 三项相乘相加，再除以 `1_000_000`（下划线只是为了好读）。
+
+@@ item d7-04
+type: code
+title: 综合四：拆条款（TypeScript）
+level: 3
+lang: ts
+--- prompt
+把第 1 题翻译成 TypeScript 的 `splitClauses(text)`，规则完全一样。
+--- starter
+type Clause = { id: string; heading: string; text: string };
+const HEAD = /^(\d+(?:\.\d+)*)\s+([A-Z].*)$/;
+
+function splitClauses(text: string): Clause[] {
+  return [];
+}
+--- solution
+type Clause = { id: string; heading: string; text: string };
+const HEAD = /^(\d+(?:\.\d+)*)\s+([A-Z].*)$/;
+
+function splitClauses(text: string): Clause[] {
+  const found: { id: string; heading: string; lines: string[] }[] = [];
+  for (const line of text.split("\n")) {
+    const m = HEAD.exec(line.trim());
+    if (m) {
+      found.push({ id: m[1], heading: m[2], lines: [] });
+    } else if (found.length > 0) {
+      found[found.length - 1].lines.push(line);
+    }
+  }
+  return found.map((c) => ({ id: c.id, heading: c.heading, text: c.lines.join("\n").trim() }));
+}
+--- tests
+const DOC = [
+  "CLOUDNOTES AGREEMENT",
+  "Preamble text.",
+  "8 Limitation of Liability",
+  "8.1 Cap on Liability",
+  "Subject to Section 12, liability shall not exceed the fees.",
+  "It applies to both parties.",
+  "12 Exclusions",
+  "The limitations in Section 8 shall not apply to Customer.",
+].join("\n");
+expect("条数", () => splitClauses(DOC).length, 3);
+expect("章节标题", () => splitClauses(DOC)[0], { id: "8", heading: "Limitation of Liability", text: "" });
+expect("多行正文", () => splitClauses(DOC)[1].text, "Subject to Section 12, liability shall not exceed the fees.\nIt applies to both parties.");
+expect("没有标题", () => splitClauses("just text"), []);
+--- hints
+- 正则对象的 `exec(字符串)` 返回匹配或 `null`；`m[1]`、`m[2]` 是两个括号。
+- 「当前这条」就是数组最后一个：`found[found.length - 1]`。
+
+@@ item d7-05
+type: code
+title: 综合五：批量审查并汇总（TypeScript）
+level: 3
+lang: ts
+--- prompt
+把第 2 题翻译成 TypeScript 的 `reviewAll(clauses)`（async）。**按顺序**一条一条 await。
+--- starter
+type Clause = { id: string; heading: string; text: string };
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+async function classify(text: string): Promise<{ verdict: string; risk_level: string }> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function reviewAll(clauses: Clause[]): Promise<{ counts: Record<string, number>; needs_attention: string[] }> {
+  return { counts: {}, needs_attention: [] };
+}
+--- solution
+type Clause = { id: string; heading: string; text: string };
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+async function classify(text: string): Promise<{ verdict: string; risk_level: string }> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function reviewAll(clauses: Clause[]): Promise<{ counts: Record<string, number>; needs_attention: string[] }> {
+  const results: { id: string; verdict: string; risk: string }[] = [];
+  for (const c of clauses) {
+    const v = await classify(`Review clause ${c.id}: ${c.text}`);
+    results.push({ id: c.id, verdict: v.verdict, risk: v.risk_level });
+  }
+  const counts: Record<string, number> = {};
+  for (const r of results) {
+    counts[r.verdict] = (counts[r.verdict] ?? 0) + 1;
+  }
+  const needs_attention = results
+    .filter((r) => r.verdict !== "accept")
+    .sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk])
+    .map((r) => r.id);
+  return { counts, needs_attention };
+}
+--- tests
+const CLAUSES: Clause[] = [
+  { id: "3.1", heading: "Invoicing", text: "Fees are payable within thirty days." },
+  { id: "6.2", heading: "Duration", text: "Obligations survive in perpetuity." },
+  { id: "8.1", heading: "Cap", text: "Customer's liability shall be unlimited." },
+  { id: "10.1", heading: "Location", text: "Data may be processed in any country." },
+];
+expectAsync("计数", async () => (await reviewAll(CLAUSES)).counts, { accept: 1, redline: 3 });
+expectAsync("排序", async () => (await reviewAll(CLAUSES)).needs_attention, ["8.1", "10.1", "6.2"]);
+expectAsync("调用次数", async () => { MOCK.reset(); await reviewAll(CLAUSES); return MOCK.calls.length; }, 4);
+--- hints
+- 结构和 Python 版一样：先收集，再计数，再 filter + sort + map。
+- `for (const c of clauses) { const v = await classify(...); ... }` 保证按顺序。
+
+@@ item d7-06
+type: code
+title: 综合六：Agent 循环（TypeScript）
+level: 3
+lang: ts
+--- prompt
+把第 4 天的 `mini_agent` 翻译成 TypeScript 的 `miniAgent(question, maxSteps = 3)`：带 `TOOLS` 请求；`finish_reason` 是 `"tool_calls"` 就执行第一个工具，把模型那条消息和 `{ role: "tool", tool_call_id, content }` 加进 messages 再请求；否则返回回答；步数用完返回 `"STOPPED"`。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+const IMPL: Record<string, (args: any) => string> = {
+  lookup_playbook: (args) => `rule for ${args.topic}: cap at 100% of annual fees`,
+};
+
+async function miniAgent(question: string, maxSteps = 3): Promise<string> {
+  const messages: any[] = [{ role: "user", content: question }];
+  return "";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+const IMPL: Record<string, (args: any) => string> = {
+  lookup_playbook: (args) => `rule for ${args.topic}: cap at 100% of annual fees`,
+};
+
+async function miniAgent(question: string, maxSteps = 3): Promise<string> {
+  const messages: any[] = [{ role: "user", content: question }];
+  for (let step = 0; step < maxSteps; step++) {
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const choice = (await res.json()).choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return choice.message.content;
+    }
+    const call = choice.message.tool_calls[0];
+    const result = IMPL[call.function.name](JSON.parse(call.function.arguments));
+    messages.push(choice.message);
+    messages.push({ role: "tool", tool_call_id: call.id, content: result });
+  }
+  return "STOPPED";
+}
+--- tests
+expectAsync("最终回答，请求 2 次", async () => {
+  MOCK.reset();
+  const answer = await miniAgent("Is unlimited liability acceptable?");
+  return [answer, MOCK.calls.length];
+}, ["Based on the playbook: rule for liability_cap: cap at 100% of annual fees", 2]);
+expectAsync("步数用完", () => miniAgent("Is unlimited liability acceptable?", 1), "STOPPED");
+--- hints
+- `for (let step = 0; step < maxSteps; step++) { ... }`，不是 tool_calls 就 return。
+- `messages` 标成 `any[]`，因为里面有好几种形状的消息。
+
+@@ item d7-07
+type: choice
+title: 排错：先怀疑谁
+level: 2
+--- prompt
+上线后律师说：「这份合同第 8.1 条明明写了无限责任，工具却判了 accept。」你打开 trace，发现送进模型的 8.1 正文是 `CloudNotes Confidential / Page 3 of 5`。第一步应该改哪里？
+--- options
+- 改 prompt，强调要仔细看责任条款
+- 换一个更强的模型
+- 修 PDF 解析和切分：模型根本没看到条款正文
+- 把 temperature 调成 0
+answer: 3
+--- explain
+这是**检索 / 输入问题**：模型拿到的是页脚，它没法判对。改 prompt 或换模型永远修不好。排错顺序：先看送进模型的是什么，再看模型怎么推理。对应学习课 01 和 Clause Check 的 `parse.py`（先拼页、去页眉页脚，再切分）。
+
+@@ item d7-08
+type: choice
+title: pass@k 和 pass^k
+level: 2
+--- prompt
+一个步骤单次成功率 90%。一个无人值守的 Agent 要连续 5 次都做对，大约有多大概率？
+--- options
+- 约 99%
+- 约 90%
+- 约 59%
+- 约 10%
+answer: 3
+--- explain
+0.9 的 5 次方 ≈ 0.59。「5 次里至少对一次」（pass@k）接近 100%，「5 次全对」（pass^k）只有 59%。所以评测要跑多次，而且无人值守的系统要看 pass^k。这也是为什么能用确定性代码写的步骤就不要交给模型。
+
+@@ item d7-09
+type: predict
+title: 综合预测（Python）
+level: 2
+--- prompt
+写出输出。
+--- code
+reviews = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "8.1", "verdict": "flag", "risk": "high"},
+    {"id": "4.2", "verdict": "redline", "risk": "medium"},
+]
+order = {"high": 0, "medium": 1, "low": 2}
+flagged = sorted([r for r in reviews if r["verdict"] != "accept"], key=lambda r: order[r["risk"]])
+print([r["id"] for r in flagged])
+print({r["id"]: r["risk"][0].upper() for r in reviews})
+print(f"{len(flagged)}/{len(reviews)} need attention")
+
+@@ item d7-10
+type: predict
+title: 综合预测（TypeScript）
+level: 2
+lang: ts
+--- prompt
+写出输出。`reduce` 把数组「折叠」成一个值：从初始值 0 开始，每个元素加到累计值上。
+--- code
+const reviews = [
+  { id: "3.1", verdict: "accept", tokens: 120 },
+  { id: "8.1", verdict: "flag", tokens: 340 },
+  { id: "4.2", verdict: "redline", tokens: 260 },
+];
+const flagged = reviews.filter((r) => r.verdict !== "accept").map((r) => r.id);
+const total = reviews.reduce((sum, r) => sum + r.tokens, 0);
+console.log(flagged, total);
+console.log(`${flagged.length}/${reviews.length} need attention`);
+
+@@ item d7-11
+type: local
+title: 本机任务：给真实项目加一条规则
+level: 3
+--- prompt
+在 Clause Check 项目里做一次完整的改动，全程自己动手：
+
+1. 打开 `data/playbook.json`，照着已有规则的格式，加一条新规则 `PB-11`，主题用 `"governing_law"`，内容：「争议不得约定在欧盟以外仲裁」（`never_accept` 里写一条），`red_flags` 写一个正则，比如 `"arbitration in (singapore|new york)"`
+2. 打开 `evals/cases.json`，加一条 `must_flag` 用例：一个约定在新加坡仲裁的条款，期望判定不是 accept
+3. 在项目根目录运行离线测试和评测：
+
+```
+cd "G:\Contract Clause Reviewer"
+$env:CLAUSECHECK_MODE="mock"; python -m pytest -q
+python evals/run_evals.py --mode mock --runs 1
+```
+
+4. 把两条命令的输出一起粘贴到下面（应该看到 `passed` 和通过率表）
+
+如果测试失败了：这正是练习。读报错，判断是 JSON 格式写错了（逗号、引号），还是规则的正则没匹配上。
+placeholder: 粘贴 pytest 和 run_evals 的输出
+verify: \d+ passed[\s\S]*high-risk recall
+--- hints
+- JSON 最常见的错误：最后一项后面多了逗号，或者用了单引号。
+- `python -c "import json; json.load(open('data/playbook.json', encoding='utf-8')); print('ok')"` 可以单独检查 JSON 格式。
+
+@@ item d7-12
+type: local
+title: 本机任务：用 DeepSeek 跑一次评测
+level: 2
+--- prompt
+用真实模型跑一次项目的评测，看看你的规则在真模型下表现如何：
+
+```
+cd "G:\Contract Clause Reviewer"
+python evals/run_evals.py --mode deepseek --runs 3
+```
+
+大约 3–5 分钟，花费几分钱。把最后的通过率表粘贴到下面，然后回答自己三个问题：
+
+- 哪条用例不是 3/3？它的失败原因是什么（看 `most common failure` 那一列）？
+- 这是检索、推理、格式还是工具问题？
+- 如果要修，你第一步会看什么？
+placeholder: 粘贴通过率表
+verify: high-risk recall
+--- hints
+- 看到 401：`.env` 里的 `DEEPSEEK_API_KEY` 不对。
+
+@@ item d7-e1
+type: scratch
+title: 毕业闭卷 1：解析并计数（Python）
+exam: yes
+level: 3
+--- prompt
+写 `parse_and_count(raw_list)`：`raw_list` 是模型返回的一组 JSON 文字，有的格式坏了，有的缺 `verdict` 字段。返回：
+
+`{"valid": 合法条数, "invalid": 不合法条数, "counts": {判定: 次数}}`
+
+合法 = 能解析成字典并且有 `verdict` 键。
+--- solution
+import json
+
+def parse_and_count(raw_list):
+    valid = 0
+    invalid = 0
+    counts = {}
+    for raw in raw_list:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            invalid += 1
+            continue
+        if not isinstance(data, dict) or "verdict" not in data:
+            invalid += 1
+            continue
+        valid += 1
+        counts[data["verdict"]] = counts.get(data["verdict"], 0) + 1
+    return {"valid": valid, "invalid": invalid, "counts": counts}
+--- tests
+RAW = ['{"verdict": "flag"}', "Sure! {", '{"verdict": "accept"}', '{"clause_id": "1"}', '{"verdict": "flag"}']
+expect("混合输入", lambda: parse_and_count(RAW), {"valid": 3, "invalid": 2, "counts": {"flag": 2, "accept": 1}})
+expect("空", lambda: parse_and_count([]), {"valid": 0, "invalid": 0, "counts": {}})
+
+@@ item d7-e2
+type: scratch
+title: 毕业闭卷 2：Pydantic 批量加载（Python）
+exam: yes
+level: 3
+--- prompt
+用 Pydantic 定义 `Clause`：`id` 字符串、`risk` 为 `low` / `medium` / `high`。
+
+写 `load_clauses(raw)`：`raw` 是一个 JSON 数组的文字。返回其中**合法**条目组成的 `Clause` 列表，不合法的跳过。整个 `raw` 不是合法 JSON 时返回 `[]`。
+--- solution
+import json
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Clause(BaseModel):
+    id: str
+    risk: Literal["low", "medium", "high"]
+
+def load_clauses(raw):
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    result = []
+    for item in items:
+        try:
+            result.append(Clause.model_validate(item))
+        except ValidationError:
+            pass
+    return result
+--- tests
+RAW = '[{"id": "8.1", "risk": "high"}, {"id": "3.1", "risk": "urgent"}, {"id": "4.2", "risk": "medium"}, {"risk": "low"}]'
+expect("跳过不合法的", lambda: [c.id for c in load_clauses(RAW)], ["8.1", "4.2"])
+expect("返回的是 Clause 对象", lambda: type(load_clauses(RAW)[0]).__name__, "Clause")
+expect("坏 JSON", lambda: load_clauses("[{"), [])
+
+@@ item d7-e3
+type: scratch
+title: 毕业闭卷 3：带重试的批量判定（Python）
+exam: yes
+level: 3
+mock: yes
+--- prompt
+写 `classify_all(texts)`：对每段文字调用 DeepSeek（`https://api.deepseek.com/v1/chat/completions`，模型 `deepseek-chat`，`json_object` 格式，密钥读环境变量 `DEEPSEEK_API_KEY`），返回每段的 `verdict` 组成的列表。
+
+每次调用遇到 429 要重试，同一段最多尝试 3 次，还不行就 `raise RuntimeError`。
+--- solution
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+
+def classify_one(text):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}}
+    for _ in range(3):
+        resp = requests.post(URL, headers=headers, json=body)
+        if resp.status_code == 200:
+            return json.loads(resp.json()["choices"][0]["message"]["content"])["verdict"]
+        if resp.status_code != 429:
+            break
+    raise RuntimeError("classify failed")
+
+def classify_all(texts):
+    return [classify_one(t) for t in texts]
+--- tests
+TEXTS = ["Review clause 8.1: liability is unlimited", "Review clause 3.1: fees within thirty days"]
+expect("两段", lambda: classify_all(TEXTS), ["redline", "accept"])
+def _retry():
+    MOCK.reset()
+    MOCK.fail_next(429, 2)
+    return classify_all(TEXTS[:1])
+expect("429 两次后成功", _retry, ["redline"])
+def _give_up():
+    MOCK.reset()
+    MOCK.fail_next(429, 3)
+    return classify_all(TEXTS[:1])
+expect_raises("三次都 429", _give_up, RuntimeError)
+
+@@ item d7-e4
+type: scratch
+title: 毕业闭卷 4：解析并计数（TypeScript）
+exam: yes
+level: 3
+lang: ts
+--- prompt
+写 `parseAndCount(rawList: string[])`，规则和闭卷 1 一样，返回 `{ valid, invalid, counts }`。
+--- solution
+function parseAndCount(rawList: string[]): { valid: number; invalid: number; counts: Record<string, number> } {
+  let valid = 0;
+  let invalid = 0;
+  const counts: Record<string, number> = {};
+  for (const raw of rawList) {
+    let data: any;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      invalid += 1;
+      continue;
+    }
+    if (typeof data !== "object" || data === null || !("verdict" in data)) {
+      invalid += 1;
+      continue;
+    }
+    valid += 1;
+    counts[data.verdict] = (counts[data.verdict] ?? 0) + 1;
+  }
+  return { valid, invalid, counts };
+}
+--- tests
+const RAW = ['{"verdict": "flag"}', "Sure! {", '{"verdict": "accept"}', '{"clause_id": "1"}', '{"verdict": "flag"}'];
+expect("混合", () => parseAndCount(RAW), { valid: 3, invalid: 2, counts: { flag: 2, accept: 1 } });
+expect("空", () => parseAndCount([]), { valid: 0, invalid: 0, counts: {} });
+
+@@ item d7-e5
+type: scratch
+title: 毕业闭卷 5：Zod 批量加载（TypeScript）
+exam: yes
+level: 3
+lang: ts
+--- prompt
+用 Zod 定义 `ClauseSchema`：`id` 字符串、`risk` 为 `low` / `medium` / `high`。写 `loadClauses(raw: string)`：返回 JSON 数组里合法的条目，不合法的跳过；整个不是合法 JSON 时返回 `[]`。
+--- solution
+import { z } from "zod";
+
+const ClauseSchema = z.object({ id: z.string(), risk: z.enum(["low", "medium", "high"]) });
+type Clause = z.infer<typeof ClauseSchema>;
+
+function loadClauses(raw: string): Clause[] {
+  let items: unknown[];
+  try {
+    items = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const result: Clause[] = [];
+  for (const item of items) {
+    const r = ClauseSchema.safeParse(item);
+    if (r.success) {
+      result.push(r.data);
+    }
+  }
+  return result;
+}
+--- tests
+const RAW = '[{"id": "8.1", "risk": "high"}, {"id": "3.1", "risk": "urgent"}, {"id": "4.2", "risk": "medium"}, {"risk": "low"}]';
+expect("跳过不合法", () => loadClauses(RAW).map((c) => c.id), ["8.1", "4.2"]);
+expect("坏 JSON", () => loadClauses("[{"), []);
+
+@@ item d7-e6
+type: scratch
+title: 毕业闭卷 6：带重试的批量判定（TypeScript）
+exam: yes
+level: 3
+lang: ts
+--- prompt
+写 `classifyAll(texts: string[]): Promise<string[]>`，规则和闭卷 3 一样：按顺序逐段调用，429 重试，同一段最多 3 次，失败就 throw。
+--- solution
+const URL_ = "https://api.deepseek.com/v1/chat/completions";
+
+async function classifyOne(text: string): Promise<string> {
+  const body = JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } });
+  for (let i = 0; i < 3; i++) {
+    const res = await fetch(URL_, { method: "POST", headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` }, body });
+    if (res.status === 200) {
+      const data = await res.json();
+      return JSON.parse(data.choices[0].message.content).verdict;
+    }
+    if (res.status !== 429) break;
+  }
+  throw new Error("classify failed");
+}
+
+async function classifyAll(texts: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const t of texts) {
+    out.push(await classifyOne(t));
+  }
+  return out;
+}
+--- tests
+const TEXTS = ["Review clause 8.1: liability is unlimited", "Review clause 3.1: fees within thirty days"];
+expectAsync("两段", () => classifyAll(TEXTS), ["redline", "accept"]);
+expectAsync("429 两次后成功", async () => { MOCK.reset(); MOCK.failNext(429, 2); return classifyAll(TEXTS.slice(0, 1)); }, ["redline"]);
+expectRejects("三次都 429", async () => { MOCK.reset(); MOCK.failNext(429, 3); return classifyAll(TEXTS.slice(0, 1)); });

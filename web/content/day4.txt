@@ -1,0 +1,1033 @@
+@@ day 4
+title: Python 做 AI：Pydantic、调接口、重试、工具调用
+lang: py
+hours: 5 小时
+--- goal
+能用 Pydantic 定义并校验模型输出；能手写一次 Chat API 调用并读出回答和 token 用量；会处理 401 / 429 / 5xx；看懂并实现一次工具调用；能用「跑 N 次看通过率」评估一个随机的函数。这是 Clause Check 里 `review.py` 的全部骨架。
+
+本页的接口是**模拟的 DeepSeek**：请求格式、返回格式、错误码都和真的一样，代码拿到本机加上真 key 就能调真接口（最后一题就是做这个）。
+--- checklist
+- 先清空复习区
+- 读完 7 张知识卡片并改动运行
+- 练习区全部通过（包括最后的本机任务：真的调一次 DeepSeek）
+- 闭卷挑战 3 题
+- 打开项目 `clausecheck/review.py`，找到 `model_review` 里的 for 循环，说出每一轮做了什么
+
+@@ concept
+title: Pydantic：给数据定规矩
+--- body
+昨天手写的 `validate_verdict` 很繁琐。Pydantic 让你**用类型标注描述数据**，它负责检查：
+
+```python
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    confidence: float = 0.5
+```
+
+- `Literal[...]` 表示「只能是这几个值之一」
+- 有默认值的字段可以不传
+- 创建对象时自动校验；能安全转换的会转换（字符串 `"0.9"` → `0.9`），不合法就报 `ValidationError`
+- `v.model_dump()` 转回字典
+--- code
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    confidence: float = 0.5
+
+v = Verdict(clause_id="8.1", verdict="flag")
+print(v.verdict, v.confidence)
+print(v.model_dump())
+w = Verdict(clause_id="12", verdict="accept", confidence="0.9")
+print(w.confidence, type(w.confidence))
+
+@@ concept
+title: 校验失败：ValidationError
+--- body
+模型输出的 JSON 文字，可以一步完成「解析 + 校验」：
+
+```python
+v = Verdict.model_validate_json(raw)
+```
+
+JSON 格式坏了、字段缺了、值不合法，都会抛 `ValidationError`。`e.errors()` 是问题列表，每项有 `loc`（哪个字段）和 `msg`（原因）。
+
+在 Clause Check 里，校验失败时不是让程序崩掉，而是把错误信息**回传给模型**让它改正，这叫「校验回送」。
+--- code
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+
+for raw in ['{"clause_id": "8.1", "verdict": "flag"}', '{"clause_id": "8.1", "verdict": "HIGH"}', "not json"]:
+    try:
+        print("ok:", Verdict.model_validate_json(raw))
+    except ValidationError as e:
+        err = e.errors()[0]
+        print("invalid:", err["loc"], err["msg"])
+
+@@ concept
+title: Chat API 的请求和回答长什么样
+--- body
+几乎所有大模型接口（DeepSeek、OpenAI、LM Studio）都用同一种格式。
+
+**请求**：POST 到 `.../chat/completions`，请求头带 `Authorization: Bearer <密钥>`，请求体：
+
+```python
+{
+    "model": "deepseek-chat",
+    "messages": [
+        {"role": "system", "content": "你是合同审查助手……"},
+        {"role": "user", "content": "请审查这一条：……"},
+    ],
+    "temperature": 0.3,
+}
+```
+
+**回答**里最常用的三处：
+
+- `data["choices"][0]["message"]["content"]` 模型说的话
+- `data["choices"][0]["finish_reason"]` 为什么停：`"stop"` 说完了，`"tool_calls"` 想调工具
+- `data["usage"]["total_tokens"]` 用了多少 token（算钱）
+--- code
+import json
+
+messages = [
+    {"role": "system", "content": "You review contract clauses."},
+    {"role": "user", "content": "Review clause 8.1: liability is unlimited."},
+]
+body = {"model": "deepseek-chat", "messages": messages, "temperature": 0.3}
+print(json.dumps(body, indent=2))
+
+@@ concept
+title: 用 requests 发请求
+mock: yes
+--- body
+```python
+import os
+import requests
+
+resp = requests.post(URL, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=60)
+resp.status_code   # 200 表示成功
+data = resp.json() # 回答变成字典
+```
+
+- `json=body` 会自动把字典转成 JSON 发出去
+- 密钥从环境变量读：`os.getenv("DEEPSEEK_API_KEY")`，**永远不要写进代码里**
+- 本页里 `requests` 连的是模拟服务器；在本机它连的就是真的 DeepSeek
+--- code
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+key = os.getenv("DEEPSEEK_API_KEY")
+body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "Say hello"}]}
+resp = requests.post(URL, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=60)
+print(resp.status_code)
+data = resp.json()
+print(data["choices"][0]["message"]["content"])
+print(data["usage"])
+
+@@ concept
+title: 状态码和重试
+mock: yes
+--- body
+- `200` 成功
+- `400` 请求写错了（字段缺了、模型名不对）：**不要重试**，改代码
+- `401` 密钥不对或没带 `Bearer`：**不要重试**
+- `429` 请求太频繁、`500` / `503` 服务器问题：**可以重试**，等一下再来
+
+重试要有**上限**（比如 3 次），否则服务一直挂着，你就一直在循环里。生产里还会在每次重试之间等待越来越久（指数退避）。
+
+本页的 `MOCK.fail_next(429, 2)` 会让模拟服务器接下来两次返回 429，用来练习重试。
+--- code
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}
+
+MOCK.fail_next(429, 2)
+for attempt in range(1, 4):
+    resp = requests.post(URL, headers=HEADERS, json=body)
+    print("attempt", attempt, "status", resp.status_code)
+    if resp.status_code == 200:
+        break
+
+print(requests.post(URL, headers={"Authorization": "wrong"}, json=body).json())
+
+@@ concept
+title: 工具调用：模型说「帮我查一下」
+mock: yes
+--- body
+把工具的说明（名字、描述、参数）放进请求的 `tools` 里，模型觉得需要时就不直接回答，而是返回：
+
+```python
+finish_reason == "tool_calls"
+message["tool_calls"] = [{"id": "call_1", "function": {"name": "lookup_playbook", "arguments": '{"topic": "liability_cap"}'}}]
+```
+
+你的代码要：
+
+1. 找到叫这个名字的 Python 函数
+2. `json.loads(arguments)` 得到参数，调用它
+3. 把模型那条消息和一条 `{"role": "tool", "tool_call_id": ..., "content": 结果}` 加进 messages，**再请求一次**
+
+模型看到工具结果后给出最终回答。这个「请求 → 调工具 → 再请求」的循环就是 Agent。
+--- code
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+messages = [{"role": "user", "content": "Is unlimited liability acceptable?"}]
+data = requests.post(URL, headers=HEADERS, json={"model": "deepseek-chat", "messages": messages, "tools": TOOLS}).json()
+choice = data["choices"][0]
+print("finish_reason:", choice["finish_reason"])
+call = choice["message"]["tool_calls"][0]
+print("tool:", call["function"]["name"], json.loads(call["function"]["arguments"]))
+
+@@ concept
+title: 随机性：跑一次不算数
+mock: yes
+--- body
+同一个输入，模型两次的回答可能不同。所以评估一个用到模型的函数时，要**跑 N 次看通过率**，而不是跑一次看对错。
+
+本页的模拟服务器会对「AS IS 免责声明」这类条款故意摇摆（约 60% 判 accept），就像真实模型一样。下面的例子数一数 10 次里有几次判 accept。
+
+这就是 Clause Check `evals/run_evals.py` 的核心思想。
+--- code
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+clause = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS".'
+results = []
+for _ in range(10):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause}], "response_format": {"type": "json_object"}}
+    content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
+    results.append(json.loads(content)["verdict"])
+print(results)
+print("accept rate:", results.count("accept") / len(results))
+
+@@ item d4-01
+type: choice
+title: Literal 是什么意思
+level: 1
+--- prompt
+在 Pydantic 模型里写 `verdict: Literal["accept", "flag", "redline"]`，表示什么？
+--- options
+- verdict 必须是字符串，内容随意
+- verdict 只能是这三个值之一，其他值会校验失败
+- verdict 是一个列表，里面有三个值
+- verdict 可以不填
+answer: 2
+--- explain
+`Literal[...]` 把取值限定在列出的几个里。模型返回 `"HIGH"`、`"Flag"` 之类都会被拒绝，抛出 `ValidationError`。这是让模型输出变可靠的第一道关。
+
+@@ item d4-02
+type: code
+title: 定义 Verdict 模型
+level: 2
+--- prompt
+用 Pydantic 定义 `Verdict`，字段：
+
+- `clause_id`：字符串
+- `verdict`：只能是 `accept` / `flag` / `redline`
+- `risk_level`：只能是 `low` / `medium` / `high`
+- `rationale`：字符串
+- `confidence`：小数，默认 `0.5`
+--- starter
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+--- solution
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+    confidence: float = 0.5
+--- tests
+from pydantic import ValidationError
+ok = dict(clause_id="8.1", verdict="flag", risk_level="high", rationale="cap is not mutual")
+expect("合法数据能创建", lambda: Verdict(**ok).verdict, "flag")
+expect("confidence 默认 0.5", lambda: Verdict(**ok).confidence, 0.5)
+expect_raises("verdict 不合法", lambda: Verdict(**{**ok, "verdict": "maybe"}), ValidationError)
+expect_raises("risk_level 不合法", lambda: Verdict(**{**ok, "risk_level": "urgent"}), ValidationError)
+expect_raises("缺 rationale", lambda: Verdict(clause_id="1", verdict="accept", risk_level="low"), ValidationError)
+--- hints
+- 每个字段一行：`名字: 类型`。
+- 有默认值的写法：`confidence: float = 0.5`。
+
+@@ item d4-03
+type: code
+title: 解析并校验模型输出
+level: 2
+--- prompt
+写 `parse_verdict(raw)`：
+
+- `raw` 合法：返回 `Verdict` 对象
+- 不合法（JSON 坏了或字段不对）：返回字符串 `"INVALID: " + 第一个错误的 msg`
+
+这就是「校验失败时把原因回传给模型」里的那条原因。
+--- starter
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+
+def parse_verdict(raw):
+    pass
+--- solution
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+
+def parse_verdict(raw):
+    try:
+        return Verdict.model_validate_json(raw)
+    except ValidationError as e:
+        return "INVALID: " + e.errors()[0]["msg"]
+--- tests
+expect("合法 → Verdict", lambda: parse_verdict('{"clause_id": "8.1", "verdict": "flag"}').verdict, "flag")
+expect_true("判定不合法 → INVALID 开头", lambda: parse_verdict('{"clause_id": "8.1", "verdict": "HIGH"}').startswith("INVALID: "))
+expect_true("JSON 坏了 → INVALID 开头", lambda: parse_verdict("Sure! {").startswith("INVALID: "))
+expect_true("错误信息里提到了允许的值", lambda: "accept" in parse_verdict('{"clause_id": "1", "verdict": "x"}'))
+--- hints
+- `Verdict.model_validate_json(raw)` 一步完成解析和校验。
+- 坏 JSON 也会抛 `ValidationError`（不是 JSONDecodeError），所以只接这一种就够了。第一个错误：`e.errors()[0]["msg"]`。
+
+@@ item d4-04
+type: predict
+title: Pydantic 的转换和默认值
+level: 2
+--- prompt
+写出输出。注意字符串 `"0.9"` 被转成了什么，以及 `model_dump()` 的样子。
+--- code
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    confidence: float = 0.5
+
+v = Verdict(clause_id="8.1", verdict="flag")
+print(v.confidence)
+print(v.model_dump())
+w = Verdict.model_validate({"clause_id": "12", "verdict": "accept", "confidence": "0.9"})
+print(w.confidence + 0.1)
+
+@@ item d4-05
+type: code
+title: 组装 messages
+level: 1
+--- prompt
+写 `build_messages(system, clause_text)`，返回两条消息的列表：
+
+1. `{"role": "system", "content": system}`
+2. `{"role": "user", "content": "Review this clause:\n" + clause_text}`（`\n` 是换行）
+--- starter
+def build_messages(system, clause_text):
+    pass
+--- solution
+def build_messages(system, clause_text):
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "Review this clause:\n" + clause_text},
+    ]
+--- tests
+m = lambda: build_messages("You review contracts.", "8.1 Cap on Liability ...")
+expect("两条消息", lambda: len(m()), 2)
+expect("第一条是 system", lambda: m()[0], {"role": "system", "content": "You review contracts."})
+expect("第二条是 user", lambda: m()[1], {"role": "user", "content": "Review this clause:\n8.1 Cap on Liability ..."})
+--- hints
+- 返回的是一个列表，里面放两个字典。
+
+@@ item d4-06
+type: code
+title: 组装请求体
+level: 1
+--- prompt
+写 `build_body(messages, model="deepseek-chat", temperature=0.3)`，返回请求体字典，有三个键：`model`、`messages`、`temperature`。
+--- starter
+def build_body(messages, model="deepseek-chat", temperature=0.3):
+    pass
+--- solution
+def build_body(messages, model="deepseek-chat", temperature=0.3):
+    return {"model": model, "messages": messages, "temperature": temperature}
+--- tests
+msgs = [{"role": "user", "content": "hi"}]
+expect("默认值", lambda: build_body(msgs), {"model": "deepseek-chat", "messages": msgs, "temperature": 0.3})
+expect("自定义温度", lambda: build_body(msgs, temperature=0)["temperature"], 0)
+--- hints
+- 默认参数已经写好，直接用它们拼字典。
+
+@@ item d4-07
+type: code
+title: 第一次调接口
+level: 2
+mock: yes
+--- prompt
+写 `ask(prompt)`：
+
+1. 用 `requests.post` 调 `API_URL`
+2. 请求头：`{"Authorization": f"Bearer {API_KEY}"}`
+3. 请求体：模型 `deepseek-chat`，messages 里只有一条 user 消息，内容是 `prompt`
+4. 返回模型回答的文字
+
+模拟服务器对普通问题的回答是 `"Mock reply: " + 你的问题`。
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def ask(prompt):
+    pass
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def ask(prompt):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    resp = requests.post(API_URL, headers={"Authorization": f"Bearer {API_KEY}"}, json=body, timeout=60)
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+--- tests
+expect("回答", lambda: ask("hello"), "Mock reply: hello")
+expect("用的模型", lambda: MOCK.calls[-1]["body"]["model"], "deepseek-chat")
+expect("只有一条消息", lambda: MOCK.calls[-1]["body"]["messages"], [{"role": "user", "content": "hello"}])
+--- hints
+- `resp = requests.post(API_URL, headers=..., json=body)`，再 `data = resp.json()`。
+- 回答的位置：`data["choices"][0]["message"]["content"]`。
+
+@@ item d4-08
+type: fix
+title: 修 bug：401
+level: 2
+mock: yes
+--- prompt
+这个函数报错了。先运行，看输出里打印的状态码和服务器的错误信息，找到原因再修。
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def ask(prompt):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    resp = requests.post(API_URL, headers={"Authorization": API_KEY}, json=body)
+    print(resp.status_code, resp.json())
+    return resp.json()["choices"][0]["message"]["content"]
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def ask(prompt):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    resp = requests.post(API_URL, headers={"Authorization": f"Bearer {API_KEY}"}, json=body)
+    print(resp.status_code)
+    return resp.json()["choices"][0]["message"]["content"]
+--- tests
+expect("修好后能拿到回答", lambda: ask("ping"), "Mock reply: ping")
+expect("请求头的格式", lambda: (ask("x"), MOCK.calls[-1]["body"]["model"])[1], "deepseek-chat")
+--- hints
+- 输出里的状态码是 401，服务器说了要什么格式的请求头。
+- 请求头应该是 `"Bearer " + 密钥`，中间有一个空格。
+
+@@ item d4-09
+type: code
+title: 顺便记下 token 用量
+level: 2
+mock: yes
+--- prompt
+写 `ask_with_usage(prompt)`：返回 `{"text": 回答文字, "tokens": 这次用掉的 total_tokens}`。
+
+token 用量在回答的 `usage` 里。记录它是算成本的第一步。
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def ask_with_usage(prompt):
+    pass
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def ask_with_usage(prompt):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return {"text": data["choices"][0]["message"]["content"], "tokens": data["usage"]["total_tokens"]}
+--- tests
+r = lambda: ask_with_usage("How much does this cost?")
+expect("text", lambda: r()["text"], "Mock reply: How much does this cost?")
+expect_true("tokens 是正整数", lambda: isinstance(r()["tokens"], int) and r()["tokens"] > 0)
+expect("只有两个键", lambda: sorted(r().keys()), ["text", "tokens"])
+--- hints
+- `data["usage"]["total_tokens"]`。
+
+@@ item d4-10
+type: code
+title: 状态码不对就报错
+level: 2
+mock: yes
+--- prompt
+写 `call_api(body)`：发请求；状态码是 200 就返回解析后的字典；否则 `raise RuntimeError(f"API error {状态码}: {服务器给的错误信息}")`。
+
+服务器的错误信息在 `resp.json()["error"]["message"]`。
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def call_api(body):
+    pass
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def call_api(body):
+    resp = requests.post(API_URL, headers=HEADERS, json=body)
+    if resp.status_code != 200:
+        raise RuntimeError(f"API error {resp.status_code}: {resp.json()['error']['message']}")
+    return resp.json()
+--- tests
+GOOD = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}
+expect("成功返回字典", lambda: call_api(GOOD)["choices"][0]["message"]["content"], "Mock reply: hi")
+expect_raises("模型名写错 → RuntimeError", lambda: call_api({"model": "gpt-9", "messages": [{"role": "user", "content": "x"}]}), RuntimeError)
+def _message():
+    MOCK.fail_next(500)
+    try:
+        call_api(GOOD)
+    except RuntimeError as e:
+        return str(e)
+expect("错误信息格式", _message, "API error 500: Internal server error")
+--- hints
+- 先判断 `resp.status_code != 200`，是就 raise。
+- f-string 里要用单引号取字典：`resp.json()['error']['message']`（外面已经是双引号了）。
+
+@@ item d4-11
+type: code
+title: 失败了就重试
+level: 3
+mock: yes
+--- prompt
+写 `ask_with_retry(prompt, max_attempts=3)`：
+
+- 状态码 200：返回回答文字
+- 状态码 429、500、503：重试，最多尝试 `max_attempts` 次
+- 其他状态码（比如 400、401）：不重试，直接 `raise RuntimeError`
+- 用完所有次数还没成功：`raise RuntimeError`
+
+测试会用 `MOCK.fail_next(...)` 让服务器先失败几次。
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+RETRYABLE = (429, 500, 503)
+
+def ask_with_retry(prompt, max_attempts=3):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    pass
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+RETRYABLE = (429, 500, 503)
+
+def ask_with_retry(prompt, max_attempts=3):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    for attempt in range(max_attempts):
+        resp = requests.post(API_URL, headers=HEADERS, json=body)
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"]
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"not retryable: {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+--- tests
+def _two_failures():
+    MOCK.reset()
+    MOCK.fail_next(429, 2)
+    text = ask_with_retry("hi")
+    return [text, len(MOCK.calls)]
+expect("两次 429 后第三次成功（一共请求 3 次）", _two_failures, ["Mock reply: hi", 3])
+def _always_down():
+    MOCK.reset()
+    MOCK.fail_next(503, 5)
+    return ask_with_retry("hi", max_attempts=3)
+expect_raises("一直 503 → RuntimeError", _always_down, RuntimeError)
+expect("而且只请求了 3 次", lambda: len(MOCK.calls), 3)
+def _auth_error():
+    MOCK.reset()
+    MOCK.fail_next(401)
+    try:
+        ask_with_retry("hi")
+    except RuntimeError:
+        return len(MOCK.calls)
+expect("401 不重试（只请求 1 次）", _auth_error, 1)
+--- hints
+- 外层 `for attempt in range(max_attempts):`，成功就 return。
+- 不可重试的状态码：在循环里直接 raise。循环结束还没 return，说明次数用完了，在循环外 raise。
+
+@@ item d4-12
+type: code
+title: 让模型返回结构化判定
+level: 3
+mock: yes
+--- prompt
+写 `classify(clause_text)`：
+
+1. 请求体里加 `"response_format": {"type": "json_object"}`（要求模型只返回 JSON）
+2. user 消息内容是 `clause_text`
+3. 用 `Verdict.model_validate_json(...)` 解析回答文字，返回 `Verdict` 对象
+
+模拟服务器会根据条款内容给出判定，比如含 `unlimited` 的判 `redline`。
+--- starter
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+
+def classify(clause_text):
+    pass
+--- solution
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+
+def classify(clause_text):
+    body = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": clause_text}],
+        "response_format": {"type": "json_object"},
+    }
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
+--- tests
+v = lambda: classify("Review clause 8.1: Customer's liability shall be unlimited.")
+expect("unlimited → redline", lambda: v().verdict, "redline")
+expect("编号", lambda: v().clause_id, "8.1")
+expect("返回的是 Verdict 对象", lambda: type(v()).__name__, "Verdict")
+expect("请求里带了 response_format", lambda: MOCK.calls[-1]["body"].get("response_format"), {"type": "json_object"})
+--- hints
+- 回答文字在 `["choices"][0]["message"]["content"]`，它是 JSON 字符串。
+- `Verdict.model_validate_json(那段文字)`。
+
+@@ item d4-13
+type: code
+title: 从啰嗦的回答里抠出 JSON
+level: 2
+--- prompt
+有些模型会在 JSON 前后加废话：`'Sure! Here is the JSON:\n{"verdict": "flag"}'`。
+
+写 `extract_json(text)`：取第一个 `{` 到最后一个 `}` 之间（包括两端）的内容，用 `json.loads` 解析后返回字典。找不到大括号就返回 `None`。
+--- starter
+import json
+
+def extract_json(text):
+    pass
+--- solution
+import json
+
+def extract_json(text):
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        return None
+    return json.loads(text[start:end + 1])
+--- tests
+expect("前面有废话", lambda: extract_json('Sure! Here is the JSON:\n{"verdict": "flag"}'), {"verdict": "flag"})
+expect("前后都有", lambda: extract_json('Result: {"a": {"b": 1}} Hope this helps.'), {"a": {"b": 1}})
+expect("干净的 JSON", lambda: extract_json('{"x": 1}'), {"x": 1})
+expect("没有大括号", lambda: extract_json("no json here"), None)
+--- hints
+- `text.find("{")` 找第一个，`text.rfind("}")` 从右边找最后一个，找不到返回 -1。
+- 切片要包括最后那个 `}`：`text[start:end + 1]`。
+
+@@ item d4-14
+type: code
+title: 执行一次工具调用
+level: 2
+--- prompt
+模型返回的工具调用长这样：
+
+```python
+call = {"id": "call_1", "type": "function",
+        "function": {"name": "lookup_playbook", "arguments": '{"topic": "payment"}'}}
+```
+
+写 `run_tool_call(call, tools)`：`tools` 是「名字 → Python 函数」的字典。找到对应函数，把 `arguments`（JSON 字符串）解析成字典，作为关键字参数调用，返回结果。工具名不存在时返回 `"UNKNOWN_TOOL: 名字"`。
+--- starter
+import json
+
+def run_tool_call(call, tools):
+    pass
+--- solution
+import json
+
+def run_tool_call(call, tools):
+    name = call["function"]["name"]
+    if name not in tools:
+        return f"UNKNOWN_TOOL: {name}"
+    args = json.loads(call["function"]["arguments"])
+    return tools[name](**args)
+--- tests
+def lookup_playbook(topic):
+    return f"rule for {topic}"
+def add(a, b):
+    return a + b
+TOOLS = {"lookup_playbook": lookup_playbook, "add": add}
+call = lambda name, args: {"id": "c", "type": "function", "function": {"name": name, "arguments": args}}
+expect("查 playbook", lambda: run_tool_call(call("lookup_playbook", '{"topic": "payment"}'), TOOLS), "rule for payment")
+expect("两个参数", lambda: run_tool_call(call("add", '{"a": 2, "b": 3}'), TOOLS), 5)
+expect("不存在的工具", lambda: run_tool_call(call("delete_all", "{}"), TOOLS), "UNKNOWN_TOOL: delete_all")
+--- hints
+- 名字：`call["function"]["name"]`；参数：`json.loads(call["function"]["arguments"])`。
+- 字典 `args` 用 `**args` 展开成关键字参数：`func(**{"topic": "x"})` 等于 `func(topic="x")`。
+
+@@ item d4-15
+type: code
+title: 通过率
+level: 2
+mock: yes
+--- prompt
+写 `pass_rate(clause_text, expected, n)`：调用 `classify(clause_text)` 共 `n` 次，返回判定等于 `expected` 的比例（0 到 1 之间的小数）。
+
+`classify` 已经写好了（就是第 12 题）。
+--- starter
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+
+def classify(clause_text):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
+
+def pass_rate(clause_text, expected, n):
+    pass
+--- solution
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+
+def classify(clause_text):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
+
+def pass_rate(clause_text, expected, n):
+    hits = 0
+    for _ in range(n):
+        if classify(clause_text).verdict == expected:
+            hits += 1
+    return hits / n
+--- tests
+UNLIMITED = "Review clause 8.1: Customer's liability shall be unlimited."
+AS_IS = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS".'
+expect("稳定的条款：5 次全对", lambda: pass_rate(UNLIMITED, "redline", 5), 1.0)
+expect("判错的期望：0", lambda: pass_rate(UNLIMITED, "accept", 3), 0.0)
+expect_true("摇摆的条款：介于 0 和 1 之间", lambda: 0 < pass_rate(AS_IS, "accept", 20) < 1)
+expect("真的调了 n 次", lambda: (MOCK.reset(), pass_rate(UNLIMITED, "redline", 4), len(MOCK.calls))[2], 4)
+--- hints
+- 准备 `hits = 0`，循环 n 次，判定对了就加 1。
+- 最后 `hits / n`。Python 3 里整数相除得到小数。
+
+@@ item d4-16
+type: code
+title: 迷你 Agent：请求 → 调工具 → 再请求
+level: 3
+mock: yes
+--- prompt
+把前面的都串起来。写 `mini_agent(question)`：
+
+1. 发请求，带上 `TOOLS`
+2. 如果 `finish_reason == "tool_calls"`：执行第一个工具调用（用 `run_tool_call`）；把模型那条消息原样加进 `messages`，再加一条 `{"role": "tool", "tool_call_id": 调用的 id, "content": 工具结果}`；然后回到第 1 步
+3. 否则返回回答文字
+4. 最多请求 `max_steps` 次，超过就返回 `"STOPPED"`
+
+这就是 Clause Check `review.py` 里那个有上限的循环。
+--- starter
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+def lookup_playbook(topic):
+    return f"rule for {topic}: cap at 100% of annual fees"
+
+def run_tool_call(call, tools):
+    return tools[call["function"]["name"]](**json.loads(call["function"]["arguments"]))
+
+def mini_agent(question, max_steps=3):
+    messages = [{"role": "user", "content": question}]
+    pass
+--- solution
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+def lookup_playbook(topic):
+    return f"rule for {topic}: cap at 100% of annual fees"
+
+def run_tool_call(call, tools):
+    return tools[call["function"]["name"]](**json.loads(call["function"]["arguments"]))
+
+def mini_agent(question, max_steps=3):
+    messages = [{"role": "user", "content": question}]
+    for _ in range(max_steps):
+        body = {"model": "deepseek-chat", "messages": messages, "tools": TOOLS}
+        choice = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]
+        message = choice["message"]
+        if choice["finish_reason"] != "tool_calls":
+            return message["content"]
+        call = message["tool_calls"][0]
+        result = run_tool_call(call, {"lookup_playbook": lookup_playbook})
+        messages.append(message)
+        messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+    return "STOPPED"
+--- tests
+def _run():
+    MOCK.reset()
+    return [mini_agent("Is unlimited liability acceptable?"), len(MOCK.calls)]
+expect("调了工具，拿到最终回答，一共请求 2 次", _run, ["Based on the playbook: rule for liability_cap: cap at 100% of annual fees", 2])
+expect("第二次请求里带着工具结果", lambda: MOCK.calls[-1]["body"]["messages"][-1]["role"], "tool")
+expect("步数用完返回 STOPPED", lambda: mini_agent("Is unlimited liability acceptable?", max_steps=1), "STOPPED")
+--- hints
+- 结构：`for _ in range(max_steps):` 里发请求；不是 tool_calls 就 return；是就执行工具、往 messages 里加两条，然后继续下一轮。
+- 循环结束还没 return，就 `return "STOPPED"`。
+
+@@ item d4-17
+type: order
+title: 排代码：一次完整的调用
+level: 2
+mock: yes
+--- prompt
+排出 `ask_json(prompt)`：请求时要求 JSON 格式，返回解析后的字典。有一行干扰项。
+--- lines
+import json, os, requests
+URL = "https://api.deepseek.com/v1/chat/completions"
+def ask_json(prompt):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+    data = requests.post(URL, headers=headers, json=body).json()
+    return json.loads(data["choices"][0]["message"]["content"])
+--- distractors
+    return data["choices"]["message"]["content"]
+--- tests
+expect("返回字典", lambda: ask_json("Review clause 4.2: renews for twenty-four (24) months")["verdict"], "redline")
+expect("topic", lambda: ask_json("Review clause 4.2: renews for twenty-four (24) months")["topic"], "auto_renewal")
+--- hints
+- 顺序：导入 → 常量 → def → 请求头 → 请求体 → 发请求 → 解析返回。
+- `choices` 是列表，要先取 `[0]`。
+
+@@ item d4-18
+type: choice
+title: temperature 设成 0 就确定了吗
+level: 2
+--- prompt
+把请求里的 `temperature` 设成 0 以后：
+--- options
+- 每次输出一定完全相同，测试跑一次就够了
+- 通常更稳定，但不保证每次相同；评估仍然要跑多次看通过率
+- 模型会拒绝回答
+- 输出会变得更有创意
+answer: 2
+--- explain
+temperature 越低输出越集中，但服务器端的批处理、浮点运算顺序、供应商更新模型都会让结果变化。而且生产用什么参数，测试就该用什么参数。所以「跑一次看对错」不可靠，要「跑 N 次看通过率」。
+
+@@ item d4-19
+type: local
+title: 本机任务：真的调一次 DeepSeek
+level: 2
+--- prompt
+在自己电脑上，**不看这个页面**，手写一次真实的调用。
+
+1. 确认 `G:\Contract Clause Reviewer\.env` 里有 `DEEPSEEK_API_KEY=sk-...`（这个文件不会进 git）
+2. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\my_first_call.py`
+3. 从空白手写：读 `.env`（`from dotenv import load_dotenv` 然后 `load_dotenv()`）、组请求、调 `https://api.deepseek.com/v1/chat/completions`、打印回答和 `total_tokens`
+4. 在终端运行：
+
+```
+cd "G:\Contract Clause Reviewer"
+python learn/my_first_call.py
+```
+
+5. 把终端的完整输出粘贴到下面
+
+卡住了可以回到第 7、9 题看你自己写过的代码，但不要复制，照着理解重打一遍。
+placeholder: 粘贴终端输出，应该包含模型的回答和 total_tokens
+verify: tokens?\D{0,30}\d+
+--- hints
+- 需要的包：`pip install requests python-dotenv`（已经装过就跳过）。
+- 如果看到 401：检查 `.env` 里的 key，以及请求头是不是 `Bearer ` 开头。
+
+@@ item d4-e1
+type: scratch
+title: 闭卷：Rule 模型
+exam: yes
+level: 2
+--- prompt
+用 Pydantic 写 `Rule` 模型：`id`（字符串）、`topic`（字符串）、`severity`（只能是 `low` / `medium` / `high`）。
+
+再写 `load_rule(raw)`：`raw` 是 JSON 文字，合法就返回 `Rule` 对象，不合法返回 `None`。
+--- solution
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Rule(BaseModel):
+    id: str
+    topic: str
+    severity: Literal["low", "medium", "high"]
+
+def load_rule(raw):
+    try:
+        return Rule.model_validate_json(raw)
+    except ValidationError:
+        return None
+--- tests
+expect("合法", lambda: load_rule('{"id": "PB-01", "topic": "liability_cap", "severity": "high"}').severity, "high")
+expect("severity 不合法", lambda: load_rule('{"id": "PB-01", "topic": "x", "severity": "urgent"}'), None)
+expect("坏 JSON", lambda: load_rule("{"), None)
+
+@@ item d4-e2
+type: scratch
+title: 闭卷：要 JSON 的调用
+exam: yes
+level: 2
+mock: yes
+--- prompt
+写 `ask_json(prompt)`：调用 `https://api.deepseek.com/v1/chat/completions`（模型 `deepseek-chat`，密钥从环境变量 `DEEPSEEK_API_KEY` 读），要求 `json_object` 格式，返回解析后的字典。
+--- solution
+import json
+import os
+import requests
+
+def ask_json(prompt):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
+    return json.loads(data["choices"][0]["message"]["content"])
+--- tests
+expect("判定", lambda: ask_json("Review clause 10.1: data may be processed in any country")["verdict"], "redline")
+expect("主题", lambda: ask_json("Review clause 10.1: data may be processed in any country")["topic"], "data_processing")
+
+@@ item d4-e3
+type: scratch
+title: 闭卷：一共花了多少 token
+exam: yes
+level: 2
+mock: yes
+--- prompt
+写 `total_tokens(prompts)`：对列表里的每个 prompt 各调用一次接口（模型 `deepseek-chat`），返回所有调用的 `total_tokens` 之和。空列表返回 0。
+--- solution
+import os
+import requests
+
+def total_tokens(prompts):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    total = 0
+    for p in prompts:
+        body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": p}]}
+        data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
+        total += data["usage"]["total_tokens"]
+    return total
+--- tests
+expect_true("两次调用的 token 大于一次", lambda: total_tokens(["a", "b"]) > total_tokens(["a"]) > 0)
+expect("空列表", lambda: total_tokens([]), 0)
+expect("调用次数", lambda: (MOCK.reset(), total_tokens(["x", "y", "z"]), len(MOCK.calls))[2], 3)

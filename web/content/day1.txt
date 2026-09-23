@@ -1,0 +1,561 @@
+@@ day 1
+title: Python 起步：变量、字符串、列表、判断
+lang: py
+hours: 4–5 小时
+--- goal
+能写出带参数、有返回值的小函数；会处理字符串和列表；会用 if 做判断；看得懂最常见的三种报错。
+--- checklist
+- 读完 7 张知识卡片，每个例子至少改一处再运行
+- 练习区全部通过（看过答案的题会进复习区，明天重做）
+- 闭卷挑战 3 题：不看提示、不能粘贴
+- 关掉页面，在 VS Code 里新建 day1.py，把今天最难的一题从空白重写一遍并运行
+
+@@ concept
+title: 代码怎么跑：print 和注释
+--- body
+代码从上到下一行一行执行。`print(...)` 把括号里的东西显示在输出区，是你观察程序的眼睛。
+
+- 文字（字符串）要用引号包起来：`"Hello"`
+- `#` 后面是注释，只给人看，不会执行
+- `print` 里用逗号隔开多个值，输出时中间自动加一个空格
+
+改一改下面的代码再点「运行」，这是今天最重要的习惯：**写两三行就运行一次**。
+--- code
+# 这是注释，不会执行
+print("Hello, Clause Check")
+print("8.1", "Cap on Liability")
+print(1 + 2)
+
+@@ concept
+title: 变量和类型
+--- body
+`=` 的意思是「把右边的值放进左边的名字里」，不是数学里的等于。之后用这个名字就能拿到那个值。
+
+最常见的几种类型：
+
+- `str` 字符串：`"8.1"`
+- `int` 整数：`3`
+- `float` 小数：`0.82`
+- `bool` 真假：`True` / `False`（首字母大写）
+- `None`：什么都没有
+
+`type(x)` 可以查看类型。变量可以被重新赋值：`page = page + 1` 是先用旧值算出新值，再放回去。
+--- code
+clause_id = "8.1"
+page = 3
+ratio = 0.82
+is_risky = True
+print(clause_id, page, ratio, is_risky)
+print(type(clause_id), type(page))
+page = page + 1
+print(page)
+
+@@ concept
+title: 字符串
+--- body
+- **f-string**：`f"..."` 里的 `{变量}` 会被替换成它的值，这是拼文字最常用的写法
+- 常用方法：`.strip()` 去首尾空白，`.lower()` / `.upper()` 转大小写，`.replace(a, b)` 替换，`.split(".")` 按分隔符切开，`.startswith(x)` 是否以 x 开头
+- `"x" in s` 判断是否包含，`len(s)` 长度
+- 下标：`s[0]` 第一个字符，`s[-1]` 最后一个；切片 `s[0:3]` 取第 0、1、2 个
+
+字符串方法**不会改变原来的字符串**，而是返回一个新的，所以要用变量接住结果。
+--- code
+heading = "  Cap on Liability  "
+clean = heading.strip()
+print(f"[{clean}]")
+print(clean.lower(), clean.upper())
+print(clean.replace("Cap", "Limit"))
+print("8.1".split("."))
+print("Liability" in clean, len(clean))
+print(clean[0], clean[-1], clean[0:3])
+
+@@ concept
+title: 列表
+--- body
+`[...]` 按顺序装多个值。
+
+- 下标从 **0** 开始：`ids[0]` 是第一个，`ids[-1]` 是最后一个
+- `len(ids)` 个数，`ids.append(x)` 在末尾添加
+- 切片 `ids[1:3]` 取下标 1 和 2（不含 3）
+- `x in ids` 判断是否在列表里
+
+和字符串不同，`append` 会**直接修改**原来的列表。
+--- code
+ids = ["3.1", "4.2", "8.1"]
+print(ids[0], ids[-1], len(ids))
+ids.append("12")
+print(ids)
+print(ids[1:3])
+print("8.1" in ids, "9.9" in ids)
+
+@@ concept
+title: if / elif / else
+--- body
+- 比较：`==` 等于，`!=` 不等于，`<` `>` `<=` `>=`
+- 组合：`and` 两边都成立，`or` 任一成立，`not` 取反
+- 结尾的冒号 `:` 不能丢
+- **缩进（4 个空格）**表示「这几行属于上面那个 if」，Python 靠缩进判断代码块
+
+`elif` 是「否则如果」，可以有很多个；`else` 是最后的兜底，可以没有。
+--- code
+risk = "high"
+verdict = "accept"
+if risk == "high":
+    print("先看这条")
+elif risk == "medium":
+    print("有空再看")
+else:
+    print("可以跳过")
+if risk == "high" and verdict == "accept":
+    print("高风险却被放过？值得复查")
+
+@@ concept
+title: 函数：def 和 return
+--- body
+练习题几乎都是「写一个函数」。先记住形状：
+
+```python
+def 函数名(参数1, 参数2):
+    ...计算...
+    return 结果
+```
+
+调用时写 `函数名(值1, 值2)`，得到 `return` 回来的结果。
+
+**return 和 print 不一样**：`print` 只是显示在屏幕上；`return` 才是把结果交给调用它的代码。测试检查的是 `return` 的值，所以只 `print` 不 `return` 的函数一定过不了测试。函数执行到 `return` 就结束，后面的行不再运行。
+--- code
+def describe(clause_id, heading):
+    return f"{clause_id} {heading}"
+
+text = describe("8.1", "Cap on Liability")
+print(text)
+print(describe("4.2", "Automatic Renewal"))
+
+@@ concept
+title: 读报错：从最后一行往上看
+error_demo: yes
+--- body
+报错不可怕，它是在告诉你哪里错了。读法：
+
+1. **先看最后一行**：错误类型和原因
+2. 再看上面的 `File "main.py", line N`：错在第几行
+3. 回到那一行对照
+
+最常见的三种：
+
+- `NameError: name 'x' is not defined`：名字没定义过，多半是**拼错了**
+- `TypeError`：类型不对，比如字符串 `+` 数字
+- `SyntaxError` / `IndentationError`：写法或缩进错，比如漏了冒号
+
+运行下面的代码，看看报错，然后修好它。
+--- code
+clause_id = "8.1"
+print("Clause " + clause_id)
+print(clause_idd)
+
+@@ item d1-01
+type: choice
+title: 一个等号是什么意思
+level: 1
+--- prompt
+下面这行代码做了什么？
+--- code
+verdict = "flag"
+--- options
+- 判断 verdict 是否等于 "flag"
+- 把字符串 "flag" 放进名字 verdict 里
+- 在屏幕上显示 flag
+- 创建一个叫 flag 的变量
+answer: 2
+--- explain
+单个 `=` 是**赋值**：把右边的值存进左边的名字。判断是否相等要用两个等号 `==`。
+
+@@ item d1-02
+type: predict
+title: print 多个值
+level: 1
+--- prompt
+不要运行，先在脑子里执行一遍，写出输出（每个 print 一行）。
+--- code
+clause_id = "8.1"
+heading = "Cap on Liability"
+print(clause_id, heading)
+print(f"{clause_id}: {heading}")
+print("Clause", clause_id + "!")
+
+@@ item d1-03
+type: predict
+title: 字符串方法
+level: 1
+--- prompt
+写出输出。注意 `strip()` 去掉了哪些字符，`len` 数的是去掉之后的长度。
+--- code
+text = "  Subject to Section 12  "
+clean = text.strip()
+print(clean)
+print(clean.lower())
+print(len(clean))
+print(clean.startswith("Subject"))
+
+@@ item d1-04
+type: code
+title: 拼一行描述
+level: 1
+--- prompt
+写函数 `describe(clause_id, heading, verdict)`，返回这样的字符串：
+
+`"8.1 Cap on Liability: flag"`
+
+格式是：编号、空格、标题、冒号、空格、判定。
+--- starter
+def describe(clause_id, heading, verdict):
+    # 用 f-string 拼出结果，然后 return 它
+    pass
+--- solution
+def describe(clause_id, heading, verdict):
+    return f"{clause_id} {heading}: {verdict}"
+--- tests
+expect("8.1 的描述", lambda: describe("8.1", "Cap on Liability", "flag"), "8.1 Cap on Liability: flag")
+expect("4.2 的描述", lambda: describe("4.2", "Automatic Renewal", "redline"), "4.2 Automatic Renewal: redline")
+expect("返回的是字符串", lambda: type(describe("1", "A", "accept")).__name__, "str")
+--- hints
+- f-string 的样子：`f"{a} {b}"`，花括号里写变量名。
+- 别忘了 `return`，只 `print` 过不了测试。`pass` 是占位符，写好后删掉它。
+
+@@ item d1-05
+type: code
+title: 是不是高风险
+level: 1
+--- prompt
+写 `is_high(risk)`：`risk` 是 `"high"` 时返回 `True`，否则返回 `False`。
+--- starter
+def is_high(risk):
+    pass
+--- solution
+def is_high(risk):
+    return risk == "high"
+--- tests
+expect("high", lambda: is_high("high"), True)
+expect("low", lambda: is_high("low"), False)
+expect("大写 HIGH 不算（大小写不同就是不同的字符串）", lambda: is_high("HIGH"), False)
+--- hints
+- 可以写 if/else 分别 return True 和 False。
+- 更短的写法：`risk == "high"` 本身就是 True 或 False，可以直接 return 它。
+
+@@ item d1-06
+type: code
+title: 清洗模型的输出
+level: 1
+--- prompt
+模型有时会返回 `"  REDLINE\n"` 这种带空格、换行、大小写不一的文字。
+
+写 `normalize(text)`：去掉首尾空白（空格和换行都算），再转成小写后返回。
+--- starter
+def normalize(text):
+    pass
+--- solution
+def normalize(text):
+    return text.strip().lower()
+--- tests
+expect("带空格和换行", lambda: normalize("  REDLINE\n"), "redline")
+expect("首字母大写", lambda: normalize("Accept"), "accept")
+expect("本来就干净", lambda: normalize("flag"), "flag")
+--- hints
+- `.strip()` 会同时去掉空格和换行。
+- 方法可以连着写：`text.strip().lower()`。
+
+@@ item d1-07
+type: fix
+title: 修 bug：字符串加数字
+level: 1
+--- prompt
+下面的函数想返回 `"Clause 12"`，测试却报错了。先点「运行」看报错的最后一行，再修好它。
+--- starter
+def label(number):
+    return "Clause " + number
+--- solution
+def label(number):
+    return "Clause " + str(number)
+--- tests
+expect("label(12)", lambda: label(12), "Clause 12")
+expect("label(3)", lambda: label(3), "Clause 3")
+--- hints
+- 报错最后一行是 `TypeError`：字符串 `str` 不能和整数 `int` 用 `+` 拼起来。
+- 用 `str(number)` 把数字变成字符串，或者改成 f-string：`f"Clause {number}"`。
+
+@@ item d1-08
+type: choice
+title: 读报错：NameError
+level: 1
+--- prompt
+代码第 1 行是 `heading = "Cap on Liability"`。运行后出现这个报错，原因最可能是什么？
+--- code
+Traceback (most recent call last):
+  File "main.py", line 3, in <module>
+    print(headng)
+NameError: name 'headng' is not defined
+--- options
+- 第 3 行把变量名拼错了
+- 第 1 行应该用 print
+- 电脑上的 Python 没装好
+- headng 是 Python 的保留字，不能用
+answer: 1
+--- explain
+`NameError` 表示「这个名字从没定义过」。最常见的原因就是拼错：定义时是 `heading`，第 3 行写成了 `headng`，少了一个 i。先看最后一行，再看 `line 3` 定位。
+
+@@ item d1-09
+type: predict
+title: 列表下标和切片
+level: 1
+--- prompt
+写出输出。提醒：下标从 0 开始，切片不包含结尾那个下标。
+--- code
+ids = ["3.1", "4.2", "8.1", "12"]
+print(ids[0])
+print(ids[-1])
+print(ids[1:3])
+print(len(ids))
+
+@@ item d1-10
+type: code
+title: 取章节号
+level: 2
+--- prompt
+条款编号 `"8.1"` 的章节号是 `"8"`，`"12"` 的章节号是 `"12"`，`"10.2.1"` 的是 `"10"`。
+
+写 `section_of(clause_id)`，返回章节号（字符串）。
+--- starter
+def section_of(clause_id):
+    pass
+--- solution
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+--- tests
+expect("8.1", lambda: section_of("8.1"), "8")
+expect("12 没有小数点", lambda: section_of("12"), "12")
+expect("10.2.1 多级", lambda: section_of("10.2.1"), "10")
+--- hints
+- `"8.1".split(".")` 得到列表 `["8", "1"]`。
+- 列表的第一个元素用 `[0]` 取。两步可以写在一行：`clause_id.split(".")[0]`。
+
+@@ item d1-11
+type: code
+title: 风险标签
+level: 2
+--- prompt
+写 `risk_label(risk)`：
+
+- `"high"` → `"HIGH RISK"`
+- `"medium"` → `"MEDIUM"`
+- `"low"` → `"LOW"`
+- 其他任何值 → `"UNKNOWN"`
+--- starter
+def risk_label(risk):
+    if risk == "high":
+        return "HIGH RISK"
+    # 继续写 elif 和 else
+--- solution
+def risk_label(risk):
+    if risk == "high":
+        return "HIGH RISK"
+    elif risk == "medium":
+        return "MEDIUM"
+    elif risk == "low":
+        return "LOW"
+    else:
+        return "UNKNOWN"
+--- tests
+expect("high", lambda: risk_label("high"), "HIGH RISK")
+expect("medium", lambda: risk_label("medium"), "MEDIUM")
+expect("low", lambda: risk_label("low"), "LOW")
+expect("其他值兜底", lambda: risk_label("urgent"), "UNKNOWN")
+--- hints
+- `elif 条件:` 是「否则如果」，和 `if` 对齐写。
+- 最后用 `else:` 兜底，处理所有其他情况。
+
+@@ item d1-12
+type: fill
+title: 填空：需要人看吗
+level: 1
+--- prompt
+判定不是 `"accept"` 的条款都需要人看。补全空格，让 `needs_attention("accept")` 返回 `False`，其他判定返回 `True`。
+--- template
+def needs_attention(verdict):
+    if verdict [[==]] "accept":
+        return [[False]]
+    return [[True]]
+--- tests
+expect("accept 不用看", lambda: needs_attention("accept"), False)
+expect("flag 要看", lambda: needs_attention("flag"), True)
+expect("redline 要看", lambda: needs_attention("redline"), True)
+--- hints
+- 判断两个值相等用两个等号。
+- `True` 和 `False` 首字母大写，不加引号。
+
+@@ item d1-13
+type: order
+title: 排代码：包含 Section 吗
+level: 1
+--- prompt
+点击代码行，按正确顺序排好，写出 `mentions_section(text)`：文字里有 `"Section"` 就返回 `True`，否则返回 `False`。
+
+有一行是干扰项，用不上。
+--- lines
+def mentions_section(text):
+    if "Section" in text:
+        return True
+    return False
+--- distractors
+    if "Section" = text:
+--- tests
+expect("有 Section", lambda: mentions_section("Subject to Section 12"), True)
+expect("没有 Section", lambda: mentions_section("Fees are payable in 30 days"), False)
+--- hints
+- 函数的第一行永远是 `def ...:`。
+- `=` 是赋值，不能用来比较，所以那一行是干扰项。
+
+@@ item d1-14
+type: code
+title: 加一条编号，不重复
+level: 2
+--- prompt
+写 `add_clause(ids, new_id)`：把 `new_id` 加到列表 `ids` 的末尾；如果它已经在列表里，就不要重复加。最后返回这个列表。
+--- starter
+def add_clause(ids, new_id):
+    pass
+--- solution
+def add_clause(ids, new_id):
+    if new_id not in ids:
+        ids.append(new_id)
+    return ids
+--- tests
+expect("加一个新的", lambda: add_clause(["3.1", "4.2"], "8.1"), ["3.1", "4.2", "8.1"])
+expect("已经有了就不加", lambda: add_clause(["3.1", "4.2"], "3.1"), ["3.1", "4.2"])
+expect("空列表", lambda: add_clause([], "1.1"), ["1.1"])
+--- hints
+- 「不在里面」写成 `new_id not in ids`。
+- `ids.append(new_id)` 会直接修改列表，最后别忘了 `return ids`。
+
+@@ item d1-15
+type: code
+title: 单数还是复数
+level: 2
+--- prompt
+写 `count_text(count, verdict)`：
+
+- `count` 是 1 时返回 `"1 clause: flag"`
+- 其他数字（包括 0）返回 `"3 clauses: flag"` 这样的复数形式
+--- starter
+def count_text(count, verdict):
+    pass
+--- solution
+def count_text(count, verdict):
+    if count == 1:
+        return f"1 clause: {verdict}"
+    return f"{count} clauses: {verdict}"
+--- tests
+expect("1 条", lambda: count_text(1, "flag"), "1 clause: flag")
+expect("3 条", lambda: count_text(3, "redline"), "3 clauses: redline")
+expect("0 条也用复数", lambda: count_text(0, "accept"), "0 clauses: accept")
+--- hints
+- 先用 `if count == 1:` 处理单数，其他情况都走下面的 return。
+- f-string 里数字不用 `str()`：`f"{count} clauses"`。
+
+@@ item d1-16
+type: choice
+title: and 还是 or
+level: 2
+--- prompt
+当 `risk = "medium"`、`verdict = "flag"` 时，哪个表达式的结果是 `True`？
+--- options
+- `risk == "high" and verdict == "flag"`
+- `risk == "high" or verdict == "flag"`
+- `not verdict == "flag"`
+- `risk == "low" or verdict == "accept"`
+answer: 2
+--- explain
+`and` 要求两边都为 True；`or` 只要有一边为 True。这里 `verdict == "flag"` 是 True，所以第二个 `or` 表达式为 True。第一个 `and` 因为 `risk == "high"` 为 False 而整体为 False。
+
+@@ item d1-17
+type: code
+title: 截断长文本
+level: 2
+--- prompt
+界面只显示前 `n` 个字符。写 `shorten(text, n)`：
+
+- 长度不超过 `n`：原样返回
+- 超过 `n`：返回前 `n` 个字符再加 `"..."`
+--- starter
+def shorten(text, n):
+    pass
+--- solution
+def shorten(text, n):
+    if len(text) <= n:
+        return text
+    return text[:n] + "..."
+--- tests
+expect("短文本原样", lambda: shorten("Fees", 10), "Fees")
+expect("长文本截断", lambda: shorten("Cap on Liability", 6), "Cap on...")
+expect("刚好等于 n 不截断", lambda: shorten("abcdef", 6), "abcdef")
+--- hints
+- `len(text)` 取长度，和 `n` 比较。
+- 切片 `text[:n]` 取前 n 个字符（`[:n]` 等于 `[0:n]`）。
+
+@@ item d1-e1
+type: scratch
+title: 闭卷：条款标题
+exam: yes
+level: 1
+--- prompt
+写函数 `clause_title(clause_id, heading)`，返回 `"Clause 8.1 - Cap on Liability"` 这种格式（中间是：空格、短横线、空格）。
+--- solution
+def clause_title(clause_id, heading):
+    return f"Clause {clause_id} - {heading}"
+--- tests
+expect("8.1", lambda: clause_title("8.1", "Cap on Liability"), "Clause 8.1 - Cap on Liability")
+expect("12", lambda: clause_title("12", "Exclusions"), "Clause 12 - Exclusions")
+
+@@ item d1-e2
+type: scratch
+title: 闭卷：判定的颜色
+exam: yes
+level: 2
+--- prompt
+写 `verdict_color(verdict)`：`"accept"` → `"green"`，`"flag"` → `"orange"`，`"redline"` → `"red"`，其他 → `"grey"`。
+
+输入可能带首尾空格或大写（例如 `" Flag "`），也要正确识别。
+--- solution
+def verdict_color(verdict):
+    v = verdict.strip().lower()
+    if v == "accept":
+        return "green"
+    elif v == "flag":
+        return "orange"
+    elif v == "redline":
+        return "red"
+    return "grey"
+--- tests
+expect("accept", lambda: verdict_color("accept"), "green")
+expect("带空格和大写的 flag", lambda: verdict_color(" Flag "), "orange")
+expect("REDLINE", lambda: verdict_color("REDLINE"), "red")
+expect("其他", lambda: verdict_color("maybe"), "grey")
+
+@@ item d1-e3
+type: scratch
+title: 闭卷：首尾两个
+exam: yes
+level: 2
+--- prompt
+写 `ends(ids)`：返回一个新列表，包含 `ids` 的第一个和最后一个元素。
+
+- `ids` 为空时返回 `[]`
+- 只有一个元素时返回 `[那个元素, 那个元素]`
+--- solution
+def ends(ids):
+    if len(ids) == 0:
+        return []
+    return [ids[0], ids[-1]]
+--- tests
+expect("普通列表", lambda: ends(["3.1", "4.2", "8.1"]), ["3.1", "8.1"])
+expect("一个元素", lambda: ends(["12"]), ["12", "12"])
+expect("空列表", lambda: ends([]), [])

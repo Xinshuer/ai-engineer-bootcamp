@@ -1,0 +1,733 @@
+@@ day 5
+title: TypeScript 基础：类型、数组、对象、函数
+lang: ts
+hours: 5 小时
+--- goal
+把前四天的 Python 知识「翻译」成 TypeScript：变量和类型、数组和对象、函数、循环、计数和排序。重点是**读懂类型错误并修好它**，这是 TypeScript 和 Python 最大的不同。很多 AI 团队用的 Mastra 框架就是 TypeScript 写的。
+--- checklist
+- 先清空复习区（Python 的题也要）
+- 读完 8 张知识卡片并改动运行，特意制造一个类型错误看看报什么
+- 练习区全部通过（类型检查也必须干净）
+- 闭卷挑战 3 题
+- 本机：在 `learn` 下新建 `hello.ts`，写 3 行，运行 `npx tsx learn/hello.ts`
+
+@@ concept
+title: 从 Python 到 TypeScript
+--- body
+概念几乎一样，写法不同：
+
+- 变量：`const x = 1`（不会再改）/ `let x = 1`（会改），不用 `=` 裸写
+- 语句末尾一般加 `;`，代码块用 `{ }` 而不是缩进
+- `print(...)` → `console.log(...)`
+- f-string `f"{a}"` → 模板字符串 `` `${a}` ``（反引号）
+- `True` / `False` / `None` → `true` / `false` / `null`、`undefined`
+- `and` / `or` / `not` → `&&` / `||` / `!`
+- 相等用 `===`，不相等用 `!==`
+- 注释 `#` → `//`
+
+本机运行：`npx tsx 文件.ts`；只做类型检查：`npx tsc --noEmit`。本页两件事都会做。
+--- code
+const clauseId = "8.1";
+let count = 3;
+count = count + 1;
+console.log(clauseId, count);
+console.log(`Clause ${clauseId} has ${count} refs`);
+console.log(count > 3 && clauseId.length > 0, !true);
+
+@@ concept
+title: 类型标注和类型错误
+error_demo: yes
+--- body
+`变量: 类型` 声明类型：`let page: number = 3;`。基本类型：`string`、`number`（整数和小数都是它）、`boolean`。
+
+很多时候不用写，TypeScript 会**推断**：`let page = 3` 就是 number。
+
+和 Python 最大的不同：**类型错误在运行之前就被发现**。下面的代码有类型错误，运行后看「类型检查」区域，读懂那句英文：`Type 'string' is not assignable to type 'number'` = 「字符串不能赋给数字类型」。
+
+练习区要求类型检查和测试**都**通过才算过。
+--- code
+let page: number = 3;
+page = "four";
+console.log(page);
+
+@@ concept
+title: 数组、对象和 type
+--- body
+- 数组：`const ids: string[] = ["3.1", "8.1"]`，`ids.length`、`ids[0]`、`ids.push("12")`
+- 对象（相当于 Python 的字典）：`{ id: "8.1", risk: "high" }`，用 `c.id` 读字段
+- 用 `type` 给对象的形状起名字：
+
+```ts
+type Clause = { id: string; verdict: Verdict; risk: "low" | "medium" | "high" };
+```
+
+- `"low" | "medium" | "high"` 叫**联合字面量类型**，就是 Python 里的 `Literal["low", "medium", "high"]`：只能是这几个值之一
+--- code
+type Verdict = "accept" | "flag" | "redline";
+type Clause = { id: string; verdict: Verdict; risk: "low" | "medium" | "high" };
+
+const clauses: Clause[] = [
+  { id: "3.1", verdict: "accept", risk: "low" },
+  { id: "8.1", verdict: "flag", risk: "high" },
+];
+clauses.push({ id: "4.2", verdict: "redline", risk: "medium" });
+console.log(clauses.length, clauses[1].id, clauses[1].risk);
+
+@@ concept
+title: 函数和箭头函数
+--- body
+参数和返回值都标类型：
+
+```ts
+function describe(id: string, heading: string): string {
+  return `${id} ${heading}`;
+}
+```
+
+箭头函数是另一种写法，常用于短小的函数和回调：
+
+```ts
+const isHigh = (risk: string): boolean => risk === "high";
+```
+
+默认参数：`function label(id: string, prefix = "Clause")`。可选参数：`note?: string`（可能是 undefined）。
+--- code
+function describe(id: string, heading: string): string {
+  return `${id} ${heading}`;
+}
+const isHigh = (risk: string): boolean => risk === "high";
+function label(id: string, prefix = "Clause"): string {
+  return `${prefix} ${id}`;
+}
+console.log(describe("8.1", "Cap on Liability"));
+console.log(isHigh("high"), isHigh("low"));
+console.log(label("8.1"), label("8.1", "Section"));
+
+@@ concept
+title: if 和循环
+--- body
+```ts
+if (risk === "high") {
+  ...
+} else if (risk === "medium") {
+  ...
+} else {
+  ...
+}
+```
+
+- 条件要写在圆括号里
+- 遍历数组的值：`for (const c of clauses) { }` （注意是 **of**；`in` 遍历的是下标/键，是常见坑）
+- 按下标：`for (let i = 0; i < ids.length; i++) { }`
+- `while (条件) { }` 和 Python 一样
+--- code
+const risks = ["low", "high", "medium"];
+for (const r of risks) {
+  if (r === "high") {
+    console.log(r, "-> look first");
+  } else {
+    console.log(r);
+  }
+}
+for (let i = 0; i < risks.length; i++) {
+  console.log(i, risks[i]);
+}
+
+@@ concept
+title: 数组方法：map、filter、find
+--- body
+TypeScript 里很少手写「准备空数组 → 循环 → push」，而是用数组方法：
+
+- `filter(c => 条件)` 留下满足条件的，相当于推导式里的 `if`
+- `map(c => 新值)` 把每个元素变成新值，相当于推导式的前半部分
+- `find(c => 条件)` 找第一个，找不到是 `undefined`
+- `includes(x)`、`join(", ")`、`some(...)`、`every(...)`
+
+可以连着写：`clauses.filter(c => c.risk === "high").map(c => c.id)`
+--- code
+type Clause = { id: string; risk: string };
+const clauses: Clause[] = [
+  { id: "3.1", risk: "low" },
+  { id: "8.1", risk: "high" },
+  { id: "10.1", risk: "high" },
+];
+console.log(clauses.filter((c) => c.risk === "high").map((c) => c.id));
+console.log(clauses.find((c) => c.id === "8.1"));
+console.log(clauses.find((c) => c.id === "99"));
+console.log(clauses.map((c) => c.id).join(", "));
+
+@@ concept
+title: Record 和计数
+--- body
+「键是字符串、值是数字」的对象写成 `Record<string, number>`，就是 Python 的 `dict[str, int]`。
+
+计数的标准写法：
+
+```ts
+const counts: Record<string, number> = {};
+for (const v of verdicts) {
+  counts[v] = (counts[v] ?? 0) + 1;
+}
+```
+
+`a ?? b`：a 是 `null` 或 `undefined` 时用 b，相当于 Python 的 `dict.get(key, 0)` 那个默认值。
+--- code
+const verdicts = ["accept", "flag", "accept", "redline"];
+const counts: Record<string, number> = {};
+for (const v of verdicts) {
+  counts[v] = (counts[v] ?? 0) + 1;
+}
+console.log(counts);
+console.log(Object.keys(counts), counts["flag"]);
+
+@@ concept
+title: 排序的两个坑
+--- body
+1. `sort()` **不给比较函数时按字符串排序**：`[10, 9, 1].sort()` 得到 `[1, 10, 9]`
+2. `sort()` **会修改原数组**。不想改原数组，先复制：`[...arr].sort(...)`
+
+比较函数返回负数表示 a 排前面：
+
+```ts
+[...clauses].sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk])
+```
+
+和 Python 的 `sorted` 一样，JavaScript 的 sort 也是稳定的。
+--- code
+const nums = [10, 9, 1];
+console.log([...nums].sort());
+console.log([...nums].sort((a, b) => a - b));
+console.log(nums);
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+const risks = ["low", "high", "medium", "high"];
+console.log([...risks].sort((a, b) => RISK_ORDER[a] - RISK_ORDER[b]));
+
+@@ item d5-01
+type: choice
+title: let 还是 const
+level: 1
+--- prompt
+下面哪段代码会被 TypeScript 报错？
+--- options
+- `let count = 1; count = 2;`
+- `const count = 1; count = 2;`
+- `const ids = ["3.1"]; ids.push("8.1");`
+- `let name = "8.1"; name = "4.2";`
+answer: 2
+--- explain
+`const` 表示这个名字不能再指向别的值（TS2588：Cannot assign to 'count' because it is a constant）。第三个选项没问题：`ids` 还是那个数组，只是往里加了元素。经验规则：默认用 `const`，确实要重新赋值时才用 `let`。
+
+@@ item d5-02
+type: predict
+title: 模板字符串和数组
+level: 1
+--- prompt
+写出输出。`console.log` 打印数组时的格式和 Python 不一样：`[ '3.1', '4.2' ]`（单引号、括号内有空格）。
+--- code
+const ids = ["3.1", "4.2", "8.1"];
+const heading = "Cap on Liability";
+console.log(ids.length, ids[0]);
+console.log(`8.1 ${heading}`);
+console.log(ids);
+console.log(heading.toUpperCase(), heading.includes("Cap"));
+
+@@ item d5-03
+type: code
+title: 拼一行描述（TS 版）
+level: 1
+--- prompt
+写 `describe(id, heading, verdict)`，返回 `"8.1 Cap on Liability: flag"`。和第 1 天那题一样，这次用 TypeScript。
+--- starter
+type Verdict = "accept" | "flag" | "redline";
+
+function describe(id: string, heading: string, verdict: Verdict): string {
+  // 用模板字符串（反引号）拼出结果
+  return "";
+}
+--- solution
+type Verdict = "accept" | "flag" | "redline";
+
+function describe(id: string, heading: string, verdict: Verdict): string {
+  return `${id} ${heading}: ${verdict}`;
+}
+--- tests
+expect("8.1", () => describe("8.1", "Cap on Liability", "flag"), "8.1 Cap on Liability: flag");
+expect("4.2", () => describe("4.2", "Automatic Renewal", "redline"), "4.2 Automatic Renewal: redline");
+--- hints
+- 模板字符串用反引号 `` ` ``，变量写成 `${变量}`。
+
+@@ item d5-04
+type: code
+title: 是不是高风险（TS 版）
+level: 1
+--- prompt
+写 `isHigh(risk)`：`risk` 是 `"high"` 时返回 `true`，否则 `false`。参数和返回值都要标类型。
+--- starter
+function isHigh(risk: string): boolean {
+  return false;
+}
+--- solution
+function isHigh(risk: string): boolean {
+  return risk === "high";
+}
+--- tests
+expect("high", () => isHigh("high"), true);
+expect("low", () => isHigh("low"), false);
+expect("HIGH 不算", () => isHigh("HIGH"), false);
+--- hints
+- 用三个等号 `===` 比较。
+
+@@ item d5-05
+type: code
+title: 取章节号（TS 版）
+level: 1
+--- prompt
+写 `sectionOf(id)`：`"8.1"` → `"8"`，`"12"` → `"12"`，`"10.2.1"` → `"10"`。
+--- starter
+function sectionOf(id: string): string {
+  return id;
+}
+--- solution
+function sectionOf(id: string): string {
+  return id.split(".")[0];
+}
+--- tests
+expect("8.1", () => sectionOf("8.1"), "8");
+expect("12", () => sectionOf("12"), "12");
+expect("10.2.1", () => sectionOf("10.2.1"), "10");
+--- hints
+- 和 Python 一样有 `split`，取第一个用 `[0]`。
+
+@@ item d5-06
+type: translate
+title: 翻译：统计每种判定
+level: 2
+--- prompt
+把上面的 Python 函数翻译成 TypeScript 的 `countVerdicts`。返回类型是 `Record<string, number>`。
+--- source
+def count_verdicts(verdicts):
+    counts = {}
+    for v in verdicts:
+        counts[v] = counts.get(v, 0) + 1
+    return counts
+--- starter
+function countVerdicts(verdicts: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  return counts;
+}
+--- solution
+function countVerdicts(verdicts: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const v of verdicts) {
+    counts[v] = (counts[v] ?? 0) + 1;
+  }
+  return counts;
+}
+--- tests
+expect("基本", () => countVerdicts(["accept", "flag", "accept"]), { accept: 2, flag: 1 });
+expect("空", () => countVerdicts([]), {});
+--- hints
+- `for (const v of verdicts) { ... }`
+- `counts.get(v, 0)` 对应 `(counts[v] ?? 0)`。
+
+@@ item d5-07
+type: code
+title: 高风险编号（filter + map）
+level: 2
+--- prompt
+写 `highRiskIds(clauses)`：返回 `risk` 为 `"high"` 的条款编号数组，保持原顺序。试着用 `filter` 和 `map` 一行写完。
+--- starter
+type Clause = { id: string; risk: "low" | "medium" | "high" };
+
+function highRiskIds(clauses: Clause[]): string[] {
+  return [];
+}
+--- solution
+type Clause = { id: string; risk: "low" | "medium" | "high" };
+
+function highRiskIds(clauses: Clause[]): string[] {
+  return clauses.filter((c) => c.risk === "high").map((c) => c.id);
+}
+--- tests
+const DATA: Clause[] = [
+  { id: "3.1", risk: "low" },
+  { id: "8.1", risk: "high" },
+  { id: "4.2", risk: "medium" },
+  { id: "10.1", risk: "high" },
+];
+expect("两条", () => highRiskIds(DATA), ["8.1", "10.1"]);
+expect("没有", () => highRiskIds([{ id: "1", risk: "low" }]), []);
+--- hints
+- `clauses.filter((c) => 条件)` 留下高风险的。
+- 再 `.map((c) => c.id)` 变成编号。
+
+@@ item d5-08
+type: fix
+title: 修类型错误
+level: 2
+--- prompt
+这段代码有两处类型错误（运行后看「类型检查」区域）。修好它们，并让 `needsAttention` 在判定不是 `accept` 时返回 `true`。
+--- starter
+type Verdict = "accept" | "flag" | "redline";
+type Clause = { id: string; verdict: Verdict; risk: "low" | "medium" | "high" };
+
+const example: Clause = { id: "8.1", verdict: "maybe", risk: "high" };
+
+function needsAttention(c: Clause): boolean {
+  return c.verdict;
+}
+--- solution
+type Verdict = "accept" | "flag" | "redline";
+type Clause = { id: string; verdict: Verdict; risk: "low" | "medium" | "high" };
+
+const example: Clause = { id: "8.1", verdict: "flag", risk: "high" };
+
+function needsAttention(c: Clause): boolean {
+  return c.verdict !== "accept";
+}
+--- tests
+expect("flag 要看", () => needsAttention({ id: "1", verdict: "flag", risk: "low" }), true);
+expect("accept 不用看", () => needsAttention({ id: "2", verdict: "accept", risk: "low" }), false);
+expect("example 合法", () => example.verdict, "flag");
+--- hints
+- 第一处：`"maybe"` 不在 Verdict 允许的值里，换成一个合法的。
+- 第二处：函数声明返回 boolean，却返回了字符串。要返回一个比较的结果。
+
+@@ item d5-09
+type: predict
+title: sort 的两个坑
+level: 2
+--- prompt
+写出输出。回忆知识卡片里的两个坑。
+--- code
+const nums = [10, 9, 1];
+console.log([...nums].sort());
+console.log([...nums].sort((a, b) => a - b));
+console.log(nums);
+const ids = ["10.1", "3.1", "8.1"];
+console.log(ids.sort());
+
+@@ item d5-10
+type: code
+title: 按风险排序（TS 版）
+level: 3
+--- prompt
+写 `attentionOrder(clauses)`：返回编号数组，`high` 在前、`medium` 其次、`low` 最后，同级保持原顺序。**不要修改传进来的数组。**
+--- starter
+type Clause = { id: string; risk: "low" | "medium" | "high" };
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+function attentionOrder(clauses: Clause[]): string[] {
+  return [];
+}
+--- solution
+type Clause = { id: string; risk: "low" | "medium" | "high" };
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+function attentionOrder(clauses: Clause[]): string[] {
+  return [...clauses].sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk]).map((c) => c.id);
+}
+--- tests
+const DATA: Clause[] = [
+  { id: "3.1", risk: "low" },
+  { id: "8.1", risk: "high" },
+  { id: "4.2", risk: "medium" },
+  { id: "10.1", risk: "high" },
+];
+expect("排序", () => attentionOrder(DATA), ["8.1", "10.1", "4.2", "3.1"]);
+expect("原数组没被改", () => (attentionOrder(DATA), DATA.map((c) => c.id)), ["3.1", "8.1", "4.2", "10.1"]);
+--- hints
+- 先复制 `[...clauses]` 再 `sort`，比较函数用 `RISK_ORDER[a.risk] - RISK_ORDER[b.risk]`。
+- 最后 `.map((c) => c.id)`。
+
+@@ item d5-11
+type: order
+title: 排代码：数高风险（TS 版）
+level: 2
+--- prompt
+排出 `countHigh`。有两行干扰项，想想它们错在哪。
+--- lines
+type Clause = { id: string; risk: string };
+function countHigh(clauses: Clause[]): number {
+  let total = 0;
+  for (const c of clauses) {
+    if (c.risk === "high") {
+      total += 1;
+    }
+  }
+  return total;
+}
+--- distractors
+  const total = 0;
+  for (const c in clauses) {
+--- tests
+expect("两条", () => countHigh([{ id: "1", risk: "high" }, { id: "2", risk: "low" }, { id: "3", risk: "high" }]), 2);
+expect("零条", () => countHigh([]), 0);
+--- hints
+- `total` 后面要被 `+= 1` 修改，所以不能用 const。
+- 遍历数组的值用 `of`；`in` 拿到的是下标字符串。
+
+@@ item d5-12
+type: code
+title: 单数还是复数（TS 版）
+level: 1
+--- prompt
+写 `countText(count, verdict)`：`count` 为 1 返回 `"1 clause: flag"`，否则返回 `"3 clauses: flag"`（0 也用复数）。
+--- starter
+function countText(count: number, verdict: string): string {
+  return "";
+}
+--- solution
+function countText(count: number, verdict: string): string {
+  if (count === 1) {
+    return `1 clause: ${verdict}`;
+  }
+  return `${count} clauses: ${verdict}`;
+}
+--- tests
+expect("1", () => countText(1, "flag"), "1 clause: flag");
+expect("3", () => countText(3, "redline"), "3 clauses: redline");
+expect("0", () => countText(0, "accept"), "0 clauses: accept");
+--- hints
+- 也可以用三元表达式：`count === 1 ? "clause" : "clauses"`。
+
+@@ item d5-13
+type: code
+title: 找条款（find）
+level: 2
+--- prompt
+写 `findClause(clauses, id)`：返回编号等于 `id` 的条款；找不到返回 `undefined`。注意返回类型怎么写。
+--- starter
+type Clause = { id: string; risk: string };
+
+function findClause(clauses: Clause[], id: string): Clause | undefined {
+  return undefined;
+}
+--- solution
+type Clause = { id: string; risk: string };
+
+function findClause(clauses: Clause[], id: string): Clause | undefined {
+  return clauses.find((c) => c.id === id);
+}
+--- tests
+const DATA: Clause[] = [{ id: "3.1", risk: "low" }, { id: "8.1", risk: "high" }];
+expect("找到", () => findClause(DATA, "8.1"), { id: "8.1", risk: "high" });
+expect("找不到", () => findClause(DATA, "99"), undefined);
+--- hints
+- 数组的 `find` 方法找不到时本来就返回 `undefined`。
+
+@@ item d5-14
+type: choice
+title: == 和 ===
+level: 1
+--- prompt
+为什么 TypeScript / JavaScript 里推荐用 `===` 而不是 `==`？
+--- options
+- `===` 运行更快
+- `==` 会先做类型转换再比较，比如 `"1" == 1` 为 true，容易出意外；`===` 不转换
+- `==` 已经被删除了
+- 两者完全一样，只是风格
+answer: 2
+--- explain
+`==` 会在比较前偷偷转换类型：`"1" == 1`、`0 == ""`、`null == undefined` 都是 true。`===` 要求类型和值都相同，行为和 Python 的 `==` 一致。一律用 `===` 和 `!==`。
+
+@@ item d5-15
+type: translate
+title: 翻译：按主题分组
+level: 3
+--- prompt
+把 Python 的 `group_by_topic` 翻译成 TypeScript 的 `groupByTopic`。
+--- source
+def group_by_topic(clauses):
+    groups = {}
+    for c in clauses:
+        if c["topic"] not in groups:
+            groups[c["topic"]] = []
+        groups[c["topic"]].append(c["id"])
+    return groups
+--- starter
+type Clause = { id: string; topic: string };
+
+function groupByTopic(clauses: Clause[]): Record<string, string[]> {
+  const groups: Record<string, string[]> = {};
+  return groups;
+}
+--- solution
+type Clause = { id: string; topic: string };
+
+function groupByTopic(clauses: Clause[]): Record<string, string[]> {
+  const groups: Record<string, string[]> = {};
+  for (const c of clauses) {
+    if (!(c.topic in groups)) {
+      groups[c.topic] = [];
+    }
+    groups[c.topic].push(c.id);
+  }
+  return groups;
+}
+--- tests
+const DATA: Clause[] = [
+  { id: "3.1", topic: "payment" },
+  { id: "8.1", topic: "liability_cap" },
+  { id: "3.2", topic: "payment" },
+];
+expect("两组", () => groupByTopic(DATA), { payment: ["3.1", "3.2"], liability_cap: ["8.1"] });
+expect("空", () => groupByTopic([]), {});
+--- hints
+- 「键不在对象里」：`!(c.topic in groups)`，或者 `groups[c.topic] === undefined`。
+- Python 的 `append` 对应 `push`。
+
+@@ item d5-16
+type: fill
+title: 填空：TS 计数模板
+level: 1
+--- prompt
+补全计数函数。
+--- template
+function countRisks(risks: string[]): [[Record]]<string, number> {
+  const counts: Record<string, number> = {};
+  for (const r [[of]] risks) {
+    counts[r] = (counts[r] [[??]] 0) + 1;
+  }
+  return counts;
+}
+--- tests
+expect("基本", () => countRisks(["high", "low", "high"]), { high: 2, low: 1 });
+expect("空", () => countRisks([]), {});
+--- hints
+- 「键是字符串、值是数字」的对象类型叫什么？
+- 遍历数组的值用哪个关键字？「为空时用默认值」是哪个运算符？
+
+@@ item d5-17
+type: code
+title: 清洗模型输出（TS 版）
+level: 1
+--- prompt
+写 `normalize(text)`：去掉首尾空白，转成小写。
+--- starter
+function normalize(text: string): string {
+  return text;
+}
+--- solution
+function normalize(text: string): string {
+  return text.trim().toLowerCase();
+}
+--- tests
+expect("空格和换行", () => normalize("  REDLINE\n"), "redline");
+expect("大小写", () => normalize("Accept"), "accept");
+--- hints
+- Python 的 `strip()` 在 TS 里叫 `trim()`，`lower()` 叫 `toLowerCase()`。
+
+@@ item d5-18
+type: code
+title: 默认参数（TS 版）
+level: 1
+--- prompt
+写 `label(id, prefix)`：`prefix` 不传时默认 `"Clause"`。`label("8.1")` → `"Clause 8.1"`，`label("8.1", "Section")` → `"Section 8.1"`。
+--- starter
+function label(id: string): string {
+  return "";
+}
+--- solution
+function label(id: string, prefix = "Clause"): string {
+  return `${prefix} ${id}`;
+}
+--- tests
+expect("默认", () => label("8.1"), "Clause 8.1");
+expect("自定义", () => label("8.1", "Section"), "Section 8.1");
+--- hints
+- 默认参数写法和 Python 很像：`prefix = "Clause"`，类型会自动推断成 string。
+
+@@ item d5-19
+type: predict
+title: 真假值和 ??
+level: 2
+--- prompt
+写出输出。`||` 在左边是「假值」（`0`、`""`、`null`、`undefined`、`false`）时取右边；`??` 只在左边是 `null` / `undefined` 时取右边。
+--- code
+const note: string | undefined = undefined;
+const zero: number = 0;
+const empty: string = "";
+console.log(note ?? "no note");
+console.log(zero || 5, zero ?? 5);
+console.log(empty || "empty", JSON.stringify(empty ?? "empty"));
+
+@@ item d5-20
+type: code
+title: 拼接编号
+level: 1
+--- prompt
+写 `joinIds(ids)`：返回 `"3.1, 4.2, 8.1"` 这样用逗号加空格连接的字符串；数组为空时返回 `"(none)"`。
+--- starter
+function joinIds(ids: string[]): string {
+  return "";
+}
+--- solution
+function joinIds(ids: string[]): string {
+  if (ids.length === 0) {
+    return "(none)";
+  }
+  return ids.join(", ");
+}
+--- tests
+expect("三个", () => joinIds(["3.1", "4.2", "8.1"]), "3.1, 4.2, 8.1");
+expect("一个", () => joinIds(["12"]), "12");
+expect("空", () => joinIds([]), "(none)");
+--- hints
+- 数组的 `join(", ")` 方法。
+
+@@ item d5-e1
+type: scratch
+title: 闭卷：条款标题（TS）
+exam: yes
+level: 1
+--- prompt
+写 `clauseTitle(id, heading)`，返回 `"Clause 8.1 - Cap on Liability"`。参数和返回值都要标类型。
+--- solution
+function clauseTitle(id: string, heading: string): string {
+  return `Clause ${id} - ${heading}`;
+}
+--- tests
+expect("8.1", () => clauseTitle("8.1", "Cap on Liability"), "Clause 8.1 - Cap on Liability");
+expect("12", () => clauseTitle("12", "Exclusions"), "Clause 12 - Exclusions");
+
+@@ item d5-e2
+type: scratch
+title: 闭卷：三档风险计数（TS）
+exam: yes
+level: 2
+--- prompt
+写 `riskCounts(clauses)`：`clauses` 的每个元素有 `risk: string`。返回 `{ high: 数量, medium: 数量, low: 数量 }`，三个键都要有，其他值忽略。
+--- solution
+function riskCounts(clauses: { risk: string }[]): Record<string, number> {
+  const counts: Record<string, number> = { high: 0, medium: 0, low: 0 };
+  for (const c of clauses) {
+    if (c.risk in counts) {
+      counts[c.risk] += 1;
+    }
+  }
+  return counts;
+}
+--- tests
+expect("混合", () => riskCounts([{ risk: "high" }, { risk: "low" }, { risk: "high" }]), { high: 2, medium: 0, low: 1 });
+expect("空", () => riskCounts([]), { high: 0, medium: 0, low: 0 });
+expect("忽略未知", () => riskCounts([{ risk: "urgent" }]), { high: 0, medium: 0, low: 0 });
+
+@@ item d5-e3
+type: scratch
+title: 闭卷：截断文本（TS）
+exam: yes
+level: 2
+--- prompt
+写 `shorten(text, n)`：长度不超过 `n` 原样返回；超过则返回前 `n` 个字符加 `"..."`。
+--- solution
+function shorten(text: string, n: number): string {
+  if (text.length <= n) {
+    return text;
+  }
+  return text.slice(0, n) + "...";
+}
+--- tests
+expect("短", () => shorten("Fees", 10), "Fees");
+expect("长", () => shorten("Cap on Liability", 6), "Cap on...");
+expect("刚好", () => shorten("abcdef", 6), "abcdef");
