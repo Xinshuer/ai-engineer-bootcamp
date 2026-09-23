@@ -52,7 +52,7 @@ Progress is kept in the browser (localStorage, written as soon as the tab is hid
 
 <a id="中文"></a>
 
-# 编程营网站的源码
+# 训练营网站的源码
 
 [English](#the-practice-site) · **中文**
 

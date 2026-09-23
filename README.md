@@ -1,4 +1,4 @@
-# Clause Check Bootcamp
+# AI Engineer Bootcamp
 
 **English** · [中文](#中文)
 
@@ -25,9 +25,9 @@ Week 5 runs the real LangChain and LangGraph libraries in the browser. Exercises
 
 <a id="中文"></a>
 
-# Clause Check 编程营
+# AI 工程师训练营
 
-[English](#clause-check-bootcamp) · **中文**
+[English](#ai-engineer-bootcamp) · **中文**
 
 35 天的练习课：通过一个真实项目 [Clause Check](https://github.com/Xinshuer/Contract-Clause-Reviewer)（用大模型逐条审查合同条款的程序）学 Python、TypeScript、SQL、云服务基础和 LangChain / LangGraph。每道练习题都是这个项目里的一小块。网站有中文和英文两个版本，页面右上角切换。
 

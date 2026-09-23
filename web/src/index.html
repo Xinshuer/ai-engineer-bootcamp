@@ -1,4 +1,4 @@
-<title>Clause Check 编程营</title>
+<title>AI 工程师训练营</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
@@ -298,7 +298,7 @@ details.schema[open] > summary { margin-bottom: 8px; }
 </style>
 
 <header class="topbar">
-  <div class="brand">Clause Check 编程营 <small>Python · TypeScript · 三周手写</small></div>
+  <div class="brand">AI 工程师训练营 <small>围绕 Clause Check 项目</small></div>
   <div class="meter" title="掌握 = 通过，并且没有进复习区"><span>已掌握</span><div class="bar"><i id="meterFill" style="width:0%"></i></div><b id="meterText">0 / 0</b></div>
   <div class="spacer"></div>
   <div class="chips">
@@ -499,8 +499,8 @@ let saveTimer = null;
 const PY_LANG_LINE = UI_LANG === "en" ? '\n_CC_LANG = "en"\n' : "";
 function applyChrome() {
   document.documentElement.lang = UI_LANG === "en" ? "en" : "zh-CN";
-  document.title = tr("Clause Check 编程营", "Clause Check Bootcamp");
-  $(".brand").replaceChildren(tr("Clause Check 编程营", "Clause Check Bootcamp") + " ", h("small", {}, "Python · TypeScript · SQL · LangChain"));
+  document.title = tr("AI 工程师训练营", "AI Engineer Bootcamp");
+  $(".brand").replaceChildren(tr("AI 工程师训练营", "AI Engineer Bootcamp") + " ", h("small", {}, tr("围绕 Clause Check 项目", "built around Clause Check")));
   const meter = $(".meter");
   meter.title = tr("掌握 = 通过，并且没有进复习区", "Mastered = solved and not in Review");
   meter.querySelector("span").textContent = tr("已掌握", "Mastered");
@@ -924,7 +924,7 @@ function makeEditor(host, { value, lang, exam, onRun, onChange, minHeight }) {
 // ---------------------------------------------------------------- local file export
 function sqlFile(item, code) {
   const py = (s) => JSON.stringify(s);   // a JSON string is also a valid Python string literal
-  return `# ${item.title} ${tr("—— 从 Clause Check 编程营导出", "— exported from Clause Check Bootcamp")}
+  return `# ${item.title} ${tr("—— 从 AI 工程师训练营导出", "— exported from AI Engineer Bootcamp")}
 # ${tr("运行", "Run")}: python ${item.id}.py        ${tr("（Python 自带 sqlite3，不用安装任何东西）", "(Python ships with sqlite3, nothing to install)")}
 ${item.bq ? tr("# 注意：本页在 SQLite 上模拟了几个 BigQuery 写法（反引号表名、SAFE_DIVIDE、COUNTIF、DATE_TRUNC……），本机的 SQLite 没有它们。\n", "# Note: the page simulates a few BigQuery forms on SQLite (backtick table names, SAFE_DIVIDE, COUNTIF, DATE_TRUNC, ...); SQLite on your computer does not have them.\n") : ""}import sqlite3
 
@@ -976,7 +976,7 @@ function localFile(item, code) {
   if (item.lang === "sql") return sqlFile(item, code);
   if (item.lang === "py") {
     if (item.type === "testwrite") return testwriteFile(item, code);
-    const prelude = `# ${item.title} ${tr("—— 从 Clause Check 编程营导出", "— exported from Clause Check Bootcamp")}
+    const prelude = `# ${item.title} ${tr("—— 从 AI 工程师训练营导出", "— exported from AI Engineer Bootcamp")}
 # ${tr("运行", "Run")}: python ${item.id}.py
 import io, sys
 _passed = _total = 0
@@ -1008,7 +1008,7 @@ def expect_output(label, fn, expected):
   const imports = (code.match(/^import .*$/gm) || []).join("\n");
   const body = code.replace(/^import .*$/gm, "");
   return `${imports}
-// ${item.title} ${tr("—— 从 Clause Check 编程营导出", "— exported from Clause Check Bootcamp")}
+// ${item.title} ${tr("—— 从 AI 工程师训练营导出", "— exported from AI Engineer Bootcamp")}
 // ${tr("运行", "Run")}: npx tsx ${item.id}.ts      ${tr("（需要先 npm install zod 才能用 zod）", "(npm install zod first if it uses zod)")}
 let _passed = 0, _total = 0;
 const _pending: Promise<void>[] = [];
@@ -1031,7 +1031,7 @@ Promise.all(_pending).then(() => console.log(\`\\n\${_passed}/\${_total} ${tr("�
 `;
 }
 function testwriteFile(item, code) {
-  return `# ${item.title} ${tr("—— 从 Clause Check 编程营导出", "— exported from Clause Check Bootcamp")}
+  return `# ${item.title} ${tr("—— 从 AI 工程师训练营导出", "— exported from AI Engineer Bootcamp")}
 # ${tr("运行", "Run")}: python -m pytest ${item.id}.py        ${tr("（需要 pip install pytest）", "(needs pip install pytest)")}
 ${item.langchain ? tr("#   先安装真正的 LangChain：", "#   install the real LangChain first: ") + LC_INSTALL + "\n" : ""}#   ${tr("或", "or")}: python ${item.id}.py                ${tr("（不用 pytest 也能跑，但不能 import pytest）", "(runs without pytest too, but then it cannot import pytest)")}
 
