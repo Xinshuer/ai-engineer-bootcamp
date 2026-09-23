@@ -328,7 +328,7 @@ for i, cid in enumerate(ids, 1):
 print(list(zip(ids, verdicts)))
 print(dict(zip(ids, verdicts)))
 --- explain
-`enumerate(ids, 1)` 从 1 开始数。`zip` 在短的列表用完时就停了，`10.1` 被**悄悄丢掉**，没有任何报错。在 Clause Check 里如果模型少返回了一条判定，这样配对会让一条条款无声无息地消失，所以下一题要自己检查长度。
+`enumerate(ids, 1)` 从 1 开始数。`zip` 在短的列表用完时就停了，`10.1` 被**悄悄丢掉**，没有任何报错。在 Clause Check 里如果模型少返回了一条判定，这样配对会让一条条款无声无息地消失，所以后面有一题要你自己检查长度。
 
 @@ item d8-04
 type: code

@@ -1,0 +1,1456 @@
+@@ day 27
+title: Deployment and serverless: Lambda, Cloud Run, Docker, queues, managed models
+lang: py
+langs: Python + TypeScript
+hours: 5 hours
+--- goal
+Turn Clause Check into a service you can deploy: read and write a Dockerfile, and know what Cloud Run and Lambda are each good for; write a Lambda HTTP entry point in Python and in TypeScript; write a queue worker that stays correct under at-least-once delivery (delete only after success, deduplicate by key); call managed models with Bedrock's `converse` and with Gemini on Vertex AI (retries, JSON, validation, token counts); write structured logs; and finally walk through a deployment with a launch checklist. This matches the project's `clausecheck/api.py` and `config.py`.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, change the examples and run them
+- Pass every practice exercise (the local task is optional)
+- The 3 closed-book challenges
+- With the launch checklist on card 8 in front of you, spend two minutes explaining out loud "how Clause Check is deployed to GCP", then do the AWS version
+
+@@ concept
+title: From script to service: statelessness, environment variables, health checks
+--- body
+So far, Clause Check has mostly been a command-line tool: you run it in a terminal, it reviews one contract and exits. For people at a law firm to use it on a web page, it has to become a **service**: always online, taking requests over HTTP. The project already has one: `clausecheck/api.py` is a FastAPI app; `GET /health` answers "I'm still alive", and `POST /review` takes an uploaded contract and returns the report as JSON.
+
+Before a service goes to the cloud, it has to meet three conditions:
+
+- **Stateless**: the cloud runs several copies (instances) at once, and it can shut one down and swap in a new one at any time. So requests can't pass things to each other through memory: whatever must be remembered goes into a bucket, a database or a queue
+- **Configuration comes from environment variables**: `Settings` in `config.py` reads everything with `os.getenv`; the `load_dotenv` it calls does nothing when it can't find `.env`, so the same code reads `.env` on your computer and the environment variables set by the platform in the cloud. The model name is configuration too: `config.py` uses `deepseek-flash` by default; to switch to `deepseek-v4-pro` when you deploy, set the environment variable `CLAUSECHECK_DEEPSEEK_MODEL`, with no code change (if you change the model, `PRICES` must have its unit prices; see the cost card on Day 28)
+- **Health checks**: the platform regularly calls an address like `/health`, and unhealthy instances get replaced
+
+The code below simulates two instances, to show why "keeping it in memory" goes wrong in the cloud.
+--- code
+class Instance:
+    """One copy of the service. The cloud may run several and replace them at any time."""
+
+    def __init__(self, name):
+        self.name = name
+        self.reviewed = []                       # in memory: gone when the instance goes away
+
+    def handle(self, contract_id, store):
+        self.reviewed.append(contract_id)
+        store.setdefault("reviewed", []).append(contract_id)   # shared: a bucket or a database
+        return f"{self.name} reviewed {contract_id}"
+
+store = {}
+a, b = Instance("instance-a"), Instance("instance-b")
+print(a.handle(101, store))
+print(b.handle(102, store))
+print(a.handle(103, store))
+print("instance-a remembers:", a.reviewed)
+print("instance-b remembers:", b.reviewed)
+a = Instance("instance-a2")                      # the platform replaced instance-a
+print("after the restart:", a.reviewed)
+print("the shared store:", store["reviewed"])
+
+@@ concept
+title: Docker: images, containers, and layer caching
+--- body
+A cloud platform doesn't care which language you use. What it wants is a **container image**: your code, Python and the dependency packages packed into one bundle that runs the same on any machine (the "but it works on my computer" problem goes away).
+
+- **Image**: the packed bundle, read-only; **container**: one running instance of an image
+- **Dockerfile**: the list of packing steps. Each step produces a **layer**. When you rebuild, layers that haven't changed come straight from the cache; once one layer changes, **every layer after it is rebuilt**
+
+Clause Check's Dockerfile looks roughly like this:
+
+```
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec uvicorn clausecheck.api:app --host 0.0.0.0 --port ${PORT:-8080}
+```
+
+- Copy only `requirements.txt` first and install the dependencies, **then** copy the code: most of the time you only change code, so the dependency layer keeps coming from the cache (run the code below to compare)
+- `--host 0.0.0.0`: by default uvicorn listens only on `127.0.0.1`, which can't be reached from outside the container. `${PORT:-8080}`: use the port the platform gives, or 8080 if there is none. `exec` lets uvicorn receive the platform's stop signal directly
+- `PYTHONUNBUFFERED=1`: logs from `print` come out right away instead of waiting in a buffer
+- `.dockerignore` lists the files that stay out of the image: `.env` (secrets), `.git`, reports and caches
+- On your computer: `docker build -t clausecheck-api .`, then `docker run -p 8080:8080 -e PORT=8080 clausecheck-api`
+--- code
+def rebuild(steps, changed):
+    """Docker re-runs the first step whose inputs changed, and every step after it."""
+    out, dirty = [], False
+    for step, inputs in steps:
+        dirty = dirty or any(f in changed for f in inputs)
+        out.append(("REBUILD " if dirty else "cached  ") + step)
+    return out
+
+CODE = ["requirements.txt", "clausecheck/api.py", "clausecheck/review.py"]
+GOOD = [
+    ("FROM python:3.12-slim", []),
+    ("COPY requirements.txt .", ["requirements.txt"]),
+    ("RUN pip install -r requirements.txt   (~2 min)", []),
+    ("COPY . .", CODE),
+]
+BAD = [
+    ("FROM python:3.12-slim", []),
+    ("COPY . .", CODE),
+    ("RUN pip install -r requirements.txt   (~2 min)", []),
+]
+for name, steps in [("good order", GOOD), ("bad order", BAD)]:
+    print(f"{name}, you edited review.py:")
+    for line in rebuild(steps, {"clausecheck/review.py"}):
+        print("  " + line)
+
+@@ concept
+title: Cloud Run: run your container, scale with requests
+--- body
+**Cloud Run** (GCP) runs your container image and handles HTTPS, machines and scaling for you. On AWS, the counterpart for running containers is ECS on Fargate (App Runner, common in older material, stopped accepting new customers at the end of April 2026, and AWS recommends moving to ECS Express Mode); Lambda is a different approach (next card). You only have to follow one rule: **listen on the port given by the environment variable `PORT`** (8080 by default), on the address `0.0.0.0`.
+
+- **Scaling**: with no requests it can scale down to 0 instances (costing nothing); with more requests it adds instances automatically. `--max-instances` sets a ceiling, so a traffic spike doesn't turn into a bill spike
+- **Concurrency**: one instance handles several requests at the same time (80 by default with 1 vCPU, and up to 1000). LLM calls spend most of their time waiting on the network, so high concurrency pays off
+- **Cold start**: going from 0 to the first running instance makes the first requests wait a few extra seconds (longer when importing big packages like langgraph). `--min-instances 1` keeps one instance always on, at the cost of always paying for it
+- **Request timeout**: 5 minutes by default, up to 60 minutes (the numbers when this lesson was written; the official docs have the final word)
+- With the default settings, **CPU is given only while a request is being handled**: work that keeps running in the background after the response is sent can't be relied on
+
+You only need to be able to read the deploy command (`--set-secrets` injects secrets from Secret Manager as environment variables):
+
+```
+gcloud run deploy clausecheck-api --source . --region europe-north1 \
+  --service-account clausecheck-api@clausecheck-dev.iam.gserviceaccount.com \
+  --set-secrets DEEPSEEK_API_KEY=deepseek-api-key:latest \
+  --max-instances 5 --no-allow-unauthenticated
+```
+--- code
+import math
+import os
+
+port = int(os.environ.get("PORT", "8080"))
+print(f"uvicorn clausecheck.api:app --host 0.0.0.0 --port {port}")
+
+def instances_needed(requests_per_second, seconds_per_request, concurrency=80):
+    in_flight = requests_per_second * seconds_per_request     # requests being handled at the same moment
+    return math.ceil(in_flight / concurrency)
+
+print(instances_needed(2, 6))                    # 2 clause reviews per second, 6 s each (mostly waiting for the LLM)
+print(instances_needed(50, 6))
+print(instances_needed(50, 6, concurrency=1))    # one request per instance: many more instances
+
+@@ concept
+title: AWS Lambda: one event, one function call
+--- body
+**Lambda** doesn't run an always-on service. It runs **a function**: an event comes in, and the function is called once. The Python entry point looks like this:
+
+```python
+def lambda_handler(event, context):
+    return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps({...})}
+```
+
+- `event` is a dictionary whose shape depends on the service that triggered it: an S3 upload, an SQS message, an HTTP request forwarded by API Gateway…
+- The event from API Gateway (the proxy integration of a REST API) has `httpMethod`, `path`, `headers` and `body`. **`body` is a string** (or possibly `None`), and you `json.loads` it yourself; when `isBase64Encoded` is true, you base64-decode it first. The newer event format of HTTP APIs uses different field names; check the docs
+- The `body` in the return value **must be a string too**: `json.dumps(...)`, not a dictionary
+- The timeout is 3 seconds by default and 15 minutes at most; you pay per call and per run time (multiplied by the memory size); it has cold starts too
+- HTTP requests through API Gateway have their own limit: a REST API waits at most **29 seconds** by default (check the official docs). So the HTTP entry point only does fast things and hands slow work to a queue (next card)
+- Code at the top level of the module (imports, creating clients, reading secrets) runs only once per instance, and later calls reuse it: keep clients and caches outside the function
+
+In TypeScript (the Node.js runtime) it is written `export const handler = async (event) => { ... }` and returns an object of the same shape.
+--- code
+import json
+
+def lambda_handler(event, context):
+    body = json.loads(event.get("body") or "{}")
+    clause_id = body.get("clause_id", "unknown")
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"clause_id": clause_id, "verdict": "flag"}),
+    }
+
+event = {
+    "httpMethod": "POST",
+    "path": "/review",
+    "headers": {"Content-Type": "application/json"},
+    "body": '{"clause_id": "8.1", "text": "Liability is unlimited."}',
+    "isBase64Encoded": False,
+}
+resp = lambda_handler(event, None)
+print(resp["statusCode"], type(resp["body"]).__name__)
+print(resp["body"])
+print(json.loads(resp["body"])["verdict"])
+
+@@ concept
+title: Events and queues: at-least-once delivery
+cloud: yes
+--- body
+Reviewing a contract takes several minutes, so the upload request can't be kept waiting. The usual approach is to **hand the work to a queue**:
+
+The contract is uploaded to a bucket → the bucket sends an "object created" **event** → the event becomes a **message** in a queue → a **worker** takes the message, runs the review and writes the report
+
+- AWS: S3 event notification → SQS queue → a worker in Lambda or in a container
+- GCP: GCS notification → Pub/Sub topic (or Eventarc) → a worker on Cloud Run
+
+A queue (and S3 event notifications themselves) guarantees **at-least-once** delivery: the same message may arrive **more than once**, and SQS standard queues don't guarantee the order either. When an SQS message is taken, it first goes "invisible" for a while (the visibility timeout, 30 seconds by default); once the worker has processed it successfully, it **deletes** it (Pub/Sub calls this an ack). If it isn't deleted, it reappears when the time is up and goes to the next worker. That is a free automatic retry, but it also means:
+
+- **Delete only after processing succeeds**. Delete first and process second, and if the worker crashes, the message is lost
+- The worker must be **idempotent** (Day 17): record finished work under a fixed key (for example `job_id`), and skip a message that comes again
+- A message that keeps failing can't be retried forever: set a maximum receive count, and past it the message moves to a **dead-letter queue** (DLQ) for a person to look at
+- `receive_message` uses **short polling** by default: it returns right away and may come back empty even when the queue has messages. Workers usually add `WaitTimeSeconds=20` (**long polling**: wait up to 20 seconds, and return as soon as there is a message), which means fewer empty responses and lower cost
+
+The boto3 / google-cloud on this page are simulated: the calls and the response shapes match the real SDKs (only the parts the course uses are implemented); in a real project, `pip install` them and set up credentials. `CLOUD.advance(seconds)` exists only in the simulation; it moves the simulated clock forward.
+--- code
+import json
+import boto3
+
+sqs = boto3.client("sqs", region_name="eu-north-1")
+url = sqs.create_queue(QueueName="review-jobs")["QueueUrl"]
+for cid in (103, 104):
+    sqs.send_message(QueueUrl=url, MessageBody=json.dumps({"job_id": f"review-{cid}", "contract_id": cid}))
+
+got = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=20).get("Messages", [])
+print("received:", [json.loads(m["Body"])["job_id"] for m in got])
+sqs.delete_message(QueueUrl=url, ReceiptHandle=got[0]["ReceiptHandle"])   # 103 done; the worker crashed on 104
+print("right away:", sqs.receive_message(QueueUrl=url).get("Messages", []))
+
+CLOUD.advance(31)                                # simulation: 31 seconds pass, the visibility timeout is over
+again = sqs.receive_message(QueueUrl=url, MessageSystemAttributeNames=["ApproximateReceiveCount"]).get("Messages", [])
+for m in again:
+    print("again:", json.loads(m["Body"])["job_id"], "receive count", m["Attributes"]["ApproximateReceiveCount"])
+
+@@ concept
+title: Managed models: Bedrock and Vertex AI
+cloud: yes
+--- body
+Right now Clause Check calls DeepSeek directly. Many companies (especially with sensitive data like contracts) prefer a **managed model** inside their own cloud: **Bedrock** on AWS, **Vertex AI** (Gemini) on GCP. The reasons: the data stays in their own cloud account and in the regions they chose; IAM controls who can call which model, so there is no separate API key to look after; billing, logs and monitoring are all in one place.
+
+The routine is the same as on Day 4: send messages, ask for JSON, validate, retry, record tokens.
+
+- Bedrock's `converse` is one unified chat interface; to switch models you only change `modelId`. Each message's `content` is a **list of blocks** `[{"text": ...}]`; the system prompt goes separately in `system=[{"text": ...}]`, not in a system message; parameters go in `inferenceConfig` (camelCase: `maxTokens`). The answer is in `resp["output"]["message"]["content"]`, and a `stopReason` of `"max_tokens"` means it was cut off
+- Newer models often have to be called with the ID of an **inference profile**: for example, an ID starting with `eu.` routes only between EU regions; one starting with `global.` may send the request to any region in the world, so don't use it for contract data
+- google-genai: `genai.Client(vertexai=True, project=..., location=...)`. Without `location` the default is `global`; to process in the EU, name an EU region explicitly (which models are available in which regions: check the Vertex AI docs). Its errors are its own `google.genai.errors.APIError` (`e.code` is 429, 503…), and it **doesn't retry by default**
+- Names change: in April 2026 Vertex AI was renamed Gemini Enterprise Agent Platform (the API didn't change; the docs for newer google-genai versions write `enterprise=True`, and `vertexai=True` still works). Model IDs go out of date too: `eu.amazon.nova-lite-v1:0` and `gemini-2.5-flash` below are only examples (Google has already announced retirement dates in 2026 for the gemini-2.5 series). Before you write code, look up the names you can use today in the model lists of the Bedrock console and the Google Cloud console, and put them in configuration instead of hard-coding them
+
+Bedrock and Gemini on this page are simulated: when the request mentions JSON, they give a verdict with keyword rules similar to the simulated DeepSeek (for example `unlimited` → redline / high).
+--- code
+import json
+import boto3
+from google import genai
+from google.genai import types
+
+SYSTEM = "You review contract clauses. Reply with JSON: clause_id, verdict, risk_level."
+CLAUSE = "Review clause 8.1: Liability of the Customer is unlimited."
+
+bedrock = boto3.client("bedrock-runtime", region_name="eu-north-1")
+resp = bedrock.converse(
+    modelId="eu.amazon.nova-lite-v1:0",
+    system=[{"text": SYSTEM}],
+    messages=[{"role": "user", "content": [{"text": CLAUSE}]}],
+    inferenceConfig={"maxTokens": 300, "temperature": 0},
+)
+print(resp["stopReason"], resp["usage"])
+print(json.loads(resp["output"]["message"]["content"][0]["text"]))
+
+gemini = genai.Client(vertexai=True, project="clausecheck-dev", location="europe-north1")
+r = gemini.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=CLAUSE,
+    config=types.GenerateContentConfig(system_instruction=SYSTEM, response_mime_type="application/json", temperature=0),
+)
+print(r.usage_metadata.prompt_token_count, r.usage_metadata.candidates_token_count)
+print(json.loads(r.text))
+
+@@ concept
+title: Structured logs and alerts
+--- body
+In production, nobody watches the terminal. The service writes its logs to **standard output**, and the platform collects them automatically: Cloud Run's go to Cloud Logging, Lambda's go to CloudWatch Logs.
+
+Logs should be **one JSON object per line** (structured logs), not a quick `print("done 8.1")`: only then can you query and count by field, for example "how many ERRORs in the past hour" or "what is the average latency of the v2 prompt".
+
+- Every line carries `severity` (INFO / WARNING / ERROR) and `message`, plus the fields you need for debugging: `trace_id`, `contract_id`, `clause_id`, `tokens`, `latency_ms`
+- Cloud Logging recognizes `severity` and `message` in the JSON and uses them as the entry's level and text; CloudWatch Logs Insights can query by JSON field too
+- `json.dumps(..., sort_keys=True)` fixes the field order: tidy for people to read, and easy to compare
+- **Don't** log full contract text, personal data or secrets: logs are kept for a long time, and many people can read them
+
+Once you have logs, set up **alerts**: notify a person when the error rate, the p95 latency or the daily token spend goes over a threshold.
+--- code
+import json
+
+def log(severity, message, **fields):
+    print(json.dumps({"severity": severity, "message": message, **fields}, sort_keys=True))
+
+log("INFO", "clause reviewed", trace_id="t-7f3a", contract_id=103, clause_id="8.1", verdict="redline", tokens=2205, latency_ms=3563)
+log("ERROR", "model call failed", trace_id="t-9c1d", contract_id=109, clause_id="8.1", error="ThrottlingException")
+
+lines = [
+    '{"severity": "INFO", "latency_ms": 1296}',
+    '{"severity": "ERROR", "latency_ms": 30000}',
+    '{"severity": "INFO", "latency_ms": 3563}',
+    '{"severity": "INFO", "latency_ms": 2149}',
+]
+records = [json.loads(line) for line in lines]
+errors = sum(1 for r in records if r["severity"] == "ERROR")
+print(f"error rate {errors / len(records):.0%}, slowest {max(r['latency_ms'] for r in records)} ms")
+
+@@ concept
+title: Launch checklist and rollback
+--- body
+Go through this list before you launch. When an interviewer asks "how would you deploy it?", answer in this order too:
+
+1. **Secrets** are not in the code or the image; they come from Secret Manager / Secrets Manager
+2. The **runtime identity** is a dedicated service account / role with least privilege (Day 26)
+3. The **region** is in the EU: the service, the buckets, the logs and the model calls all are
+4. **Limits**: maximum number of instances, step and token limits per clause (Day 17), budget alerts
+5. **Observability**: structured logs, alerts on error rate and latency, tracing (Langfuse)
+6. **Rollback**: every Cloud Run deploy creates a new **revision**. You can first send 10% of the traffic to the new revision to try it, and if something goes wrong, switch back to the old one without rebuilding (`gcloud run services update-traffic`); Lambda does the same with versions plus aliases. Give the image a fixed tag, not `latest`
+7. **Health check**: `/health` answers
+
+Explaining an architecture in two minutes: what it does → how requests flow (upload → queue → worker → report) → where the data lives and who can access it → what happens on failure (retries, idempotency, dead-letter queue) → what it costs and where the limits are.
+--- code
+def route(traffic):
+    return ", ".join(f"{rev}: {pct}%" for rev, pct in traffic.items())
+
+traffic = {"clausecheck-api-00012": 100}
+print("before:  ", route(traffic))
+traffic = {"clausecheck-api-00012": 90, "clausecheck-api-00013": 10}   # canary: 10% try the new revision
+print("canary:  ", route(traffic))
+
+error_rate = {"clausecheck-api-00012": 0.004, "clausecheck-api-00013": 0.09}   # from the structured logs
+if error_rate["clausecheck-api-00013"] > 2 * error_rate["clausecheck-api-00012"]:
+    traffic = {"clausecheck-api-00012": 100}   # roll back: no rebuild, just move the traffic
+    print("rollback:", route(traffic))
+
+@@ item d27-01
+type: predict
+title: Recap: the same message twice
+level: 1
+cards: Events and queues: at-least-once delivery; d17:Idempotency: a retry must not send two emails
+--- context
+Today, review work gets handed to a queue. A queue sometimes delivers the same job twice, and if the worker (the program that does the work in the background) does it twice, the lawyer gets duplicate notifications. First, recall Day 17's approach with a small piece of code.
+--- prompt
+A review of Day 17's idempotency. Today's queue delivers the same message more than once, and the worker blocks duplicates with a "done" set. Write the output.
+--- code
+messages = [
+    {"job_id": "review-103", "clause": "8.1"},
+    {"job_id": "review-104", "clause": "3.1"},
+    {"job_id": "review-103", "clause": "8.1"},
+]
+done = set()
+emails = []
+for m in messages:
+    if m["job_id"] in done:
+        print("skip", m["job_id"])
+        continue
+    emails.append(m["clause"])
+    done.add(m["job_id"])
+    print("done", m["job_id"])
+print(len(emails), sorted(done))
+--- explain
+The key is recorded after the work succeeds, and when the same key comes again it is skipped, so the email for 8.1 is sent only once. In production this `done` can't live in memory (instances get replaced, card 1); it goes into a database, Redis, or a marker file in a bucket.
+
+@@ item d27-02
+type: choice
+title: Recap: the SDK retried for you
+level: 1
+cards: Managed models: Bedrock and Vertex AI; d26:Errors and retries: retry only temporary errors
+--- context
+The worker on AWS calls Bedrock (the managed models on Amazon's cloud). With many contracts, the service applies a rate limit: it rejects requests for a while to make you slow down. Before you decide whether to write your own retries, find out what happens with the default settings.
+--- prompt
+A review of Day 26. The worker created a Bedrock client with the default settings: `boto3.client("bedrock-runtime", region_name="eu-north-1")`. On one `converse` call, Bedrock returned `ThrottlingException` twice in a row, and the 3rd try succeeded. What does your code see?
+--- options
+- A `ClientError` with the error code `ThrottlingException`
+- A normal answer: boto3 retried behind the scenes, and `resp["ResponseMetadata"]["RetryAttempts"]` is `2`
+- A `NoCredentialsError`
+- A normal answer, but `stopReason` is `"throttled"`
+answer: 2
+--- explain
+By default (legacy mode) boto3 tries 5 times in total, so temporary errors such as rate limits and 5xx are absorbed inside the SDK; only when every attempt fails does the error reach your code, with `(reached max retries: 4)` in the message. To change the count, use `Config(retries={"mode": "standard", "total_max_attempts": 3})`. Note: google-genai (Gemini) does **not** retry by default; today you'll write that yourself.
+
+@@ item d27-03
+type: code
+title: Lambda HTTP entry point
+level: 2
+cards: AWS Lambda: one event, one function call; From script to service: statelessness, environment variables, health checks
+--- context
+When the review API is deployed to AWS, it can go into Lambda: a review request from the web page first goes through API Gateway (AWS's entry point for HTTP requests) and becomes an `event` dictionary handed to this function. A request may be empty or malformed; bad requests have to be turned away here, so no money is wasted calling the model.
+--- prompt
+Write the AWS Lambda entry point `lambda_handler(event, context, review=review_clause)` that handles `POST /review` requests forwarded by API Gateway. The request body is JSON: `{"clause_id": "8.1", "text": "..."}`.
+
+- `event["body"]` is a string, or possibly `None`. If parsing fails, or the result is not a JSON object (a dictionary): return 400 with the body `{"error": "body must be a JSON object"}`
+- `text` is missing, not a string, or empty after stripping whitespace: return 400 with the body `{"error": "text is required"}`
+- `clause_id` is optional; the default is `"unknown"`
+- Everything is fine: call `review(clause_id, text)` (it returns a dictionary) and return 200 with that dictionary as the body
+
+Every response is `{"statusCode": <status code>, "headers": {"Content-Type": "application/json"}, "body": json.dumps(<body>)}`, and `body` must be a **string**. Write the small function `respond(status, payload)` first to build responses; it saves a lot of repetition.
+
+`review` is injected through a default argument: Lambda passes only `(event, context)`, so the default `review_clause` is used; the tests pass in a fake one.
+--- starter
+import json
+
+def review_clause(clause_id, text):
+    """The real one calls the LLM. Tests pass their own."""
+    return {"clause_id": clause_id, "verdict": "flag", "risk_level": "medium"}
+
+def respond(status, payload):
+    pass
+
+def lambda_handler(event, context, review=review_clause):
+    pass
+--- solution
+import json
+
+def review_clause(clause_id, text):
+    """The real one calls the LLM. Tests pass their own."""
+    return {"clause_id": clause_id, "verdict": "flag", "risk_level": "medium"}
+
+def respond(status, payload):
+    return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
+
+def lambda_handler(event, context, review=review_clause):
+    try:
+        data = json.loads(event.get("body") or "")
+    except json.JSONDecodeError:
+        return respond(400, {"error": "body must be a JSON object"})
+    if not isinstance(data, dict):
+        return respond(400, {"error": "body must be a JSON object"})
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return respond(400, {"error": "text is required"})
+    return respond(200, review(data.get("clause_id", "unknown"), text))
+--- tests
+import json
+def ev(body):
+    return {"httpMethod": "POST", "path": "/review", "headers": {"Content-Type": "application/json"}, "body": body, "isBase64Encoded": False}
+calls = []
+def fake_review(clause_id, text):
+    calls.append((clause_id, text))
+    return {"clause_id": clause_id, "verdict": "redline", "risk_level": "high"}
+def call(body):
+    r = lambda_handler(ev(body), None, review=fake_review)
+    return r["statusCode"], r["headers"], json.loads(r["body"])
+BAD_BODY = {"error": "body must be a JSON object"}
+expect("normal: 200 + the review result", lambda: call('{"clause_id": "8.1", "text": "Liability is unlimited."}'), (200, {"Content-Type": "application/json"}, {"clause_id": "8.1", "verdict": "redline", "risk_level": "high"}))
+expect("body is a string", lambda: type(lambda_handler(ev('{"text": "x"}'), None, review=fake_review)["body"]).__name__, "str")
+expect("no body / bad JSON / a JSON array: all 400", lambda: [call(b)[::2] for b in (None, '{"text": ', '["x"]')], [(400, BAD_BODY)] * 3)
+expect("text is blank or not a string: 400, and the model is not called", lambda: (calls.clear(), [call(b)[::2] for b in ('{"text": "   "}', '{"text": 42}')], len(calls))[1:], ([(400, {"error": "text is required"})] * 2, 0))
+expect("when Lambda passes only two arguments, the default review_clause is used", lambda: json.loads(lambda_handler(ev('{"text": "Fees are payable in 30 days."}'), None)["body"]), {"clause_id": "unknown", "verdict": "flag", "risk_level": "medium"})
+--- hints
+- `respond`: `return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}`.
+- Parsing: put `json.loads(event.get("body") or "")` inside a `try` (`None` becomes an empty string, and an empty string is bad JSON too), and return 400 in `except json.JSONDecodeError:`; then use `isinstance(data, dict)` to rule out arrays and numbers.
+- Validation: `if not isinstance(text, str) or not text.strip(): return respond(400, ...)`. Call `review(data.get("clause_id", "unknown"), text)` only when every check passes.
+
+@@ item d27-04
+type: code
+title: Parse an S3 upload event
+level: 2
+cards: Events and queues: at-least-once delivery; AWS Lambda: one event, one function call
+--- context
+On AWS, after the law firm uploads a contract to an S3 bucket (where files are stored in the cloud), the review isn't started directly by a web request: it is triggered by the "object created" event that the bucket sends. The worker first has to read from the event which bucket and which file it is, before it can download the contract and start the review.
+--- prompt
+After a contract is uploaded to S3, S3 can send an event (that triggers Lambda directly, or goes into SQS first). The event looks like this (only the fields you need are kept):
+
+```python
+{"Records": [
+    {"eventSource": "aws:s3", "eventName": "ObjectCreated:Put",
+     "s3": {"bucket": {"name": "clausecheck-contracts"},
+            "object": {"key": "contracts/2/103/hospital+software+license.pdf", "size": 48213}}},
+]}
+```
+
+Write `parse_s3_event(event)` that returns `[(bucket, key), ...]`:
+
+- One event may contain **several** `Records`; handle them in order
+- Keep only those whose `eventName` starts with `"ObjectCreated:"` (skip delete events such as `ObjectRemoved:Delete`)
+- Keys in the event are **URL-encoded**: a space becomes `+`, `ö` becomes `%C3%B6`, and a real `+` becomes `%2B`. Restore them with `urllib.parse.unquote_plus(key)`; otherwise passing the key to `get_object` gives `NoSuchKey`
+- No `Records` key: return `[]` (this really happens: right after you set up notifications, S3 first sends a test message with `"Event": "s3:TestEvent"`, which has no `Records`)
+--- starter
+from urllib.parse import unquote_plus
+
+def parse_s3_event(event):
+    record = event["Records"][0]
+    return [(record["s3"]["bucket"]["name"], record["s3"]["object"]["key"])]
+--- solution
+from urllib.parse import unquote_plus
+
+def parse_s3_event(event):
+    out = []
+    for record in event.get("Records", []):
+        if not record["eventName"].startswith("ObjectCreated:"):
+            continue
+        bucket = record["s3"]["bucket"]["name"]
+        key = unquote_plus(record["s3"]["object"]["key"])
+        out.append((bucket, key))
+    return out
+--- tests
+def rec(key, name="ObjectCreated:Put"):
+    return {"eventSource": "aws:s3", "eventName": name, "s3": {"bucket": {"name": "clausecheck-contracts"}, "object": {"key": key, "size": 100}}}
+expect("one record", lambda: parse_s3_event({"Records": [rec("contracts/2/103/original.pdf")]}), [("clausecheck-contracts", "contracts/2/103/original.pdf")])
+expect("+ back to a space, %C3%B6 back to ö", lambda: parse_s3_event({"Records": [rec("contracts/5/109/Avtal+Malm%C3%B6+2026.pdf")]}), [("clausecheck-contracts", "contracts/5/109/Avtal Malmö 2026.pdf")])
+expect("a real + is %2B in the event", lambda: parse_s3_event({"Records": [rec("contracts/1/101/C%2B%2B+SDK+License.pdf")]})[0][1], "contracts/1/101/C++ SDK License.pdf")
+expect("several records, delete events skipped", lambda: parse_s3_event({"Records": [rec("a.pdf"), rec("b.pdf", "ObjectRemoved:Delete"), rec("c.pdf", "ObjectCreated:CompleteMultipartUpload")]}), [("clausecheck-contracts", "a.pdf"), ("clausecheck-contracts", "c.pdf")])
+expect("no Records", lambda: parse_s3_event({}), [])
+--- hints
+- `for record in event.get("Records", []):`, then first check `record["eventName"].startswith("ObjectCreated:")`, and `continue` if it doesn't.
+- The bucket name is in `record["s3"]["bucket"]["name"]`, the key in `record["s3"]["object"]["key"]`; pass the key through `unquote_plus(...)`.
+
+@@ item d27-05
+type: predict
+title: When does the message come back?
+level: 2
+cloud: yes
+cards: Events and queues: at-least-once delivery
+--- context
+Uploaded contracts become review jobs in an SQS queue (AWS's message queue), and a worker takes one and reviews it. A worker may also crash halfway through a review. How the queue treats a job that was "taken but not deleted" decides whether work gets lost or redone. This code demonstrates it with a simulated clock.
+--- prompt
+Write the output. This queue's visibility timeout is set to 60 seconds; `CLOUD.advance(seconds)` moves the simulated clock forward. Think it through: when does a message that was taken but not deleted reappear?
+--- code
+import json
+import boto3
+
+sqs = boto3.client("sqs", region_name="eu-north-1")
+url = sqs.create_queue(QueueName="review-jobs", Attributes={"VisibilityTimeout": "60"})["QueueUrl"]
+for cid in (103, 104, 105):
+    sqs.send_message(QueueUrl=url, MessageBody=json.dumps({"job_id": f"review-{cid}"}))
+
+def job_ids(resp):
+    return [json.loads(m["Body"])["job_id"] for m in resp.get("Messages", [])]
+
+first = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=2)
+print(job_ids(first))
+print(job_ids(sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)))
+sqs.delete_message(QueueUrl=url, ReceiptHandle=first["Messages"][0]["ReceiptHandle"])
+CLOUD.advance(30)
+print(job_ids(sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)))
+CLOUD.advance(31)
+print(job_ids(sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)))
+--- explain
+A message that has been taken stays invisible for 60 seconds, so the second receive gets only the remaining 105. At second 30, each of the three is either deleted or still invisible, so nothing comes back. After 60 seconds, 104 and 105, which were not deleted, reappear (that is the automatic retry), and the deleted 103 never comes again. Nobody deleted the 105 from the second receive either: whenever a worker forgets to delete, the message comes back. `MaxNumberOfMessages` is 1 by default and 10 at most. The simulation on this page returns messages in the order they were sent, with none missing, so you can work it out; a real SQS standard queue doesn't guarantee the order, and with short polling it may also return fewer.
+
+@@ item d27-06
+type: code
+title: Queue worker
+level: 3
+cloud: yes
+cards: Events and queues: at-least-once delivery; d17:Idempotency: a retry must not send two emails
+--- context
+This is one core round of the background worker: take review jobs from the queue and hand them to the review function. A real queue delivers the same job more than once, and a review may fail because the model returns an error; when this round is over, no job may be lost and none may be reviewed twice.
+--- prompt
+Write one round of an SQS worker, `process_batch(sqs, queue_url, handle, seen)`:
+
+1. Call `receive_message` once, taking up to 10 messages (`MaxNumberOfMessages=10`); when there are no messages, the response has no `Messages` key
+2. Each message's `Body` is JSON containing `job_id`
+3. `job_id` is already in the set `seen`: this is a duplicate delivery; **delete it right away** and count it as `skipped`
+4. Otherwise call `handle(job)` (`job` is the parsed dictionary):
+   - success: add `job_id` to `seen`, **then** delete the message, and count it as `done`
+   - `handle` raises any exception: **don't delete** (it comes back when the visibility timeout is over, which works as an automatic retry), count it as `failed`, and go on to the next message
+5. Return `{"done": ..., "skipped": ..., "failed": ...}`
+
+Delete with `sqs.delete_message(QueueUrl=..., ReceiptHandle=msg["ReceiptHandle"])`. `seen` is passed in by the caller (in production it lives in a database; in the tests it is a set).
+--- starter
+import json
+
+def process_batch(sqs, queue_url, handle, seen):
+    counts = {"done": 0, "skipped": 0, "failed": 0}
+    resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+    return counts
+--- solution
+import json
+
+def process_batch(sqs, queue_url, handle, seen):
+    counts = {"done": 0, "skipped": 0, "failed": 0}
+    resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+    for msg in resp.get("Messages", []):
+        job = json.loads(msg["Body"])
+        if job["job_id"] in seen:
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+            counts["skipped"] += 1
+            continue
+        try:
+            handle(job)
+        except Exception:
+            counts["failed"] += 1
+            continue
+        seen.add(job["job_id"])
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+        counts["done"] += 1
+    return counts
+--- tests
+import json
+import boto3
+SQS = boto3.client("sqs", region_name="eu-north-1")
+URL = SQS.create_queue(QueueName="review-jobs")["QueueUrl"]
+for job_id in ("review-103", "review-104", "review-101"):
+    SQS.send_message(QueueUrl=URL, MessageBody=json.dumps({"job_id": job_id}))
+handled = []
+flaky = {"review-104": 1}            # review-104 fails once (the LLM timed out), then works
+def handle(job):
+    if flaky.get(job["job_id"], 0) > 0:
+        flaky[job["job_id"]] -= 1
+        raise TimeoutError("LLM timed out")
+    handled.append(job["job_id"])
+SEEN = {"review-101"}               # 101 was already done earlier
+expect("first round: 103 done, 104 failed, 101 is a duplicate", lambda: process_batch(SQS, URL, handle, SEEN), {"done": 1, "skipped": 1, "failed": 1})
+expect("only the failed one is still in the queue", lambda: [json.loads(m["Body"])["job_id"] for m in CLOUD.sqs[URL]["messages"]], ["review-104"])
+expect("another round while it is invisible: nothing comes back", lambda: process_batch(SQS, URL, handle, SEEN), {"done": 0, "skipped": 0, "failed": 0})
+def _later():
+    CLOUD.advance(31)
+    return process_batch(SQS, URL, handle, SEEN), handled, sorted(SEEN)
+expect("31 seconds later 104 is back, and this time it succeeds", _later, ({"done": 1, "skipped": 0, "failed": 0}, ["review-103", "review-104"], ["review-101", "review-103", "review-104"]))
+--- hints
+- The message list: `resp.get("Messages", [])`; for each one, first `job = json.loads(msg["Body"])`.
+- The order is the key: put `handle(job)` inside a `try`; in `except Exception:` only count and `continue`, **no delete**; only after success do `seen.add(...)` and `delete_message(...)`.
+- Duplicate messages must be deleted too, or they keep coming back again and again.
+
+@@ item d27-07
+type: fix
+title: Fix the bug: the event that never goes out
+level: 2
+cloud: yes
+cards: Events and queues: at-least-once delivery
+--- context
+On GCP, after a contract is uploaded, this function publishes a "contract uploaded" message to Pub/Sub (GCP's messaging service), and the worker subscribed to it starts the review when it receives the message. If the message never actually goes out and the program doesn't notice, nobody will ever review that contract.
+--- prompt
+The GCP version of the "contract uploaded" event: publish a message to the Pub/Sub topic `contract-uploaded`, which the worker subscribes to. `publish_uploaded(publisher, topic, contract)` should:
+
+- make the message body the JSON of the `contract` dictionary, **encoded as bytes**
+- attach two attributes, `contract_id` and `customer_id`, so subscribers can filter without parsing the body. Attribute values must be **strings**
+- return the message ID given by the server. `publish()` returns a future right away, and only `future.result()` waits for the result; errors such as a topic that doesn't exist are also raised by `result()`
+
+The current code has several bugs. Run it, read the errors one at a time, and fix it until every test passes.
+--- starter
+import json
+
+def publish_uploaded(publisher, topic, contract):
+    data = json.dumps(contract)
+    future = publisher.publish(topic, data, contract_id=contract["contract_id"], customer_id=contract["customer_id"])
+    return future
+--- solution
+import json
+
+def publish_uploaded(publisher, topic, contract):
+    data = json.dumps(contract).encode("utf-8")
+    future = publisher.publish(
+        topic,
+        data,
+        contract_id=str(contract["contract_id"]),
+        customer_id=str(contract["customer_id"]),
+    )
+    return future.result()
+--- tests
+import json
+from google.cloud import pubsub_v1
+from google.api_core.exceptions import NotFound
+PUB = pubsub_v1.PublisherClient()
+TOPIC = PUB.topic_path("clausecheck-dev", "contract-uploaded")
+C = {"contract_id": 103, "customer_id": 2, "bucket": "clausecheck-contracts", "key": "contracts/2/103/original.pdf"}
+expect("returns the message ID from the server (a string)", lambda: publish_uploaded(PUB, TOPIC, C) == CLOUD.topics[TOPIC][-1]["message_id"], True)
+expect("the body is JSON bytes", lambda: json.loads(CLOUD.topics[TOPIC][0]["data"]), C)
+expect("all attributes are strings", lambda: CLOUD.topics[TOPIC][0]["attributes"], {"contract_id": "103", "customer_id": "2"})
+expect_raises("topic doesn't exist: NotFound is raised from result()", lambda: publish_uploaded(PUB, PUB.topic_path("clausecheck-dev", "no-such-topic"), C), NotFound)
+--- hints
+- The first error: the body for `publish` must be bytes: `json.dumps(contract).encode("utf-8")`.
+- The second error: attribute values can only be strings: `str(contract["contract_id"])`.
+- Finally: return `future.result()`. That way you get the message ID, and if publishing fails, the error is raised right here instead of being silently lost.
+
+@@ item d27-08
+type: fill
+title: Fill in: the Bedrock client
+level: 2
+cloud: yes
+cards: Managed models: Bedrock and Vertex AI; d26:Errors and retries: retry only temporary errors
+--- context
+Suppose a customer requires that contract data never leaves the AWS account and region they chose; then Clause Check has to review with a model on Bedrock. The first step is to create the client (the object that talks to the service) and try one question. The client's settings decide who retries when you hit a rate limit.
+--- prompt
+Create a Bedrock Runtime client: the region is Stockholm; retries use standard mode, with **at most 4 attempts in total** (including the first; when you don't set it, standard mode uses 3). Then ask one question with `converse`. Note that `converse`'s message format differs from DeepSeek's: `content` is a list of blocks. Fill in the blanks.
+--- template
+import boto3
+from botocore.config import Config
+
+MODEL_ID = "eu.amazon.nova-lite-v1:0"
+
+def make_client():
+    return boto3.client(
+        "bedrock-runtime",
+        region_name="[[eu-north-1]]",
+        config=Config(retries={"mode": "standard", "[[total_max_attempts]]": 4}),
+    )
+
+def ask(client, text):
+    resp = client.converse(
+        modelId=MODEL_ID,
+        messages=[{"role": "[[user]]", "content": [{"[[text]]": text}]}],
+        inferenceConfig={"maxTokens": 300, "temperature": 0},
+    )
+    return resp["output"]["message"]["content"][0]["text"]
+--- tests
+from botocore.exceptions import ClientError
+expect("region", lambda: make_client().meta.region_name, "eu-north-1")
+expect("one question", lambda: ask(make_client(), "Hello from Stockholm"), "Mock Bedrock reply: Hello from Stockholm")
+def _throttled(n):
+    CLOUD.queue.clear()
+    CLOUD.fail_next("bedrock-runtime", "throttle", n)
+    try:
+        return ask(make_client(), "Hello")
+    except ClientError as e:
+        return e.response["Error"]["Code"]
+expect("throttled 3 times: the SDK retries by itself, and the 4th attempt succeeds", lambda: _throttled(3), "Mock Bedrock reply: Hello")
+expect("throttled 4 times: after all 4 attempts, the error is handed to you", lambda: _throttled(4), "ThrottlingException")
+--- hints
+- Stockholm's region name is `eu-north-1` (GCP's Finland is `europe-north1`; don't mix them up).
+- Two keys set the number of retries: `total_max_attempts` counts all attempts (including the first), and the older `max_attempts` counts retries (not including the first). The exercise asks for "4 in total".
+- The message: `{"role": "user", "content": [{"text": text}]}`.
+
+@@ item d27-09
+type: code
+title: Review one clause with Bedrock
+level: 3
+cloud: yes
+cards: Managed models: Bedrock and Vertex AI
+--- context
+This moves the "review one clause" step onto Bedrock: send the clause, get a JSON verdict back, and record how many tokens were used (the model is billed by tokens). The verdict goes straight into the report for the lawyer, so, as on Day 4, what the model says has to be checked before it is used.
+--- prompt
+Write `review_with_bedrock(client, clause_id, text)`:
+
+- Call `client.converse(modelId=MODEL_ID, system=[{"text": SYSTEM}], messages=[...], inferenceConfig={"maxTokens": 300, "temperature": 0})` with a single user message whose content is `f"Review clause {clause_id}: {text}"`
+- Check `stopReason` first: `"max_tokens"` means the answer was cut off, so the JSON is incomplete and can't be trusted: `raise ValueError("truncated")` (don't wait for `json.loads` to raise a confusing error)
+- Join **all the blocks in `content` that have `"text"`**, then `json.loads` the result (some models put a reasoning block first, which has no `"text"`)
+- `verdict` not in `VERDICTS`: `raise ValueError(f"bad verdict: {verdict}")` (always validate the model's output)
+- Return `{"clause_id": ..., "verdict": ..., "risk_level": ..., "tokens": resp["usage"]["totalTokens"]}`
+--- starter
+import json
+
+MODEL_ID = "eu.amazon.nova-lite-v1:0"
+SYSTEM = "You review contract clauses against a playbook. Reply with JSON only: clause_id, verdict, risk_level."
+VERDICTS = ("accept", "flag", "redline")
+
+def review_with_bedrock(client, clause_id, text):
+    pass
+--- solution
+import json
+
+MODEL_ID = "eu.amazon.nova-lite-v1:0"
+SYSTEM = "You review contract clauses against a playbook. Reply with JSON only: clause_id, verdict, risk_level."
+VERDICTS = ("accept", "flag", "redline")
+
+def review_with_bedrock(client, clause_id, text):
+    resp = client.converse(
+        modelId=MODEL_ID,
+        system=[{"text": SYSTEM}],
+        messages=[{"role": "user", "content": [{"text": f"Review clause {clause_id}: {text}"}]}],
+        inferenceConfig={"maxTokens": 300, "temperature": 0},
+    )
+    if resp["stopReason"] == "max_tokens":
+        raise ValueError("truncated")
+    blocks = resp["output"]["message"]["content"]
+    data = json.loads("".join(b["text"] for b in blocks if "text" in b))
+    if data["verdict"] not in VERDICTS:
+        raise ValueError(f"bad verdict: {data['verdict']}")
+    return {"clause_id": data["clause_id"], "verdict": data["verdict"], "risk_level": data["risk_level"],
+            "tokens": resp["usage"]["totalTokens"]}
+--- tests
+import boto3
+BR = boto3.client("bedrock-runtime", region_name="eu-north-1")
+expect("high-risk clause", lambda: review_with_bedrock(BR, "8.1", "Liability of the Customer is unlimited."), {"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "tokens": 63})
+expect("ordinary clause", lambda: review_with_bedrock(BR, "3.1", "Fees are payable within thirty (30) days of invoice.")["verdict"], "accept")
+class FakeBedrock:
+    """Returns a prepared response, so tests can try what the real model sometimes does."""
+    def __init__(self, blocks, stop="end_turn"):
+        self.resp = {"output": {"message": {"role": "assistant", "content": blocks}}, "stopReason": stop,
+                     "usage": {"inputTokens": 40, "outputTokens": 20, "totalTokens": 60}}
+    def converse(self, **kwargs):
+        return self.resp
+GOOD = '{"clause_id": "12", "verdict": "flag", "risk_level": "medium"}'
+def _error(client):
+    try:
+        review_with_bedrock(client, "12", "x")
+    except Exception as e:
+        return type(e).__name__, str(e)
+    return "no error"
+expect("a reasoning block first: join only the text blocks", lambda: review_with_bedrock(FakeBedrock([{"reasoningContent": {"reasoningText": {"text": "thinking"}}}, {"text": GOOD}]), "12", "x"), {"clause_id": "12", "verdict": "flag", "risk_level": "medium", "tokens": 60})
+expect("cut off: check stopReason first, ValueError(\"truncated\")", lambda: _error(FakeBedrock([{"text": GOOD[:20]}], stop="max_tokens")), ("ValueError", "truncated"))
+expect("unknown verdict: ValueError", lambda: _error(FakeBedrock([{"text": GOOD.replace("flag", "approve")}])), ("ValueError", "bad verdict: approve"))
+--- hints
+- `messages=[{"role": "user", "content": [{"text": f"Review clause {clause_id}: {text}"}]}]`; the system prompt goes in `system=[{"text": SYSTEM}]`.
+- Check `resp["stopReason"]` first, then parse. Joining the text: `"".join(b["text"] for b in blocks if "text" in b)`.
+- `tokens` is in `resp["usage"]["totalTokens"]` (camelCase).
+
+@@ item d27-10
+type: code
+title: Gemini: retry it yourself
+level: 3
+cloud: yes
+cards: Managed models: Bedrock and Vertex AI; d26:Errors and retries: retry only temporary errors
+--- context
+The same clause review, this time with a Gemini model on GCP's Vertex AI. With many contracts, the model service applies rate limits or is temporarily unavailable; if the code gives up the first time that happens, the review of a contract stops halfway.
+--- prompt
+The same review, switched to Gemini on Vertex AI. google-genai **doesn't retry by default**: rate limits (429) and server errors (503) reach your code directly, so here you retry yourself. Write `review_with_gemini(client, clause_id, text, sleep, model="gemini-2.5-flash")`:
+
+- Call `client.models.generate_content(model=model, contents=f"Review clause {clause_id}: {text}", config=types.GenerateContentConfig(system_instruction=SYSTEM, response_mime_type="application/json", temperature=0))`, passing every argument by keyword
+- Catch `errors.APIError`: when `e.code` is 429 or 503, retry, with at most 3 calls in total: `sleep(1)` after the 1st failure, `sleep(2)` after the 2nd, and raise if the 3rd fails too; other error codes (for example 404, model not found) are raised right away
+- `response.text` may be `None` (nothing was generated): `raise ValueError("empty response")`
+- Parse the JSON and return `{"clause_id", "verdict", "risk_level", "tokens"}`, where `tokens` is `usage_metadata.prompt_token_count + usage_metadata.candidates_token_count` (input and answer only. Models like gemini-2.5 "think" first by default; the thinking tokens are counted separately in `thoughts_token_count` and billed at the output price; to compute the real cost, look at `total_token_count`)
+
+`client` is `genai.Client(vertexai=True, project="clausecheck-dev", location="europe-north1")`. The model name is a parameter because it goes out of date (the "Managed models" card).
+--- starter
+import json
+from google.genai import types, errors
+
+SYSTEM = "You review contract clauses against a playbook. Reply with JSON: clause_id, verdict, risk_level."
+
+def review_with_gemini(client, clause_id, text, sleep, model="gemini-2.5-flash"):
+    response = client.models.generate_content(model=model, contents=f"Review clause {clause_id}: {text}")
+    return json.loads(response.text)
+--- solution
+import json
+from google.genai import types, errors
+
+SYSTEM = "You review contract clauses against a playbook. Reply with JSON: clause_id, verdict, risk_level."
+
+def review_with_gemini(client, clause_id, text, sleep, model="gemini-2.5-flash"):
+    config = types.GenerateContentConfig(system_instruction=SYSTEM, response_mime_type="application/json", temperature=0)
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(model=model, contents=f"Review clause {clause_id}: {text}", config=config)
+            break
+        except errors.APIError as e:
+            if e.code not in (429, 503) or attempt == 2:
+                raise
+            sleep(attempt + 1)
+    if response.text is None:
+        raise ValueError("empty response")
+    data = json.loads(response.text)
+    usage = response.usage_metadata
+    return {"clause_id": data["clause_id"], "verdict": data["verdict"], "risk_level": data["risk_level"],
+            "tokens": usage.prompt_token_count + usage.candidates_token_count}
+--- tests
+from types import SimpleNamespace
+from google import genai
+from google.genai import errors
+G = genai.Client(vertexai=True, project="clausecheck-dev", location="europe-north1")
+R = {"clause_id": "8.1", "verdict": "redline", "risk_level": "high"}
+def run(fails=0, kind="throttle", **kw):
+    CLOUD.queue.clear()
+    CLOUD.fail_next("genai", kind, fails)
+    delays = []
+    try:
+        out = review_with_gemini(G, "8.1", "Liability of the Customer is unlimited.", delays.append, **kw)
+        out = {k: v for k, v in out.items() if k != "tokens"}
+    except errors.APIError as e:
+        out = e.code
+    return out, delays
+expect("normal", lambda: run(), (R, []))
+expect("429 twice, then success: waits 1 s, then 2 s", lambda: run(2), (R, [1, 2]))
+expect("503 is retried too", lambda: run(1, "unavailable"), (R, [1]))
+expect("429 every time: raises after 3 calls", lambda: run(5), (429, [1, 2]))
+expect("404 model not found: no retry", lambda: run(model="gpt-4o"), (404, []))
+class FakeGemini:
+    def __init__(self, text, prompt=10, out=5):
+        self.models = self
+        self.r = SimpleNamespace(text=text, usage_metadata=SimpleNamespace(prompt_token_count=prompt, candidates_token_count=out))
+    def generate_content(self, **kwargs):
+        return self.r
+expect("tokens = prompt + candidates", lambda: review_with_gemini(FakeGemini('{"clause_id": "3.1", "verdict": "accept", "risk_level": "low"}', 120, 30), "3.1", "x", print)["tokens"], 150)
+expect_raises("nothing generated: ValueError", lambda: review_with_gemini(FakeGemini(None), "3.1", "x", print), ValueError)
+--- hints
+- The skeleton: inside `for attempt in range(3):`, `try: response = ...; break`; in `except errors.APIError as e:`, `if e.code not in (429, 503) or attempt == 2: raise`, otherwise `sleep(attempt + 1)`.
+- After the loop, check `response.text is None` first, then `json.loads(response.text)`.
+- The token counts are in `response.usage_metadata.prompt_token_count` and `.candidates_token_count`.
+
+@@ item d27-11
+type: code
+title: JSON logs, one per line
+level: 2
+cards: Structured logs and alerts
+--- context
+Once the service is live, nobody watches the terminal; when something goes wrong, the logs are all you have. The cloud platform collects every line the program prints, and only a uniform format lets you ask "how many tokens did clause 8.1 use" or "how many errors were there in the past hour". Contract text or secrets in the logs amount to a leak.
+--- prompt
+Write `log_event(message, severity="INFO", **fields)`: print **one line** of JSON (a structured log) for Cloud Logging / CloudWatch to collect.
+
+- The JSON has `severity` and `message`, plus every field in `fields`
+- Apply `.upper()` to `severity` first (so passing `"error"` works too); after that it must be one of `SEVERITIES`, otherwise `raise ValueError(f"bad severity: {severity}")`
+- For fields whose name is in `SECRET_FIELDS` (full contract text and secrets must not go into logs), replace the value with `"[redacted]"`
+- Use `json.dumps(..., sort_keys=True, ensure_ascii=False)`: the field order is fixed, and `ö` is printed as is
+- Return `None`
+
+Example: `log_event("clause reviewed", clause_id="8.1", tokens=2205)` prints
+
+`{"clause_id": "8.1", "message": "clause reviewed", "severity": "INFO", "tokens": 2205}`
+--- starter
+import json
+
+SEVERITIES = ("DEBUG", "INFO", "WARNING", "ERROR")
+SECRET_FIELDS = ("text", "contract_text", "api_key")
+
+def log_event(message, severity="INFO", **fields):
+    print(f"{severity}: {message} {fields}")
+--- solution
+import json
+
+SEVERITIES = ("DEBUG", "INFO", "WARNING", "ERROR")
+SECRET_FIELDS = ("text", "contract_text", "api_key")
+
+def log_event(message, severity="INFO", **fields):
+    severity = severity.upper()
+    if severity not in SEVERITIES:
+        raise ValueError(f"bad severity: {severity}")
+    record = {"severity": severity, "message": message}
+    for name, value in fields.items():
+        record[name] = "[redacted]" if name in SECRET_FIELDS else value
+    print(json.dumps(record, sort_keys=True, ensure_ascii=False))
+--- tests
+expect_output("the example from the prompt", lambda: log_event("clause reviewed", clause_id="8.1", tokens=2205), '{"clause_id": "8.1", "message": "clause reviewed", "severity": "INFO", "tokens": 2205}')
+expect_output("lowercase error works too", lambda: log_event("model call failed", severity="error", contract_id=109), '{"contract_id": 109, "message": "model call failed", "severity": "ERROR"}')
+expect_output("contract text and secrets are redacted, ö is printed as is", lambda: log_event("request", text="Liability is unlimited.", api_key="sk-live-9f2c", customer="Malmö AB"), '{"api_key": "[redacted]", "customer": "Malmö AB", "message": "request", "severity": "INFO", "text": "[redacted]"}')
+expect_raises("unknown severity", lambda: log_event("x", severity="FATAL"), ValueError)
+--- hints
+- Handle the severity first: `severity = severity.upper()`, then check `in SEVERITIES`.
+- `record = {"severity": severity, "message": message}`, then put the fields in one by one with `for name, value in fields.items():`; if the name is in `SECRET_FIELDS`, put `"[redacted]"` instead.
+- Finally, `print(json.dumps(record, sort_keys=True, ensure_ascii=False))`.
+
+@@ item d27-12
+type: choice
+title: Where should a long job run?
+level: 2
+cards: Cloud Run: run your container, scale with requests; AWS Lambda: one event, one function call; Events and queues: at-least-once delivery
+--- context
+Real contracts uploaded by law firms often run to dozens of pages, and reviewing them clause by clause takes several minutes. Before deploying to the cloud, decide where such a long job should run.
+--- prompt
+Reviewing a 40-page contract: about 65 clauses, one model call per clause (3–10 seconds), 5–10 minutes for the whole contract. Right now, one HTTP request reviews the whole contract and then returns. When you deploy to the cloud, which design is the most robust?
+--- options
+- Put it in Lambda and review a whole contract in one call: Lambda can run for 15 minutes, which is enough
+- Put it in Cloud Run, raise the request timeout to 60 minutes, and have the front end keep waiting
+- After the upload, send a message to a queue; a worker (Cloud Run or Lambda, either works) handles one contract or a few clauses at a time and writes progress and results to a database or bucket; the front end checks the progress
+- Cloud Run returns 202 as soon as it gets the request, then reviews at its own pace in a background thread on the same instance
+answer: 3
+--- explain
+How long something can run is only part of it: with one request hanging for 10 minutes, if the network drops, the instance is replaced or the model is rate-limited along the way, the whole contract starts over, and the user has to keep the page open the whole time. Split up through a queue, every step is short, can be retried (undeleted messages come back) and can run in parallel, and messages that keep failing go to the dead-letter queue for a person to look at. The first option is too close to the 15-minute limit, so a longer contract times out; on top of that, an HTTP request through API Gateway is cut off after 29 seconds by default, so it never even gets the result. The second works but is fragile. The fourth: with Cloud Run's default settings, an instance gets almost no CPU after it returns the response, and the instance can be reclaimed at any time, so the work in the background thread is silently lost.
+
+@@ item d27-13
+type: order
+title: Put the Dockerfile in order
+level: 2
+lang: docker
+cards: Docker: images, containers, and layer caching; Cloud Run: run your container, scale with requests
+--- context
+To put the Clause Check API on Cloud Run, it first has to be packed into a container image: one bundle with the code, Python and the dependencies. The Dockerfile is the list of packing steps; every time you change the code, the bundle is rebuilt by following it.
+--- prompt
+Put the Clause Check API's Dockerfile in order (this exercise is graded on the order of the lines). Requirements:
+
+- Start from the official `python:3.12-slim` image; the working directory is `/app`, set before any file is copied
+- When only the code has changed, don't reinstall the dependencies (think about layer caching: what to copy first, what to install first)
+- When the container starts, run uvicorn listening on `0.0.0.0` and on the `$PORT` from the platform (8080 if there is none); by convention, the start command is the last line
+
+There are two distractor lines.
+--- lines
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec uvicorn clausecheck.api:app --host 0.0.0.0 --port ${PORT:-8080}
+--- distractors
+COPY .env .
+CMD uvicorn clausecheck.api:app --port 8000
+--- hints
+- The order: base image → working directory → dependency list → install the dependencies → the rest of the code → start command.
+- `.env` holds the secrets on your computer and never goes into an image (secrets in production come from Secret Manager). `--port 8000` hard-codes the port, and by default uvicorn listens only on `127.0.0.1`, which can't be reached from outside the container.
+
+@@ item d27-14
+type: choice
+title: What stays out of the image
+level: 2
+cards: Docker: images, containers, and layer caching; d26:Secret management: not in code, not in images
+--- context
+Once built, the image is pushed to an image registry in the cloud, and every machine that runs it pulls a copy. When packing, the whole project folder gets copied in, so for everything in the folder, think about whether it should go along.
+--- prompt
+`.dockerignore` decides which files **don't** go into the image on `COPY . .`. Clause Check's project root contains the items below. Which ones should be written into `.dockerignore`? (Choose all that apply.)
+--- options
+- `.env`
+- `clausecheck/`
+- `.git/`
+- `*.report.json`, `work/`, `__pycache__/`
+- `requirements.txt`
+answer: 1,3,4
+--- explain
+`.env` holds the secrets from your computer: the image is pushed to an image registry and pulled by many people and machines, so a secret in the image is as good as leaked (deleting it in a later step doesn't help: it is still in the earlier layer). `.git/` is big and carries the whole history, possibly including things that were committed by mistake long ago. Reports, temporary files and caches make the image bigger and may carry customer data. `clausecheck/` is the code itself, and `requirements.txt` is needed to install the dependencies; both must go into the image. The syntax is the same as `.gitignore`: one pattern per line.
+
+@@ item d27-15
+type: code
+title: TS: a typed Lambda
+level: 2
+lang: ts
+cards: AWS Lambda: one event, one function call; d6:Zod: the Pydantic of TypeScript
+--- context
+If the team's backend uses Node.js, the Lambda review entry point can be written in TypeScript too. It does the same job as the Python version: take the review request forwarded by API Gateway, check it, and only then hand it to the review function.
+--- prompt
+Write the same Lambda in TypeScript (the Node.js runtime). The types are already in the starter code: a real project uses `APIGatewayProxyEvent` / `APIGatewayProxyResult` from the `@types/aws-lambda` package; here we define a simplified version ourselves.
+
+Write `export const handler = async (event: ApiEvent): Promise<ApiResult> => { ... }`:
+
+- `event.httpMethod` is not `"POST"`: 405, body `{ error: "method not allowed" }`
+- `event.body` is `null`, or `JSON.parse` fails: 400, body `{ error: "body must be JSON" }`
+- Validate with `ReviewRequest.safeParse(...)`; if that fails: 400, body `{ error: "invalid request" }`
+- Success: 200, body `{ clause_id, verdict: reviewClause(text) }`; when `clause_id` is not given, it is `"unknown"` (the default in the schema; `r.data.clause_id` already gives you that)
+
+Use the ready-made `respond(statusCode, payload)` for every response.
+--- starter
+import { z } from "zod";
+
+type ApiEvent = { httpMethod: string; path: string; headers: Record<string, string>; body: string | null; isBase64Encoded: boolean };
+type ApiResult = { statusCode: number; headers: Record<string, string>; body: string };
+
+const ReviewRequest = z.object({
+  clause_id: z.string().default("unknown"),
+  text: z.string().min(1),
+});
+
+function reviewClause(text: string): "accept" | "flag" | "redline" {
+  return /unlimited/i.test(text) ? "redline" : "accept";
+}
+
+function respond(statusCode: number, payload: unknown): ApiResult {
+  return { statusCode, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+}
+
+export const handler = async (event: ApiEvent): Promise<ApiResult> => {
+  return respond(200, {});
+};
+--- solution
+import { z } from "zod";
+
+type ApiEvent = { httpMethod: string; path: string; headers: Record<string, string>; body: string | null; isBase64Encoded: boolean };
+type ApiResult = { statusCode: number; headers: Record<string, string>; body: string };
+
+const ReviewRequest = z.object({
+  clause_id: z.string().default("unknown"),
+  text: z.string().min(1),
+});
+
+function reviewClause(text: string): "accept" | "flag" | "redline" {
+  return /unlimited/i.test(text) ? "redline" : "accept";
+}
+
+function respond(statusCode: number, payload: unknown): ApiResult {
+  return { statusCode, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+}
+
+export const handler = async (event: ApiEvent): Promise<ApiResult> => {
+  if (event.httpMethod !== "POST") {
+    return respond(405, { error: "method not allowed" });
+  }
+  if (event.body === null) {
+    return respond(400, { error: "body must be JSON" });
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(event.body);
+  } catch {
+    return respond(400, { error: "body must be JSON" });
+  }
+  const r = ReviewRequest.safeParse(raw);
+  if (!r.success) {
+    return respond(400, { error: "invalid request" });
+  }
+  return respond(200, { clause_id: r.data.clause_id, verdict: reviewClause(r.data.text) });
+};
+--- tests
+const ev = (body: string | null, method = "POST"): ApiEvent => ({ httpMethod: method, path: "/review", headers: { "Content-Type": "application/json" }, body, isBase64Encoded: false });
+const call = async (e: ApiEvent) => {
+  const r = await handler(e);
+  return [r.statusCode, r.headers["Content-Type"], JSON.parse(r.body)];
+};
+expectAsync("normal", () => call(ev('{"clause_id": "8.1", "text": "Liability is unlimited."}')), [200, "application/json", { clause_id: "8.1", verdict: "redline" }]);
+expectAsync("clause_id uses the default", () => call(ev('{"text": "Fees are payable in 30 days."}')), [200, "application/json", { clause_id: "unknown", verdict: "accept" }]);
+expectAsync("GET: 405", () => call(ev(null, "GET")), [405, "application/json", { error: "method not allowed" }]);
+expectAsync("no body, bad JSON: 400", async () => [(await call(ev(null)))[2], (await call(ev('{"text": ')))[2]], [{ error: "body must be JSON" }, { error: "body must be JSON" }]);
+expectAsync("text is an empty string: 400", () => call(ev('{"text": ""}')), [400, "application/json", { error: "invalid request" }]);
+--- hints
+- Return early, in order: first check `event.httpMethod`, then `event.body === null`, then `try { raw = JSON.parse(event.body); } catch { ... }` (declare `raw` as `let raw: unknown;`).
+- `const r = ReviewRequest.safeParse(raw);`, and return 400 `if (!r.success)`; after that, TypeScript knows that `r.data` has `clause_id` and `text`.
+
+@@ item d27-16
+type: translate
+title: Translate: parse an S3 event
+level: 2
+lang: ts
+cards: Events and queues: at-least-once delivery; d5:From Python to TypeScript
+--- context
+If the worker is written in Node.js, the code that parses S3 upload events needs a TypeScript version too. Contract file names may contain spaces and letters like `ö`; restore them wrongly and the file can't be found.
+--- prompt
+Translate today's `parse_s3_event` into the TypeScript function `parseS3Event(event)`, which returns an array of `[bucket, key]` tuples.
+
+Python's `unquote_plus(key)` takes two steps in JavaScript: first turn `+` back into spaces, then `decodeURIComponent`: `decodeURIComponent(key.replace(/\+/g, " "))`. The order can't be reversed: if you decode first, the real `+` that `%2B` turns into would also become a space. `event.get("Records", [])` is `event.Records ?? []` in TS.
+--- source
+from urllib.parse import unquote_plus
+
+def parse_s3_event(event):
+    out = []
+    for record in event.get("Records", []):
+        if not record["eventName"].startswith("ObjectCreated:"):
+            continue
+        bucket = record["s3"]["bucket"]["name"]
+        key = unquote_plus(record["s3"]["object"]["key"])
+        out.append((bucket, key))
+    return out
+--- starter
+type S3Record = { eventName: string; s3: { bucket: { name: string }; object: { key: string; size: number } } };
+type S3Event = { Records?: S3Record[] };
+
+function parseS3Event(event: S3Event): [string, string][] {
+  return [];
+}
+--- solution
+type S3Record = { eventName: string; s3: { bucket: { name: string }; object: { key: string; size: number } } };
+type S3Event = { Records?: S3Record[] };
+
+function parseS3Event(event: S3Event): [string, string][] {
+  const out: [string, string][] = [];
+  for (const record of event.Records ?? []) {
+    if (!record.eventName.startsWith("ObjectCreated:")) continue;
+    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+    out.push([record.s3.bucket.name, key]);
+  }
+  return out;
+}
+--- tests
+const rec = (key: string, eventName = "ObjectCreated:Put"): S3Record => ({ eventName, s3: { bucket: { name: "clausecheck-contracts" }, object: { key, size: 100 } } });
+expect("one record", () => parseS3Event({ Records: [rec("contracts/2/103/original.pdf")] }), [["clausecheck-contracts", "contracts/2/103/original.pdf"]]);
+expect("+ and %C3%B6", () => parseS3Event({ Records: [rec("contracts/5/109/Avtal+Malm%C3%B6+2026.pdf")] }), [["clausecheck-contracts", "contracts/5/109/Avtal Malmö 2026.pdf"]]);
+expect("a real + is %2B", () => parseS3Event({ Records: [rec("contracts/1/101/C%2B%2B+SDK+License.pdf")] })[0][1], "contracts/1/101/C++ SDK License.pdf");
+expect("delete events skipped", () => parseS3Event({ Records: [rec("a.pdf", "ObjectRemoved:Delete"), rec("b.pdf")] }), [["clausecheck-contracts", "b.pdf"]]);
+expect("no Records", () => parseS3Event({}), []);
+--- hints
+- `for (const record of event.Records ?? [])`, and `continue` when the name doesn't start with `ObjectCreated:`.
+- Give the result array a type: `const out: [string, string][] = [];`, then `out.push([record.s3.bucket.name, key])`.
+
+@@ item d27-17
+type: code
+title: Automatic checks before launch
+level: 2
+cards: Launch checklist and rollback; d26:Data residency: contracts stay in the EU
+--- context
+A launch checklist that relies on people's memory will miss an item sooner or later. Write the items that can be checked automatically as code and put them in CI (checks that run automatically on every commit), so a bad deploy configuration is stopped right away instead of being discovered after launch.
+--- prompt
+Turn part of the launch checklist into code: it runs in CI before a deploy, and stops the deploy when it finds problems. Write `check_deploy(config)`, which checks the following in this order and returns a list of problems (strings); with no problems, it returns `[]`:
+
+1. `config["region"]` is not in `EU_REGIONS`: `"region <region> is not an EU region"`. Note that this is an allowlist, not a prefix check: `europe-west2` and `eu-west-2` are both in London, and the UK is not in the EU
+2. `config["service_account"]` is `"default"`, or ends with `"-compute@developer.gserviceaccount.com"` (GCP's default compute service account, which often has broad permissions): `"use a dedicated service account"`
+3. `config.get("max_instances")` is not a positive integer (the key is missing, `None`, `0`): `"set max_instances"`
+4. For every variable in `config["env"]` whose value starts with `"sk-"`, in alphabetical order of the variable names: `"<name> looks like a secret, use a secret manager"`
+5. `config["image"]` ends with `":latest"`: `"pin the image tag"` (`latest` changes, so on a rollback you don't know which version you are going back to)
+--- starter
+EU_REGIONS = {
+    "europe-north1", "europe-west1", "europe-west3", "europe-west4",   # GCP: Finland, Belgium, Frankfurt, Netherlands
+    "eu-north-1", "eu-central-1", "eu-west-1", "eu-west-3",           # AWS: Stockholm, Frankfurt, Ireland, Paris
+}
+
+def check_deploy(config):
+    problems = []
+    return problems
+--- solution
+EU_REGIONS = {
+    "europe-north1", "europe-west1", "europe-west3", "europe-west4",   # GCP: Finland, Belgium, Frankfurt, Netherlands
+    "eu-north-1", "eu-central-1", "eu-west-1", "eu-west-3",           # AWS: Stockholm, Frankfurt, Ireland, Paris
+}
+
+def check_deploy(config):
+    problems = []
+    if config["region"] not in EU_REGIONS:
+        problems.append(f"region {config['region']} is not an EU region")
+    account = config["service_account"]
+    if account == "default" or account.endswith("-compute@developer.gserviceaccount.com"):
+        problems.append("use a dedicated service account")
+    max_instances = config.get("max_instances")
+    if not isinstance(max_instances, int) or max_instances < 1:
+        problems.append("set max_instances")
+    for name in sorted(config["env"]):
+        if config["env"][name].startswith("sk-"):
+            problems.append(f"{name} looks like a secret, use a secret manager")
+    if config["image"].endswith(":latest"):
+        problems.append("pin the image tag")
+    return problems
+--- tests
+GOOD = {
+    "region": "europe-north1",
+    "service_account": "clausecheck-api@clausecheck-dev.iam.gserviceaccount.com",
+    "max_instances": 5,
+    "env": {"CLAUSECHECK_MODE": "deepseek", "CLAUSECHECK_DEEPSEEK_MODEL": "deepseek-flash", "CLAUSECHECK_PROMPT_VERSION": "v2"},
+    "image": "europe-north1-docker.pkg.dev/clausecheck-dev/app/clausecheck-api:2026-09-23.1",
+}
+BAD = {
+    "region": "us-central1",
+    "service_account": "123456789012-compute@developer.gserviceaccount.com",
+    "max_instances": 0,
+    "env": {"LANGFUSE_SECRET_KEY": "sk-lf-1a2b", "DEEPSEEK_API_KEY": "sk-live-9f2c", "CLAUSECHECK_MODE": "deepseek"},
+    "image": "europe-north1-docker.pkg.dev/clausecheck-dev/app/clausecheck-api:latest",
+}
+expect("no problems", lambda: check_deploy(GOOD), [])
+expect("every problem (in order)", lambda: check_deploy(BAD), ["region us-central1 is not an EU region", "use a dedicated service account", "set max_instances", "DEEPSEEK_API_KEY looks like a secret, use a secret manager", "LANGFUSE_SECRET_KEY looks like a secret, use a secret manager", "pin the image tag"])
+expect("London is not in the EU", lambda: check_deploy({**GOOD, "region": "europe-west2"}), ["region europe-west2 is not an EU region"])
+expect("AWS Stockholm is fine; no max_instances key", lambda: check_deploy({k: v for k, v in {**GOOD, "region": "eu-north-1"}.items() if k != "max_instances"}), ["set max_instances"])
+--- hints
+- One `if` per rule, with `problems.append(...)` in the order given in the prompt.
+- `config.get("max_instances")` is `None` when the key is missing; `not isinstance(x, int) or x < 1` blocks both `None` and `0`.
+- Sort the environment variables by name: `for name in sorted(config["env"]):`.
+
+@@ item d27-18
+type: local
+title: Local task (optional): build an image
+level: 2
+cards: Docker: images, containers, and layer caching; From script to service: statelessness, environment variables, health checks
+--- context
+The earlier exercises were all simulated in the browser. In this one you really pack Clause Check into an image on your own computer and run it, so you see with your own eyes what the "bundle" the cloud platform gets looks like; if you don't have Docker installed, understanding what each step does is fine too.
+--- prompt
+If you have Docker Desktop installed, really pack Clause Check into an image. If you don't, that's fine: read through the steps, then write below what each line of the Dockerfile does (include the `FROM` and `CMD` lines).
+
+In the project root `G:\Contract Clause Reviewer`, create a `Dockerfile`:
+
+```
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec uvicorn clausecheck.api:app --host 0.0.0.0 --port ${PORT:-8080}
+```
+
+Then create `.dockerignore` (`.env` holds secrets and `work` holds your own practice files; neither belongs in the image):
+
+```
+.env
+.git
+__pycache__
+.pytest_cache
+*.report.json
+work
+```
+
+Then run this in PowerShell (the first time, it downloads the base image and the dependencies, which can take several minutes):
+
+```
+cd "G:\Contract Clause Reviewer"
+docker build -t clausecheck-api .
+docker run --rm -p 8080:8080 -e PORT=8080 -e CLAUSECHECK_MODE=mock clausecheck-api
+```
+
+Open a second PowerShell window and run `curl.exe http://localhost:8080/health`; you should see `{"ok":true,"mode":"mock",...}`. Note that we didn't put `.env` into the image, so we passed a setting that needs no secret with `-e`. Go back to the first window and press Ctrl+C to stop the container.
+
+Paste the output of `curl.exe` (or your line-by-line explanation of the Dockerfile) below.
+placeholder: Paste the output of /health, or what each line of the Dockerfile does
+verify: "ok"\s*:\s*true|FROM python[\s\S]*CMD
+--- hints
+- `docker` command not found: Docker Desktop isn't installed or isn't running. Installing it needs administrator rights and some disk space; without it you can still do the second version of this task.
+- `curl.exe` can't connect: check whether the first window printed `Uvicorn running on http://0.0.0.0:8080`; the `-p 8080:8080` in `docker run` connects port 8080 on your computer to port 8080 in the container.
+- The image is big (the dependencies include streamlit, langgraph and pytest): a real project gives the service its own dependency list with only what it needs to run.
+
+@@ item d27-e1
+type: scratch
+title: Closed book: Lambda entry point
+exam: yes
+level: 3
+cards: AWS Lambda: one event, one function call
+--- context
+This is Clause Check's review entry point when it runs on Lambda: requests from the web page come in through API Gateway, and it decides whether to pass each one on to the review or turn it away. In production every kind of request shows up, and whatever it sends back to the web page on an error can be seen by outsiders too.
+--- prompt
+Write the AWS Lambda entry point `lambda_handler(event, context, review=review_clause)` that handles requests forwarded by API Gateway (REST API proxy). First define this in the file:
+
+```python
+def review_clause(clause_id, text):
+    return {"clause_id": clause_id, "verdict": "accept"}
+```
+
+The rules (checked in this order):
+
+- `event["path"]` is not `"/review"`: 404, body `{"error": "not found"}`; `event["httpMethod"]` is not `"POST"`: 405, body `{"error": "method not allowed"}`
+- When `event.get("isBase64Encoded")` is true, `body` is base64-encoded: first `base64.b64decode(body).decode("utf-8")`
+- `body` is `None`, not valid JSON, or not a JSON object: 400, body `{"error": "body must be a JSON object"}`
+- `text` must be a string that is not empty after stripping whitespace, and `clause_id`, if given, must be a string (when not given, it is `"unknown"`): otherwise 400, body `{"error": "invalid request"}`
+- Call `review(clause_id, text)`; if it raises any exception: 502, body `{"error": "review failed"}` (don't return the exception message to the caller)
+- Success: 200, and the body is what `review` returned
+
+Every response is `{"statusCode": <status code>, "headers": {"Content-Type": "application/json"}, "body": json.dumps(<body>)}`.
+--- solution
+import base64
+import json
+
+def review_clause(clause_id, text):
+    return {"clause_id": clause_id, "verdict": "accept"}
+
+def respond(status, payload):
+    return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
+
+def lambda_handler(event, context, review=review_clause):
+    if event.get("path") != "/review":
+        return respond(404, {"error": "not found"})
+    if event.get("httpMethod") != "POST":
+        return respond(405, {"error": "method not allowed"})
+    body = event.get("body")
+    if body is not None and event.get("isBase64Encoded"):
+        body = base64.b64decode(body).decode("utf-8")
+    try:
+        data = json.loads(body or "")
+    except json.JSONDecodeError:
+        return respond(400, {"error": "body must be a JSON object"})
+    if not isinstance(data, dict):
+        return respond(400, {"error": "body must be a JSON object"})
+    text = data.get("text")
+    clause_id = data.get("clause_id", "unknown")
+    if not isinstance(text, str) or not text.strip() or not isinstance(clause_id, str):
+        return respond(400, {"error": "invalid request"})
+    try:
+        result = review(clause_id, text)
+    except Exception:
+        return respond(502, {"error": "review failed"})
+    return respond(200, result)
+--- tests
+import base64
+import json
+def ev(body, method="POST", path="/review", b64=False):
+    return {"httpMethod": method, "path": path, "headers": {}, "body": body, "isBase64Encoded": b64}
+def call(event, review=None):
+    r = lambda_handler(event, None) if review is None else lambda_handler(event, None, review=review)
+    return r["statusCode"], json.loads(r["body"]), r["headers"]["Content-Type"]
+BODY = '{"clause_id": "8.1", "text": "Liability is unlimited."}'
+expect("normal, and a base64 body", lambda: [call(ev(BODY)), call(ev(base64.b64encode(BODY.encode()).decode(), b64=True))], [(200, {"clause_id": "8.1", "verdict": "accept"}, "application/json")] * 2)
+expect("path and method", lambda: [call(ev(BODY, path="/admin"))[:2], call(ev(BODY, method="GET"))[:2]], [(404, {"error": "not found"}), (405, {"error": "method not allowed"})])
+expect("bad requests", lambda: [call(ev(b))[:2] for b in (None, "{oops", "[1]", '{"text": "  "}', '{"text": "x", "clause_id": 8.1}')], [(400, {"error": "body must be a JSON object"})] * 3 + [(400, {"error": "invalid request"})] * 2)
+def _boom(clause_id, text):
+    raise TimeoutError("secret internal detail")
+expect("review fails: 502, no details leaked", lambda: call(ev(BODY), review=_boom)[:2], (502, {"error": "review failed"}))
+
+@@ item d27-e2
+type: scratch
+title: Closed book: an idempotent queue worker
+exam: yes
+level: 3
+cloud: yes
+cards: Events and queues: at-least-once delivery; d17:Idempotency: a retry must not send two emails
+--- context
+The background worker has to process every review job in the queue. A real queue delivers jobs more than once, and there can also be one bad job that never gets through the review; the worker must neither review anything twice nor get stuck on one bad job forever.
+--- prompt
+Write `drain(sqs, queue_url, handle, done, dead)`: keep processing an SQS queue until a round receives no messages at all (10 rounds at most).
+
+- Each round: `sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=20, MessageSystemAttributeNames=["ApproximateReceiveCount"])` (long polling: with short polling on real SQS, an empty response doesn't mean the queue is empty); when there are no messages, the response has no `Messages` key
+- Each message's `Body` is JSON containing `job_id`. Handle each message in this order:
+  1. `job_id` is in the set `done`: a duplicate delivery; delete the message and don't process it
+  2. The message's `msg["Attributes"]["ApproximateReceiveCount"]` (note: a **string**), converted to an integer, is greater than 3: this is a "poison message" that keeps failing; append the raw `Body` to the list `dead` (a simulated dead-letter queue), delete the message and don't process it
+  3. Otherwise call `handle(job)`: on success, `done.add(job_id)` and delete the message; if it raises any exception, **don't delete** (it comes back after a while)
+- Delete with `sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])`
+- Return the list of `job_id`s processed successfully in this call (in processing order)
+--- solution
+import json
+
+def drain(sqs, queue_url, handle, done, dead):
+    finished = []
+    for _ in range(10):
+        resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=20,
+                                   MessageSystemAttributeNames=["ApproximateReceiveCount"])
+        messages = resp.get("Messages", [])
+        if not messages:
+            break
+        for msg in messages:
+            job = json.loads(msg["Body"])
+            receipt = msg["ReceiptHandle"]
+            if job["job_id"] in done:
+                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+                continue
+            if int(msg["Attributes"]["ApproximateReceiveCount"]) > 3:
+                dead.append(msg["Body"])
+                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+                continue
+            try:
+                handle(job)
+            except Exception:
+                continue
+            done.add(job["job_id"])
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+            finished.append(job["job_id"])
+    return finished
+--- tests
+import json
+import boto3
+SQS = boto3.client("sqs", region_name="eu-north-1")
+URL = SQS.create_queue(QueueName="review-jobs")["QueueUrl"]
+for job_id in ("review-201", "review-202", "review-201", "review-203"):
+    SQS.send_message(QueueUrl=URL, MessageBody=json.dumps({"job_id": job_id}))
+def handle(job):
+    if job["job_id"] == "review-202":
+        raise ValueError("this contract always breaks the parser")
+DONE, DEAD = set(), []
+expect("first round: 201 and 203 succeed, the duplicate 201 is skipped", lambda: drain(SQS, URL, handle, DONE, DEAD), ["review-201", "review-203"])
+def _three_more():
+    out = []
+    for _ in range(3):
+        CLOUD.advance(31)
+        out.append((drain(SQS, URL, handle, DONE, DEAD), len(DEAD)))
+    return out, DEAD, len(CLOUD.sqs[URL]["messages"])
+expect("202 is still retried on its 2nd and 3rd delivery, goes to the dead-letter list only on the 4th, and the queue ends up empty", _three_more, ([([], 0), ([], 0), ([], 1)], ['{"job_id": "review-202"}'], 0))
+expect("done holds the two successes", lambda: sorted(DONE), ["review-201", "review-203"])
+
+@@ item d27-e3
+type: scratch
+title: Closed book: Bedrock + retries + fallback
+exam: yes
+level: 3
+cloud: yes
+cards: Managed models: Bedrock and Vertex AI; d26:Errors and retries: retry only temporary errors
+--- context
+When a customer requires Bedrock for contract reviews, every clause goes through this step. A contract has dozens of clauses, and a rate limit or a bad model answer on any one of them should not stop the whole report from being produced.
+--- prompt
+Write `review_clause_bedrock(client, clause_id, text, sleep)`. `client` is a `bedrock-runtime` client, already set up so that the SDK **doesn't retry** (`total_max_attempts=1`), so rate-limit errors come straight to you.
+
+- Call `client.converse(...)`: `modelId="eu.amazon.nova-lite-v1:0"`; `system=[{"text": "Reply with JSON only: clause_id, verdict, risk_level."}]`; one user message whose content is `f"Review clause {clause_id}: {text}"`; `inferenceConfig={"maxTokens": 200, "temperature": 0}`
+- Retry when the error code of a `botocore.exceptions.ClientError` is `ThrottlingException` or `ServiceUnavailableException`: at most 4 calls in total, with `sleep(2 ** i)` after failure number `i` (`i` starts at 0); if the 4th call fails too, raise the error. Other errors are raised right away
+- Once you have an answer: if `stopReason` is `"max_tokens"` (cut off; don't trust it even if the text happens to parse), `content[0]["text"]` is not valid JSON, or `verdict` is not in `("accept", "flag", "redline")`, **don't raise**; return the fallback result `{"clause_id": clause_id, "verdict": "flag", "risk_level": "medium", "fallback": True}` instead (when unsure, hand it to a person: that is Clause Check's principle)
+- Otherwise return `{"clause_id": clause_id, "verdict": ..., "risk_level": ..., "fallback": False}`
+--- solution
+import json
+from botocore.exceptions import ClientError
+
+RETRY_CODES = ("ThrottlingException", "ServiceUnavailableException")
+VERDICTS = ("accept", "flag", "redline")
+
+def review_clause_bedrock(client, clause_id, text, sleep):
+    for i in range(4):
+        try:
+            resp = client.converse(
+                modelId="eu.amazon.nova-lite-v1:0",
+                system=[{"text": "Reply with JSON only: clause_id, verdict, risk_level."}],
+                messages=[{"role": "user", "content": [{"text": f"Review clause {clause_id}: {text}"}]}],
+                inferenceConfig={"maxTokens": 200, "temperature": 0},
+            )
+            break
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in RETRY_CODES or i == 3:
+                raise
+            sleep(2 ** i)
+    fallback = {"clause_id": clause_id, "verdict": "flag", "risk_level": "medium", "fallback": True}
+    if resp["stopReason"] == "max_tokens":
+        return fallback
+    try:
+        data = json.loads(resp["output"]["message"]["content"][0]["text"])
+    except json.JSONDecodeError:
+        return fallback
+    if data.get("verdict") not in VERDICTS:
+        return fallback
+    return {"clause_id": clause_id, "verdict": data["verdict"], "risk_level": data.get("risk_level"), "fallback": False}
+--- tests
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+BR = boto3.client("bedrock-runtime", region_name="eu-north-1", config=Config(retries={"total_max_attempts": 1}))
+def run(fails=0, kind="throttle"):
+    CLOUD.queue.clear()
+    CLOUD.fail_next("bedrock-runtime", kind, fails)
+    delays = []
+    try:
+        out = review_clause_bedrock(BR, "8.1", "Liability of the Customer is unlimited.", delays.append)
+    except ClientError as e:
+        out = e.response["Error"]["Code"]
+    return out, delays
+RED = {"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "fallback": False}
+expect("succeeds after 2 throttles, and after one 503", lambda: (run(2), run(1, "unavailable")), ((RED, [1, 2]), (RED, [1])))
+expect("throttled every time: raises after 4 calls", lambda: run(9), ("ThrottlingException", [1, 2, 4]))
+class Fake:
+    def __init__(self, text, stop="end_turn"):
+        self.resp = {"output": {"message": {"role": "assistant", "content": [{"text": text}]}}, "stopReason": stop, "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}}
+    def converse(self, **kwargs):
+        return self.resp
+FLAG = {"clause_id": "12", "verdict": "flag", "risk_level": "medium", "fallback": True}
+expect("cut off (even if the text parses), bad JSON, a strange verdict: all fall back to flag", lambda: [review_clause_bedrock(Fake(t, s), "12", "x", print) for t, s in (('{"verdict": "accept"}', "max_tokens"), ("Sure! Here you go", "end_turn"), ('{"verdict": "approve"}', "end_turn"))], [FLAG] * 3)

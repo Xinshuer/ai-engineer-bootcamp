@@ -1,30 +1,30 @@
 @@ day 17
-title: Agent 循环：工具注册、参数校验、上限、审批、幂等
+title: The agent loop: tool registry, argument validation, limits, approval, idempotency
 lang: ts
-hours: 5 小时
+hours: 5 hours
 --- goal
-手写一个「能上线的形状」的 Agent 循环：用 Zod 定义工具并生成 JSON Schema，参数不合法时把错误回送给模型，有步数和 token 上限并说明为什么停，每一步都留下轨迹，危险的工具要人批准，有副作用的工具重试也只执行一次。最后你会看到，Mastra 的 `createTool` / `Agent` 和 Clause Check 的 `tools.py`、`review.py` 用的是同一套零件。
+Hand-write an agent loop in a shape that is ready to ship: define tools with Zod and generate JSON Schema from them, send the error back to the model when the arguments are invalid, have step and token limits and say why it stopped, leave a trace of every step, make risky tools wait for a person's approval, and run tools with side effects only once even when they are retried. At the end you'll see that Mastra's `createTool` / `Agent` and Clause Check's `tools.py` and `review.py` are built from the same parts.
 --- checklist
-- 先清空复习区
-- 读完 8 张知识卡片并改动运行
-- 练习区全部通过（包括本机任务：看真实项目的工具轨迹）
-- 闭卷挑战 3 题
-- 打开 `clausecheck/tools.py` 的 `execute` 和 `review.py` 的 `model_review`，指出今天写的每个零件对应哪几行
+- Clear your Review list first
+- Read all 8 knowledge cards, change the examples and run them
+- Pass every practice exercise (including the local task: look at the real project's tool trace)
+- The 3 closed-book challenges
+- Open `execute` in `clausecheck/tools.py` and `model_review` in `review.py`, and point out which lines match each part you wrote today
 
 @@ concept
-title: Agent = 循环 + 上限
+title: Agent = loop + limits
 --- body
-第 7 天的 `miniAgent` 已经是一个 Agent：请求模型 → 模型要调工具就执行 → 把结果放回 messages → 再请求……直到模型给出文字回答。今天把它改造成能上线的样子。
+Day 7's `miniAgent` is already an agent: ask the model → if the model wants a tool, run it → put the result back into messages → ask again… until the model gives a text answer. Today you turn it into something that is ready to ship.
 
-上线前最先要想的不是「怎么让它更聪明」，而是**「怎么让它停下来」**：模型可能一直调工具（死循环），而每一步都花钱。所以上限是设计的一部分，停下来时还要说明原因：
+Before you ship, the first question is not "how do I make it smarter" but **"how do I make it stop"**: the model may keep calling tools forever (an infinite loop), and every step costs money. So limits are part of the design, and when the loop stops it must also say why:
 
 ```ts
 type StopReason = "answer" | "max_steps" | "budget";
 ```
 
-Clause Check 的 `review.py` 里 `while trace.steps < settings.max_steps` 就是这个上限（`config.py` 默认 6 步）。本页的模拟服务器有个开关：用户消息里带 `[loop]`，模型就会一直调工具，专门用来测上限。
+In Clause Check's `review.py`, `while trace.steps < settings.max_steps` is this limit (`config.py` defaults to 6 steps). This page's mock server has a switch: if the user message contains `[loop]`, the model keeps calling tools forever. It exists just for testing limits.
 
-请求体里的 `thinking: { type: "disabled" }` 关掉了 DeepSeek 默认开着的思考模式。Agent 每一步都要请求一次模型，思考的 token 按输出计费，还拖慢每一步；选工具、给判定用不着长推理，所以工具循环一般把思考关掉（关掉后 `temperature` 也重新起作用）。今天的请求都这样写。
+`thinking: { type: "disabled" }` in the request body turns off DeepSeek's thinking mode, which is on by default. An agent calls the model once per step; thinking tokens are billed as output and also slow every step down. Picking a tool or giving a verdict doesn't need long reasoning, so tool loops usually turn thinking off (once it is off, `temperature` works again). All of today's requests are written this way.
 --- code
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
@@ -53,18 +53,18 @@ async function main() {
 main();
 
 @@ concept
-title: 工具注册表：一个 schema，两种用途
+title: Tool registry: one schema, two uses
 --- body
-一个工具 = 名字 + 说明 + 参数 schema + 执行函数。schema 同时做两件事：
+A tool = a name + a description + a parameter schema + a function that runs it. The schema does two jobs at once:
 
-1. `z.toJSONSchema(schema)` 生成给模型看的 `parameters`
-2. 模型传回参数时，用 `schema.safeParse(...)` 在代码里校验
+1. `z.toJSONSchema(schema)` generates the `parameters` the model sees
+2. When the model sends arguments back, `schema.safeParse(...)` checks them in code
 
-一份定义，模型看到的和代码检查的永远一致。`tools.py` 的 `tool_specs()` 用 Pydantic 的 `model_json_schema()` 做的是同一件事。
+With one definition, what the model sees and what the code checks always match. `tool_specs()` in `tools.py` does the same thing with Pydantic's `model_json_schema()`.
 
-工具按名字放进 `Map<string, Tool>`（第 16 天），查找用 `.get(name)`。`run` 的参数写成 `any`，因为每个工具的参数形状都不同；这里用 any 是安全的，因为进 `run` 之前一定先过了 `safeParse`。
+Tools go into a `Map<string, Tool>` by name (Day 16), and you look one up with `.get(name)`. The parameter of `run` is typed `any` because every tool's arguments have a different shape. `any` is safe here, because the arguments always pass `safeParse` before they reach `run`.
 
-小说明：本页的 Zod 类型声明是简化版，没有 `z.ZodType`，所以题目里写好了 `type AnySchema = ReturnType<typeof z.any>`，意思就是「任何一个 Zod schema」。真实项目里直接写 `z.ZodType`。
+A small note: this page's Zod type declarations are a simplified version without `z.ZodType`, so the exercises already include `type AnySchema = ReturnType<typeof z.any>`, which simply means "any Zod schema". In a real project, write `z.ZodType` directly.
 --- code
 import { z } from "zod";
 
@@ -83,17 +83,17 @@ console.log(JSON.stringify(z.toJSONSchema(lookupPlaybook.schema), null, 2));
 console.log(registry.has("lookup_playbook"), registry.get("delete_all"));
 
 @@ concept
-title: 参数校验：错误是写给模型看的
+title: Argument validation: errors are messages for the model
 --- body
-模型给的 `arguments` 是一段 **JSON 文字**，它可能：格式坏了、字段不对、工具名根本不存在。这三种情况都**不要 throw 让整个循环崩掉**，而是把错误写成工具结果回给模型，它下一步通常会自己改正：
+The `arguments` the model gives are **JSON text**. The text may be malformed, have the wrong fields, or name a tool that doesn't exist at all. In none of these three cases should you **throw and crash the whole loop**. Instead, write the error as the tool result and send it back to the model; it usually corrects itself on the next step:
 
 ```ts
 messages.push({ role: "tool", tool_call_id: call.id, content: "INVALID_ARGS: topic: Invalid option ..." });
 ```
 
-这正是 `tools.py` 里 `execute` 的做法：`UNKNOWN_TOOL`、`INVALID_ARGS` 作为内容返回，外加一个 `is_error` 标记，注释写的是「Never raises for model mistakes」。
+This is exactly what `execute` in `tools.py` does: `UNKNOWN_TOOL` and `INVALID_ARGS` come back as content, plus an `is_error` flag, and the comment says "Never raises for model mistakes".
 
-经典错误：`JSON.parse` 没包 try/catch。模型写坏一次参数，整份合同的审查就崩了。
+A classic mistake: `JSON.parse` without a try/catch. The model writes bad arguments once, and the review of the whole contract crashes.
 --- code
 import { z } from "zod";
 
@@ -119,20 +119,20 @@ console.log(check('{"topic": '));
 console.log(check('{"topic": "gdpr"}'));
 
 @@ concept
-title: 上限和停止原因
+title: Limits and stop reasons
 --- body
-两种上限一起用：
+Use two kinds of limits together:
 
-- **步数**：最多请求模型几次（`maxSteps`）
-- **预算**：把每次回答里的 `usage.total_tokens` 加起来，达到 `maxTokens` 就停。messages 越来越长，所以每一步都比上一步贵（运行下面的例子看数字）。思考模式开着的话，思考的 token 也算在 `completion_tokens` 里，预算花得更快
+- **Steps**: the most times to ask the model (`maxSteps`)
+- **Budget**: add up `usage.total_tokens` from every response, and stop once the total reaches `maxTokens`. messages keeps growing, so every step costs more than the one before (run the example below to see the numbers). With thinking mode on, thinking tokens also count in `completion_tokens`, so the budget runs out faster
 
-停下来时返回的不只是一段文字，而是一个说明「为什么停」的对象：
+When the loop stops, it returns not just some text but an object that says why it stopped:
 
 ```ts
 type RunResult = { reason: "answer" | "max_steps" | "budget"; answer: string | null; steps: number };
 ```
 
-调用方看 `reason` 决定怎么办：`answer` 正常使用；`max_steps` / `budget` 就像 `review.py` 那样退回「flag，需要人看」，而不是假装审查完成了。
+The caller looks at `reason` to decide what to do: `answer` is used normally; for `max_steps` / `budget`, fall back to "flag, needs a person" the way `review.py` does, instead of pretending the review is finished.
 --- code
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
@@ -154,19 +154,19 @@ async function main() {
 main();
 
 @@ concept
-title: 轨迹：每一步都记下来
+title: Traces: record every step
 --- body
-律师问「8.1 为什么被 flag？」，你要能打开记录看到：模型调了哪些工具、传了什么参数、成功没有、拿到了什么。这就是**轨迹**（trace），Langfuse 这类工具展示的就是它。
+A lawyer asks "why was 8.1 flagged?" You need to be able to open a record and see which tools the model called, with which arguments, whether each call succeeded, and what it got back. This is a **trace**, and it is what tools like Langfuse display.
 
-每调一次工具记一条：
+Record one entry per tool call:
 
 ```ts
 type TraceEntry = { step: number; tool: string; args: string; ok: boolean; result: string };
 ```
 
-`args` 记模型给的**原始文字**（坏 JSON 也要记下来，排错时最需要它）。Clause Check 的 `ReviewTrace` 记了 `steps`、token 数、`stop_reason`，还有 `tool_calls` 标签列表，比如 `lookup_playbook:liability_cap`、`get_clause:12`、`propose_redline:INVALID_ARGS`。
+`args` records the model's **raw text** (record bad JSON too: it's what you need most when debugging). Clause Check's `ReviewTrace` records `steps`, token counts, `stop_reason`, and a list of `tool_calls` labels such as `lookup_playbook:liability_cap`, `get_clause:12`, `propose_redline:INVALID_ARGS`.
 
-排错顺序还是第 7 天那句：先看模型拿到了什么（轨迹），再怀疑模型的推理。
+The debugging order is still the one from Day 7: first look at what the model received (the trace), then question the model's reasoning.
 --- code
 type TraceEntry = { step: number; tool: string; args: string; ok: boolean; result: string };
 
@@ -186,16 +186,16 @@ const errors = trace.filter((e) => !e.ok).length;
 console.log(`${trace.length} tool calls, ${errors} error(s)`);
 
 @@ concept
-title: 人在回路：危险的工具要人批准
+title: Human in the loop: risky tools need a person to approve
 --- body
-查 playbook、读条款是**只读**的，调错了也没关系。发邮件、改合同、付款这类有后果的工具，要先问人：
+Looking up the playbook and reading clauses are **read-only**: a wrong call does no harm. Tools with consequences, like sending an email, changing a contract or making a payment, must ask a person first:
 
-- 工具上标记 `needsApproval: true`
-- 循环执行它之前，调用一个**注入进来的** `approve(request)` 函数；真实应用里它会弹出按钮等人点，测试里传一个假的
-- 被拒绝时不执行，把 `DENIED: ...` 作为工具结果告诉模型，让它换个做法
-- **批准永远不能来自模型**：不能给工具加一个 `approved` 参数让模型自己填
+- Mark the tool with `needsApproval: true`
+- Before the loop runs it, call an **injected** `approve(request)` function. In a real app it shows buttons and waits for a person to click; in tests you pass a fake one
+- When it is rejected, don't run it: send `DENIED: ...` back to the model as the tool result, so it tries another approach
+- **Approval must never come from the model**: don't give the tool an `approved` parameter for the model to fill in itself
 
-Clause Check 的做法一样：`propose_redline` 只「记录一个提议」，真正把修改写进导出文件之前，`graph.py` 的 `approve` 节点会停下来等人决定（明天手写这个「暂停再继续」）。
+Clause Check does the same: `propose_redline` only "records a proposal", and before the change is actually written into the exported file, the `approve` node in `graph.py` stops and waits for a person to decide (tomorrow you hand-write this "pause and resume").
 --- code
 type Call = { tool: string; args: Record<string, string> };
 const NEEDS_APPROVAL = new Set(["send_redline_email"]);
@@ -223,16 +223,16 @@ async function main() {
 main();
 
 @@ concept
-title: 幂等：重试不能发两封邮件
+title: Idempotency: a retry must not send two emails
 --- body
-同一个工具调用可能被执行不止一次：模型重复调用、429 之后整步重试、程序崩了从检查点恢复（明天）。只读工具无所谓，**发邮件就会发两封**。
+The same tool call may run more than once: the model calls it again, the whole step is retried after a 429, or the program crashes and resumes from a checkpoint (tomorrow). For read-only tools that doesn't matter, but **an email gets sent twice**.
 
-解决办法叫**幂等**：给每个动作一个固定的 key（比如 `` `${clauseId}:${action}` ``），做成功后把 key 记进一个 `Set`；下次看到同一个 key 就直接返回「已经做过了」，不再真的做。
+The fix is called **idempotency**: give every action a fixed key (for example `` `${clauseId}:${action}` ``), and after the action succeeds, record the key in a `Set`. The next time you see the same key, return "already done" right away instead of really doing it again.
 
-两个要点：
+Two key points:
 
-- **做成功之后**再记 key。发送失败时不记，重试才发得出去
-- 真实系统里这个 Set 要放进数据库，否则程序一重启就忘了。Stripe 这类支付接口支持 `Idempotency-Key` 请求头，是同一个思路
+- Record the key **after the action succeeds**. If sending fails, don't record it, so a retry can still send
+- In a real system this Set has to live in a database, or the program forgets it the moment it restarts. Payment APIs like Stripe support an `Idempotency-Key` request header; it's the same idea
 --- code
 class Outbox {
   #done = new Set<string>();
@@ -256,9 +256,9 @@ console.log(outbox.send("8.1", "reminder"));
 console.log(outbox.sent);
 
 @@ concept
-title: 对照框架：Mastra 和 LangGraph
+title: Framework comparison: Mastra and LangGraph
 --- body
-今天手写的零件，框架里都有现成的。Mastra 的写法大致如下（示意，具体签名以 mastra.ai 官方文档为准）：
+Frameworks have ready-made versions of every part you hand-wrote today. In Mastra it looks roughly like this (a sketch; check the official docs at mastra.ai for the exact signatures):
 
 ```ts
 import { createTool } from "@mastra/core/tools";
@@ -273,11 +273,11 @@ const lookupPlaybook = createTool({
 const reviewer = new Agent({ name: "reviewer", instructions: "...", model: ..., tools: { lookupPlaybook } });
 ```
 
-- `inputSchema` 就是你的 `schema`：框架替你生成 JSON Schema、替你校验参数
-- `execute` 就是你的 `run`；`Agent` 里的循环就是你的 `runAgent`，步数上限在调用时的选项里设置
-- LangGraph（Python）：`ToolNode` 负责执行模型要的工具，`recursion_limit` 限制总步数，人工审批用 `interrupt()`（明天）
+- `inputSchema` is your `schema`: the framework generates the JSON Schema and validates the arguments for you
+- `execute` is your `run`; the loop inside `Agent` is your `runAgent`, and the step limit is set in the options when you call it
+- LangGraph (Python): `ToolNode` runs the tools the model asks for, `recursion_limit` caps the total number of steps, and human approval uses `interrupt()` (tomorrow)
 
-面试时可以这样说：「我手写过这个循环，所以知道框架替我做了哪些事，出了问题知道去哪儿找。」
+In an interview you can say: "I've hand-written this loop, so I know what the framework does for me, and when something goes wrong I know where to look."
 --- code
 const parts = [
   { mine: "Tool.schema (Zod)", mastra: "createTool inputSchema", project: "tools.py ARG_MODELS" },
@@ -292,13 +292,13 @@ for (const p of parts) {
 
 @@ item d17-01
 type: predict
-title: 复习：可辨识联合
+title: Recap: discriminated unions
 level: 1
-cards: d15:可辨识联合和穷尽检查; Agent = 循环 + 上限
+cards: d15:Discriminated unions and exhaustiveness checks; Agent = loop + limits
 --- context
-今天要写的 Agent 每走一步，结果只有几种：调了一次工具、给出了回答、或者被上限拦下。用可辨识联合把每一步描述清楚，后面记录轨迹、显示给律师看都要用到它。
+Each step of the agent you write today has only a few possible results: it called a tool, gave an answer, or was stopped by a limit. A discriminated union describes each step clearly; you'll need it later for recording the trace and for showing it to the lawyer.
 --- prompt
-复习第 15 天。Agent 的每一步可以用一个可辨识联合来描述。写出输出。
+Review Day 15. Each step of the agent can be described with a discriminated union. Write the output.
 --- code
 type Step =
   | { kind: "tool"; name: string; ok: boolean }
@@ -326,23 +326,23 @@ for (const s of steps) {
 }
 console.log(describe({ kind: "stopped", reason: "budget" }));
 --- explain
-`switch (s.kind)` 进了哪个 case，TypeScript 就知道 `s` 是哪一种，所以 `case "tool"` 里能用 `s.name`，`case "answer"` 里能用 `s.text`。今天的停止原因 `"answer" | "max_steps" | "budget"` 也是字面量联合，调用方用 switch 分别处理。
+Whichever case `switch (s.kind)` enters, TypeScript knows which kind `s` is, so inside `case "tool"` you can use `s.name`, and inside `case "answer"` you can use `s.text`. Today's stop reason `"answer" | "max_steps" | "budget"` is also a union of literals, and the caller handles each one in a switch.
 
 @@ item d17-02
 type: code
-title: 复习：参数必须是对象
+title: Recap: arguments must be an object
 level: 1
-cards: 参数校验：错误是写给模型看的; d16:Result：失败也是一种返回值
+cards: Argument validation: errors are messages for the model; d16:Result: failure is a return value too
 --- context
-模型要调工具时，参数是它自己写的一段 JSON 文字，可能写坏，也可能不是工具要的形状。这是进工具之前的第一道检查：查出问题要变成一句错误说明，而不是让整个审查崩掉。
+When the model wants to call a tool, the arguments are a piece of JSON text it wrote itself. The text may be broken, or not the shape the tool needs. This is the first check before a tool runs: a problem must turn into a one-line error message, not crash the whole review.
 --- prompt
-复习第 16 天的 `Result`。工具参数必须是一个 JSON **对象**。写 `parseJsonObject(text)`：
+Review Day 16's `Result`. Tool arguments must be a JSON **object**. Write `parseJsonObject(text)`:
 
-- 解析失败：`{ ok: false, error: "INVALID_JSON" }`
-- 解析出来不是对象（数组、`null`、字符串、数字）：`{ ok: false, error: "NOT_AN_OBJECT" }`
-- 否则：`{ ok: true, value: 解析结果 }`
+- parsing fails: `{ ok: false, error: "INVALID_JSON" }`
+- the parsed value is not an object (an array, `null`, a string, a number): `{ ok: false, error: "NOT_AN_OBJECT" }`
+- otherwise: `{ ok: true, value: <the parsed value> }`
 
-例：`parseJsonObject('["payment"]')` → `{ ok: false, error: "NOT_AN_OBJECT" }`。`review.py` 里也有这一步检查：「arguments were not a JSON object」。
+Example: `parseJsonObject('["payment"]')` → `{ ok: false, error: "NOT_AN_OBJECT" }`. `review.py` has this check too: "arguments were not a JSON object".
 --- starter
 type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -365,30 +365,30 @@ function parseJsonObject(text: string): Result<object> {
   return { ok: true, value: data };
 }
 --- tests
-expect("合法对象", () => parseJsonObject('{"topic": "payment"}'), { ok: true, value: { topic: "payment" } });
-expect("坏 JSON", () => parseJsonObject('{"topic": '), { ok: false, error: "INVALID_JSON" });
-expect("数组不算", () => parseJsonObject('["payment"]'), { ok: false, error: "NOT_AN_OBJECT" });
-expect("null 不算", () => parseJsonObject("null"), { ok: false, error: "NOT_AN_OBJECT" });
-expect("字符串不算", () => parseJsonObject('"payment"'), { ok: false, error: "NOT_AN_OBJECT" });
+expect("a valid object", () => parseJsonObject('{"topic": "payment"}'), { ok: true, value: { topic: "payment" } });
+expect("bad JSON", () => parseJsonObject('{"topic": '), { ok: false, error: "INVALID_JSON" });
+expect("an array doesn't count", () => parseJsonObject('["payment"]'), { ok: false, error: "NOT_AN_OBJECT" });
+expect("null doesn't count", () => parseJsonObject("null"), { ok: false, error: "NOT_AN_OBJECT" });
+expect("a string doesn't count", () => parseJsonObject('"payment"'), { ok: false, error: "NOT_AN_OBJECT" });
 --- hints
-- 先 try/catch 包住 `JSON.parse`，结果存进 `let data: unknown`。
-- `typeof null` 也是 `"object"`，数组的 typeof 也是 `"object"`，所以要额外判断 `data === null` 和 `Array.isArray(data)`。
+- First wrap `JSON.parse` in a try/catch and store the result in `let data: unknown`.
+- `typeof null` is also `"object"`, and so is the typeof of an array, so you also need to check `data === null` and `Array.isArray(data)`.
 
 @@ item d17-03
 type: code
-title: 从 Zod 生成工具定义
+title: Generate the tool definition from Zod
 level: 2
-cards: 工具注册表：一个 schema，两种用途
+cards: Tool registry: one schema, two uses
 --- context
-模型要先知道有哪些工具、每个工具要什么参数，才会去调用，这些说明每次请求都随 `tools` 一起发过去。参数规则已经用 Zod 写了一份，从它生成给模型看的说明，就不用手写第二份，两边也不会对不上。
+The model has to know which tools exist and what arguments each one needs before it calls them; these descriptions go along with every request in `tools`. The argument rules are already written once in Zod. Generate the model's description from them, and you never hand-write a second copy, so the two can't drift apart.
 --- prompt
-写 `toolSpec(tool)`，返回发给 API 的工具对象：
+Write `toolSpec(tool)`, which returns the tool object sent to the API:
 
 ```ts
 { type: "function", function: { name, description, parameters } }
 ```
 
-`parameters` 用 `z.toJSONSchema(tool.schema)` 生成，再删掉其中的 `$schema` 键（它只说明 JSON Schema 的版本，模型用不上；`tools.py` 的 `tool_specs()` 也会删掉多余的 `title`）。删除一个键：`delete obj.key`。
+Generate `parameters` with `z.toJSONSchema(tool.schema)`, then delete its `$schema` key (it only states the JSON Schema version, which the model doesn't need; `tool_specs()` in `tools.py` also removes the extra `title`). To delete a key: `delete obj.key`.
 --- starter
 import { z } from "zod";
 
@@ -418,46 +418,46 @@ const GET_CLAUSE: Tool = {
   schema: z.object({ clause_id: z.string().describe("Clause number as printed, e.g. '12'") }),
   run: (args) => `text of ${args.clause_id}`,
 };
-expect("外层结构", () => toolSpec(GET_CLAUSE).type, "function");
-expect("description 原样带上", () => toolSpec(GET_CLAUSE).function.description, GET_CLAUSE.description);
-expect("parameters 来自 schema", () => toolSpec(GET_CLAUSE).function.parameters, {
+expect("outer shape", () => toolSpec(GET_CLAUSE).type, "function");
+expect("description carried over as is", () => toolSpec(GET_CLAUSE).function.description, GET_CLAUSE.description);
+expect("parameters come from the schema", () => toolSpec(GET_CLAUSE).function.parameters, {
   type: "object",
   properties: { clause_id: { type: "string", description: "Clause number as printed, e.g. '12'" } },
   required: ["clause_id"],
   additionalProperties: false,
 });
-expect("没有 $schema", () => "$schema" in toolSpec(GET_CLAUSE).function.parameters, false);
+expect("no $schema", () => "$schema" in toolSpec(GET_CLAUSE).function.parameters, false);
 --- hints
-- `const parameters = z.toJSONSchema(tool.schema);` 得到一个普通对象。
-- `delete parameters.$schema;` 之后再放进返回的对象里。
+- `const parameters = z.toJSONSchema(tool.schema);` gives you a plain object.
+- Run `delete parameters.$schema;`, then put it into the object you return.
 
 @@ item d17-04
 type: choice
-title: 限制写在哪里
+title: Where the restriction goes
 level: 1
-cards: 工具注册表：一个 schema，两种用途; 参数校验：错误是写给模型看的
+cards: Tool registry: one schema, two uses; Argument validation: errors are messages for the model
 --- context
-`lookup_playbook` 按主题查客户的审查规则。模型有时会编一个 playbook 里没有的主题名，这时查不到规则，给出的判定就没有依据。
+`lookup_playbook` looks up the customer's review rules by topic. Sometimes the model makes up a topic name that isn't in the playbook; then no rule is found, and the verdict it gives has nothing to rest on.
 --- prompt
-`lookup_playbook` 的参数 `topic` 只能是 playbook 里的 11 个主题之一。这个限制放在哪里最好？
+The `topic` argument of `lookup_playbook` must be one of the 11 topics in the playbook. Where is the best place to put this restriction?
 --- options
-- 只写在 description 里：「topic must be one of liability_cap, payment, …」
-- 写成 `z.enum([...])`：它会变成 JSON Schema 里的 `enum` 给模型看，`safeParse` 还会在代码里真的拦住不合法的值
-- 不用限制，工具内部查不到就返回空字符串
-- 写在 system prompt 里，让模型记住
+- Only in the description: "topic must be one of liability_cap, payment, …"
+- As `z.enum([...])`: it becomes an `enum` in the JSON Schema the model sees, and `safeParse` also really blocks invalid values in code
+- No restriction needed: the tool returns an empty string when it finds nothing
+- In the system prompt, so the model remembers it
 answer: 2
 --- explain
-description 和 prompt 是给模型的「建议」，模型可能不听；schema 是「规则」：它同时生成 `enum` 给模型看，又在代码里执行。`tools.py` 里就是这样：`LookupPlaybookArgs` 的 `topic: Topic` 是一个 11 个值的 `Literal`，生成的 schema 里就是 `enum`。description 该写的是「什么时候用、什么时候不用、调用后会发生什么」（第 12 天 `mark_for_review` 的教训）。返回空字符串最糟：模型以为 playbook 对这个主题没有要求。
+The description and the prompt are "suggestions" to the model, and it may ignore them; the schema is a "rule": it generates the `enum` the model sees and is also enforced in code. That's how `tools.py` does it: `topic: Topic` in `LookupPlaybookArgs` is a `Literal` with 11 values, and the generated schema has an `enum`. What the description should say is "when to use it, when not to, and what happens after the call" (the lesson of `mark_for_review` on Day 12). Returning an empty string is the worst choice: the model concludes the playbook has no requirement for that topic.
 
 @@ item d17-05
 type: fill
-title: 填空：注册表
+title: Fill in: the registry
 level: 1
-cards: 工具注册表：一个 schema，两种用途; d16:Map 和 Set
+cards: Tool registry: one schema, two uses; d16:Map and Set
 --- context
-Agent 收到的工具调用里只有一个工具名。注册表就是「名字 → 工具」的一张表：程序启动时建好，循环里每次按名字去找。模型偶尔会写一个不存在的工具名。
+A tool call the agent receives contains only a tool name. The registry is a "name → tool" table: it is built when the program starts, and the loop looks tools up in it by name every time. Now and then the model writes a tool name that doesn't exist.
 --- prompt
-填空，完成 `buildRegistry`（名字重复就 throw）和 `findTool`（找不到时返回一段列出可用工具的错误文字，模型看到就知道该用哪个名字）。
+Fill in the blanks to complete `buildRegistry` (throw on a duplicate name) and `findTool` (when the name isn't found, return an error text that lists the available tools, so the model knows which name to use).
 --- template
 import { z } from "zod";
 
@@ -481,26 +481,26 @@ function findTool(registry: Map<string, Tool>, name: string): Tool | string {
 --- tests
 const mk = (name: string): Tool => ({ name, description: name, schema: z.object({}), run: () => name });
 const REG = buildRegistry([mk("lookup_playbook"), mk("get_clause")]);
-expect("两个工具", () => REG.size, 2);
-expect("找得到", () => {
+expect("two tools", () => REG.size, 2);
+expect("found", () => {
   const t = findTool(REG, "get_clause");
   return typeof t === "string" ? t : t.name;
 }, "get_clause");
-expect("找不到", () => findTool(REG, "delete_all"), "UNKNOWN_TOOL: delete_all. Available: lookup_playbook, get_clause");
-expectThrows("名字重复", () => buildRegistry([mk("get_clause"), mk("get_clause")]));
+expect("not found", () => findTool(REG, "delete_all"), "UNKNOWN_TOOL: delete_all. Available: lookup_playbook, get_clause");
+expectThrows("duplicate name", () => buildRegistry([mk("get_clause"), mk("get_clause")]));
 --- hints
-- Map 的四个常用方法：`has`、`get`、`set`、`size`（最后一个是属性）。
-- `registry.get(name)` 找不到时是 `undefined`，所以后面的 `??` 会接上错误文字。
+- Four Map members you use all the time: `has`, `get`, `set`, `size` (the last one is a property).
+- `registry.get(name)` is `undefined` when nothing is found, so the `??` after it supplies the error text.
 
 @@ item d17-06
 type: predict
-title: 模型看到的参数说明
+title: The argument description the model sees
 level: 2
-cards: 工具注册表：一个 schema，两种用途
+cards: Tool registry: one schema, two uses
 --- context
-你用 Zod 写的参数规则，发给模型之前会变成一段 JSON Schema。模型决定怎么填参数时只看得到这一段，所以要知道你的写法最后变成了什么样子。
+The argument rules you write in Zod become a piece of JSON Schema before they are sent to the model. When the model decides how to fill in the arguments, this is all it can see, so you need to know what your code turns into in the end.
 --- prompt
-写出输出。注意 `.optional()` 的字段在不在 `required` 里，`.describe(...)` 变成了什么。
+Write the output. Notice whether the `.optional()` field is in `required`, and what `.describe(...)` turns into.
 --- code
 import { z } from "zod";
 
@@ -514,23 +514,23 @@ console.log(JSON.stringify(schema.required));
 console.log(JSON.stringify(schema.properties.topic));
 console.log(Object.keys(schema.properties).length);
 --- explain
-可选字段不会出现在 `required` 里；`.describe()` 变成 `description`，这是模型看到的「这个参数是什么」，写清楚它和写清楚工具的 description 一样重要。`z.enum` 变成 `enum` 列表，模型就知道只能从这几个里选。
+Optional fields don't appear in `required`. `.describe()` becomes `description`, which tells the model "what this argument is"; writing it clearly matters as much as writing the tool's description clearly. `z.enum` becomes an `enum` list, so the model knows it can only pick from those values.
 
 @@ item d17-07
 type: code
-title: 解析并校验参数
+title: Parse and validate the arguments
 level: 2
-cards: 参数校验：错误是写给模型看的; 工具注册表：一个 schema，两种用途
+cards: Argument validation: errors are messages for the model; Tool registry: one schema, two uses
 --- context
-模型写的参数可能缺字段、类型不对。真实项目的 `tools.py` 也是先校验再执行：出错时回给模型一句带字段名的说明，它下一步通常会自己改对。
+The arguments the model writes may be missing fields or have the wrong types. The real project's `tools.py` also validates first and runs the tool second: on an error it sends the model a message that names the field, and the model usually fixes it on the next step.
 --- prompt
-写 `parseArgs(tool, text)`，返回 `Result<any>`：
+Write `parseArgs(tool, text)`, which returns a `Result<any>`:
 
-- `text` 不是合法 JSON：`{ ok: false, error: "INVALID_JSON: arguments are not valid JSON" }`
-- `tool.schema.safeParse` 失败：取第一个 issue，`{ ok: false, error: "INVALID_ARGS: " + 路径 + ": " + message }`，路径用 `issue.path.join(".")`
-- 成功：`{ ok: true, value: r.data }`
+- `text` is not valid JSON: `{ ok: false, error: "INVALID_JSON: arguments are not valid JSON" }`
+- `tool.schema.safeParse` fails: take the first issue and return `{ ok: false, error: "INVALID_ARGS: " + path + ": " + message }`, where the path is `issue.path.join(".")`
+- success: `{ ok: true, value: r.data }`
 
-注意返回 `r.data` 而不是原始对象：Zod 会补上默认值（下面 `max_chars` 默认 1500，和 `tools.py` 里的 `MAX_CLAUSE_CHARS` 同一个数；真实的 `get_clause` 没有这个参数，直接用这个常量截断）。
+Note: return `r.data`, not the raw object, because Zod fills in default values (below, `max_chars` defaults to 1500, the same number as `MAX_CLAUSE_CHARS` in `tools.py`; the real `get_clause` has no such argument and simply truncates with that constant).
 --- starter
 import { z } from "zod";
 
@@ -570,29 +570,29 @@ const GET_CLAUSE: Tool = {
   run: (args) => `text of ${args.clause_id}`,
 };
 const head = (r: Result<any>) => (r.ok ? "ok" : r.error.split(":").slice(0, 2).join(":"));
-expect("合法，并补上默认值", () => parseArgs(GET_CLAUSE, '{"clause_id": "12"}'), { ok: true, value: { clause_id: "12", max_chars: 1500 } });
-expect("坏 JSON", () => parseArgs(GET_CLAUSE, '{"clause_id": '), { ok: false, error: "INVALID_JSON: arguments are not valid JSON" });
-expect("缺字段", () => head(parseArgs(GET_CLAUSE, "{}")), "INVALID_ARGS: clause_id");
-expect("类型不对", () => head(parseArgs(GET_CLAUSE, '{"clause_id": "12", "max_chars": "long"}')), "INVALID_ARGS: max_chars");
+expect("valid, with the default filled in", () => parseArgs(GET_CLAUSE, '{"clause_id": "12"}'), { ok: true, value: { clause_id: "12", max_chars: 1500 } });
+expect("bad JSON", () => parseArgs(GET_CLAUSE, '{"clause_id": '), { ok: false, error: "INVALID_JSON: arguments are not valid JSON" });
+expect("missing field", () => head(parseArgs(GET_CLAUSE, "{}")), "INVALID_ARGS: clause_id");
+expect("wrong type", () => head(parseArgs(GET_CLAUSE, '{"clause_id": "12", "max_chars": "long"}')), "INVALID_ARGS: max_chars");
 --- hints
-- 两步：先 try/catch `JSON.parse`，再 `tool.schema.safeParse(raw)`。
-- 失败时 `const issue = r.error.issues[0];`，路径是数组，用 `issue.path.join(".")` 变成文字。
+- Two steps: first try/catch `JSON.parse`, then `tool.schema.safeParse(raw)`.
+- On failure, `const issue = r.error.issues[0];`. The path is an array; turn it into text with `issue.path.join(".")`.
 
 @@ item d17-08
 type: code
-title: 分发一次工具调用
+title: Dispatch one tool call
 level: 2
-cards: 参数校验：错误是写给模型看的; 工具注册表：一个 schema，两种用途
+cards: Argument validation: errors are messages for the model; Tool registry: one schema, two uses
 --- context
-这是 Agent 循环里「执行工具」的那一步：拿到模型的一次调用，找到工具、查过参数、真正去做。以后改合同、发邮件的工具也走这里，参数不对还照样执行的话，后果可能收不回来。
+This is the "run the tool" step of the agent loop: take one call from the model, find the tool, check the arguments, and actually do the work. Later, tools that change contracts or send emails go through here too; if they ran even with wrong arguments, the damage might not be reversible.
 --- prompt
-写 `dispatch(registry, call)`（async），返回 `ToolResult`：
+Write `dispatch(registry, call)` (async), which returns a `ToolResult`:
 
-- 工具名不在注册表里：`{ ok: false, content: "UNKNOWN_TOOL: 名字" }`
-- `parseArgs` 失败：`{ ok: false, content: 它的 error }`
-- 成功：`{ ok: true, content: await tool.run(参数) }`（`run` 可能是 async 的，所以要 await）
+- the tool name is not in the registry: `{ ok: false, content: "UNKNOWN_TOOL: <name>" }`
+- `parseArgs` fails: `{ ok: false, content: <its error> }`
+- success: `{ ok: true, content: await tool.run(<arguments>) }` (`run` may be async, so await it)
 
-参数不合法时**绝不能**执行工具。`parseArgs` 已经写好（上一题）。
+When the arguments are invalid, the tool must **never** run. `parseArgs` is already written (the previous exercise).
 --- starter
 import { z } from "zod";
 
@@ -668,34 +668,34 @@ const LOOKUP: Tool = {
 };
 const REG = new Map<string, Tool>([[LOOKUP.name, LOOKUP]]);
 const call = (name: string, args: string): ToolCall => ({ id: "call_1", function: { name, arguments: args } });
-expectAsync("成功（run 是 async 的）", () => dispatch(REG, call("lookup_playbook", '{"topic": "payment"}')), { ok: true, content: "rule for payment" });
-expectAsync("不存在的工具", () => dispatch(REG, call("delete_all", "{}")), { ok: false, content: "UNKNOWN_TOOL: delete_all" });
-expectAsync("坏 JSON", () => dispatch(REG, call("lookup_playbook", '{"topic": ')), { ok: false, content: "INVALID_JSON: arguments are not valid JSON" });
-expectAsync("参数不合法：不执行工具", async () => {
+expectAsync("success (run is async)", () => dispatch(REG, call("lookup_playbook", '{"topic": "payment"}')), { ok: true, content: "rule for payment" });
+expectAsync("a tool that doesn't exist", () => dispatch(REG, call("delete_all", "{}")), { ok: false, content: "UNKNOWN_TOOL: delete_all" });
+expectAsync("bad JSON", () => dispatch(REG, call("lookup_playbook", '{"topic": ')), { ok: false, content: "INVALID_JSON: arguments are not valid JSON" });
+expectAsync("invalid arguments: the tool does not run", async () => {
   runs = 0;
   const r = await dispatch(REG, call("lookup_playbook", '{"topic": "gdpr"}'));
   return [r.ok, r.content.startsWith("INVALID_ARGS: topic"), runs];
 }, [false, true, 0]);
 --- hints
-- `const tool = registry.get(call.function.name);` 找不到时是 `undefined`，用 `if (!tool)` 提前返回。
-- `const args = parseArgs(...)`；`if (!args.ok)` 返回错误，之后 TypeScript 就知道 `args.value` 存在。
+- `const tool = registry.get(call.function.name);` is `undefined` when nothing is found; return early with `if (!tool)`.
+- `const args = parseArgs(...)`; if `!args.ok`, return the error. After that, TypeScript knows `args.value` exists.
 
 @@ item d17-09
 type: code
-title: 有上限的 Agent 循环
+title: An agent loop with limits
 level: 3
-cards: Agent = 循环 + 上限; 上限和停止原因
+cards: Agent = loop + limits; Limits and stop reasons
 --- context
-把前面几题的零件装成一个完整的 Agent：审一条条款时，模型可以先调 `lookup_playbook` 查规则，再给判定。真实项目 `review.py` 的循环默认最多 6 步；没有上限的话，模型一直调工具，每一步都在花钱。
+Put the parts from the previous exercises together into a complete agent: when it reviews a clause, the model can first call `lookup_playbook` to look up the rule, then give its verdict. The loop in the real project's `review.py` allows at most 6 steps by default; without a limit, the model could keep calling tools, and every step costs money.
 --- prompt
-写 `runAgent(question, registry, maxSteps = 4)`，返回 `RunResult`：
+Write `runAgent(question, registry, maxSteps = 4)`, which returns a `RunResult`:
 
-1. `messages` 从一条 user 消息开始；每一步 POST 一次，请求体带 `model: "deepseek-flash"`、`messages`、`tools`（注册表里每个工具的 `toolSpec`）、`thinking: { type: "disabled" }`
-2. `finish_reason` 不是 `"tool_calls"`：返回 `{ reason: "answer", answer: 回答文字, steps: 已请求次数 }`
-3. 否则：先把模型那条消息 push 进 `messages`，再对 `tool_calls` 里的**每一个**调用 `dispatch`，各 push 一条 `{ role: "tool", tool_call_id, content }`
-4. 请求满 `maxSteps` 次还没有回答：返回 `{ reason: "max_steps", answer: null, steps: maxSteps }`
+1. `messages` starts with one user message. Each step makes one POST whose request body has `model: "deepseek-flash"`, `messages`, `tools` (the `toolSpec` of every tool in the registry) and `thinking: { type: "disabled" }`
+2. `finish_reason` is not `"tool_calls"`: return `{ reason: "answer", answer: <the answer text>, steps: <number of requests so far> }`
+3. Otherwise: first push the model's message into `messages`, then call `dispatch` for **every** call in `tool_calls` and push one `{ role: "tool", tool_call_id, content }` for each
+4. Still no answer after `maxSteps` requests: return `{ reason: "max_steps", answer: null, steps: maxSteps }`
 
-`toolSpec`、`dispatch` 已经写好。测试会用 `[bad-args]`（模型给坏参数）和 `[loop]`（模型停不下来）。
+`toolSpec` and `dispatch` are already written. The tests use `[bad-args]` (the model gives bad arguments) and `[loop]` (the model can't stop).
 --- starter
 import { z } from "zod";
 
@@ -811,42 +811,42 @@ async function runAgent(question: string, registry: Map<string, Tool>, maxSteps 
   return { reason: "max_steps", answer: null, steps: maxSteps };
 }
 --- tests
-expectAsync("正常：调一次工具，第 2 步回答", async () => {
+expectAsync("normal: one tool call, answer at step 2", async () => {
   MOCK.reset();
   const r = await runAgent("Is unlimited liability acceptable?", REGISTRY);
   return [r, MOCK.calls.length];
 }, [{ reason: "answer", answer: "Based on the playbook: rule for liability_cap: cap at 12 months of fees", steps: 2 }, 2]);
-expectAsync("请求里带着工具定义、模型名，思考已关", async () => {
+expectAsync("the request carries the tool definitions and the model name, thinking off", async () => {
   MOCK.reset();
   await runAgent("Is unlimited liability acceptable?", REGISTRY);
   const body = MOCK.calls[0].body;
   return [body.tools[0].function.name, body.model, body.thinking];
 }, ["lookup_playbook", "deepseek-flash", { type: "disabled" }]);
-expectAsync("[bad-args]：错误回给模型，循环不崩", async () => {
+expectAsync("[bad-args]: the error goes back to the model, the loop doesn't crash", async () => {
   MOCK.reset();
   const r = await runAgent("Is unlimited liability acceptable? [bad-args]", REGISTRY);
   const toolMsg = MOCK.calls[1].body.messages[2];
   return [r.reason, toolMsg.role, toolMsg.content.slice(0, 12)];
 }, ["answer", "tool", "INVALID_JSON"]);
-expectAsync("[loop]：请求 3 次后停下", async () => {
+expectAsync("[loop]: stops after 3 requests", async () => {
   MOCK.reset();
   const r = await runAgent("Is unlimited liability acceptable? [loop]", REGISTRY, 3);
   return [r, MOCK.calls.length];
 }, [{ reason: "max_steps", answer: null, steps: 3 }, 3]);
 --- hints
-- 骨架：`for (let step = 1; step <= maxSteps; step++) { 请求; 是回答就 return; 否则 push 模型消息 + 每个工具结果 }`，循环外 return max_steps。
-- `const choice = (await res.json()).choices[0];`，工具调用在 `choice.message.tool_calls`，它是数组，用 `for (const call of ...)`。
-- 每个工具结果：`messages.push({ role: "tool", tool_call_id: call.id, content: (await dispatch(registry, call)).content });`
+- Skeleton: `for (let step = 1; step <= maxSteps; step++) { request; if it's an answer, return; otherwise push the model message + every tool result }`, and return max_steps after the loop.
+- `const choice = (await res.json()).choices[0];`. The tool calls are in `choice.message.tool_calls`, which is an array, so use `for (const call of ...)`.
+- Each tool result: `messages.push({ role: "tool", tool_call_id: call.id, content: (await dispatch(registry, call)).content });`
 
 @@ item d17-10
 type: fix
-title: 修 bug：少了一条消息
+title: Fix the bug: a missing message
 level: 2
-cards: Agent = 循环 + 上限; d4:工具调用：模型说「帮我查一下」
+cards: Agent = loop + limits; d4:Tool calls: the model asks you to look something up
 --- context
-Agent 的第一次请求总是好的，问题常常出在第二次：前面的对话要按接口的规矩带上，请求才会被接受。这类 bug 在工具循环里非常常见，面试的找 bug 题也爱考。
+An agent's first request always works; the trouble usually starts with the second: the earlier conversation has to be sent along by the API's rules, or the request is rejected. This kind of bug is very common in tool loops, and interview bug-hunting questions love it.
 --- prompt
-这个循环一到第二次请求就出错。DeepSeek / OpenAI 接口规定：每条 `tool` 消息前面，必须有那条带 `tool_calls` 的 assistant 消息（模型要知道「我刚才调了什么」），否则返回 400。本页的模拟服务器也按这个规矩检查，所以代码拿到的是 400 的错误回答，读 `choices[0]` 时就崩了。运行测试，看第二次请求的角色顺序，修好它。
+This loop fails as soon as it makes its second request. The DeepSeek / OpenAI API requires every `tool` message to be preceded by the assistant message that carries `tool_calls` (the model needs to know "what I just called"); otherwise it returns 400. This page's mock server checks the same rule, so the code gets a 400 error response and crashes when it reads `choices[0]`. Run the tests, look at the order of roles in the second request, and fix it.
 --- starter
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
@@ -889,30 +889,30 @@ async function agent(question: string, maxSteps = 3): Promise<string> {
   return "STOPPED";
 }
 --- tests
-expectAsync("还能拿到回答", () => agent("Is unlimited liability acceptable?"), "Based on the playbook: rule for liability_cap");
-expectAsync("第二次请求的角色顺序", async () => {
+expectAsync("still gets an answer", () => agent("Is unlimited liability acceptable?"), "Based on the playbook: rule for liability_cap");
+expectAsync("order of roles in the second request", async () => {
   MOCK.reset();
   await agent("Is unlimited liability acceptable?");
   return MOCK.calls[1].body.messages.map((m: any) => m.role);
 }, ["user", "assistant", "tool"]);
-expectAsync("assistant 消息里带着 tool_calls", async () => {
+expectAsync("the assistant message carries tool_calls", async () => {
   MOCK.reset();
   await agent("Is unlimited liability acceptable?");
   return MOCK.calls[1].body.messages[1].tool_calls[0].id;
 }, "call_1");
 --- hints
-- 第二次请求里只有 `["user", "tool"]`：模型自己那条消息没放回去。
-- 在执行工具之前加一行 `messages.push(choice.message);`（整条原样放回，里面有 `tool_calls`）。
+- The second request contains only `["user", "tool"]`: the model's own message was never put back.
+- Add the line `messages.push(choice.message);` before running the tools (put the whole message back as it is; it contains `tool_calls`).
 
 @@ item d17-11
 type: fix
-title: 修 bug：多请求了一次
+title: Fix the bug: one request too many
 level: 2
-cards: 上限和停止原因; Agent = 循环 + 上限
+cards: Limits and stop reasons; Agent = loop + limits
 --- context
-步数上限不只是防死循环，也是账单的上限：每多请求一次模型，就多付一次钱。上线后发现账单对不上，是这类问题最常见的暴露方式。
+The step limit doesn't only prevent infinite loops; it also caps the bill: every extra request to the model is one more thing you pay for. After launch, a bill that doesn't add up is the most common way this kind of problem shows itself.
 --- prompt
-上线后发现：设置 `maxSteps = 3` 的条款，账单上每条都有 4 次请求。用 `[loop]` 让模型停不下来，运行测试，找到多出来的那一次并修好。
+After launch you notice that every clause run with `maxSteps = 3` shows 4 requests on the bill. Use `[loop]` so the model can't stop, run the tests, find the extra request and fix it.
 --- starter
 const API_URL = "https://api.deepseek.com/v1/chat/completions";
 const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
@@ -958,30 +958,30 @@ async function agent(question: string, maxSteps: number): Promise<{ reason: stri
   return { reason: "max_steps", steps };
 }
 --- tests
-expectAsync("maxSteps = 3 只请求 3 次", async () => {
+expectAsync("maxSteps = 3 makes only 3 requests", async () => {
   MOCK.reset();
   const r = await agent("Is unlimited liability acceptable? [loop]", 3);
   return [r, MOCK.calls.length];
 }, [{ reason: "max_steps", steps: 3 }, 3]);
-expectAsync("maxSteps = 1 只请求 1 次", async () => {
+expectAsync("maxSteps = 1 makes only 1 request", async () => {
   MOCK.reset();
   await agent("Is unlimited liability acceptable? [loop]", 1);
   return MOCK.calls.length;
 }, 1);
-expectAsync("正常回答不受影响", () => agent("Is unlimited liability acceptable?", 3), { reason: "answer", steps: 2 });
+expectAsync("a normal answer is not affected", () => agent("Is unlimited liability acceptable?", 3), { reason: "answer", steps: 2 });
 --- hints
-- 在脑子里走一遍 `maxSteps = 1`：`steps` 从 0 开始，循环条件第一次、第二次各是什么？
-- 「最多 N 次」：从 0 开始数就用 `<`，从 1 开始数才用 `<=`。
+- Walk through `maxSteps = 1` in your head: `steps` starts at 0; what is the loop condition the first time, and the second time?
+- "At most N times": when you count from 0, use `<`; only when you count from 1 do you use `<=`.
 
 @@ item d17-12
 type: order
-title: 排代码：循环的主体
+title: Put the code in order: the body of the loop
 level: 2
-cards: Agent = 循环 + 上限
+cards: Agent = loop + limits
 --- context
-这十来行就是 Agent 的心脏。真实项目 `review.py` 审每一条条款，用的是同样形状的循环；面试让你手写一个 Agent，写的也是它。
+These ten or so lines are the heart of an agent. The real project's `review.py` reviews every clause with a loop of the same shape, and when an interview asks you to hand-write an agent, this is what you write.
 --- prompt
-排出 `agentLoop`。`callModel(messages)`（发请求并返回解析后的回答）和 `dispatch(call)`（执行一个工具，返回文字）已经写好。有两行干扰项。
+Put `agentLoop` in order. `callModel(messages)` (sends the request and returns the parsed response) and `dispatch(call)` (runs one tool and returns text) are already written. There are two distractor lines.
 --- lines
 async function agentLoop(question: string, maxSteps: number): Promise<string> {
   const messages: any[] = [{ role: "user", content: question }];
@@ -1008,32 +1008,32 @@ async function callModel(messages: any[]): Promise<any> {
 async function dispatch(call: any): Promise<string> {
   return `rule for ${JSON.parse(call.function.arguments).topic}`;
 }
-expectAsync("回答", () => agentLoop("Is unlimited liability acceptable?", 3), "Based on the playbook: rule for liability_cap");
-expectAsync("[loop] 只请求 2 次", async () => {
+expectAsync("the answer", () => agentLoop("Is unlimited liability acceptable?", 3), "Based on the playbook: rule for liability_cap");
+expectAsync("[loop] makes only 2 requests", async () => {
   MOCK.reset();
   const r = await agentLoop("Is unlimited liability acceptable? [loop]", 2);
   return [r, MOCK.calls.length];
 }, ["STOPPED: max_steps", 2]);
-expectAsync("消息顺序", async () => {
+expectAsync("message order", async () => {
   MOCK.reset();
   await agentLoop("Is unlimited liability acceptable?", 3);
   return MOCK.calls[1].body.messages.map((m: any) => m.role);
 }, ["user", "assistant", "tool"]);
 --- hints
-- 顺序：准备 messages → 循环 → 请求 → 取出消息 → 是回答就 return → 放回模型消息 → 逐个执行工具。
-- 一个干扰项会多请求一次，另一个少了 await。
+- The order: set up messages → loop → request → take out the message → if it's an answer, return → put the model's message back → run the tools one by one.
+- One distractor makes one request too many; the other is missing an await.
 
 @@ item d17-13
 type: translate
-title: 翻译：轨迹摘要
+title: Translate: trace summary
 level: 2
-cards: 轨迹：每一步都记下来
+cards: Traces: record every step
 --- context
-律师问「8.1 为什么被 flag」时，要能看到模型调了哪些工具。真实项目的报告表格里有一列 `tools`，把每条条款的工具调用缩成 `get_clause:12` 这样的短标签，一眼就能看完。
+When a lawyer asks "why was 8.1 flagged", you need to see which tools the model called. The report table in the real project has a `tools` column that shrinks each clause's tool calls into short labels like `get_clause:12`, so you can read them at a glance.
 --- prompt
-把下面的 Python 翻译成 TypeScript 的 `summarizeTrace(trace)`。它把轨迹变成 Clause Check 报告里 `tools` 那一列的标签（简化版）：成功的调用是 `工具名:clause_id`（没有就用 topic，都没有就只写工具名），失败的是 `工具名:INVALID_ARGS`。
+Translate the Python below into a TypeScript `summarizeTrace(trace)`. It turns a trace into the labels of the `tools` column in the Clause Check report (a simplified version): a successful call becomes `tool_name:clause_id` (if there is no clause_id, use topic; if there is neither, just the tool name), and a failed one becomes `tool_name:INVALID_ARGS`.
 
-提示：Python 的 `a or b` 在 TypeScript 里是 `a || b`。
+Hint: Python's `a or b` is `a || b` in TypeScript.
 --- source
 def summarize_trace(trace):
     labels = []
@@ -1078,59 +1078,59 @@ const TRACE: TraceEntry[] = [
   { tool: "propose_redline", args: {}, ok: false },
   { tool: "mark_for_review", args: {}, ok: true },
 ];
-expect("四次调用", () => summarizeTrace(TRACE), {
+expect("four calls", () => summarizeTrace(TRACE), {
   calls: 4,
   errors: 1,
   tool_calls: ["lookup_playbook:liability_cap", "get_clause:12", "propose_redline:INVALID_ARGS", "mark_for_review"],
 });
-expect("空轨迹", () => summarizeTrace([]), { calls: 0, errors: 0, tool_calls: [] });
-expect("clause_id 优先于 topic", () => summarizeTrace([{ tool: "get_clause", args: { clause_id: "8.1", topic: "payment" }, ok: true }]).tool_calls, ["get_clause:8.1"]);
+expect("empty trace", () => summarizeTrace([]), { calls: 0, errors: 0, tool_calls: [] });
+expect("clause_id comes before topic", () => summarizeTrace([{ tool: "get_clause", args: { clause_id: "8.1", topic: "payment" }, ok: true }]).tool_calls, ["get_clause:8.1"]);
 --- hints
-- `for (const e of trace)`；`e["ok"]` → `e.ok`，`e["args"].get("clause_id")` → `e.args.clause_id`（不存在时是 `undefined`）。
-- 条件表达式：`key ? \`${e.tool}:${key}\` : e.tool`。
+- `for (const e of trace)`; `e["ok"]` → `e.ok`, `e["args"].get("clause_id")` → `e.args.clause_id` (`undefined` when it's missing).
+- The conditional expression: `key ? \`${e.tool}:${key}\` : e.tool`.
 
 @@ item d17-14
 type: local
-title: 本机任务：看真实项目的工具轨迹
+title: Local task: look at the real project's tool trace
 level: 2
-cards: 轨迹：每一步都记下来; Agent = 循环 + 上限
+cards: Traces: record every step; Agent = loop + limits
 --- context
-前面在网页里写的轨迹，真实项目里也有。用免费的 mock 模式（规则审查器代替模型）跑一遍示例合同，看每条条款调了哪些工具，把今天的代码和真实的输出对上。
+The trace you wrote on the web page exists in the real project too. Use the free mock mode (a rule-based reviewer stands in for the model) to run the sample contract, see which tools each clause called, and match today's code to the real output.
 --- prompt
-在真实项目里看一次轨迹。在 PowerShell 里运行（mock 模式不调模型、不花钱）：
+Look at a trace in the real project. Run this in PowerShell (mock mode doesn't call the model and costs nothing):
 
 ```
 cd "G:\Contract Clause Reviewer"
 python -m clausecheck review data/sample_contract.txt --mode mock
 ```
 
-表格最后一列 `tools` 就是每条的 `trace.tool_calls`，和上一题的标签是一个格式。找到调用了 `get_clause` 的行，然后回答自己：
+The last column of the table, `tools`, is each clause's `trace.tool_calls`, in the same format as the labels in the previous exercise. Find the rows that called `get_clause`, then answer these for yourself:
 
-- 8.1 为什么要去读第 12 条？（打开 `data/sample_contract.txt` 看 8.1 的第一句）
-- 第 12 条调了几次 `get_clause`？如果真实模型每一步只调一个工具，`config.py` 里默认的 `max_steps = 6` 够它做完这些调用吗？
+- Why does 8.1 need to read clause 12? (Open `data/sample_contract.txt` and look at the first sentence of 8.1)
+- How many times does clause 12 call `get_clause`? If a real model called only one tool per step, would the default `max_steps = 6` in `config.py` be enough for it to make all these calls?
 
-把终端输出粘贴到下面。
-placeholder: 粘贴终端输出（要包含 tools 那一列）
+Paste the terminal output below.
+placeholder: Paste the terminal output (it must include the tools column)
 verify: lookup_playbook:\w+[\s\S]*get_clause:\d
 --- hints
-- 看到 `No module named clausecheck`：确认你在项目根目录 `G:\Contract Clause Reviewer` 里运行。
-- 报告会写到 `data/sample_contract.report.json`（`.gitignore` 已经忽略它），可以在 VS Code 里打开看完整的 `trace`。
+- If you see `No module named clausecheck`: make sure you are running it in the project root, `G:\Contract Clause Reviewer`.
+- The report is written to `data/sample_contract.report.json` (`.gitignore` already ignores it); open it in VS Code to see the full `trace`.
 
 @@ item d17-15
 type: code
-title: 预算上限 + 轨迹
+title: Budget limit + trace
 level: 3
-cards: 上限和停止原因; 轨迹：每一步都记下来
+cards: Limits and stop reasons; Traces: record every step
 --- context
-对话越长，每次请求越贵，光限制步数管不住花费，token（模型按它计费）也要有上限。真实项目的 `ReviewTrace` 同样记下步数、token 数和停止原因，事后才能查清一条条款花了多少、为什么停。
+The longer the conversation, the more each request costs, so limiting steps alone can't keep spending under control: tokens (what the model bills by) need a limit too. The real project's `ReviewTrace` also records steps, token counts and the stop reason, so afterwards you can find out how much one clause cost and why it stopped.
 --- prompt
-在上一版循环上加两样东西。写 `runAgent(question, registry, limits)`，返回 `RunResult`：
+Add two things to the previous version of the loop. Write `runAgent(question, registry, limits)`, which returns a `RunResult`:
 
-- **token 预算**：每次拿到回答后，把 `usage.total_tokens` 加进 `tokens`。是文字回答就返回 `reason: "answer"`（已经付过钱了）；要调工具时，如果 `tokens >= limits.maxTokens`，**不执行工具**，返回 `reason: "budget"`
-- **轨迹**：每执行一个工具，往 `trace` 里 push `{ step, tool: 工具名, args: 原始 arguments 文字, ok, result: dispatch 的 content }`
-- 请求满 `limits.maxSteps` 次：`reason: "max_steps"`
+- **Token budget**: every time you get a response, add `usage.total_tokens` to `tokens`. If it's a text answer, return `reason: "answer"` (it's already paid for); if it wants to call tools and `tokens >= limits.maxTokens`, **don't run the tools**, and return `reason: "budget"`
+- **Trace**: for every tool you run, push `{ step, tool: <tool name>, args: <the raw arguments text>, ok, result: <dispatch's content> }` into `trace`
+- After `limits.maxSteps` requests: `reason: "max_steps"`
 
-三种返回都带上 `steps`（已请求次数）、`tokens`、`trace`，`answer` 只有回答时才有文字，其余为 `null`。`callModel` 和 `dispatch` 已经写好。
+All three returns include `steps` (the number of requests so far), `tokens` and `trace`; `answer` holds text only for an answer and is `null` otherwise. `callModel` and `dispatch` are already written.
 --- starter
 import { z } from "zod";
 
@@ -1266,47 +1266,47 @@ async function runAgent(question: string, registry: Map<string, Tool>, limits: L
 }
 --- tests
 const BIG: Limits = { maxSteps: 5, maxTokens: 100000 };
-expectAsync("正常回答，轨迹一条", async () => {
+expectAsync("a normal answer, one trace entry", async () => {
   MOCK.reset();
   const r = await runAgent("Is unlimited liability acceptable?", REGISTRY, BIG);
   return [r.reason, r.steps, r.trace];
 }, ["answer", 2, [{ step: 1, tool: "lookup_playbook", args: '{"topic":"liability_cap"}', ok: true, result: "rule for liability_cap: cap at 12 months of fees" }]]);
-expectAsync("坏参数也记进轨迹", async () => {
+expectAsync("bad arguments are recorded in the trace too", async () => {
   MOCK.reset();
   const r = await runAgent("Is unlimited liability acceptable? [bad-args]", REGISTRY, BIG);
   return [r.trace[0].ok, r.trace[0].args, r.trace[0].result.slice(0, 12)];
 }, [false, '{"topic": ', "INVALID_JSON"]);
-expectAsync("[loop] + 步数上限", async () => {
+expectAsync("[loop] + step limit", async () => {
   MOCK.reset();
   const r = await runAgent("Is unlimited liability acceptable? [loop]", REGISTRY, { maxSteps: 3, maxTokens: 100000 });
   return [r.reason, r.steps, r.trace.length, r.tokens];
 }, ["max_steps", 3, 3, 105]);
-expectAsync("[loop] + 预算上限：第 3 步超预算，不再执行工具", async () => {
+expectAsync("[loop] + budget limit: over budget at step 3, no more tools run", async () => {
   MOCK.reset();
   const r = await runAgent("Is unlimited liability acceptable? [loop]", REGISTRY, { maxSteps: 10, maxTokens: 100 });
   return [r.reason, r.steps, r.trace.length, r.tokens, MOCK.calls.length];
 }, ["budget", 3, 2, 105, 3]);
 --- hints
-- 在上一版循环里，拿到 `data` 后第一件事：`tokens += data.usage.total_tokens;`。
-- 先判断「是不是回答」，再判断「预算够不够」，两个都过了才执行工具。
-- 轨迹在执行工具的那个 for 里记：`trace.push({ step, tool: call.function.name, args: call.function.arguments, ok: r.ok, result: r.content });`
+- In the previous version of the loop, the first thing to do after you get `data`: `tokens += data.usage.total_tokens;`.
+- First check "is it an answer?", then "is there budget left?"; only when both checks pass do you run the tools.
+- Record the trace inside the for loop that runs the tools: `trace.push({ step, tool: call.function.name, args: call.function.arguments, ok: r.ok, result: r.content });`
 
 @@ item d17-16
 type: code
-title: 审批关卡
+title: The approval gate
 level: 3
-cards: 人在回路：危险的工具要人批准
+cards: Human in the loop: risky tools need a person to approve
 --- context
-查规则、读条款是只读的，调错了也无所谓；发修订邮件、改合同就有后果了。真实项目里 `propose_redline` 只是记下一个提议，真正把修改写进导出文件之前，要等人拍板。
+Looking up rules and reading clauses are read-only, so a wrong call doesn't matter; sending a redline email or changing a contract has consequences. In the real project, `propose_redline` only records a proposal, and before the change is actually written into the exported file, a person has to give the final word.
 --- prompt
-写 `gatedDispatch(registry, call, approve)`：和 `dispatch` 一样，但多一道关：
+Write `gatedDispatch(registry, call, approve)`: the same as `dispatch`, but with one more gate:
 
-1. 工具不存在 / 参数不合法：和以前一样返回错误，**不问人**（坏的调用不值得打扰人）
-2. 工具有 `needsApproval: true`：先 `await approve({ tool: 工具名, args: 校验后的参数 })`
-3. 被拒绝：返回 `{ ok: false, content: "DENIED: the user rejected 工具名" }`，**不执行**工具
-4. 其他情况执行工具，返回 `{ ok: true, content }`
+1. The tool doesn't exist / the arguments are invalid: return the error as before, **without asking a person** (a broken call isn't worth bothering anyone about)
+2. The tool has `needsApproval: true`: first `await approve({ tool: <tool name>, args: <the validated arguments> })`
+3. Rejected: return `{ ok: false, content: "DENIED: the user rejected <tool name>" }` and **don't run** the tool
+4. In every other case, run the tool and return `{ ok: true, content }`
 
-`approve` 是注入进来的函数：真实应用里它等人点按钮，测试里传假的。
+`approve` is an injected function: in a real app it waits for a person to click a button; in tests you pass a fake one.
 --- starter
 import { z } from "zod";
 
@@ -1406,65 +1406,65 @@ const yes: Approve = async (req) => { asked.push(req); return true; };
 const no: Approve = async (req) => { asked.push(req); return false; };
 const call = (name: string, args: string): ToolCall => ({ id: "call_1", function: { name, arguments: args } });
 const reset = () => { sends = 0; asked = []; };
-expectAsync("批准后执行，approve 拿到校验后的参数", async () => {
+expectAsync("runs after approval; approve gets the validated arguments", async () => {
   reset();
   const r = await gatedDispatch(REG, call("send_redline_email", '{"clause_id": "8.1"}'), yes);
   return [r, asked, sends];
 }, [{ ok: true, content: "email sent for 8.1" }, [{ tool: "send_redline_email", args: { clause_id: "8.1" } }], 1]);
-expectAsync("拒绝：不执行", async () => {
+expectAsync("rejected: does not run", async () => {
   reset();
   const r = await gatedDispatch(REG, call("send_redline_email", '{"clause_id": "8.1"}'), no);
   return [r, sends];
 }, [{ ok: false, content: "DENIED: the user rejected send_redline_email" }, 0]);
-expectAsync("只读工具不问人", async () => {
+expectAsync("read-only tools don't ask a person", async () => {
   reset();
   const r = await gatedDispatch(REG, call("lookup_playbook", '{"topic": "payment"}'), no);
   return [r.content, asked.length];
 }, ["rule for payment", 0]);
-expectAsync("坏参数不打扰人", async () => {
+expectAsync("bad arguments don't bother a person", async () => {
   reset();
   const r = await gatedDispatch(REG, call("send_redline_email", "{}"), yes);
   return [r.ok, asked.length, sends];
 }, [false, 0, 0]);
 --- hints
-- 审批这一步放在「参数校验通过」之后、`tool.run` 之前。
+- The approval step goes after "the arguments passed validation" and before `tool.run`.
 - `if (tool.needsApproval) { const yes = await approve({ tool: tool.name, args: args.value }); if (!yes) return ...; }`
 
 @@ item d17-17
 type: choice
-title: 谁来批准
+title: Who approves
 level: 2
-cards: 人在回路：危险的工具要人批准
+cards: Human in the loop: risky tools need a person to approve
 --- context
-发给客户的修订邮件必须先经律师同意。同事嫌审批弹窗麻烦，想了一个「看起来也能用」的捷径。
+A redline email to the customer must first be approved by the lawyer. A colleague finds the approval pop-up annoying and comes up with a shortcut that "seems to work too".
 --- prompt
-同事想省事：给 `send_redline_email` 的 schema 加了一个参数 `approved: z.boolean()`，description 里写「只有用户明确同意时才传 true」，代码里 `if (args.approved) send()`。问题在哪？
+A colleague wants to save effort: they add an argument `approved: z.boolean()` to the schema of `send_redline_email`, write "pass true only when the user has clearly agreed" in the description, and in the code do `if (args.approved) send()`. What's wrong with this?
 --- options
-- 没问题，模型会遵守 description
-- 批准变成了模型自己说了算：合同文字里的一句提示注入，或者模型一次误判，就能让它传 `true`。批准必须来自模型之外的人（注入的 `approve` 函数），不能来自模型的输出
-- 应该用 `z.string()` 而不是 `z.boolean()`
-- description 写得不够严厉，加上 "IMPORTANT" 就行
+- Nothing: the model will follow the description
+- The model now decides the approval itself: one prompt injection in the contract text, or one misjudgment by the model, can make it pass `true`. Approval must come from a person outside the model (the injected `approve` function), never from the model's output
+- It should use `z.string()` instead of `z.boolean()`
+- The description isn't strict enough; adding "IMPORTANT" would fix it
 answer: 2
 --- explain
-模型的输出（包括工具参数）都可能被合同里的文字影响（第 12 天的提示注入）。能触发真实后果的决定，要由代码去问人，而且人的回答不经过模型。这也是 `graph.py` 文档里那句话：「The approved decision is executed by code - the model does not get to re-decide」。
+Everything the model outputs (tool arguments included) can be influenced by text in the contract (prompt injection, Day 12). A decision that can trigger real consequences must be asked of a person by the code, and the person's answer must not pass through the model. This is also what the `graph.py` docs say: "The approved decision is executed by code - the model does not get to re-decide".
 
 @@ item d17-18
 type: code
-title: 只发一次的发件箱
+title: An outbox that sends only once
 level: 2
-cards: 幂等：重试不能发两封邮件; d16:私有状态和 getter
+cards: Idempotency: a retry must not send two emails; d16:Private state and getters
 --- context
-同一个动作可能被执行不止一次：模型重复调用、出错后整步重试、从检查点恢复。查规则多做一次没关系，给客户发修订邮件却会发出两封，很不专业。
+The same action may run more than once: the model calls it again, the whole step is retried after an error, or the run resumes from a checkpoint. Looking up a rule one extra time does no harm, but a redline email sent to the customer twice looks very unprofessional.
 --- prompt
-写 `Outbox` 类，让发送变成幂等的：
+Write an `Outbox` class that makes sending idempotent:
 
-- 构造时传入 `mailer: (key: string) => void`（真正发邮件的函数，可能 throw）
-- `send(clauseId, action)`：key 是 `` `${clauseId}:${action}` ``
-  - 这个 key 已经成功发过：返回 `"ALREADY_DONE: " + key`，不调用 mailer
-  - 否则调用 `mailer(key)`；成功后记下 key，返回 `"SENT: " + key`
-  - `mailer` throw 时**不要记下 key**，让错误继续往外抛（调用方稍后重试时还能发出去）
+- The constructor takes `mailer: (key: string) => void` (the function that really sends the email; it may throw)
+- `send(clauseId, action)`: the key is `` `${clauseId}:${action}` ``
+  - this key was already sent successfully: return `"ALREADY_DONE: " + key` without calling mailer
+  - otherwise call `mailer(key)`; after it succeeds, record the key and return `"SENT: " + key`
+  - when `mailer` throws, **don't record the key**, and let the error keep propagating (so the caller can still send it when it retries later)
 
-用 `#done = new Set<string>()` 记录（第 16 天的私有字段）。
+Record the keys with `#done = new Set<string>()` (Day 16's private fields).
 --- starter
 class Outbox {
   #done = new Set<string>();
@@ -1500,9 +1500,9 @@ class Outbox {
 --- tests
 const mailed: string[] = [];
 const box = new Outbox((key) => { mailed.push(key); });
-expect("第一次发送", () => box.send("8.1", "redline_email"), "SENT: 8.1:redline_email");
-expect("重复调用不再发送", () => [box.send("8.1", "redline_email"), mailed.length], ["ALREADY_DONE: 8.1:redline_email", 1]);
-expect("不同动作是不同的 key", () => [box.send("8.1", "reminder"), mailed], ["SENT: 8.1:reminder", ["8.1:redline_email", "8.1:reminder"]]);
+expect("first send", () => box.send("8.1", "redline_email"), "SENT: 8.1:redline_email");
+expect("a repeated call doesn't send again", () => [box.send("8.1", "redline_email"), mailed.length], ["ALREADY_DONE: 8.1:redline_email", 1]);
+expect("a different action is a different key", () => [box.send("8.1", "reminder"), mailed], ["SENT: 8.1:reminder", ["8.1:redline_email", "8.1:reminder"]]);
 let failures = 1;
 const flaky = new Outbox(() => {
   if (failures > 0) {
@@ -1510,47 +1510,47 @@ const flaky = new Outbox(() => {
     throw new Error("SMTP timeout");
   }
 });
-expectThrows("发送失败：错误抛出去", () => flaky.send("12", "redline_email"));
-expect("失败后重试能发出去", () => flaky.send("12", "redline_email"), "SENT: 12:redline_email");
+expectThrows("sending fails: the error is thrown", () => flaky.send("12", "redline_email"));
+expect("a retry after the failure gets through", () => flaky.send("12", "redline_email"), "SENT: 12:redline_email");
 --- hints
-- 先算 key，再 `if (this.#done.has(key)) return ...`。
-- 顺序很重要：先 `this.#mailer(key)`，它没 throw 才会走到下一行 `this.#done.add(key)`。不用写 try/catch，错误会自己抛出去。
+- Compute the key first, then `if (this.#done.has(key)) return ...`.
+- The order matters: first `this.#mailer(key)`; only if it doesn't throw do you reach the next line, `this.#done.add(key)`. You don't need a try/catch: the error propagates on its own.
 
 @@ item d17-19
 type: choice
-title: 对照 Mastra
+title: Comparing with Mastra
 level: 2
-cards: 对照框架：Mastra 和 LangGraph; 工具注册表：一个 schema，两种用途
+cards: Framework comparison: Mastra and LangGraph; Tool registry: one schema, two uses
 --- context
-面试官常问「你用过 Mastra 吗」。今天手写的零件在框架里都有现成的对应，能说清一一对应的关系，就说明你知道框架在替你做什么。
+Interviewers often ask "Have you used Mastra?" Every part you hand-wrote today has a ready-made counterpart in the framework. If you can explain how they map one to one, you show that you know what the framework is doing for you.
 --- prompt
-Mastra 里定义工具和 Agent 的写法（示意）：
+How tools and agents are defined in Mastra (a sketch):
 
 ```ts
 const lookupPlaybook = createTool({ id: "lookup_playbook", description: "...", inputSchema: z.object({ topic: z.enum(TOPICS) }), execute: async (...) => { ... } });
 const reviewer = new Agent({ name: "reviewer", instructions: "...", model: ..., tools: { lookupPlaybook } });
 ```
 
-下面哪一个对应关系是**错的**？
+Which of these mappings is **wrong**?
 --- options
-- `inputSchema` 对应你的 `Tool.schema`：用来生成 JSON Schema，也用来校验模型给的参数
-- `execute` 对应你的 `Tool.run`
-- `new Agent({ tools })` 加上一次调用，对应你的注册表 + `runAgent` 循环
-- `description` 只是给开发者看的注释，不会发给模型
+- `inputSchema` matches your `Tool.schema`: it generates the JSON Schema and also validates the arguments the model gives
+- `execute` matches your `Tool.run`
+- `new Agent({ tools })` plus one call matches your registry + the `runAgent` loop
+- `description` is only a comment for developers and is never sent to the model
 answer: 4
 --- explain
-`description` 会和参数 schema 一起发给模型，它是模型决定「要不要调、什么时候调」的主要依据，本质上是 prompt 的一部分（第 12 天：`mark_for_review` 的 description 写错，模型就过度 flag）。其余三个对应关系都对：框架帮你写好了 `toolSpec`、`dispatch` 和循环，但零件是一样的。
+`description` is sent to the model together with the parameter schema. It is the main thing the model uses to decide "whether to call it, and when", so it is really part of the prompt (Day 12: when the `mark_for_review` description was written badly, the model over-flagged). The other three mappings are right: the framework writes `toolSpec`, `dispatch` and the loop for you, but the parts are the same.
 
 @@ item d17-e1
 type: scratch
-title: 闭卷：工具分发
+title: Closed book: tool dispatch
 exam: yes
 level: 3
-cards: 参数校验：错误是写给模型看的; 工具注册表：一个 schema，两种用途
+cards: Argument validation: errors are messages for the model; Tool registry: one schema, two uses
 --- context
-闭卷写 Agent 里执行工具的那一步。审一份合同要调几十次工具，任何一次出问题都只能影响这一次调用，不能让整份合同的审查崩掉。
+Closed book: write the step of the agent that runs a tool. Reviewing one contract takes dozens of tool calls; a problem in any one of them must affect only that call, never crash the review of the whole contract.
 --- prompt
-写 `dispatch(registry, call)`（async）。先原样定义这些类型：
+Write `dispatch(registry, call)` (async). First define these types exactly as shown:
 
 ```ts
 import { z } from "zod";
@@ -1560,13 +1560,13 @@ type ToolCall = { id: string; function: { name: string; arguments: string } };
 type ToolResult = { ok: boolean; content: string };
 ```
 
-`registry` 是 `Map<string, Tool>`。返回：
+`registry` is a `Map<string, Tool>`. Return:
 
-- 工具不存在：`{ ok: false, content: "UNKNOWN_TOOL: 名字" }`
-- `arguments` 不是合法 JSON：`{ ok: false, content: "INVALID_JSON" }`
-- schema 校验失败（取第一个 issue）：`{ ok: false, content: "INVALID_ARGS: " + issue.path.join(".") + ": " + issue.message }`
-- `run` throw 了：`{ ok: false, content: "TOOL_ERROR: " + 错误的 message }`
-- 成功：`{ ok: true, content: run 的返回值 }`（传给 `run` 的是 safeParse 之后的数据）
+- the tool doesn't exist: `{ ok: false, content: "UNKNOWN_TOOL: <name>" }`
+- `arguments` is not valid JSON: `{ ok: false, content: "INVALID_JSON" }`
+- schema validation fails (take the first issue): `{ ok: false, content: "INVALID_ARGS: " + issue.path.join(".") + ": " + issue.message }`
+- `run` throws: `{ ok: false, content: "TOOL_ERROR: " + <the error's message> }`
+- success: `{ ok: true, content: <what run returns> }` (what you pass to `run` is the data after safeParse)
 --- solution
 import { z } from "zod";
 
@@ -1609,34 +1609,34 @@ const GET_CLAUSE: Tool = {
 };
 const REG = new Map<string, Tool>([[GET_CLAUSE.name, GET_CLAUSE]]);
 const call = (name: string, args: string): ToolCall => ({ id: "call_1", function: { name, arguments: args } });
-expectAsync("成功（带默认值）", () => dispatch(REG, call("get_clause", '{"clause_id": "12"}')), { ok: true, content: "text of 12, max 20" });
-expectAsync("未知工具和坏 JSON", async () => [
+expectAsync("success (with the default)", () => dispatch(REG, call("get_clause", '{"clause_id": "12"}')), { ok: true, content: "text of 12, max 20" });
+expectAsync("unknown tool and bad JSON", async () => [
   (await dispatch(REG, call("send_email", "{}"))).content,
   (await dispatch(REG, call("get_clause", "{oops"))).content,
 ], ["UNKNOWN_TOOL: send_email", "INVALID_JSON"]);
-expectAsync("参数不合法", async () => (await dispatch(REG, call("get_clause", "{}"))).content.split(":").slice(0, 2).join(":"), "INVALID_ARGS: clause_id");
-expectAsync("工具自己出错", () => dispatch(REG, call("get_clause", '{"clause_id": "99"}')), { ok: false, content: "TOOL_ERROR: NOT_FOUND 99" });
+expectAsync("invalid arguments", async () => (await dispatch(REG, call("get_clause", "{}"))).content.split(":").slice(0, 2).join(":"), "INVALID_ARGS: clause_id");
+expectAsync("the tool itself fails", () => dispatch(REG, call("get_clause", '{"clause_id": "99"}')), { ok: false, content: "TOOL_ERROR: NOT_FOUND 99" });
 
 @@ item d17-e2
 type: scratch
-title: 闭卷：有上限的循环
+title: Closed book: a loop with limits
 exam: yes
 level: 3
-cards: Agent = 循环 + 上限; 上限和停止原因
+cards: Agent = loop + limits; Limits and stop reasons
 --- context
-闭卷写一个有步数上限的 Agent 循环：审条款时模型可以先查 playbook 规则再回答。面试里「手写一个 Agent」考的就是它，停不下来的循环会一直花钱。
+Closed book: write an agent loop with a step limit. When reviewing a clause, the model can look up the playbook rule first and then answer. This is what "hand-write an agent" tests in an interview, and a loop that can't stop keeps costing money.
 --- prompt
-写 `agent(question: string, maxSteps: number)`，返回 `Promise<{ reason: "answer" | "max_steps"; answer: string | null; steps: number }>`。
+Write `agent(question: string, maxSteps: number)`, which returns `Promise<{ reason: "answer" | "max_steps"; answer: string | null; steps: number }>`.
 
-- 每一步 POST 到 `https://api.deepseek.com/v1/chat/completions`，请求头 `Authorization: Bearer ${process.env.DEEPSEEK_API_KEY}`，请求体 `{ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }`，`TOOLS` 如下（原样复制）：
+- Each step POSTs to `https://api.deepseek.com/v1/chat/completions` with the header `Authorization: Bearer ${process.env.DEEPSEEK_API_KEY}` and the request body `{ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }`, where `TOOLS` is the following (copy it exactly):
 
 ```ts
 const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
 ```
 
-- `finish_reason` 不是 `"tool_calls"`：返回 `{ reason: "answer", answer: 回答文字, steps: 已请求次数 }`
-- 否则把模型消息放回 `messages`，对每个工具调用放一条 tool 消息：参数能解析就是 `` `rule for ${topic}` ``，解析失败就是 `"INVALID_JSON"`
-- 请求满 `maxSteps` 次：`{ reason: "max_steps", answer: null, steps: maxSteps }`
+- `finish_reason` is not `"tool_calls"`: return `{ reason: "answer", answer: <the answer text>, steps: <number of requests so far> }`
+- Otherwise put the model's message back into `messages`, and add one tool message for each tool call: `` `rule for ${topic}` `` if the arguments can be parsed, `"INVALID_JSON"` if parsing fails
+- After `maxSteps` requests: `{ reason: "max_steps", answer: null, steps: maxSteps }`
 --- solution
 const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
 
@@ -1668,14 +1668,14 @@ async function agent(question: string, maxSteps: number): Promise<{ reason: "ans
   return { reason: "max_steps", answer: null, steps: maxSteps };
 }
 --- tests
-expectAsync("正常回答", () => agent("Is unlimited liability acceptable?", 4), { reason: "answer", answer: "Based on the playbook: rule for liability_cap", steps: 2 });
-expectAsync("坏参数也不崩", () => agent("Is unlimited liability acceptable? [bad-args]", 4), { reason: "answer", answer: "Based on the playbook: INVALID_JSON", steps: 2 });
-expectAsync("[loop] 停在上限", async () => {
+expectAsync("a normal answer", () => agent("Is unlimited liability acceptable?", 4), { reason: "answer", answer: "Based on the playbook: rule for liability_cap", steps: 2 });
+expectAsync("bad arguments don't crash it either", () => agent("Is unlimited liability acceptable? [bad-args]", 4), { reason: "answer", answer: "Based on the playbook: INVALID_JSON", steps: 2 });
+expectAsync("[loop] stops at the limit", async () => {
   MOCK.reset();
   const r = await agent("Is unlimited liability acceptable? [loop]", 3);
   return [r, MOCK.calls.length];
 }, [{ reason: "max_steps", answer: null, steps: 3 }, 3]);
-expectAsync("请求体：deepseek-flash，思考已关", async () => {
+expectAsync("request body: deepseek-flash, thinking off", async () => {
   MOCK.reset();
   await agent("Is unlimited liability acceptable?", 4);
   return [MOCK.calls[0].body.model, MOCK.calls[0].body.thinking];
@@ -1683,20 +1683,20 @@ expectAsync("请求体：deepseek-flash，思考已关", async () => {
 
 @@ item d17-e3
 type: scratch
-title: 闭卷：审批 + 幂等
+title: Closed book: approval + idempotency
 exam: yes
 level: 3
-cards: 幂等：重试不能发两封邮件; 人在回路：危险的工具要人批准
+cards: Idempotency: a retry must not send two emails; Human in the loop: risky tools need a person to approve
 --- context
-闭卷把今天的两道安全关合在一起：有后果的动作（比如给客户发某条条款的修订）要先经律师同意，同一个动作重试时也不能做第二次。
+Closed book: combine today's two safety gates. An action with consequences (for example, sending the customer the redline for a clause) needs the lawyer's approval first, and retrying the same action must not do it a second time.
 --- prompt
-写 `ActionRunner` 类：
+Write an `ActionRunner` class:
 
-- 构造函数 `constructor(approve: (key: string) => boolean, perform: (key: string) => void)`
-- 方法 `run(clauseId: string, action: string): "DONE" | "DUPLICATE" | "DENIED"`，key 是 `` `${clauseId}:${action}` ``：
-  1. 这个 key 已经做过：返回 `"DUPLICATE"`，**不再问人**，也不执行
-  2. 否则问 `approve(key)`；拒绝就返回 `"DENIED"`（不记录，以后还可以再问）
-  3. 批准就调用 `perform(key)`，记下 key，返回 `"DONE"`
+- Constructor: `constructor(approve: (key: string) => boolean, perform: (key: string) => void)`
+- Method: `run(clauseId: string, action: string): "DONE" | "DUPLICATE" | "DENIED"`, where the key is `` `${clauseId}:${action}` ``:
+  1. this key was already done: return `"DUPLICATE"`, **without asking a person again**, and don't perform it
+  2. otherwise ask `approve(key)`; if it's rejected, return `"DENIED"` (don't record anything; you can ask again later)
+  3. if it's approved, call `perform(key)`, record the key, and return `"DONE"`
 --- solution
 class ActionRunner {
   #done = new Set<string>();
@@ -1729,7 +1729,7 @@ const runner = new ActionRunner(
   (key) => { asked.push(key); return allow; },
   (key) => { performed.push(key); },
 );
-expect("先被拒绝", () => runner.run("8.1", "send_redline"), "DENIED");
-expect("再次询问后批准", () => { allow = true; return runner.run("8.1", "send_redline"); }, "DONE");
-expect("重复：不问人、不执行", () => [runner.run("8.1", "send_redline"), asked.length, performed], ["DUPLICATE", 2, ["8.1:send_redline"]]);
-expect("另一条条款", () => [runner.run("12", "send_redline"), performed.length], ["DONE", 2]);
+expect("rejected at first", () => runner.run("8.1", "send_redline"), "DENIED");
+expect("asked again, approved", () => { allow = true; return runner.run("8.1", "send_redline"); }, "DONE");
+expect("duplicate: doesn't ask, doesn't perform", () => [runner.run("8.1", "send_redline"), asked.length, performed], ["DUPLICATE", 2, ["8.1:send_redline"]]);
+expect("another clause", () => [runner.run("12", "send_redline"), performed.length], ["DONE", 2]);

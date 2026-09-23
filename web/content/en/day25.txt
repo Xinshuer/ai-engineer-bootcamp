@@ -1,0 +1,1083 @@
+@@ day 25
+title: BigQuery: data warehouses, cost, the Python client
+lang: sql
+dataset: clausecheck
+langs: SQL + Python
+hours: 5 hours
+--- goal
+Know what a data warehouse is and how BigQuery charges (by bytes scanned: select only the columns you need, partitions, dry runs, a limit); write BigQuery SQL for the questions on an LLM observability dashboard: cost per customer per month, cache hit rate, redline rate per prompt version, latency percentiles; use the Python client to query safely (parameters, dry runs, a byte limit) and to write data (the error list of streaming inserts).
+
+In the project: once it is live, the tokens, latency and errors that `clausecheck/pipeline.py` collects, together with the `ReviewTrace` in `models.py`, go into a BigQuery table, one row per review; the pass rate and p95 you computed by hand on Day 13 are a single SQL query in the warehouse.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change one thing in each before you run it
+- Pass every practice exercise (the local task is optional)
+- The 3 closed-book exercises
+- Say in your own words: why `SELECT * ... LIMIT 10` doesn't save money in BigQuery, and what does
+
+@@ concept
+title: Data warehouses and BigQuery
+bq: yes
+--- body
+BigQuery on this page is simulated: the SQL runs on SQLite in your browser, which imitates a few BigQuery features; the Python client's calls and return structures match the real SDK (google-cloud-bigquery), though only the parts this course uses are implemented. In a real project, run `pip install google-cloud-bigquery` and set up credentials, and you're ready.
+
+Yesterday's SQLite / Postgres is a **business database** (OLTP): each read or write touches a few rows, and it must be fast and have transactions. Once Clause Check is live, every review produces one row of trace data. Over time that adds up to hundreds of millions of rows, and the people in charge want a **dashboard**: how much each customer cost per month, the prompt cache hit rate, latency p95, the redline rate and failure rate of each prompt version. Questions that "scan a big stretch of history" like these are the job of a **data warehouse** (OLAP).
+
+BigQuery is Google Cloud's data warehouse:
+
+- **Serverless**: no machines to manage; you just write SQL and pay for what you use
+- **Columnar storage**: each column is stored separately and only the columns a query uses are read, so even scanning hundreds of millions of rows is fast
+- Names have three parts: `project.dataset.table`, for example `clausecheck-dev.clausecheck.reviews` (on this page the project is called clausecheck-dev and the dataset clausecheck). In SQL, wrap a full name that includes the project in backticks, like the FROM in the example below
+- It is built for analysis, not as an application's backend database: it is not good at changing single rows often
+- When you create a dataset you choose its **location** (for example the `EU` multi-region, or `europe-north1` in Finland), and you can't change it afterwards. Trace data may contain customer information, so following common GDPR practice it goes in the EU by default
+
+The AWS equivalents:
+
+- BigQuery ↔ Amazon Redshift (data warehouse)
+- BigQuery external tables (querying files in Cloud Storage) ↔ Amazon Athena (querying files in S3 directly with SQL)
+--- code
+SELECT model, COUNT(*) AS reviews, ROUND(SUM(cost_usd), 4) AS cost_usd
+FROM `clausecheck-dev.clausecheck.reviews`
+GROUP BY model
+ORDER BY reviews DESC
+
+@@ concept
+title: Billing: how many columns and partitions you scan
+lang: py
+--- body
+With on-demand pricing, BigQuery charges by the **bytes scanned** by a query. The official pricing page says 6.25 US dollars per TiB, with the first 1 TiB each month free (prices change; the official pricing page is the source of truth). The other model is capacity pricing (editions: you pay for how many compute slots you use, for how many hours), which teams with heavy use often choose; today covers on-demand only. Because storage is columnar:
+
+- Bytes scanned = the full size of **every column the query uses** (anything that appears in SELECT, WHERE, JOIN or GROUP BY counts), no matter how many rows come back. `SELECT *` reads every column and is the most expensive
+- `LIMIT 10` does **not** scan less; on a table without partitions or clustering, neither does `WHERE`
+- Every table a query uses is billed at least 10 MB; queries that fail and queries answered from the cache are free. If you only want to see what the data looks like, use the table's Preview tab in the console (free)
+- **Partitioned tables**: `PARTITION BY DATE(created_at)` cuts the table into one block per day. When WHERE compares the partition column directly with a constant (`created_at >= TIMESTAMP('2026-09-01')`), only those days' partitions are read. Turn on `OPTIONS (require_partition_filter = TRUE)` when you create the table, and any query without such a filter fails with an error
+- **Clustering**: `CLUSTER BY customer_id` stores each customer's data together, so filtering on it can skip many blocks. How much it saves is only known once the query has run, so a dry run's estimate on a clustered table is an upper bound
+
+This page can't simulate partitions and clustering, so below we do the math for an imaginary table with "200 million rows a year".
+--- code
+TIB = 2 ** 40
+PRICE_PER_TIB = 6.25                 # example price; the official pricing page is the source of truth
+ROWS = 200_000_000                   # imaginary: one year live, one row per review
+BYTES_PER_ROW = {                    # average bytes per row for each column: 8 for numbers and times, about 2 + length for text
+    "id": 8, "contract_id": 8, "clause_id": 6, "heading": 22, "topic": 15, "verdict": 8,
+    "risk": 6, "model": 16, "prompt_version": 4, "prompt_tokens": 8, "completion_tokens": 8,
+    "cache_hit_tokens": 8, "latency_ms": 8, "cost_usd": 8, "error": 2, "created_at": 8,
+    "rationale": 400,                # the model's reasoning: the column that takes the most space
+}
+
+def usd(columns, share_of_rows=1.0):
+    scanned = ROWS * share_of_rows * sum(BYTES_PER_ROW[c] for c in columns)
+    return scanned / TIB * PRICE_PER_TIB
+
+runs_per_month = 12 * 24 * 30        # the dashboard refreshes every 5 minutes
+print(f"SELECT * ... LIMIT 10          ${usd(BYTES_PER_ROW):.3f} per run")
+print(f"SELECT created_at, cost_usd    ${usd(['created_at', 'cost_usd']):.4f} per run")
+print(f"  + 30 of 365 day partitions   ${usd(['created_at', 'cost_usd'], 30 / 365):.5f} per run")
+print(f"dashboard with SELECT *        ${usd(BYTES_PER_ROW) * runs_per_month:,.0f} per month")
+print(f"dashboard, 2 cols, partitions  ${usd(['created_at', 'cost_usd'], 30 / 365) * runs_per_month:,.2f} per month")
+
+@@ concept
+title: The GoogleSQL dialect: table names, division, COUNTIF
+bq: yes
+--- body
+BigQuery's SQL is called GoogleSQL. The SELECT, JOIN, CTEs and window functions from the last two days all work as usual. Here are the places where it differs from SQLite that you'll use today (this page simulates them, and you can use them in exercises marked as BigQuery syntax):
+
+- Table names need the dataset: `clausecheck.reviews`; or write the full name including the project, wrapped in backticks (the key below Esc in the top-left corner of the keyboard), like the FROM in the example below. Writing just `reviews` gives a missing dataset error
+- `/` always gives a decimal: `7 / 2 = 3.5` (in SQLite and Postgres, dividing two whole numbers gives 3). For whole-number division use `DIV(7, 2)`
+- `SAFE_DIVIDE(a, b)`: gives NULL when b is 0, instead of an error. Use it for ratios (hit rate, pass rate)
+- `COUNTIF(condition)`: counts the rows that meet the condition, the same as `SUM(CASE WHEN condition THEN 1 ELSE 0 END)` (when there are no rows at all, COUNTIF gives 0 and SUM gives NULL)
+- `IF(condition, a, b)`: a shorter CASE WHEN
+- The type names are different: `CAST(x AS STRING)`, `INT64`, `FLOAT64`, `BOOL`
+
+Below we compare two models: on average the large model v4-pro produces more than three times as many output tokens as flash, and it is much slower too.
+--- code
+SELECT
+  model,
+  COUNT(*) AS reviews,
+  COUNTIF(verdict = 'flag') AS flags,
+  ROUND(SAFE_DIVIDE(SUM(completion_tokens), COUNT(*)), 1) AS avg_output_tokens,
+  IF(AVG(latency_ms) > 5000, 'slow', 'ok') AS speed,
+  7 / 2 AS float_div,
+  DIV(7, 2) AS int_div
+FROM `clausecheck-dev.clausecheck.reviews`
+GROUP BY model
+
+@@ concept
+title: Time: DATE_TRUNC and TIMESTAMP_DIFF
+bq: yes
+--- body
+The most common time types in BigQuery are `DATE` (a date) and `TIMESTAMP` (a moment in time, in UTC); there are also `DATETIME` and `TIME`, which have no time zone. On this page the time columns are stored as text, but the functions below are simulated following BigQuery's rules:
+
+- `DATE(created_at)`: moment → date
+- `DATE_TRUNC(date, MONTH)`: cut back to the start of the month (also WEEK, QUARTER, YEAR). **The value comes first, the unit second**, and the unit is a keyword without quotes: exactly the reverse of Postgres's `date_trunc('month', ts)`. Writing `'MONTH'` gives an error
+- Truncating doesn't change the type: a TIMESTAMP cut to the month is still a TIMESTAMP (`2026-09-01 00:00:00`), so "by month" is usually written `DATE_TRUNC(DATE(created_at), MONTH)`, which gives `2026-09-01`
+- `WEEK` starts on Sunday (to start on Monday, real BigQuery has `ISOWEEK` or `WEEK(MONDAY)`; this page doesn't simulate them)
+- `TIMESTAMP_DIFF(later, earlier, SECOND)`: how many whole seconds apart two moments are (the largest unit is DAY; with DAY it counts full 24-hour periods). To count calendar days or months between them, use `DATE_DIFF(DATE(a), DATE(b), DAY)` (or `MONTH`)
+
+A small limitation of this page: don't give a column an alias that is just a time-unit word, such as `month`, `week`, `day`, `hour` or `year` (the simulator may take it for a unit and quietly compute the wrong result); use names like `month_start`. Real BigQuery doesn't have this problem.
+
+Below: how long each of the two eval runs took. v1 and v2 each finished their 24 runs in about three and a half minutes.
+--- code
+SELECT
+  prompt_version,
+  DATE(MIN(created_at)) AS run_date,
+  DATE_TRUNC(DATE(MIN(created_at)), WEEK) AS week_start,
+  TIMESTAMP_DIFF(MAX(created_at), MIN(created_at), SECOND) AS run_seconds,
+  COUNT(*) AS runs
+FROM clausecheck.evals
+GROUP BY prompt_version
+ORDER BY prompt_version
+
+@@ concept
+title: BigQuery syntax this page cannot run
+bq: yes
+--- body
+You'll use these every day in real BigQuery, but this page can't simulate them. Learn to recognize them, and be able to write them in an interview:
+
+- `QUALIFY`: like HAVING, but it filters on the results of window functions. "The latest review of each clause" takes one statement:
+
+```sql
+SELECT contract_id, clause_id, verdict
+FROM clausecheck.reviews
+WHERE error IS NULL
+QUALIFY ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id ORDER BY created_at DESC) = 1
+```
+
+  The way to write it on this page: put ROW_NUMBER in a CTE and use `WHERE rn = 1` outside it (Day 23)
+- `APPROX_QUANTILES(latency_ms, 100)[OFFSET(95)]`: an approximate p95. This page computes it with window functions using nearest-rank (the method from Day 13); that's the example below
+- `ARRAY_AGG(x)` collects a group of values into an array, `UNNEST(array)` expands an array into rows (like yesterday's json_each), `STRUCT(a, b)` packs several fields into one
+- `SELECT * EXCEPT (rationale)`: every column except a few (the columns you leave out aren't scanned, so you don't pay for them)
+- AI inside the warehouse: BigQuery ML can call a model from SQL to generate embeddings, and `VECTOR_SEARCH` does vector similarity search over a table (the official docs are the source of truth for how to use them)
+
+In the example: `rn` is the rank after sorting and `n` is the number of rows in the group. The smallest latency among the rows ranked ≥ 0.95 × n is exactly the row ranked ceil(0.95 × n), which is the nearest-rank p95.
+--- code
+WITH ranked AS (
+  SELECT
+    model,
+    latency_ms,
+    ROW_NUMBER() OVER (PARTITION BY model ORDER BY latency_ms) AS rn,
+    COUNT(*) OVER (PARTITION BY model) AS n
+  FROM clausecheck.reviews
+)
+SELECT
+  model,
+  MAX(n) AS n,
+  MIN(IF(rn >= 0.95 * n, latency_ms, NULL)) AS p95_ms
+FROM ranked
+GROUP BY model
+ORDER BY model
+
+@@ concept
+title: The Python client: queries, parameters, rows
+lang: py
+cloud: yes
+dataset: clausecheck
+--- body
+In Python you use `google-cloud-bigquery`:
+
+```python
+from google.cloud import bigquery
+client = bigquery.Client()                    # the project and credentials come from the environment (more on Day 26)
+config = bigquery.QueryJobConfig(
+    query_parameters=[bigquery.ScalarQueryParameter("cid", "INT64", 103)],
+    labels={"feature": "dashboard"},
+)
+job = client.query(sql, job_config=config)    # submit a query job
+rows = list(job.result())                     # wait for it to finish and get all the rows
+```
+
+- In the SQL write `@cid`, and pass the value with `ScalarQueryParameter(name, type, value)`; the type is `"STRING"`, `"INT64"`, `"FLOAT64"`, `"BOOL"`, `"DATE"` or `"TIMESTAMP"`. Same idea as yesterday's `?`: **never build values into SQL with an f-string**. Table and column names can't be parameters either
+- Read values from a row with `row["verdict"]`, `row.verdict` or `row[0]`; `dict(row.items())` turns it into a dictionary. INT64 → int, FLOAT64 → float, TIMESTAMP → a `datetime` with a time zone (UTC)
+- You can loop over `job.result()` only **once**; if you need it twice, wrap it in `list(...)` first
+- A mistake in the SQL, a table that doesn't exist: the error is raised by `job.result()`, not by `client.query()`
+- `labels` tag the query, so the bill can split costs by feature
+- In the real SDK, `job.result().to_dataframe()` turns the result straight into a pandas table (this page has no pandas)
+--- code
+from google.cloud import bigquery
+
+client = bigquery.Client()
+sql = """
+SELECT id, clause_id, verdict, created_at
+FROM clausecheck.reviews
+WHERE contract_id = @cid AND risk = @risk
+ORDER BY id
+"""
+config = bigquery.QueryJobConfig(query_parameters=[
+    bigquery.ScalarQueryParameter("cid", "INT64", 103),
+    bigquery.ScalarQueryParameter("risk", "STRING", "high"),
+])
+job = client.query(sql, job_config=config)
+rows = list(job.result())
+for row in rows:
+    print(row["id"], row.clause_id, row[2], row.created_at.isoformat())
+print(dict(rows[0].items()))
+
+bad = client.query("SELECT verdict FROM reviews")      # forgot the dataset
+print("client.query() did not raise")
+try:
+    bad.result()
+except Exception as e:
+    print(type(e).__name__, e)
+
+@@ concept
+title: Dry runs, byte limits, and caching
+lang: py
+cloud: yes
+dataset: clausecheck
+--- body
+Do the math before you spend money:
+
+- **Dry run**: `QueryJobConfig(dry_run=True)`. BigQuery only checks the SQL and estimates how much it will scan; it doesn't really run it, and it's **free**. Read `job.total_bytes_processed`. If the SQL has an error, `client.query()` raises it right away. The official Python sample writes `QueryJobConfig(dry_run=True, use_query_cache=False)`: the estimate ignores the cache
+- **Byte limit**: `QueryJobConfig(maximum_bytes_billed=number_of_bytes)`. If the bytes the query is expected to bill go over the limit, the query fails right away and costs nothing. Every table is billed at least 10 MB (10485760 bytes), so with a limit below that, every query that reads a table fails
+- The error reason for going over the limit is `bytesBilledLimitExceeded`. With `client.query()` + `result()`, the SDK's error mapping has no entry for this reason, so it reports a 500 `InternalServerError`, **not** `BadRequest`; with another way of calling, the type may be different again. So catch their common parent class `GoogleAPICallError`, then look at `e.errors[0]["reason"]`
+- **Cache**: when exactly the same query (down to the spaces) runs again within 24 hours and the table hasn't changed, the result comes straight from the cache (`job.cache_hit` is True) and 0 bytes are billed. When the table has just received streaming inserts, or the query uses a function that changes every time, such as `CURRENT_TIMESTAMP()`, the cache isn't used
+
+Below: how much three queries scan (note the one with LIMIT); a limit that is too low; the same query run twice.
+--- code
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPICallError
+
+client = bigquery.Client()
+for sql in [
+    "SELECT * FROM clausecheck.reviews",
+    "SELECT verdict, cost_usd FROM clausecheck.reviews",
+    "SELECT verdict, cost_usd FROM clausecheck.reviews LIMIT 1",
+]:
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
+    print(f"{job.total_bytes_processed:>5} bytes  {sql}")
+
+limited = bigquery.QueryJobConfig(maximum_bytes_billed=5_000_000)
+try:
+    client.query("SELECT verdict FROM clausecheck.reviews", job_config=limited).result()
+except GoogleAPICallError as e:
+    print(type(e).__name__, e.errors[0]["reason"])
+
+first = client.query("SELECT COUNT(*) AS n FROM clausecheck.evals")
+first.result()
+again = client.query("SELECT COUNT(*) AS n FROM clausecheck.evals")
+print("cache hit:", first.cache_hit, again.cache_hit, "| billed:", first.total_bytes_billed, again.total_bytes_billed)
+
+@@ concept
+title: Writing data: streaming and batch loading
+lang: py
+cloud: yes
+dataset: clausecheck
+--- body
+How does trace data get into BigQuery? There are two ways:
+
+- **Streaming inserts** with `client.insert_rows_json(table_name, list_of_rows)`: the rows can be queried within a few seconds of writing, and you pay for the amount written (official pricing page: 0.01 US dollars per 200 MiB, each row counted as at least 1 KB; the official page is the source of truth). Good for a worker that writes one row each time it finishes a review. It uses the old insertAll (REST) API and is the simplest to write; for new projects Google recommends the gRPC-based Storage Write API, which is cheaper
+- **Batch loading**: first write a batch of data to files in Cloud Storage, then import them with a load job. Loading itself is free; good for large amounts of data that aren't urgent
+
+When the row data has problems, `insert_rows_json` **doesn't raise an exception: it returns a list of errors**, and you must check it. Success is `[]`; on failure each entry is `{"index": row_number, "errors": [...]}`. (Only errors about the whole request, such as a missing table or no permission, raise an exception.) By default, **one bad row means none of the batch is written**: the bad row's reason is `invalid`, the other rows get `stopped` and can be sent again as they are. `skip_invalid_rows=True` lets the good rows go straight in.
+
+BigQuery won't block duplicate rows for you: a table can declare a primary key, but it isn't enforced (it's only used to optimize queries). Send the same row twice and it's usually stored as two rows (the `row_ids` parameter only removes duplicates on a best-effort basis). So dashboard queries often have to remove duplicates themselves, for example with QUALIFY to take the latest row of each group. Note: this page's simulation treats `id` as a primary key, so when the same id is sent twice only one row is kept. Real BigQuery is different here.
+--- code
+from google.cloud import bigquery
+
+client = bigquery.Client()
+TABLE = "clausecheck-dev.clausecheck.reviews"
+row = {
+    "id": 1066, "contract_id": 110, "clause_id": "9.1", "heading": "Warranties", "topic": "warranty",
+    "verdict": "accept", "risk": "low", "rule_ids": '["PB-00"]', "model": "deepseek-flash",
+    "prompt_version": "v2", "prompt_tokens": 2104, "completion_tokens": 151, "cache_hit_tokens": 1650,
+    "latency_ms": 2210, "cost_usd": 0.000327, "created_at": "2026-09-23 10:00:00",
+}
+bad = dict(row, id=1067, prompt_tokens="many")
+
+errors = client.insert_rows_json(TABLE, [row, bad])
+for e in errors:
+    print(e["index"], e["errors"][0]["reason"], e["errors"][0]["message"])
+print(client.insert_rows_json(TABLE, [row]))
+n = list(client.query("SELECT COUNT(*) AS n FROM clausecheck.reviews").result())[0]["n"]
+print("rows now:", n)
+
+@@ item d25-01
+type: sql
+title: Recap: the two slowest reviews per model
+level: 2
+ordered: yes
+cards: d23:Window functions: every row stays; d23:CTE: name each step with WITH
+--- context
+When tracking down latency problems, you often start by picking out the slowest few reviews of each model, to see which clauses they reviewed and whether they have something in common.
+--- prompt
+Review Day 23's window functions (this exercise uses plain SQLite syntax; table names don't need the dataset): find the **two** reviews with the highest latency for each model. Return four columns: `model`, `id`, `clause_id`, `latency_ms`, sorted by model, and within the same model by latency_ms from high to low. Use `ROW_NUMBER()`.
+--- solution
+WITH ranked AS (
+  SELECT model, id, clause_id, latency_ms,
+         ROW_NUMBER() OVER (PARTITION BY model ORDER BY latency_ms DESC) AS rn
+  FROM reviews
+)
+SELECT model, id, clause_id, latency_ms
+FROM ranked
+WHERE rn <= 2
+ORDER BY model, latency_ms DESC;
+--- hints
+- Number each row in a CTE: `ROW_NUMBER() OVER (PARTITION BY model ORDER BY latency_ms DESC) AS rn`.
+- The outer query keeps only the rows with `rn <= 2`. A window function's result can't go directly into the WHERE at the same level, which is why you need a CTE around it.
+- Finish with `ORDER BY model, latency_ms DESC`.
+
+@@ item d25-02
+type: sql
+title: Fix the bug: an error after moving to BigQuery
+level: 1
+bq: yes
+ordered: yes
+cards: The GoogleSQL dialect: table names, division, COUNTIF; Data warehouses and BigQuery
+--- context
+Suppose that once Clause Check is live, all review records go into BigQuery (Google Cloud's data warehouse). A query written for SQLite often fails when you move it over, because of the dialect (the small differences in how each database writes SQL).
+--- prompt
+This query counts, over the finished contracts (status = 'reviewed'), how many successful reviews each verdict has. It works fine in SQLite, but fails once moved to BigQuery. Run it, read the error, and fix it. The result has two columns: `verdict`, `n`, sorted by n from most to fewest.
+--- starter
+SELECT r.verdict, COUNT(*) AS n
+FROM reviews AS r
+JOIN contracts AS c ON c.id = r.contract_id
+WHERE c.status = 'reviewed' AND r.error IS NULL
+GROUP BY r.verdict
+ORDER BY n DESC, r.verdict;
+--- solution
+SELECT r.verdict, COUNT(*) AS n
+FROM clausecheck.reviews AS r
+JOIN clausecheck.contracts AS c ON c.id = r.contract_id
+WHERE c.status = 'reviewed' AND r.error IS NULL
+GROUP BY r.verdict
+ORDER BY n DESC, r.verdict;
+--- hints
+- The error says `Table name "reviews" missing dataset`: BigQuery doesn't know which dataset reviews is in.
+- Both tables need the dataset: `clausecheck.reviews`, `clausecheck.contracts` (or the backtick form with the project). The aliases `r` and `c` stay as they are.
+
+@@ item d25-03
+type: sql
+title: Redline rate per version
+level: 1
+bq: yes
+ordered: yes
+cards: The GoogleSQL dialect: table names, division, COUNTIF
+--- context
+The person in charge wants to know whether the share of clauses the model suggests rewriting changed after the switch to the v2 prompt. A sudden rise could mean the new prompt made the model too strict.
+--- prompt
+The dashboard's first question: the redline rate of each prompt version. Count only successful reviews (`error IS NULL`). Return four columns:
+
+- `prompt_version`
+- `reviews`: the number of successful reviews
+- `redlines`: how many of them are redline
+- `redline_rate`: redlines ÷ reviews, `ROUND(..., 3)`
+
+Sort by prompt_version. Use `COUNTIF` and `SAFE_DIVIDE`.
+--- solution
+SELECT
+  prompt_version,
+  COUNT(*) AS reviews,
+  COUNTIF(verdict = 'redline') AS redlines,
+  ROUND(SAFE_DIVIDE(COUNTIF(verdict = 'redline'), COUNT(*)), 3) AS redline_rate
+FROM clausecheck.reviews
+WHERE error IS NULL
+GROUP BY prompt_version
+ORDER BY prompt_version;
+--- hints
+- First remove the failed rows with WHERE, then `GROUP BY prompt_version`.
+- `COUNTIF(verdict = 'redline')` counts the redlines; the rate: `ROUND(SAFE_DIVIDE(COUNTIF(verdict = 'redline'), COUNT(*)), 3)`.
+
+@@ item d25-04
+type: sql
+title: Cache hit rate per contract
+level: 2
+bq: yes
+ordered: yes
+cards: The GoogleSQL dialect: table names, division, COUNTIF
+--- context
+The more input tokens hit the cache, the cheaper the review (Day 12's prefix cache). Looking at the hit rate per contract shows which contracts missed out on that saving.
+--- prompt
+Cache hit rate = input tokens that hit the cache ÷ all input tokens (Days 12 and 13). Compute each contract's hit rate and return three columns: `contract_id`, `reviews` (the number of reviews), `cache_hit_ratio` (`SUM(cache_hit_tokens)` ÷ `SUM(prompt_tokens)`, `ROUND(..., 3)`), sorted by hit rate from low to high.
+
+Look at the result: the lowest hit rate belongs to 110, which has only 2 reviews. Why do contracts with few reviews have a low hit rate? (Look at the `cache_hit_tokens` of each contract's first review.)
+--- solution
+SELECT
+  contract_id,
+  COUNT(*) AS reviews,
+  ROUND(SAFE_DIVIDE(SUM(cache_hit_tokens), SUM(prompt_tokens)), 3) AS cache_hit_ratio
+FROM clausecheck.reviews
+GROUP BY contract_id
+ORDER BY cache_hit_ratio;
+--- hints
+- Sum first, then divide: `SAFE_DIVIDE(SUM(cache_hit_tokens), SUM(prompt_tokens))`. Don't compute a ratio for each row and then take the AVG: that gives short and long requests the same weight, and the result is wrong.
+- In SQLite and Postgres, `SUM(a) / SUM(b)` is whole-number division and gives 0; BigQuery's `/` gives a decimal anyway. SAFE_DIVIDE adds one more safety net: when the denominator is 0 you get NULL, and the whole query doesn't fail.
+- The first request of each contract finds the cache cold (cache_hit_tokens is 0); only the later requests hit the shared prefix. The fewer the reviews, the bigger the share of that cold request.
+
+@@ item d25-05
+type: sql
+title: Cost per customer per month
+level: 2
+bq: yes
+ordered: yes
+cards: Time: DATE_TRUNC and TIMESTAMP_DIFF; d23:JOIN: connect tables
+--- context
+Customers pay for a plan, but the model costs money for every clause it reviews. Only by adding up model costs per customer and per month do you know what each customer costs, and whether the plan's price covers it.
+--- prompt
+Work out the costs: what the reviews of each customer cost in each month. Take the month from the **review time**; failed reviews cost money too, so count them as well. Return four columns:
+
+- `month_start`: `DATE_TRUNC(DATE(r.created_at), MONTH)`
+- `customer`: the customer's name
+- `reviews`: the number of reviews
+- `cost_usd`: `ROUND(SUM(cost_usd), 4)`
+
+Sort by month_start from earliest to latest, and within the same month by cost_usd from high to low. Customers without reviews don't need to appear.
+--- solution
+SELECT
+  DATE_TRUNC(DATE(r.created_at), MONTH) AS month_start,
+  cu.name AS customer,
+  COUNT(*) AS reviews,
+  ROUND(SUM(r.cost_usd), 4) AS cost_usd
+FROM clausecheck.reviews AS r
+JOIN clausecheck.contracts AS c ON c.id = r.contract_id
+JOIN clausecheck.customers AS cu ON cu.id = c.customer_id
+GROUP BY month_start, customer
+ORDER BY month_start, cost_usd DESC;
+--- hints
+- Reviews reach customers through contracts: reviews → contracts → customers, and all three tables need the dataset.
+- GROUP BY can use the aliases directly: `GROUP BY month_start, customer`.
+- Note that the unit has no quotes: `DATE_TRUNC(DATE(r.created_at), MONTH)`.
+
+@@ item d25-06
+type: sql
+title: Time to first review, and any re-reviews
+level: 2
+bq: yes
+ordered: yes
+cards: Time: DATE_TRUNC and TIMESTAMP_DIFF
+--- context
+How long customers wait between uploading a contract and the start of its review directly affects whether it feels fast to them. New reviews that show up many days later usually mean a re-review with a new prompt version, or a rerun after a failure.
+--- prompt
+Two operations questions: how soon after upload does a contract's review start? Was it reviewed again later? For each contract, return three columns:
+
+- `contract_id`
+- `seconds_to_first`: the seconds from upload (`uploaded_at`) to the first review, with `TIMESTAMP_DIFF`
+- `days_to_last`: how many days lie between the upload date and the date of the last review, with `DATE_DIFF(DATE(...), DATE(...), DAY)`
+
+Sort by days_to_last from largest to smallest, and ties by contract_id from smallest to largest.
+--- solution
+SELECT
+  c.id AS contract_id,
+  TIMESTAMP_DIFF(MIN(r.created_at), c.uploaded_at, SECOND) AS seconds_to_first,
+  DATE_DIFF(DATE(MAX(r.created_at)), DATE(c.uploaded_at), DAY) AS days_to_last
+FROM clausecheck.contracts AS c
+JOIN clausecheck.reviews AS r ON r.contract_id = c.id
+GROUP BY c.id, c.uploaded_at
+ORDER BY days_to_last DESC, contract_id;
+--- hints
+- Group by contract: `GROUP BY c.id, c.uploaded_at` (uploaded_at is used in a calculation in SELECT, so it goes into GROUP BY too).
+- The first review is `MIN(r.created_at)`, the last is `MAX(r.created_at)`. The arguments go "later first, earlier second": `TIMESTAMP_DIFF(MIN(r.created_at), c.uploaded_at, SECOND)`.
+- The top two contracts in the result are 103 and 109: exactly those two re-reviews (the data you used on Day 23 for "the latest row per group").
+
+@@ item d25-07
+type: sql
+title: Latency p50 and p95
+level: 3
+bq: yes
+ordered: yes
+cards: BigQuery syntax this page cannot run; d23:Window functions: every row stays
+--- context
+When lawyers feel the tool is "slow", it's usually because of the slowest small share of reviews, and the average hides them (Day 13). Looking at p50 and p95 per prompt version tells you whether the experience got better after the prompt change.
+--- prompt
+You can't judge latency by the average alone (Day 13). Compute the latency p50 and p95 for each prompt_version with nearest-rank: the value in position ceil(p × n) after sorting. Return five columns: `prompt_version`, `n` (the number of rows), `p50_ms`, `p95_ms`, `avg_ms` (`ROUND(AVG(latency_ms))`), sorted by prompt_version.
+
+In real BigQuery you'd write `APPROX_QUANTILES(latency_ms, 100)[OFFSET(95)]`; on this page, use the window-function version from the knowledge card. Look at the result: why is v1's p95 so much higher than v2's?
+--- solution
+WITH ranked AS (
+  SELECT
+    prompt_version,
+    latency_ms,
+    ROW_NUMBER() OVER (PARTITION BY prompt_version ORDER BY latency_ms) AS rn,
+    COUNT(*) OVER (PARTITION BY prompt_version) AS n
+  FROM clausecheck.reviews
+)
+SELECT
+  prompt_version,
+  MAX(n) AS n,
+  MIN(IF(rn >= 0.5 * n, latency_ms, NULL)) AS p50_ms,
+  MIN(IF(rn >= 0.95 * n, latency_ms, NULL)) AS p95_ms,
+  ROUND(AVG(latency_ms)) AS avg_ms
+FROM ranked
+GROUP BY prompt_version
+ORDER BY prompt_version;
+--- hints
+- Follow the example in the knowledge card "BigQuery syntax this page cannot run", changing `PARTITION BY model` to `PARTITION BY prompt_version`.
+- p50 and p95 follow the same pattern: `MIN(IF(rn >= 0.5 * n, latency_ms, NULL))`; change 0.5 to 0.95 and you have p95.
+- 2 of v1's 29 reviews used deepseek-v4-pro (over 8 seconds). They are the two slowest, and p95 lands exactly on one of them: the average is only 0.5 seconds higher, but p95 is more than twice as high.
+
+@@ item d25-08
+type: fill
+title: Fill in: weekly failure rate
+level: 2
+bq: yes
+ordered: yes
+cards: Time: DATE_TRUNC and TIMESTAMP_DIFF; The GoogleSQL dialect: table names, division, COUNTIF
+--- context
+Failed reviews have to be rerun, and they still cost money. Looking at the failure rate by week helps you spot early which week had a problem, for example too much rate limiting.
+--- prompt
+Complete this dashboard query: for each week (starting on Sunday), count the reviews, the failed reviews and the failure rate (a review failed when `error` is not NULL), with the weeks from earliest to latest.
+--- template
+SELECT
+  DATE_TRUNC(DATE(created_at), [[WEEK]]) AS week_start,
+  COUNT(*) AS reviews,
+  [[COUNTIF]](error IS NOT NULL) AS failed,
+  ROUND([[SAFE_DIVIDE]](COUNTIF(error IS NOT NULL), COUNT(*)), 3) AS failure_rate
+FROM [[clausecheck.reviews]]
+GROUP BY week_start
+ORDER BY week_start;
+--- hints
+- The unit keyword for cutting to the week is `WEEK`, without quotes.
+- Count the rows that meet a condition with `COUNTIF`; divide safely with `SAFE_DIVIDE`; table names need the dataset.
+
+@@ item d25-09
+type: choice
+title: Does LIMIT save money?
+level: 1
+cards: Billing: how many columns and partitions you scan
+--- context
+A colleague who is new to BigQuery wants to see what the data in a table looks like first. BigQuery charges by usage, so every query has a price: find out what this one will be billed before running it.
+--- prompt
+A colleague wants to see what `clausecheck.reviews` looks like (say the whole table is 2 TiB) and writes `SELECT * FROM clausecheck.reviews LIMIT 10` in BigQuery. With on-demand pricing, about how much data is this query billed for?
+--- options
+- 10 rows of data, a few KB
+- Every column of the whole table, about 2 TiB: LIMIT only returns fewer rows, and columnar storage still reads the columns it uses in full
+- 0: queries with LIMIT are free
+- Only the first column
+answer: 2
+--- explain
+At the example price on the official pricing page (6.25 US dollars per TiB; the official pricing page is the source of truth), that one query costs 12.5 US dollars, and a dashboard that runs it every 5 minutes costs a fortune. To see what the data looks like, use the table's Preview tab in the console, which is free; for a real query, select only the columns you need, do a dry run first to see how much it scans, and set `maximum_bytes_billed` as a seat belt. Interviews ask this one a lot.
+
+@@ item d25-10
+type: choice
+title: Which one scans the least?
+level: 2
+cards: Billing: how many columns and partitions you scan
+--- context
+This table holds a whole year of reviews, and the dashboard queries it many times a day. When you pay by usage, a small difference in how a query is written adds up to a sizable bill over a year.
+--- prompt
+`clausecheck.reviews` is partitioned by `DATE(created_at)`, clustered by `customer_id`, and holds a whole year of data. Which of the queries below scans the **least** data?
+--- options
+- `SELECT customer_id, cost_usd FROM clausecheck.reviews LIMIT 100`
+- `SELECT * FROM clausecheck.reviews WHERE created_at >= TIMESTAMP('2026-09-01')`
+- `SELECT customer_id, cost_usd FROM clausecheck.reviews WHERE created_at >= TIMESTAMP('2026-09-01')`
+- `SELECT customer_id, cost_usd FROM clausecheck.reviews WHERE cost_usd > 0.0005`
+answer: 3
+--- explain
+Option 3 compares the partition column `created_at` with a constant, so it reads only the partitions from September on, and only 3 columns (the created_at in WHERE counts too). Option 2 prunes the same partitions, but `SELECT *` reads every column. In option 1, LIMIT doesn't reduce the scan, so it reads the whole year. Option 4 filters on an ordinary column, so no partitions are pruned and it reads the whole year too. With `require_partition_filter = TRUE` set when the table is created, queries like options 1 and 4 fail with an error instead of quietly scanning the whole table.
+
+@@ item d25-11
+type: predict
+title: Rows, types, and looping only once
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+cards: The Python client: queries, parameters, rows
+--- context
+The dashboard backend fetches data from BigQuery in Python. What the rows, the empty values and the time columns look like when they come back decides how the rest of the code has to be written.
+--- prompt
+Write the output. Things to watch: what does NULL become in Python? What type does a TIMESTAMP column come back as (does `.day` work)? Can you loop over `job.result()` twice?
+--- code
+from google.cloud import bigquery
+
+client = bigquery.Client()
+job = client.query("SELECT id, verdict, risk, created_at FROM clausecheck.reviews WHERE contract_id = 109 ORDER BY id")
+rows = job.result()
+print(rows.total_rows)
+for row in rows:
+    print(row["id"], row.verdict, row[2], row.created_at.day)
+try:
+    for row in rows:
+        print("again", row.id)
+except ValueError as e:
+    print("ValueError:", e.args[0])
+--- explain
+Review 1061 failed, so its verdict and risk are NULL, which becomes `None` in Python. A TIMESTAMP column comes back as a `datetime` with the UTC time zone, so `.day` works. The iterator that `result()` returns can only be walked through once: the second loop raises `ValueError: Iterator has already started`. If you need the rows twice, first write `rows = list(job.result())`.
+
+@@ item d25-12
+type: code
+title: Customer report: use parameters
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+cards: The Python client: queries, parameters, rows; d24:Parameterized queries and SQL injection
+--- context
+A customer opens "My reports" on the web page, and the backend looks up a summary of each of their contracts in BigQuery by customer number. The customer number comes from the web request.
+--- prompt
+Write `run_report(client, customer_id)`: use the `SQL` in the starter code to get a summary of each of this customer's contracts, and return a list of dictionaries (`dict(row.items())`) sorted by contract_id; a customer without contracts gives `[]`.
+
+Pass the `@customer_id` in the SQL with `bigquery.ScalarQueryParameter("customer_id", "INT64", customer_id)`, inside `QueryJobConfig(query_parameters=[...])`.
+
+Example: `run_report(client, 4)` → `[{"contract_id": 107, "title": "Reseller Agreement", "reviews": 8, "redlines": 2, "cost_usd": 0.006198}, {"contract_id": 108, ...}]`
+--- starter
+from google.cloud import bigquery
+
+SQL = """
+SELECT c.id AS contract_id, c.title, COUNT(r.id) AS reviews,
+       COUNTIF(r.verdict = 'redline') AS redlines,
+       ROUND(SUM(r.cost_usd), 6) AS cost_usd
+FROM clausecheck.contracts AS c
+JOIN clausecheck.reviews AS r ON r.contract_id = c.id
+WHERE c.customer_id = @customer_id
+GROUP BY c.id, c.title
+ORDER BY c.id
+"""
+
+def run_report(client, customer_id):
+    pass
+--- solution
+from google.cloud import bigquery
+
+SQL = """
+SELECT c.id AS contract_id, c.title, COUNT(r.id) AS reviews,
+       COUNTIF(r.verdict = 'redline') AS redlines,
+       ROUND(SUM(r.cost_usd), 6) AS cost_usd
+FROM clausecheck.contracts AS c
+JOIN clausecheck.reviews AS r ON r.contract_id = c.id
+WHERE c.customer_id = @customer_id
+GROUP BY c.id, c.title
+ORDER BY c.id
+"""
+
+def run_report(client, customer_id):
+    config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("customer_id", "INT64", customer_id)],
+    )
+    rows = client.query(SQL, job_config=config).result()
+    return [dict(row.items()) for row in rows]
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+def _brief(customer_id):
+    return [(r["contract_id"], r["title"], r["reviews"], r["redlines"], round(r["cost_usd"], 6)) for r in run_report(client, customer_id)]
+expect("customer 4's two contracts", lambda: _brief(4), [(107, "Reseller Agreement", 8, 2, 0.006198), (108, "Mutual NDA", 4, 1, 0.00238)])
+expect("each entry is a dictionary whose keys are the column names", lambda: sorted(run_report(client, 2)[0]), ["contract_id", "cost_usd", "redlines", "reviews", "title"])
+expect("customer 2", lambda: [r["contract_id"] for r in run_report(client, 2)], [103, 104])
+expect("a customer without contracts", lambda: run_report(client, 6), [])
+def _sent_sql():
+    run_report(client, 3)
+    return "@customer_id" in CLOUD.calls[-1][1]
+expect("the SQL goes out unchanged and the value goes as a parameter (3 is not built into the SQL)", _sent_sql, True)
+--- hints
+- `config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("customer_id", "INT64", customer_id)])`.
+- `rows = client.query(SQL, job_config=config).result()`, then `[dict(row.items()) for row in rows]`.
+
+@@ item d25-13
+type: fix
+title: Fix the bug: an f-string builds the SQL
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+cards: The Python client: queries, parameters, rows; d24:Parameterized queries and SQL injection
+--- context
+The dashboard can filter reviews by topic. The topic value comes from the web request, and anyone can change it to any text.
+--- prompt
+`reviews_by_topic(client, topic)` returns the ids of the reviews on one topic (sorted by id). It puts topic straight into the SQL: a value with an apostrophe causes an error, and the query can be injected. Run the tests, then change it to use an `@topic` parameter (type `"STRING"`). Yesterday you fixed exactly the same bug in SQLite; this time it's the BigQuery version.
+--- starter
+from google.cloud import bigquery
+
+def reviews_by_topic(client, topic):
+    sql = f"SELECT id FROM clausecheck.reviews WHERE topic = '{topic}' ORDER BY id"
+    return [row["id"] for row in client.query(sql).result()]
+--- solution
+from google.cloud import bigquery
+
+def reviews_by_topic(client, topic):
+    sql = "SELECT id FROM clausecheck.reviews WHERE topic = @topic ORDER BY id"
+    config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("topic", "STRING", topic)],
+    )
+    return [row["id"] for row in client.query(sql, job_config=config).result()]
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+expect("an ordinary topic", lambda: reviews_by_topic(client, "termination"), [1010, 1027, 1033, 1043, 1053])
+expect("the injection is just a strange topic that matches nothing", lambda: reviews_by_topic(client, "x' OR 'a'='a"), [])
+expect("a value with an apostrophe doesn't break the SQL", lambda: reviews_by_topic(client, "o'clock"), [])
+def _value_in_sql():
+    reviews_by_topic(client, "warranty")
+    return "warranty" in CLOUD.calls[-1][1]
+expect("the value is not built into the SQL text", _value_in_sql, False)
+--- hints
+- In the SQL write `WHERE topic = @topic`: no quotes, and no f-string.
+- Put the value in `bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("topic", "STRING", topic)])`, then call `client.query(sql, job_config=config)`.
+
+@@ item d25-14
+type: code
+title: Estimate first, don't really run it
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+cards: Dry runs, byte limits, and caching; Billing: how many columns and partitions you scan
+--- context
+BigQuery charges by bytes scanned, and one badly written query can scan a whole large table in one go. Before the dashboard goes live, you want to know what each query will cost, without actually spending money just to find out the price.
+--- prompt
+Write `estimate_cost(client, sql, usd_per_tib=6.25)`: use a **dry run** to estimate how much this query scans and what it costs, and return `{"bytes": bytes_scanned, "usd": dollars}`, where `usd = bytes / 2**40 * usd_per_tib` (not rounded; 6.25 is only an example price, and the official pricing page is the source of truth).
+
+- Never actually run the query: when you estimate the cost of a DELETE, the data must not be deleted
+- If the SQL has an error, let the error be raised (a dry run raises `BadRequest` already in `client.query()`)
+
+Real bills also have the "at least 10 MB per table" rule; ignore it here.
+--- starter
+from google.cloud import bigquery
+
+def estimate_cost(client, sql, usd_per_tib=6.25):
+    job = client.query(sql)
+    job.result()
+    n = job.total_bytes_processed
+    return {"bytes": n, "usd": n / 2**40 * usd_per_tib}
+--- solution
+from google.cloud import bigquery
+
+def estimate_cost(client, sql, usd_per_tib=6.25):
+    config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+    job = client.query(sql, job_config=config)
+    n = job.total_bytes_processed
+    return {"bytes": n, "usd": n / 2**40 * usd_per_tib}
+--- tests
+from google.cloud import bigquery
+from google.api_core.exceptions import BadRequest
+client = bigquery.Client()
+STAR = "SELECT * FROM clausecheck.reviews"
+TWO = "SELECT verdict, cost_usd FROM clausecheck.reviews"
+expect("bytes for SELECT *", lambda: estimate_cost(client, STAR)["bytes"], 9508)
+expect("only two columns: scans much less", lambda: estimate_cost(client, TWO)["bytes"], 1008)
+expect("the same SQL estimated twice gives the same result (a real run would hit the cache the second time and give 0)", lambda: [estimate_cost(client, TWO)["bytes"] for _ in range(2)], [1008, 1008])
+expect("cost = bytes / 2**40 * price", lambda: estimate_cost(client, STAR, usd_per_tib=5.0)["usd"], 9508 / 2**40 * 5.0)
+def _delete_is_safe():
+    estimate_cost(client, "DELETE FROM clausecheck.reviews WHERE error IS NOT NULL")
+    return list(client.query("SELECT COUNT(*) AS n FROM clausecheck.reviews").result())[0]["n"]
+expect("estimating a DELETE doesn't really delete data", _delete_is_safe, 65)
+expect_raises("a mistake in the SQL: the dry run raises BadRequest right away", lambda: estimate_cost(client, "SELEC verdict FROM clausecheck.reviews"), BadRequest)
+--- hints
+- The starter code really runs the query: look at the "estimating a DELETE" test, where the data really got deleted.
+- `config = bigquery.QueryJobConfig(dry_run=True)` (the official sample also adds `use_query_cache=False`), `job = client.query(sql, job_config=config)`; a dry run doesn't need `result()` (it would only return 0 rows), so read `job.total_bytes_processed` directly.
+
+@@ item d25-15
+type: code
+title: A byte limit as a seat belt
+level: 3
+lang: py
+cloud: yes
+dataset: clausecheck
+cards: Dry runs, byte limits, and caching
+--- context
+The dashboard lets users put together their own queries, and one slip can scan a whole large table. This function is the query's seat belt: it stops the query before too much money is spent.
+--- prompt
+Write `safe_query(client, sql, max_bytes)`:
+
+- Run the query with `QueryJobConfig(maximum_bytes_billed=max_bytes)` and return the rows as a list of dictionaries (`dict(row.items())`)
+- Over the limit (the error's `errors[0]["reason"]` is `"bytesBilledLimitExceeded"`): don't crash, return `None`
+- Other errors (a mistake in the SQL, a table that doesn't exist) are raised as usual
+
+When the over-limit error comes out of `result()`, it is a 500 `InternalServerError`, not `BadRequest` (the knowledge card explained why): use `except GoogleAPICallError as e:`, then look at the reason. Remember that every table a query uses is billed at least 10 MB (`10 * 1024 * 1024` bytes).
+--- starter
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPICallError
+
+def safe_query(client, sql, max_bytes):
+    config = bigquery.QueryJobConfig(maximum_bytes_billed=max_bytes)
+    job = client.query(sql, job_config=config)
+    return [dict(row.items()) for row in job.result()]
+--- solution
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPICallError
+
+def safe_query(client, sql, max_bytes):
+    config = bigquery.QueryJobConfig(maximum_bytes_billed=max_bytes)
+    job = client.query(sql, job_config=config)
+    try:
+        rows = job.result()
+    except GoogleAPICallError as e:
+        if e.errors and e.errors[0].get("reason") == "bytesBilledLimitExceeded":
+            return None
+        raise
+    return [dict(row.items()) for row in rows]
+--- tests
+from google.cloud import bigquery
+from google.api_core.exceptions import BadRequest, NotFound
+client = bigquery.Client()
+MB = 1024 * 1024
+ONE = "SELECT verdict, COUNT(*) AS n FROM clausecheck.reviews WHERE error IS NULL GROUP BY verdict ORDER BY verdict"
+TWO = "SELECT r.id, c.title FROM clausecheck.reviews AS r JOIN clausecheck.contracts AS c ON c.id = r.contract_id WHERE r.id = 1001"
+expect("limit too low: returns None, no crash", lambda: safe_query(client, ONE, 5_000_000), None)
+expect("one table, a 10 MB limit: enough", lambda: safe_query(client, ONE, 10 * MB), [{"verdict": "accept", "n": 37}, {"verdict": "flag", "n": 14}, {"verdict": "redline", "n": 12}])
+expect("two tables need at least 20 MB: 10 MB is not enough", lambda: safe_query(client, TWO, 10 * MB), None)
+expect("two tables, a 20 MB limit", lambda: safe_query(client, TWO, 20 * MB), [{"id": 1001, "title": "CloudNotes SaaS Agreement"}])
+expect_raises("a misspelled table name: NotFound is raised as usual", lambda: safe_query(client, "SELECT id FROM clausecheck.review", 20 * MB), NotFound)
+expect_raises("a mistake in the SQL: BadRequest is raised as usual", lambda: safe_query(client, "SELEC id FROM clausecheck.reviews", 20 * MB), BadRequest)
+--- hints
+- The error is raised by `job.result()`, so wrap `result()` in the try.
+- Inside `except GoogleAPICallError as e:`, look at `e.errors[0].get("reason")`: if it's `"bytesBilledLimitExceeded"`, `return None`; otherwise `raise` to pass it on unchanged.
+- Writing only `except BadRequest` doesn't catch the over-limit error (it's a 500); writing only `except GoogleAPICallError: return None` swallows real bugs too; catching only `InternalServerError` is also wrong, because a 500 from a real server failure would then be treated as "over the limit". Only checking the reason is accurate.
+
+@@ item d25-16
+type: code
+title: Streaming inserts: check the error list
+level: 3
+lang: py
+cloud: yes
+dataset: clausecheck
+cards: Writing data: streaming and batch loading
+--- context
+Each time the worker finishes reviewing a clause, it writes the result to BigQuery, and a few seconds later it shows up on the dashboard. When a write goes wrong, no exception is raised; if you don't check, data is quietly lost.
+--- prompt
+Write `stream_reviews(client, rows)`, which streams the review rows into `TABLE` and returns `{"inserted": number_of_rows_written, "bad": [indexes_of_bad_rows, smallest first]}`:
+
+1. `rows` is empty: return `{"inserted": 0, "bad": []}` right away, **without calling** the API
+2. `errors = client.insert_rows_json(TABLE, rows)`; `errors == []` means every row was written
+3. Otherwise: the entries in errors whose reason is `"invalid"` are bad rows, so note their indexes; send the other rows (reason `"stopped"`: good rows held back because of the bad ones) once more, unchanged
+4. If the resend still returns errors: `raise RuntimeError`
+
+Example: in 4 rows, rows 1 and 3 are bad → return `{"inserted": 2, "bad": [1, 3]}`, and rows 0 and 2 are now in the table.
+--- starter
+from google.cloud import bigquery
+
+TABLE = "clausecheck-dev.clausecheck.reviews"
+
+def stream_reviews(client, rows):
+    client.insert_rows_json(TABLE, rows)
+    return {"inserted": len(rows), "bad": []}
+--- solution
+from google.cloud import bigquery
+
+TABLE = "clausecheck-dev.clausecheck.reviews"
+
+def stream_reviews(client, rows):
+    if not rows:
+        return {"inserted": 0, "bad": []}
+    errors = client.insert_rows_json(TABLE, rows)
+    if not errors:
+        return {"inserted": len(rows), "bad": []}
+    bad = sorted(e["index"] for e in errors if any(x["reason"] == "invalid" for x in e["errors"]))
+    retry = [row for i, row in enumerate(rows) if i not in bad]
+    if retry:
+        again = client.insert_rows_json(TABLE, retry)
+        if again:
+            raise RuntimeError(f"retry failed: {again}")
+    return {"inserted": len(retry), "bad": bad}
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+def _row(i, **changes):
+    row = {"id": i, "contract_id": 110, "clause_id": "9.1", "heading": "Warranties", "topic": "warranty",
+           "verdict": "accept", "risk": "low", "rule_ids": '["PB-00"]', "model": "deepseek-flash",
+           "prompt_version": "v2", "prompt_tokens": 2104, "completion_tokens": 151, "cache_hit_tokens": 1650,
+           "latency_ms": 2210, "cost_usd": 0.000327, "created_at": "2026-09-23 10:00:00"}
+    row.update(changes)
+    return row
+def _all_good():
+    result = stream_reviews(client, [_row(3001), _row(3002)])
+    ids = [r["id"] for r in client.query("SELECT id FROM clausecheck.reviews WHERE id BETWEEN 3000 AND 3099 ORDER BY id").result()]
+    return result, ids
+expect("all rows good", _all_good, ({"inserted": 2, "bad": []}, [3001, 3002]))
+def _mixed():
+    result = stream_reviews(client, [_row(3101), _row(3102, prompt_tokens="many"), _row(3103), _row(3104, created_at=None)])
+    ids = [r["id"] for r in client.query("SELECT id FROM clausecheck.reviews WHERE id BETWEEN 3100 AND 3199 ORDER BY id").result()]
+    return result, ids
+expect("bad rows noted by index, good rows written after the resend", _mixed, ({"inserted": 2, "bad": [1, 3]}, [3101, 3103]))
+def _empty():
+    before = len(CLOUD.calls)
+    result = stream_reviews(client, [])
+    return result, len(CLOUD.calls) - before
+expect("empty list: no API call", _empty, ({"inserted": 0, "bad": []}, 0))
+--- hints
+- The starter code ignores the return value: when `insert_rows_json` fails it **doesn't raise an exception**, it only returns the error list.
+- Bad rows: `[e["index"] for e in errors if any(x["reason"] == "invalid" for x in e["errors"])]`; the rows to resend are the rest: `[row for i, row in enumerate(rows) if i not in bad]`.
+- Another way works too: pass `skip_invalid_rows=True` the first time; the good rows go straight in, and the returned errors contain only the bad rows.
+
+@@ item d25-17
+type: order
+title: Put the code in order: count by risk
+level: 2
+lang: py
+cloud: yes
+dataset: clausecheck
+cards: The Python client: queries, parameters, rows
+--- context
+The contract detail page shows how many clauses are high, medium and low risk. These numbers come from BigQuery and are turned into a dictionary for the front end.
+--- prompt
+Put `risk_counts(client, contract_id)` in order: it returns the number of reviews at each risk level for this contract, like `{"low": 8, "medium": 2, "high": 2}`; failed reviews (risk is NULL) don't count. Pass contract_id as a parameter. Two lines are distractors.
+--- lines
+from google.cloud import bigquery
+def risk_counts(client, contract_id):
+    sql = "SELECT risk, COUNT(*) AS n FROM clausecheck.reviews WHERE contract_id = @cid AND risk IS NOT NULL GROUP BY risk"
+    param = bigquery.ScalarQueryParameter("cid", "INT64", contract_id)
+    config = bigquery.QueryJobConfig(query_parameters=[param])
+    job = client.query(sql, job_config=config)
+    rows = job.result()
+    return {row["risk"]: row["n"] for row in rows}
+--- distractors
+    sql = f"SELECT risk, COUNT(*) AS n FROM clausecheck.reviews WHERE contract_id = {contract_id} AND risk IS NOT NULL GROUP BY risk"
+    config = bigquery.QueryJobConfig(query_parameters=param)
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+expect("contract 101", lambda: risk_counts(client, 101), {"low": 8, "medium": 2, "high": 2})
+expect("failed reviews don't count", lambda: risk_counts(client, 106), {"low": 1, "high": 1})
+def _uses_param():
+    risk_counts(client, 110)
+    return "@cid" in CLOUD.calls[-1][1]
+expect("the SQL uses a parameter", _uses_param, True)
+--- hints
+- The order: write the SQL → make the parameter → put it in the config → submit the query → get the results → turn them into a dictionary.
+- `query_parameters` wants a **list**: `[param]`.
+
+@@ item d25-18
+type: local
+title: Local task (optional): the BigQuery sandbox
+level: 2
+lang: py
+cards: Billing: how many columns and partitions you scan; Dry runs, byte limits, and caching
+--- context
+All the BigQuery so far has been simulated. This exercise runs one query in the real BigQuery sandbox (a free trial environment), so you can see the scan estimate and the actual billing with your own eyes.
+--- prompt
+BigQuery has a free **sandbox**: you open it with a Google account, with no credit card and no billing account. According to the official "BigQuery sandbox" page: 1 TiB of queries a month, the same as the free tier, 10 GiB of storage in total (deleting data doesn't give the quota back), tables expire automatically after 60 days, and streaming inserts and DML that changes data are not supported (the rules change; the official page is the source of truth). If you can't reach Google services, skip this exercise.
+
+**Step 1**: open `console.cloud.google.com/bigquery` in your browser, sign in with your Google account, accept the terms of service, and create a project when asked (for the organization, "No organization" is fine). Don't click Upgrade, and don't add any billing information.
+
+**Step 2**: paste the query below into the query editor (a public dataset: a table of word counts from Shakespeare's works), and **don't run it yet**:
+
+```sql
+SELECT word, SUM(word_count) AS n
+FROM `bigquery-public-data.samples.shakespeare`
+GROUP BY word
+ORDER BY n DESC
+LIMIT 10
+```
+
+**Step 3**: look at the note next to the editor (a green check mark, saying This query will process … when run): that is the scan estimate from a dry run. Write it down.
+
+**Step 4**: for a moment, replace the whole query with the one below and see what the estimate changes to (does LIMIT save anything?), then switch back to the query from step 2:
+
+```sql
+SELECT * FROM `bigquery-public-data.samples.shakespeare` LIMIT 10
+```
+
+**Step 5**: click Run. In Job information next to the results, find the bytes processed and the bytes billed (Bytes processed / Bytes billed).
+
+**Step 6**: paste both estimates and those two lines from Job information below. Why are the bytes billed more than the bytes processed? (Hint: today's "at least 10 MB per table".)
+placeholder: Paste both scan estimates, plus the Bytes processed / Bytes billed lines from Job information
+verify: (process|bytes|MB|KB)
+--- hints
+- Can't find the estimate? It only appears when the SQL is correct; when the SQL is wrong, that spot shows a red error instead.
+- In step 4, if you only change the first line to `SELECT *`, the `GROUP BY word` below is still there and the query is wrong (the columns in `*` aren't grouped), so replace the whole query.
+
+@@ item d25-e1
+type: sql
+title: Closed book: redline rate per customer per month
+exam: yes
+level: 3
+bq: yes
+ordered: yes
+cards: Time: DATE_TRUNC and TIMESTAMP_DIFF; The GoogleSQL dialect: table names, division, COUNTIF
+--- context
+Account managers bring this table to their monthly meeting with each customer: what share of the clauses in the customer's contracts got a suggested rewrite this month, and whether that is more or less than last month.
+--- prompt
+Using BigQuery syntax: the redline rate of each customer in each month, counting only successful reviews (`error IS NULL`), with the month taken from the review time. Return five columns:
+
+- `month_start`: the first day of the month the review is in (DATE)
+- `customer`: the customer's name
+- `reviews`: the number of successful reviews
+- `redlines`: how many of them are redline
+- `redline_rate`: redlines ÷ reviews, with SAFE_DIVIDE, `ROUND(..., 3)`
+
+Sort by month_start from earliest to latest, within the same month by redline_rate from high to low, and ties by customer in alphabetical order. Tables: `clausecheck.reviews`, `clausecheck.contracts` (`customer_id`), `clausecheck.customers` (`name`).
+--- solution
+SELECT
+  DATE_TRUNC(DATE(r.created_at), MONTH) AS month_start,
+  cu.name AS customer,
+  COUNT(*) AS reviews,
+  COUNTIF(r.verdict = 'redline') AS redlines,
+  ROUND(SAFE_DIVIDE(COUNTIF(r.verdict = 'redline'), COUNT(*)), 3) AS redline_rate
+FROM clausecheck.reviews AS r
+JOIN clausecheck.contracts AS c ON c.id = r.contract_id
+JOIN clausecheck.customers AS cu ON cu.id = c.customer_id
+WHERE r.error IS NULL
+GROUP BY month_start, customer
+ORDER BY month_start, redline_rate DESC, customer;
+
+@@ item d25-e2
+type: scratch
+title: Closed book: price it before you query
+exam: yes
+level: 3
+lang: py
+cloud: yes
+dataset: clausecheck
+cards: Dry runs, byte limits, and caching; The Python client: queries, parameters, rows
+--- context
+The dashboard backend has to guarantee two things: no query ever spends a large sum by accident, and every value in a query is handed to the database safely.
+--- prompt
+Write `guarded_query(client, sql, params, max_usd, usd_per_tib=6.25)`, using `from google.cloud import bigquery`:
+
+- `params` is a dictionary `{parameter_name: (type, value)}`, for example `{"cid": ("INT64", 103)}`, with `@cid` in the SQL. Turn them into a list of `bigquery.ScalarQueryParameter(name, type, value)`; `params` can be an empty dictionary
+- First do a **dry run** (with the parameters as well, or the dry run fails because it can't find `@cid`); cost = `total_bytes_processed / 2**40 * usd_per_tib`
+- If the cost is greater than `max_usd`: `raise ValueError`, and **don't** really run the query
+- Otherwise really run it (with the parameters) and return the rows as a list of dictionaries (`dict(row.items())`)
+
+Example: `guarded_query(client, "SELECT id, verdict FROM clausecheck.reviews WHERE contract_id = @cid AND risk = @risk ORDER BY id", {"cid": ("INT64", 101), "risk": ("STRING", "high")}, 0.01)` → `[{"id": 1005, "verdict": "redline"}, {"id": 1006, "verdict": "flag"}]`
+--- solution
+from google.cloud import bigquery
+
+def guarded_query(client, sql, params, max_usd, usd_per_tib=6.25):
+    qp = [bigquery.ScalarQueryParameter(name, type_, value) for name, (type_, value) in params.items()]
+    dry = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=qp, dry_run=True, use_query_cache=False))
+    usd = dry.total_bytes_processed / 2**40 * usd_per_tib
+    if usd > max_usd:
+        raise ValueError(f"query would cost {usd:.8f} USD, limit {max_usd}")
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=qp))
+    return [dict(row.items()) for row in job.result()]
+--- tests
+from google.cloud import bigquery
+client = bigquery.Client()
+SQL = "SELECT id, verdict FROM clausecheck.reviews WHERE contract_id = @cid AND risk = @risk ORDER BY id"
+expect("a cheap query: with parameters, returns the rows", lambda: guarded_query(client, SQL, {"cid": ("INT64", 101), "risk": ("STRING", "high")}, 0.01), [{"id": 1005, "verdict": "redline"}, {"id": 1006, "verdict": "flag"}])
+def _too_expensive():
+    before = len(CLOUD.calls)
+    try:
+        guarded_query(client, "SELECT * FROM clausecheck.reviews", {}, 0.0)
+    except ValueError:
+        return len(CLOUD.calls) - before
+    return "no ValueError raised"
+expect("too expensive: ValueError, and only the dry run was made (1 call)", _too_expensive, 1)
+def _delete_not_run():
+    try:
+        guarded_query(client, "DELETE FROM clausecheck.reviews WHERE contract_id = @cid", {"cid": ("INT64", 110)}, 0.0)
+    except ValueError:
+        pass
+    return list(client.query("SELECT COUNT(*) AS n FROM clausecheck.reviews").result())[0]["n"]
+expect("price first, then run: the too-expensive DELETE did not run", _delete_not_run, 65)
+
+@@ item d25-e3
+type: sql
+title: Closed book: eval pass rate
+exam: yes
+level: 3
+bq: yes
+ordered: yes
+cards: The GoogleSQL dialect: table names, division, COUNTIF
+--- context
+The eval cases fall into groups by their expected verdict: should accept, should flag, should redline. Looking at the pass rate per group shows which group the v2 prompt's changes affected most.
+--- prompt
+Using BigQuery syntax, compute from `clausecheck.evals` the pass rate of each expected verdict (`expected`) under each prompt version. The `passed` column is 1 (passed) or 0. Return five columns:
+
+- `expected`
+- `prompt_version`
+- `runs`: how many runs
+- `passed_runs`: how many of them passed
+- `pass_rate`: passed_runs ÷ runs, with SAFE_DIVIDE, `ROUND(..., 3)`
+
+Sort by expected, then by prompt_version. Look at the result: which group of test cases did v2 fix, and which group did it make slightly worse?
+--- solution
+SELECT
+  expected,
+  prompt_version,
+  COUNT(*) AS runs,
+  COUNTIF(passed = 1) AS passed_runs,
+  ROUND(SAFE_DIVIDE(COUNTIF(passed = 1), COUNT(*)), 3) AS pass_rate
+FROM clausecheck.evals
+GROUP BY expected, prompt_version
+ORDER BY expected, prompt_version;

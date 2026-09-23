@@ -1,0 +1,1218 @@
+@@ day 29
+title: LangChain: models, messages, prompts, LCEL
+lang: py
+langchain: yes
+hours: 4–5 hours
+--- goal
+Call DeepSeek with LangChain and know exactly what it sends for you (`MOCK.calls[-1]["body"]`, compared with the `requests.post` you wrote by hand on Day 4); use message classes, prompt templates and the `prompt | model | parser` pipe; call a chain with streaming and in batches; pass the model into a function as a parameter, so you can test a chain with a fake model without going online.
+
+In the project: Clause Check's `review.py` makes the call by hand (just like Day 4), and `graph.py` uses LangGraph. This week is about exactly these two frameworks: LangChain first (today, tomorrow and Day 31), then LangGraph. This page runs the **real** LangChain / LangGraph; only the network is a mock DeepSeek, so code that works here works the same on your own computer.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards and change one thing in each before you run it (the first run has to load LangChain, which takes a few seconds)
+- Pass every practice exercise (the local task is optional)
+- The 3 closed-book challenges
+- Without looking at code, say what type goes into and comes out of each step of `prompt | model | StrOutputParser()`
+
+@@ concept
+title: Why use a framework (and when not to)
+--- body
+On Day 4 you wrote a call yourself: build the URL, add the `Authorization` request header, put together the JSON request body, and take the answer from `choices[0]["message"]["content"]`. LangChain wraps all of this in a **chat model object**:
+
+```python
+model = ChatDeepSeek(model="deepseek-flash")
+reply = model.invoke("Review clause 3.1 ...")   # returns an AIMessage
+```
+
+The upside: switching providers mostly means changing just this line (`ChatOpenAI` and `ChatAnthropic` work the same way); messages, templates, retries, streaming, token counts, tools and structured output all have one common way of writing them. The cost: several extra layers, so tracebacks get long; and it changes fast: 1.0 came out in October 2025, and the `LLMChain` and `langchain.chains` from older tutorials are gone from the `langchain` package in 1.x (1.0 moved many old modules into `langchain-classic`).
+
+Clause Check's choice (see the README): the review flow is linear, so plain Python is enough; LangGraph is used only for "pause and wait for a person to approve, then continue in another process".
+
+The two pieces of code below send the same request (LangChain only adds one extra `"stream": False`). `MOCK.calls[-1]["body"]` is the JSON that LangChain really sent; you will look at it a lot this week.
+--- code
+import os
+import requests
+import langchain
+import langchain_core
+from langchain_deepseek import ChatDeepSeek
+
+question = "Review clause 3.1: Fees are due in 30 days."
+
+# Day 4: by hand
+URL = "https://api.deepseek.com/v1/chat/completions"
+headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": question}]}
+data = requests.post(URL, headers=headers, json=body).json()
+print("requests: ", data["choices"][0]["message"]["content"])
+
+# LangChain: the URL, the headers, the API key (read from the environment variable DEEPSEEK_API_KEY) and the parsing are all done for you
+model = ChatDeepSeek(model="deepseek-flash")
+reply = model.invoke(question)
+print("LangChain:", reply.content)
+print("request body it sent:", MOCK.calls[-1]["body"])
+print("versions: langchain-core", langchain_core.__version__, "| langchain", langchain.__version__)
+
+@@ concept
+title: AIMessage and thinking mode
+--- body
+`invoke` returns an `AIMessage`. The parts you use most:
+
+- `.content`: the answer text
+- `.usage_metadata`: `input_tokens`, `output_tokens`, `total_tokens`, plus `input_token_details["cache_read"]` (input that hit the cache) and `"reasoning"` inside `output_token_details` (tokens used for thinking; without thinking this dictionary may be empty, so use `.get("reasoning", 0)`)
+- `.response_metadata["finish_reason"]`: why it stopped
+
+In DeepSeek V4, **thinking mode is on by default**: the model thinks before it answers, the thinking goes into `additional_kwargs["reasoning_content"]`, it is **billed as output tokens**, and while it is on, `temperature` has no effect. Short tasks like reviewing or classifying usually turn it off, which is faster and cheaper:
+
+```python
+ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+```
+
+Whatever is in `extra_body` goes into the request body as it is (langchain-deepseek 1.1, which this page uses, has no dedicated thinking parameter). `temperature=0` only means something once thinking is off.
+
+Model names: use `deepseek-flash` (cheap, fast) or `deepseek-v4-pro` now. DeepSeek has officially announced that `deepseek-chat` and `deepseek-reasoner`, from older tutorials, are retired from 2026-07-24; tested in 2026-09 they could still be called (both answered by `deepseek-flash`), but they are no longer in the model list and may stop working at any time, so don't use them anymore. A wrong model name returns 400, with the error message `The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed ...`. You can also pick the provider with a string: `init_chat_model("deepseek:deepseek-flash")` gives you a `ChatDeepSeek` as well.
+--- code
+from langchain_deepseek import ChatDeepSeek
+
+QUESTION = "Review clause 8.1: Customer's liability shall be unlimited."
+default = ChatDeepSeek(model="deepseek-flash")
+fast = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}, temperature=0)
+
+msg = default.invoke(QUESTION)
+print(type(msg).__name__, "|", msg.content)
+print("finish_reason:", msg.response_metadata["finish_reason"])
+print("thinking:", msg.additional_kwargs["reasoning_content"])
+for name, model in [("thinking on ", default), ("thinking off", fast)]:
+    u = model.invoke(QUESTION).usage_metadata
+    print(f"{name}: output {u['output_tokens']} tokens, of which reasoning {u['output_token_details'].get('reasoning', 0)}")
+print("sent:", {k: v for k, v in MOCK.calls[-1]["body"].items() if k != "messages"})
+
+@@ concept
+title: Messages
+--- body
+Day 4's `role` turns into classes: `SystemMessage` (system), `HumanMessage` (user), `AIMessage` (assistant), and tomorrow `ToolMessage` as well. `invoke` also accepts a shorthand: `[("system", "..."), ("user", "...")]`, or dictionaries like on Day 4.
+
+**Multi-turn conversations**: the model remembers nothing by itself, so every turn has to send the **whole history**. How: append the `AIMessage` the model returned to the list as it is, then append the next `HumanMessage`. The longer the history, the more tokens each request uses (Day 33 covers how to trim it).
+
+Every `AIMessage` the model returns carries a random `id` (`lc_run--...`) that is different on every run (messages you create yourself have `None` as their `id`). So in tests, compare `.content` and `type(m).__name__`, not whole messages.
+--- code
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_deepseek import ChatDeepSeek
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+history = [
+    SystemMessage("You review contract clauses for the Customer."),
+    HumanMessage("Review clause 8.1: liability is unlimited."),
+]
+first = model.invoke(history)
+history.append(first)                                   # put the model's answer back as it is
+history.append(HumanMessage("Now clause 9.2: fees are due in 30 days."))
+second = model.invoke(history)
+
+for m in history + [second]:
+    print(f"{type(m).__name__:<14}{m.content}")
+print("roles sent:", [m["role"] for m in MOCK.calls[-1]["body"]["messages"]])
+print("shorthand:", model.invoke([("system", "You review contracts."), ("user", "Hi")]).content)
+print("id:", first.id[:8] + "... (different on every run)")
+
+@@ concept
+title: ChatPromptTemplate
+--- body
+On Day 12 you wrote templates with `str.format`. A LangChain template is **a list of message templates**:
+
+```python
+prompt = ChatPromptTemplate.from_messages([("system", "You review clauses for the {party}."), ("user", "{text}")])
+prompt.invoke({"party": "Customer", "text": "..."}).to_messages()
+```
+
+- `.invoke(dict)` returns a `ChatPromptValue`; `.to_messages()` takes out the list of messages
+- `input_variables`: which variables it needs (sorted alphabetically). Leave one out → `KeyError`, and the message says which one is missing
+- To write a JSON example in a template, double the braces `{{ }}`, just like on Day 12; braces inside a **variable's value** are fine, because values are not treated as templates again
+- `MessagesPlaceholder("history")`: inserts a whole run of history messages at this position
+- `.partial(party="Customer")`: fills in part of it now and returns a new template
+--- code
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+review = ChatPromptTemplate.from_messages([
+    ("system", 'You review clauses for the {party}. Reply as JSON like {{"verdict": "accept"}}.'),
+    ("user", "Review clause {clause_id}: {text}"),
+])
+print(review.input_variables)
+value = review.invoke({"party": "Customer", "clause_id": "8.1", "text": "Pay {net 30}."})
+print(type(value).__name__)
+for m in value.to_messages():
+    print(" ", type(m).__name__, "->", m.content)
+
+try:
+    review.invoke({"party": "Customer", "clause_id": "8.1"})
+except KeyError as e:
+    print("KeyError:", e.args[0].split(".")[0])
+
+print(review.partial(party="Customer").input_variables)
+
+chat = ChatPromptTemplate.from_messages([
+    ("system", "You answer questions about one contract."),
+    MessagesPlaceholder("history"),
+    ("user", "{question}"),
+])
+msgs = chat.invoke({"history": [("user", "What is clause 8.1?"), ("assistant", "A liability cap.")], "question": "Is it mutual?"}).to_messages()
+print([type(m).__name__ for m in msgs])
+
+@@ concept
+title: LCEL: chain steps with |
+--- body
+Almost every part in LangChain is a **Runnable**: they all have `invoke` (one input), `batch` (a batch of inputs) and `stream` (streaming). `|` joins them into a chain, and the output of one step is the input of the next:
+
+```
+dict --prompt--> ChatPromptValue --model--> AIMessage --StrOutputParser()--> str
+```
+
+Put a plain function in the pipe and it is wrapped into a `RunnableLambda` automatically. The whole chain is a Runnable too, so it can also batch, stream and take callbacks.
+
+Run the example below and you'll see that the type name of `StrOutputParser`'s output is `TextAccessor`: it is a subclass of `str` (added in 1.0 to stay compatible with older code), so just use it like a normal string; `==`, `.strip()` and `isinstance(x, str)` all work as usual.
+
+The classic mistake: the order is reversed, for example the parser goes before the model. It then receives a ChatPromptValue instead of an AIMessage and raises a hard-to-read `ValidationError`. **When debugging, look at the input and output type of each step**; the example below walks through it one step at a time.
+--- code
+from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.from_messages([("system", "You summarise clauses in one sentence."), ("user", "{text}")])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt | model | StrOutputParser() | (lambda s: s.upper())
+
+print(type(chain).__name__, [type(s).__name__ for s in chain.steps])
+value = {"text": "Fees are due in 30 days."}
+for step in chain.steps:           # walk through the pipe by hand and see what type each step outputs
+    value = step.invoke(value)
+    print(f"  {type(step).__name__:<19}-> {type(value).__name__}")
+print(chain.invoke({"text": "Fees are due in 30 days."}))
+
+text = StrOutputParser().invoke(AIMessage("accept"))
+print(type(text).__name__, isinstance(text, str), text == "accept")
+
+@@ concept
+title: stream and batch
+--- body
+- `chain.stream(input)`: hands you the answer one piece at a time; on screen this is the typewriter effect. When the chain ends with `StrOutputParser`, each piece is a string. Some pieces are **empty strings**: the first one (it only carries the role) and the last one (only the finish reason and the usage) are always there; with thinking mode on, a long run of them also comes first (the thinking is not part of the answer). Skip them when you display the answer
+- `chain.batch([input1, input2, ...])`: the results come back in the same order as the inputs
+- `return_exceptions=True`: the position that failed holds the exception object, and the others come back as usual (Day 28's "one failure doesn't take down the rest"). Without it, one failure makes the whole batch raise
+- `config={"max_concurrency": 3}`: at most 3 requests at the same time. The browser on this page has no threads, so they run one after another; on your own computer they really run in parallel
+
+A real web service usually uses the async versions: `await chain.ainvoke(...)`, `astream`, `abatch`. This page can't run asyncio, so they are only mentioned here.
+--- code
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.from_messages([("user", "{text}")])
+off = prompt | ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}) | StrOutputParser()
+on = prompt | ChatDeepSeek(model="deepseek-flash") | StrOutputParser()
+
+print(list(off.stream({"text": "Summarise clause 9.2 on fees"})))
+pieces = list(on.stream({"text": "Summarise clause 9.2 on fees"}))
+print(len(pieces), "pieces with thinking on,", pieces.count(""), "of them empty")
+
+inputs = [{"text": "Fees are due in 30 days."}, {"text": "Liability is unlimited."}, {"wrong_key": "x"}]
+print(off.batch(inputs[:2]))
+results = off.batch(inputs, return_exceptions=True, config={"max_concurrency": 2})
+print(["ok" if isinstance(r, str) else type(r).__name__ for r in results])
+
+@@ concept
+title: Small Runnable building blocks
+--- body
+- `RunnableLambda(fn)`: turns a function into a Runnable (plain functions in a pipe are wrapped automatically)
+- `RunnableParallel(summary=chain1, risk=chain2)`, or simply a dictionary `{"summary": chain1, "risk": chain2}`: hands **the same input** to several chains at once and combines the results into one dictionary
+- `RunnablePassthrough.assign(words=fn)`: keeps the input dictionary as it is and adds one key (the value can be a function or a chain)
+
+Typical use: one clause needs both a summary and a risk level; the two requests don't depend on each other, so they can run in parallel.
+
+A reminder: don't use them just for the sake of it. When a plain Python function says it clearly, wrapping it in three layers of Runnable only makes the traceback longer.
+--- code
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
+from langchain_deepseek import ChatDeepSeek
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+summary = ChatPromptTemplate.from_messages([("user", "Summarise: {text}")]) | model | StrOutputParser()
+risk = ChatPromptTemplate.from_messages([("user", "Risk level of: {text}")]) | model | StrOutputParser()
+
+brief = RunnableParallel(summary=summary, risk=risk)
+print(brief.invoke({"text": "Liability is unlimited."}))
+
+count = RunnablePassthrough.assign(words=lambda d: len(d["text"].split()))
+print(count.invoke({"text": "Liability is unlimited."}))
+
+pipeline = count | RunnableLambda(lambda d: f"{d['words']} words: {d['text']}")
+print(pipeline.invoke({"text": "Fees are due in 30 days."}))
+
+@@ concept
+title: Testing chains offline: fake models
+--- body
+On Day 19 you learned dependency injection: **pass the model in as a parameter** (`build_chain(model)`), and in tests pass in a fake one:
+
+- `FakeListChatModel(responses=["a", "b"])`: returns them in order and starts again from the beginning when it runs out
+- `GenericFakeChatModel(messages=iter([AIMessage(...)]))`: raises `StopIteration` when it runs out; when streaming, it splits the text into pieces at spaces
+- Any Runnable can act as a model: `RunnableLambda(fn)`. `fn` receives the ChatPromptValue, so it can **decide the answer based on the input**, and check along the way that the prompt is right
+
+Limitation: fake models don't support `bind_tools` (`NotImplementedError`); tomorrow, to test tools, you'll use the mock server.
+
+What to test: **the logic you wrote yourself** in the chain (templates, parsing, cleanup). Whether the model answers well is a job for evals (Day 13).
+--- code
+from langchain_core.language_models.fake_chat_models import FakeListChatModel, GenericFakeChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+
+def build_chain(model):
+    prompt = ChatPromptTemplate.from_messages([("system", "Answer with one word: accept, flag or redline."), ("user", "{text}")])
+    return prompt | model | StrOutputParser() | (lambda s: s.strip().lower())
+
+chain = build_chain(FakeListChatModel(responses=[" Redline\n", "accept"]))
+print([chain.invoke({"text": "x"}) for _ in range(3)])
+
+def by_rule(prompt_value):
+    text = prompt_value.to_messages()[-1].content
+    return AIMessage("redline" if "unlimited" in text else "accept")
+
+chain = build_chain(RunnableLambda(by_rule))
+print(chain.batch([{"text": "Liability is unlimited."}, {"text": "Fees are due."}]))
+print("requests to the server:", len(MOCK.calls))
+
+g = GenericFakeChatModel(messages=iter([AIMessage("flag this clause")]))
+print([chunk.content for chunk in g.stream("x")])
+try:
+    FakeListChatModel(responses=["x"]).bind_tools([])
+except NotImplementedError:
+    print("bind_tools: NotImplementedError")
+
+@@ item d29-01
+type: choice
+title: Recap: what the framework does for you
+level: 1
+cards: Why use a framework (and when not to); d4:Sending requests with requests
+--- context
+This week you'll use LangChain (a Python framework that calls models for you) to rewrite the part of Clause Check that calls the model. First get this clear: once you switch to a framework, who takes care of each of the steps you wrote by hand on Day 4?
+--- prompt
+A review of Day 4. You wrote this by hand:
+
+```python
+resp = requests.post(URL, headers={"Authorization": f"Bearer {key}"}, json=body)
+text = resp.json()["choices"][0]["message"]["content"]
+```
+
+Once you switch to `ChatDeepSeek(model="deepseek-flash").invoke(...)`, which of these is **still your job**?
+--- options
+- Build the URL `https://api.deepseek.com/v1/chat/completions`
+- Write the `Authorization: Bearer ...` request header
+- Take the answer out of `choices[0]["message"]["content"]`
+- Put the API key in the environment variable `DEEPSEEK_API_KEY` (or `.env`), not in the code
+answer: 4
+--- explain
+`ChatDeepSeek` builds the URL for you (by default `https://api.deepseek.com/v1`), adds the headers, and parses the answer into `AIMessage.content`. But where the API key comes from is still up to you: by default it reads the environment variable `DEEPSEEK_API_KEY`, and you have to make sure the key is there and never goes into code or git. In an interview you can put it like this: a framework saves you boilerplate code, not your security responsibilities.
+
+@@ item d29-02
+type: code
+title: Your first ChatDeepSeek call
+level: 1
+cards: Why use a framework (and when not to); AIMessage and thinking mode
+--- context
+This is the first step of calling a model with LangChain: create a chat model object, ask one question, and pass the answer on to the next step of the program. This page connects to a mock server, so it costs nothing and needs no API key.
+--- prompt
+Write `ask(question)`: call `deepseek-flash` with `ChatDeepSeek`, **turn off thinking mode**, and return the answer text (a string, not an AIMessage).
+
+For an ordinary question, the mock server answers `"Mock reply: " + question`.
+
+Creating the model object once, outside the function, is enough; creating a new one on every call to `ask` also works, it's just unnecessary.
+--- starter
+from langchain_deepseek import ChatDeepSeek
+
+def ask(question):
+    pass
+--- solution
+from langchain_deepseek import ChatDeepSeek
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def ask(question):
+    return model.invoke(question).content
+--- tests
+expect("answer", lambda: ask("Is clause 3.1 fine?"), "Mock reply: Is clause 3.1 fine?")
+expect("returns a string, not an AIMessage", lambda: isinstance(ask("x"), str), True)
+expect("model name", lambda: (ask("x"), MOCK.calls[-1]["body"]["model"])[1], "deepseek-flash")
+expect("thinking is turned off", lambda: (ask("x"), MOCK.calls[-1]["body"].get("thinking"))[1], {"type": "disabled"})
+--- hints
+- `ChatDeepSeek(model="deepseek-flash", extra_body=...)`: the dictionary in `extra_body` goes into the request body as it is; the value is `{"thinking": {"type": "disabled"}}`.
+- `model.invoke(question)` returns an AIMessage; the text is in `.content`.
+
+@@ item d29-03
+type: code
+title: How many tokens thinking used
+level: 2
+cards: AIMessage and thinking mode
+--- context
+For every clause it reviews, Clause Check records how many tokens it used (the model bills by the token), and the cost statistics depend on these numbers. With LangChain, these numbers sit inside the message object that comes back, and you have to take them out yourself.
+--- prompt
+Write `token_report(model, question)`: answer `question` once with `model` and return a dictionary:
+
+- `"answer"`: the answer text
+- `"output"`: the total number of output tokens (`usage_metadata["output_tokens"]`)
+- `"reasoning"`: how many of them went into thinking (`usage_metadata["output_token_details"]["reasoning"]`)
+- `"thinking"`: whether the answer includes a thinking process (`True` when `additional_kwargs` has the key `"reasoning_content"`)
+
+The numbers are not always there: with thinking off, the answer may not include a thinking token count (the mock server on this page leaves it out in that case), and `output_token_details` is an empty dictionary; some models don't report usage at all (for example the fake models used in tests), and then `usage_metadata` is `None`. Rules: when `usage_metadata` is `None`, `output` and `reasoning` are both 0; when there is no `output_token_details`, or it has no `"reasoning"`, `reasoning` is 0.
+
+Example: with thinking mode on, `token_report(model, "Review clause 3.1: fees.")` → `{"answer": "Mock reply: Review clause 3.1: fees.", "output": 68, "reasoning": 54, "thinking": True}`
+--- starter
+def token_report(model, question):
+    msg = model.invoke(question)
+    return {}
+--- solution
+def token_report(model, question):
+    msg = model.invoke(question)
+    usage = msg.usage_metadata or {}
+    details = usage.get("output_token_details") or {}
+    return {
+        "answer": msg.content,
+        "output": usage.get("output_tokens", 0),
+        "reasoning": details.get("reasoning", 0),
+        "thinking": "reasoning_content" in msg.additional_kwargs,
+    }
+--- tests
+from langchain_core.language_models.fake_chat_models import FakeListChatModel, GenericFakeChatModel
+from langchain_core.messages import AIMessage
+from langchain_deepseek import ChatDeepSeek
+ON = ChatDeepSeek(model="deepseek-flash")
+OFF = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+expect("thinking on: most of the output is thinking", lambda: token_report(ON, "Review clause 3.1: fees."), {"answer": "Mock reply: Review clause 3.1: fees.", "output": 68, "reasoning": 54, "thinking": True})
+expect("thinking off: the same answer, much cheaper", lambda: token_report(OFF, "Review clause 3.1: fees."), {"answer": "Mock reply: Review clause 3.1: fees.", "output": 14, "reasoning": 0, "thinking": False})
+expect("a fake model reports no usage: usage_metadata is None", lambda: token_report(FakeListChatModel(responses=["accept"]), "x"), {"answer": "accept", "output": 0, "reasoning": 0, "thinking": False})
+USAGE = {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+expect("usage but no output_token_details", lambda: token_report(GenericFakeChatModel(messages=iter([AIMessage("flag", usage_metadata=USAGE)])), "x"), {"answer": "flag", "output": 7, "reasoning": 0, "thinking": False})
+--- hints
+- Start with `usage = msg.usage_metadata or {}`: if it is None, it becomes an empty dictionary, and after that you can always use `.get(key, 0)`.
+- `details = usage.get("output_token_details") or {}`, then `details.get("reasoning", 0)`.
+- Whether a key is there: `"reasoning_content" in msg.additional_kwargs`.
+
+@@ item d29-04
+type: predict
+title: What a multi-turn conversation sends
+level: 2
+cards: Messages
+--- context
+If a lawyer wants to ask several follow-up questions about the same contract, the program needs a multi-turn conversation. Read this code and work out what is really sent to the model in each turn.
+--- prompt
+Write the output. Pay attention to which messages the second request sends, and how many messages `history` has at the end.
+--- code
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_deepseek import ChatDeepSeek
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+history = [SystemMessage("You review contracts."), HumanMessage("Review clause 8.1.")]
+first = model.invoke(history)
+history.append(first)
+history.append(HumanMessage("And clause 9.2?"))
+second = model.invoke(history)
+
+print(type(first).__name__, "|", first.content)
+print([m["role"] for m in MOCK.calls[-1]["body"]["messages"]])
+print(second.content)
+print(len(history), len(MOCK.calls))
+--- explain
+The second request carries the whole history: system, the first question, the model's first answer (assistant), and the second question. The model doesn't remember the previous turn; it all depends on you sending the history back. `second` was not appended to `history`, so it still has 4 messages; there were 2 requests in total. The mock server only looks at the last user message; a real model reads the whole history.
+
+@@ item d29-05
+type: predict
+title: What the template turns into
+level: 2
+cards: ChatPromptTemplate
+--- context
+In a review prompt, some parts never change and some change every time, such as the clause number and the clause text; this exercise also leaves "which party we review for" as a blank. LangChain separates these two kinds of parts with a template. First see clearly what the template turns into once it is filled in.
+--- prompt
+Write the output. `input_variables` is sorted alphabetically.
+--- code
+from langchain_core.prompts import ChatPromptTemplate
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You review contracts for the {party}."),
+    ("user", "Clause {clause_id}: {text}"),
+])
+print(prompt.input_variables)
+value = prompt.invoke({"party": "Customer", "clause_id": "8.1", "text": "Liability is unlimited."})
+for m in value.to_messages():
+    print(type(m).__name__, "->", m.content)
+customer = prompt.partial(party="Customer")
+print(customer.input_variables)
+print(customer.invoke({"clause_id": "3.1", "text": "Net 30."}).to_messages()[1].content)
+--- explain
+`("system", ...)` becomes a `SystemMessage`, and `("user", ...)` becomes a `HumanMessage`. `partial` returns a **new template** with `party` already filled in, so only two variables are left; the original `prompt` does not change. In the project you can fill in fixed information like "who we review for" in advance with partial, so callers only pass the clause.
+
+@@ item d29-06
+type: code
+title: A review prompt template
+level: 2
+cards: ChatPromptTemplate; d12:Delimiters and prompt injection
+--- context
+This exercise writes the clause-review prompt as a LangChain template (simpler than the real project's prompt). Later, reviewing another clause or reviewing for the other party just means filling different values into the template; the prompt itself is written only once.
+--- prompt
+Write the template `REVIEW_PROMPT` and the function `review_messages(clause_id, text, party="Customer")`:
+
+- system: `"You review contract clauses for the {party}. Answer with one word: accept, flag or redline."`
+- user: `"Review clause {clause_id}:\n<clause>\n{text}\n</clause>"` (Day 12's tags: the clause is data, not instructions)
+- `review_messages` returns the filled-in list of messages
+
+`review_messages("8.1", "Liability is unlimited.")[1].content` → `"Review clause 8.1:\n<clause>\nLiability is unlimited.\n</clause>"`
+--- starter
+from langchain_core.prompts import ChatPromptTemplate
+
+REVIEW_PROMPT = None
+
+def review_messages(clause_id, text, party="Customer"):
+    pass
+--- solution
+from langchain_core.prompts import ChatPromptTemplate
+
+REVIEW_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You review contract clauses for the {party}. Answer with one word: accept, flag or redline."),
+    ("user", "Review clause {clause_id}:\n<clause>\n{text}\n</clause>"),
+])
+
+def review_messages(clause_id, text, party="Customer"):
+    return REVIEW_PROMPT.invoke({"party": party, "clause_id": clause_id, "text": text}).to_messages()
+--- tests
+expect("types of the two messages", lambda: [type(m).__name__ for m in review_messages("8.1", "x")], ["SystemMessage", "HumanMessage"])
+expect("system (reviews for the Customer by default)", lambda: review_messages("8.1", "x")[0].content, "You review contract clauses for the Customer. Answer with one word: accept, flag or redline.")
+expect("user: the clause goes inside the tags", lambda: review_messages("8.1", "Liability is unlimited.")[1].content, "Review clause 8.1:\n<clause>\nLiability is unlimited.\n</clause>")
+expect("reviewing for the Provider instead", lambda: review_messages("3.1", "x", party="Provider")[0].content.split(".")[0], "You review contract clauses for the Provider")
+expect("braces in the clause are fine", lambda: review_messages("3.1", "Pay {net 30}.")[1].content, "Review clause 3.1:\n<clause>\nPay {net 30}.\n</clause>")
+expect("variables the template needs", lambda: REVIEW_PROMPT.input_variables, ["clause_id", "party", "text"])
+--- hints
+- `ChatPromptTemplate.from_messages([("system", "..."), ("user", "...")])`; write placeholders like `{party}`.
+- `REVIEW_PROMPT.invoke({...})` gives you a ChatPromptValue; then call `.to_messages()`.
+- The `\n` in the user template is a line break; write it straight into the string.
+
+@@ item d29-07
+type: fix
+title: Fix the bug: braces in a JSON example
+level: 2
+cards: ChatPromptTemplate
+--- context
+Showing the model a JSON example in the prompt tells it which fields to answer with; this is a common prompt-writing technique. A colleague wrote a template this way, and it fails as soon as it is called.
+--- prompt
+Your colleague wants to show the model a JSON example in the system message. Run it: first look at the printed `input_variables`, then at which variable the error says is missing. Fix it so that the system text the model sees **still** contains the complete JSON example.
+--- starter
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", 'You review contract clauses. Reply in JSON like {"verdict": "flag", "risk_level": "medium"}.'),
+    ("user", "Review clause {clause_id}: {text}"),
+])
+
+def build(clause_id, text):
+    return PROMPT.invoke({"clause_id": clause_id, "text": text}).to_messages()
+
+print(PROMPT.input_variables)
+print(build("8.1", "Liability is unlimited.")[0].content)
+--- solution
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", 'You review contract clauses. Reply in JSON like {{"verdict": "flag", "risk_level": "medium"}}.'),
+    ("user", "Review clause {clause_id}: {text}"),
+])
+
+def build(clause_id, text):
+    return PROMPT.invoke({"clause_id": clause_id, "text": text}).to_messages()
+
+print(PROMPT.input_variables)
+print(build("8.1", "Liability is unlimited.")[0].content)
+--- tests
+expect("needs only two variables", lambda: PROMPT.input_variables, ["clause_id", "text"])
+expect("the system text has the complete JSON example", lambda: build("8.1", "x")[0].content, 'You review contract clauses. Reply in JSON like {"verdict": "flag", "risk_level": "medium"}.')
+expect("user", lambda: build("8.1", "Liability is unlimited.")[1].content, "Review clause 8.1: Liability is unlimited.")
+--- hints
+- `'"verdict"'` shows up in `input_variables`: the template treated the braces in `{"verdict": ...}` as a placeholder.
+- For literal braces, write each one twice: `{{` and `}}`. Change only the JSON example; don't touch real variables like `{clause_id}`.
+
+@@ item d29-08
+type: code
+title: A conversation with history
+level: 2
+cards: Messages; ChatPromptTemplate
+--- context
+This exercise builds a Q&A assistant: a lawyer can ask several follow-up questions about one contract, for example first about the payment clause, then "and what about breach?". The model doesn't remember what was said in the previous turn, so the program has to bring the earlier conversation along.
+--- prompt
+Build a Q&A assistant that remembers the context.
+
+1. Add `MessagesPlaceholder("history")` between the system and user messages of `PROMPT`
+2. Write `chat(history, question)`: call `chain` with `{"history": history, "question": question}` to get the answer text; **then** add this turn to `history`: first `HumanMessage(question)`, then `AIMessage(answer)`; return the answer
+
+Mind the order: if you append the question to `history` before the call, the question appears twice in the request.
+--- starter
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_deepseek import ChatDeepSeek
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You answer questions about one contract for the Customer."),
+    ("user", "{question}"),
+])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = PROMPT | model | StrOutputParser()
+
+def chat(history, question):
+    pass
+--- solution
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_deepseek import ChatDeepSeek
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You answer questions about one contract for the Customer."),
+    MessagesPlaceholder("history"),
+    ("user", "{question}"),
+])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = PROMPT | model | StrOutputParser()
+
+def chat(history, question):
+    answer = chain.invoke({"history": history, "question": question})
+    history.append(HumanMessage(question))
+    history.append(AIMessage(answer))
+    return answer
+--- tests
+def _two_turns():
+    MOCK.reset()
+    h = []
+    a1 = chat(h, "What does clause 8.1 say?")
+    a2 = chat(h, "And clause 9.2?")
+    return [a1, a2, [type(m).__name__ for m in h]]
+expect("two turns: the answers and the history", _two_turns, ["Mock reply: What does clause 8.1 say?", "Mock reply: And clause 9.2?", ["HumanMessage", "AIMessage", "HumanMessage", "AIMessage"]])
+expect("first request: the question appears only once", lambda: [m["role"] for m in MOCK.calls[0]["body"]["messages"]], ["system", "user"])
+expect("the second request carries the previous turn", lambda: [m["role"] for m in MOCK.calls[1]["body"]["messages"]], ["system", "user", "assistant", "user"])
+expect("the history stores the answer text", lambda: MOCK.calls[1]["body"]["messages"][2]["content"], "Mock reply: What does clause 8.1 say?")
+--- hints
+- Add a line `MessagesPlaceholder("history"),` to the template, between system and user.
+- `chain.invoke({...})` is already a string (the last step is StrOutputParser), so just write `AIMessage(answer)`.
+- First invoke, then append the two messages, and finally return.
+
+@@ item d29-09
+type: fill
+title: Fill in: your first chain
+level: 1
+cards: LCEL: chain steps with |; ChatPromptTemplate
+--- context
+This is the most common way to write LangChain code: the prompt, the model and taking out the text, joined into one chain. This exercise uses it to write a one-sentence summary of a clause, so a lawyer can tell at a glance what the clause is about.
+--- prompt
+Fill in the blanks to finish a "prompt → model → text" chain and a function that calls it.
+--- template
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.[[from_messages]]([
+    ("system", "You summarise contract clauses in one sentence."),
+    ("user", "{text}"),
+])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt [[|]] model | [[StrOutputParser()]]
+
+def summarise(text):
+    return chain.[[invoke]]({"text": text})
+--- tests
+expect("returns the text", lambda: summarise("Fees are due in 30 days."), "Mock reply: Fees are due in 30 days.")
+expect("the messages sent", lambda: [m["role"] for m in MOCK.calls[-1]["body"]["messages"]], ["system", "user"])
+expect("the system content", lambda: MOCK.calls[-1]["body"]["messages"][0]["content"], "You summarise contract clauses in one sentence.")
+--- hints
+- The method that builds a template from a list of `(role, template)` pairs is called `from_messages`.
+- The part that turns an AIMessage into a string is `StrOutputParser()` (note the parentheses: you need an object); to call it once, use `invoke`.
+
+@@ item d29-10
+type: fix
+title: Fix the bug: the order of the parts
+level: 2
+cards: LCEL: chain steps with |
+--- context
+A colleague built a chain that answers questions. All the parts look right, but it fails as soon as it is called, with a long, hard-to-read traceback. This happens a lot once you use a framework, so learn to follow the data step by step to find the cause.
+--- prompt
+This chain fails as soon as it is called. Run the tests and read the last few lines of the error: the `text` of `Generation` expects a string, but what type did it actually get? Compare with "the input and output type of each step" in the card, find the cause, and fix it.
+--- starter
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.from_messages([("system", "Answer with one word."), ("user", "{question}")])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt | StrOutputParser() | model
+
+def one_word(question):
+    return chain.invoke({"question": question}).strip()
+--- solution
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+prompt = ChatPromptTemplate.from_messages([("system", "Answer with one word."), ("user", "{question}")])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt | model | StrOutputParser()
+
+def one_word(question):
+    return chain.invoke({"question": question}).strip()
+--- tests
+expect("gets an answer", lambda: one_word("Is clause 8.1 acceptable?"), "Mock reply: Is clause 8.1 acceptable?")
+expect("sends two messages", lambda: [m["role"] for m in MOCK.calls[-1]["body"]["messages"]], ["system", "user"])
+expect("the three steps of the chain", lambda: [type(s).__name__ for s in chain.steps], ["ChatPromptTemplate", "ChatDeepSeek", "StrOutputParser"])
+--- hints
+- The error says `input_type=ChatPromptValue`: StrOutputParser received the prompt, not the model's answer.
+- StrOutputParser's job is to turn an **AIMessage** into a string, so it can only go after the model.
+
+@@ item d29-11
+type: order
+title: Put the code in order: build a chain
+level: 2
+cards: LCEL: chain steps with |
+--- context
+In an interview you may be asked to write a minimal LangChain chain without looking anything up. If you can write it from start to end from memory, you really understand what each part does.
+--- prompt
+Put `one_word(question)` in order: answer with a `prompt | model | parser` chain and return the text with the whitespace at both ends removed. There are two distractor lines.
+--- lines
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+prompt = ChatPromptTemplate.from_messages([("system", "Answer in one word."), ("user", "{question}")])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = prompt | model | StrOutputParser()
+def one_word(question):
+    return chain.invoke({"question": question}).strip()
+--- distractors
+chain = model | prompt | StrOutputParser()
+    return chain.invoke(question).strip()
+--- tests
+expect("answer", lambda: one_word("Is clause 3.1 fine?"), "Mock reply: Is clause 3.1 fine?")
+expect("the system message comes first", lambda: MOCK.calls[-1]["body"]["messages"][0], {"content": "Answer in one word.", "role": "system"})
+--- hints
+- Imports first, then the three objects (prompt, model, chain), and the function last. chain uses the first two, so it goes after them.
+- The template needs a dictionary `{"question": ...}`; the first part of the chain must be the prompt.
+
+@@ item d29-12
+type: predict
+title: batch and the one that fails
+level: 2
+cards: stream and batch; Small Runnable building blocks
+--- context
+A contract has dozens of clauses, and the program often has to process them together in a batch. First use a small function that doesn't call a model to see clearly what happens when one item in a batch fails.
+--- prompt
+Write the output. `RunnableLambda` turns a plain function into a Runnable, so it has `invoke` and `batch` too.
+--- code
+from langchain_core.runnables import RunnableLambda
+
+def word_count(clause):
+    if not clause.strip():
+        raise ValueError("empty clause")
+    return len(clause.split())
+
+counter = RunnableLambda(word_count)
+print(counter.invoke("Fees are due."))
+print(counter.batch(["Liability is unlimited.", "Fees are due within 30 days"]))
+results = counter.batch(["a b", " ", "c"], return_exceptions=True)
+print([type(r).__name__ for r in results])
+print(results[1])
+try:
+    counter.batch(["a", " "])
+except ValueError as e:
+    print("without return_exceptions:", e)
+--- explain
+The results of `batch` match the inputs one to one, in the same order. With `return_exceptions=True`, the position that failed holds the exception object itself (`print` it and you see the error message), and the rest come back as usual; without it the whole batch raises the exception, and you don't get the results that succeeded either. When reviewing a contract, one failed clause shouldn't void the whole report, so a batch review almost always uses `return_exceptions=True` and then records the exception as "this clause failed".
+
+@@ item d29-13
+type: code
+title: Labeling in a batch
+level: 2
+cards: stream and batch
+--- context
+Handing a contract's dozens of clauses to the chain together as one batch is much faster than calling it one clause at a time. The labels that come back must line up with the clauses one to one, so the report doesn't put 8.1's verdict under 9.2.
+--- prompt
+Write `label_clauses(chain, texts)`:
+
+- `chain` takes `{"text": clause text}` as input and outputs a string
+- process all the clauses with **one** `chain.batch(...)`; one failure must not take down the whole batch
+- return a list in the same order as `texts`: for a success, the chain's output; for a failure, `"ERROR: " + the exception's class name`
+
+`label_clauses(chain, ["Fees are due.", ""])` → `["accept", "ERROR: ValueError"]` (assuming an empty clause makes the chain raise ValueError)
+--- starter
+def label_clauses(chain, texts):
+    results = []
+    return results
+--- solution
+def label_clauses(chain, texts):
+    results = chain.batch([{"text": t} for t in texts], return_exceptions=True)
+    return [f"ERROR: {type(r).__name__}" if isinstance(r, Exception) else r for r in results]
+--- tests
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+def fake(d):
+    if not d["text"]:
+        raise ValueError("empty clause")
+    return "redline" if "unlimited" in d["text"] else "accept"
+FAKE = RunnableLambda(fake)
+expect("same order as the input", lambda: label_clauses(FAKE, ["Liability is unlimited.", "Fees are due.", "Data stays in the EU."]), ["redline", "accept", "accept"])
+expect("one failure doesn't take down the batch", lambda: label_clauses(FAKE, ["Fees are due.", "", "Liability is unlimited."]), ["accept", "ERROR: ValueError", "redline"])
+expect("empty list", lambda: label_clauses(FAKE, []), [])
+class OnlyBatch:
+    # a stand-in with only a batch method: records how many inputs each batch call got and whether return_exceptions=True was passed
+    def __init__(self):
+        self.calls = []
+    def batch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        self.calls.append([len(inputs), return_exceptions])
+        return ["accept" if d["text"] else ValueError("empty clause") for d in inputs]
+def _only_batch():
+    spy = OnlyBatch()
+    return [label_clauses(spy, ["Fees are due.", ""]), spy.calls]
+expect("calls batch only once, with return_exceptions=True", _only_batch, [["accept", "ERROR: ValueError"], [[2, True]]])
+REAL =ChatPromptTemplate.from_messages([("user", "{text}")]) | ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}) | StrOutputParser()
+def _real():
+    MOCK.reset()
+    out = label_clauses(REAL, ["Fees are due.", "Liability is unlimited."])
+    return [out, len(MOCK.calls)]
+expect("with a real chain: one request per clause", _real, [["Mock reply: Fees are due.", "Mock reply: Liability is unlimited."], 2])
+--- hints
+- First turn each text into the dictionary the chain needs: `[{"text": t} for t in texts]`, then `chain.batch(that_list, return_exceptions=True)`.
+- You can recognize the exceptions in the results with `isinstance(r, Exception)`; the class name is `type(r).__name__`.
+
+@@ item d29-14
+type: code
+title: Streaming, skipping empty pieces
+level: 2
+cards: stream and batch
+--- context
+When a lawyer asks a question on the web page and the answer takes ten seconds or more to show up all at once, the page looks frozen. Streaming output makes the words appear a little at a time, as if someone were typing.
+--- prompt
+Write `stream_answer(chain, inputs, show)`:
+
+- use `chain.stream(inputs)` to get the answer one piece at a time (the chain ends with StrOutputParser, so each piece is a string)
+- for each **non-empty** piece, call `show(piece)` once (in a real app it would put the words on the screen); skip empty strings
+- finally return the complete answer (all the pieces joined together)
+
+There are always empty pieces at the start and at the end, and with thinking mode on there is a long run of them before the answer as well; the screen must not flicker because of them.
+--- starter
+def stream_answer(chain, inputs, show):
+    pass
+--- solution
+def stream_answer(chain, inputs, show):
+    parts = []
+    for piece in chain.stream(inputs):
+        if piece:
+            show(piece)
+            parts.append(piece)
+    return "".join(parts)
+--- tests
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+PROMPT = ChatPromptTemplate.from_messages([("user", "{question}")])
+ON = PROMPT | ChatDeepSeek(model="deepseek-flash") | StrOutputParser()
+OFF = PROMPT | ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}) | StrOutputParser()
+def _run(chain, question):
+    shown = []
+    text = stream_answer(chain, {"question": question}, shown.append)
+    return [text, shown]
+expect("thinking off: the full answer + the pieces shown in order", lambda: _run(OFF, "Summarise clause 9.2 on fees"), ["Mock reply: Summarise clause 9.2 on fees", ["Mock reply: ", "Summarise cl", "ause 9.2 on ", "fees"]])
+expect("thinking on: not a single empty piece shown", lambda: _run(ON, "Summarise clause 9.2 on fees"), ["Mock reply: Summarise clause 9.2 on fees", ["Mock reply: ", "Summarise cl", "ause 9.2 on ", "fees"]])
+expect("sends a streaming request", lambda: (_run(OFF, "hi"), MOCK.calls[-1]["body"]["stream"])[1], True)
+--- hints
+- `for piece in chain.stream(inputs):`; inside the loop, `if piece:` skips the empty strings.
+- Collect the non-empty pieces in a list, and at the end `"".join(the_list)`.
+
+@@ item d29-15
+type: code
+title: Summary and risk in one go
+level: 2
+cards: Small Runnable building blocks; LCEL: chain steps with |
+--- context
+Next to each clause in the report, it is best to have both a one-sentence summary and a risk level. These are two unrelated questions: ask the model each one separately, then put the answers together with the original text and hand them to the report.
+--- prompt
+Write `build_brief(model)` that returns a Runnable:
+
+- input `{"text": clause}`, output `{"text": original text, "summary": summary, "risk": risk level}`
+- `summary` comes from `SUMMARY | model | StrOutputParser()`
+- `risk` comes from `RISK | model | StrOutputParser()`, followed by removing the whitespace at both ends and converting to lowercase
+
+The two small chains don't depend on each other; use `RunnablePassthrough.assign(...)` to attach them to the original dictionary (it keeps `text`).
+--- starter
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+SUMMARY = ChatPromptTemplate.from_messages([("user", "Summarise in one sentence: {text}")])
+RISK = ChatPromptTemplate.from_messages([("user", "Risk level (low, medium or high) of: {text}")])
+
+def build_brief(model):
+    pass
+--- solution
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+SUMMARY = ChatPromptTemplate.from_messages([("user", "Summarise in one sentence: {text}")])
+RISK = ChatPromptTemplate.from_messages([("user", "Risk level (low, medium or high) of: {text}")])
+
+def build_brief(model):
+    summary = SUMMARY | model | StrOutputParser()
+    risk = RISK | model | StrOutputParser() | (lambda s: s.strip().lower())
+    return RunnablePassthrough.assign(summary=summary, risk=risk)
+--- tests
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+def fake(prompt_value):
+    text = prompt_value.to_messages()[-1].content
+    return AIMessage("Customer bears unlimited liability." if text.startswith("Summarise") else " HIGH\n")
+expect("three keys", lambda: build_brief(RunnableLambda(fake)).invoke({"text": "Liability is unlimited."}), {"text": "Liability is unlimited.", "summary": "Customer bears unlimited liability.", "risk": "high"})
+def _mock():
+    MOCK.reset()
+    out = build_brief(ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})).invoke({"text": "Fees are due."})
+    sent = sorted(c["body"]["messages"][0]["content"] for c in MOCK.calls)
+    return [out["summary"], sent]
+expect("a real model: two requests", _mock, ["Mock reply: Summarise in one sentence: Fees are due.", ["Risk level (low, medium or high) of: Fees are due.", "Summarise in one sentence: Fees are due."]])
+--- hints
+- First build the two small chains: `summary = SUMMARY | model | StrOutputParser()`; the risk one gets one more `lambda s: s.strip().lower()` at the end.
+- `RunnablePassthrough.assign(summary=summary, risk=risk)`: the argument names become the new keys in the output dictionary.
+
+@@ item d29-16
+type: code
+title: Pass the model in as a parameter
+level: 2
+cards: Testing chains offline: fake models; d19:Dependency injection makes RAG testable
+--- context
+What you really need to test in a chain is the part you wrote yourself, such as cleaning up the answer. If the model is created inside the function, the tests have no choice but to go online for real: slow, costly, and with a different result every time.
+--- prompt
+Write `build_chain(model)` that returns `PROMPT | model | StrOutputParser() | cleanup`. The cleanup step: collapse each run of whitespace (spaces, line breaks) in the answer into a single space and remove the whitespace at both ends; one line does it: `" ".join(s.split())`.
+
+**Always use the `model` that is passed in**; don't create a `ChatDeepSeek` inside the function yourself: the tests pass in fake models, and the whole test never goes online, not even once.
+--- starter
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Summarise the clause in one short sentence."),
+    ("user", "Clause {clause_id}: {text}"),
+])
+
+def build_chain(model):
+    pass
+--- solution
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Summarise the clause in one short sentence."),
+    ("user", "Clause {clause_id}: {text}"),
+])
+
+def build_chain(model):
+    return PROMPT | model | StrOutputParser() | (lambda s: " ".join(s.split()))
+--- tests
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
+IN = {"clause_id": "8.1", "text": "Liability is unlimited."}
+expect("cleans up the whitespace", lambda: build_chain(FakeListChatModel(responses=["  Customer's liability\n  has no cap. "])).invoke(IN), "Customer's liability has no cap.")
+seen = []
+def spy(prompt_value):
+    seen.append([(type(m).__name__, m.content) for m in prompt_value.to_messages()])
+    return AIMessage("ok")
+expect("the messages the model received", lambda: (build_chain(RunnableLambda(spy)).invoke(IN), seen[-1])[1], [("SystemMessage", "Summarise the clause in one short sentence."), ("HumanMessage", "Clause 8.1: Liability is unlimited.")])
+expect("no network at all", lambda: (MOCK.reset(), build_chain(FakeListChatModel(responses=["a"])).invoke(IN), len(MOCK.calls))[2], 0)
+expect("returns a Runnable, so batch works too", lambda: build_chain(FakeListChatModel(responses=["a  b"])).batch([IN]), ["a b"])
+--- hints
+- The function body is one line: `return PROMPT | model | StrOutputParser() | (lambda s: ...)`.
+- `s.split()` with no argument splits at any whitespace and also drops the whitespace at both ends; then join the parts back with `" ".join(...)`.
+
+@@ item d29-17
+type: testwrite
+title: Write tests: cleaning up the model's answer
+level: 3
+cards: Testing chains offline: fake models; d9:How to come up with test cases
+--- context
+If the verdict word is cleaned up wrongly, a clause that should be redlined may be let through as accepted. Real models answer in all sorts of ways; here you use an offline fake model to try out every kind of answer you can think of.
+--- prompt
+The function under test, `label(model, text, default="flag")`, asks the model to answer with just one word, then cleans the answer into one of `accept` / `flag` / `redline`; an answer it can't understand returns `default` (hand it to a person rather than let it through).
+
+Write tests with `FakeListChatModel` as the model (`assert` inside `def test_...():`): they must all pass on the correct function and also catch several hidden buggy versions. The starter code has only one test, which is too weak. Think about the ways a real model "disobeys": extra spaces, line breaks, capital letters, a period, an answer that misses the point.
+--- impl
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="flag"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.strip().lower().rstrip(".")
+    return word if word in VALID else default
+--- mutants
+===== Whitespace: the model's answer has spaces or a line break around it
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="flag"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.lower().rstrip(".")
+    return word if word in VALID else default
+===== Case: the model answers Redline
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="flag"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.strip().rstrip(".")
+    return word if word in VALID else default
+===== Period: the model answers redline.
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="flag"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.strip().lower()
+    return word if word in VALID else default
+===== An answer it can't understand: it should go to a person, not be let through
+VALID = ("accept", "flag", "redline")
+
+def label(model, text, default="accept"):
+    reply = model.invoke(f"Answer with one word (accept, flag or redline).\nClause: {text}")
+    word = reply.content.strip().lower().rstrip(".")
+    return word if word in VALID else default
+--- starter
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+def test_plain_answer():
+    model = FakeListChatModel(responses=["accept"])
+    assert label(model, "Fees are due in 30 days.") == "accept"
+--- solution
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+def fake(reply):
+    return FakeListChatModel(responses=[reply])
+
+def test_plain_answer():
+    assert label(fake("accept"), "Fees are due in 30 days.") == "accept"
+
+def test_whitespace_around_answer():
+    assert label(fake(" redline\n"), "Liability is unlimited.") == "redline"
+
+def test_upper_case():
+    assert label(fake("Redline"), "Liability is unlimited.") == "redline"
+
+def test_trailing_period():
+    assert label(fake("redline."), "Liability is unlimited.") == "redline"
+
+def test_unknown_answer_goes_to_a_human():
+    assert label(fake("I think it is fine"), "x") == "flag"
+
+def test_custom_default():
+    assert label(fake("??"), "x", default="redline") == "redline"
+--- hints
+- Write a small helper `def fake(reply): return FakeListChatModel(responses=[reply])`, so each test can create one kind of "disobedient" answer in a single line.
+- One test checks one thing: whitespace around the answer, capitals, a period, an answer that misses the point, one test each.
+- For an answer that misses the point, the expected value is `"flag"`: this test is what catches the version whose default was wrongly set to `"accept"`.
+
+@@ item d29-18
+type: choice
+title: Why not switch everything to a framework
+level: 2
+cards: Why use a framework (and when not to)
+--- context
+When an interviewer sees that your project uses LangGraph in only one file and calls the model by hand everywhere else, they will very likely ask why.
+--- prompt
+Clause Check's `review.py` calls DeepSeek directly with `requests`; only `graph.py` uses LangGraph. The interviewer asks: "Why not switch the whole project to LangChain?" Which answer is best?
+--- options
+- LangChain doesn't support DeepSeek, so the calls have to be written by hand
+- Every LangChain call is much slower than requests, which hurts performance
+- The review flow is a fixed series of linear steps; plain Python is enough, easy to debug, and has few dependencies. What really needs a framework is "pause and wait for a person to approve, then resume in another process", and only that part uses LangGraph. If we later need to switch model providers, add streaming or common callbacks, we'll evaluate LangChain then
+- The more frameworks, the more professional; everything should be switched, because interviewers like to see frameworks
+answer: 3
+--- explain
+Option 1 is wrong: the `langchain-deepseek` used today is the official integration. Option 2 is wrong: the overhead of the framework's Python layers is negligible next to a model call that takes a few seconds; the real cost is the extra abstraction and dependencies (longer tracebacks, fast-changing versions). Adding things as you need them, and being able to say which specific problem each framework solves, is what the interviewer wants to hear. This is exactly the "Why LangGraph was not the first choice" section of the README.
+
+@@ item d29-19
+type: local
+title: Local task (optional): run an exercise on your own computer
+level: 1
+cards: Why use a framework (and when not to)
+--- context
+This page runs the real LangChain; only the network is mocked. Move one exercise to your own computer and run it, to confirm that the code you learn here works the same way there.
+--- prompt
+Take one of today's exercises to your own computer and run it, to confirm the same code also runs in real Python (no API key needed, and it costs nothing).
+
+1. Install (only once):
+
+```
+python -m pip install langchain langgraph langchain-deepseek langchain-openai langchain-text-splitters langgraph-checkpoint-sqlite numpy
+```
+
+2. When you have finished and passed exercise 2 (`ask`), click Copy as local file, create `G:\Contract Clause Reviewer\work\d29-02.py` in VS Code, paste and save
+3. Run it in PowerShell:
+
+```
+cd "G:\Contract Clause Reviewer\work"
+python d29-02.py
+```
+
+4. Paste the terminal output below; the last line should be `4/4 passed`
+
+The file carries the mock server with it, so no key is needed. If you have installed LM Studio and loaded a model, you can try one more step (no need to paste it): delete the two sections "mock DeepSeek server" and "the page's LangChain setup" from the file, replace the model line with `ChatOpenAI(model="qwen38", base_url="http://127.0.0.1:1234/v1", api_key="lm-studio")` (first add `from langchain_openai import ChatOpenAI`), and run it again. The "got ..." after the first test is your local model's real answer; the tests fail (the answer is no longer `Mock reply`, and the file no longer has `MOCK`), and that is expected: switching models changed only one line, which is exactly what LangChain is good for.
+placeholder: Paste the terminal output; the last line looks like "4/4 passed"
+verify: (\d+)/\1\s*passed
+--- hints
+- If `pip` can't be found: use `python -m pip ...`, which makes sure the packages go into the same Python that runs your file.
+- If you get `ModuleNotFoundError`: first run `python -c "import langchain; print(langchain.__version__)"` to confirm the install worked.
+
+@@ item d29-e1
+type: scratch
+title: Closed book: a verdict chain
+exam: yes
+level: 3
+cards: LCEL: chain steps with |; ChatPromptTemplate
+--- context
+This is the core of the review, rewritten with LangChain: give it a clause, get back a verdict word. The verdict decides whether the clause goes to a person, but the model's answers are often not quite well-behaved.
+--- prompt
+Write `make_label_chain(model)` that returns a chain: input `{"clause_id": ..., "text": ...}`, output a verdict word (a string).
+
+1. The prompt has two messages: system is `"You review contract clauses for the {party}. Answer with one word: accept, flag or redline."` and user is `"Clause {clause_id}: {text}"`; `party` is filled in beforehand as `"Customer"`, so callers don't pass it
+2. Connect `model` and `StrOutputParser()`
+3. The last step: remove the whitespace at both ends, convert to lowercase, remove a trailing period; if the result is not one of `accept` / `flag` / `redline`, return `"flag"`
+
+Example: when the model answers `" Redline.\n"`, the chain outputs `"redline"`. Imports: `from langchain_core.prompts import ChatPromptTemplate`, `from langchain_core.output_parsers import StrOutputParser`.
+--- solution
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You review contract clauses for the {party}. Answer with one word: accept, flag or redline."),
+    ("user", "Clause {clause_id}: {text}"),
+]).partial(party="Customer")
+
+def to_label(text):
+    word = text.strip().lower().rstrip(".")
+    return word if word in ("accept", "flag", "redline") else "flag"
+
+def make_label_chain(model):
+    return PROMPT | model | StrOutputParser() | to_label
+--- tests
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+IN = {"clause_id": "8.1", "text": "Liability is unlimited."}
+expect("cleans up the answer", lambda: make_label_chain(FakeListChatModel(responses=[" Redline.\n"])).invoke(IN), "redline")
+expect("an answer it can't understand → flag", lambda: make_label_chain(FakeListChatModel(responses=["It depends."])).invoke(IN), "flag")
+seen = []
+def spy(prompt_value):
+    seen.append([m.content for m in prompt_value.to_messages()])
+    return AIMessage("accept")
+expect("the two messages the model receives (party already filled in)", lambda: (make_label_chain(RunnableLambda(spy)).invoke(IN), seen[-1])[1], ["You review contract clauses for the Customer. Answer with one word: accept, flag or redline.", "Clause 8.1: Liability is unlimited."])
+expect("with the mock server: the answer is not one word → flag", lambda: make_label_chain(ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})).invoke(IN), "flag")
+
+@@ item d29-e2
+type: scratch
+title: Closed book: batch review
+exam: yes
+level: 3
+cards: stream and batch
+--- context
+All the clauses of a contract are sent for review in one batch, and the results are organized by clause number and handed on to report generation. With many clauses, the number of requests sent at the same time needs a cap too, so the model service doesn't rate-limit you.
+--- prompt
+Write `review_batch(chain, clauses)`:
+
+- `clauses` is a list of dictionaries, each with `"clause_id"` and `"text"`; the input of `chain` is exactly one such dictionary, and it outputs a string
+- call `chain.batch(...)` only **once**, with `return_exceptions=True` and `config={"max_concurrency": 4}`
+- return a dictionary `{clause_id: result}`; for a clause that failed, the result is `"ERROR: " + the exception's class name`
+- `clauses` is an empty list: return `{}` without calling the chain
+
+Example: the second one raises ValueError → `{"3.1": "accept", "5.2": "ERROR: ValueError", "8.1": "redline"}`
+--- solution
+def review_batch(chain, clauses):
+    if not clauses:
+        return {}
+    results = chain.batch(clauses, config={"max_concurrency": 4}, return_exceptions=True)
+    out = {}
+    for clause, result in zip(clauses, results):
+        out[clause["clause_id"]] = f"ERROR: {type(result).__name__}" if isinstance(result, Exception) else result
+    return out
+--- tests
+from langchain_core.runnables import RunnableLambda
+def fake(d):
+    if not d["text"].strip():
+        raise ValueError("empty clause")
+    return "redline" if "unlimited" in d["text"] else "accept"
+CLAUSES = [{"clause_id": "3.1", "text": "Fees are due."}, {"clause_id": "5.2", "text": " "}, {"clause_id": "8.1", "text": "Liability is unlimited."}]
+expect("one failure doesn't take down the rest", lambda: review_batch(RunnableLambda(fake), CLAUSES), {"3.1": "accept", "5.2": "ERROR: ValueError", "8.1": "redline"})
+class Spy:
+    def __init__(self):
+        self.calls = []
+    def batch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        self.calls.append((len(inputs), (config or {}).get("max_concurrency"), return_exceptions))
+        return ["accept"] * len(inputs)
+def _spy():
+    s = Spy()
+    review_batch(s, CLAUSES)
+    return s.calls
+expect("calls batch only once, with both options", _spy, [(3, 4, True)])
+def _empty():
+    s = Spy()
+    return [review_batch(s, []), s.calls]
+expect("empty list: no call", _empty, [{}, []])
+
+@@ item d29-e3
+type: scratch
+title: Closed book: a session with memory
+exam: yes
+level: 3
+cards: Messages; ChatPromptTemplate
+--- context
+This exercise's contract Q&A assistant has to hold an ongoing conversation, but the longer the history, the more tokens each request uses (the model bills by the token). The full conversation record should be kept, but what is sent to the model each time doesn't have to be all of it.
+--- prompt
+Write the class `ChatSession`:
+
+- `ChatSession(model, max_history=4)`: `self.history` starts as an empty list
+- The chain it uses: the prompt is system `"You answer questions about one contract for the Customer."` → `MessagesPlaceholder("history")` → user `"{question}"`, followed by `model` and `StrOutputParser()`
+- `ask(question)`: put only the **last `max_history` messages** of `self.history` into the history slot (`max_history=0` means none at all), and call the chain to get the answer; then append `HumanMessage(question)` and `AIMessage(answer)` to `self.history` (this stores the full history, untrimmed); return the answer
+
+Careful: `lst[-0:]` is the whole list, not an empty list.
+
+Imports: `AIMessage` and `HumanMessage` from `langchain_core.messages`, `ChatPromptTemplate` and `MessagesPlaceholder` from `langchain_core.prompts`, `StrOutputParser` from `langchain_core.output_parsers`.
+--- solution
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You answer questions about one contract for the Customer."),
+    MessagesPlaceholder("history"),
+    ("user", "{question}"),
+])
+
+class ChatSession:
+    def __init__(self, model, max_history=4):
+        self.chain = PROMPT | model | StrOutputParser()
+        self.max_history = max_history
+        self.history = []
+
+    def ask(self, question):
+        recent = self.history[-self.max_history:] if self.max_history > 0 else []
+        answer = self.chain.invoke({"history": recent, "question": question})
+        self.history.append(HumanMessage(question))
+        self.history.append(AIMessage(answer))
+        return answer
+--- tests
+from langchain_deepseek import ChatDeepSeek
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+def _roles(max_history, turns):
+    s = ChatSession(MODEL, max_history=max_history)
+    for i in range(turns):
+        s.ask(f"Question {i + 1} about clause 8.1?")
+    return [[m["role"] for m in MOCK.calls[-1]["body"]["messages"]], len(s.history)]
+expect("three turns, only the last 2 messages", lambda: _roles(2, 3), [["system", "user", "assistant", "user"], 6])
+expect("three turns, at most 4 messages", lambda: _roles(4, 3), [["system", "user", "assistant", "user", "assistant", "user"], 6])
+expect("max_history=0: no history", lambda: _roles(0, 3), [["system", "user"], 6])
+expect("answer", lambda: ChatSession(MODEL).ask("What does clause 8.1 say?"), "Mock reply: What does clause 8.1 say?")

@@ -1,0 +1,1123 @@
+@@ day 4
+title: Python for AI: Pydantic, API calls, retries, tool calls
+lang: py
+hours: 5 hours
+--- goal
+Define and validate model output with Pydantic; write a Chat API call by hand and read the answer and the token usage from the response; handle 401 / 429 / 5xx; understand and implement a tool call; evaluate a random function by "running it N times and looking at the pass rate". This is the whole skeleton of `review.py` in Clause Check.
+
+The API on this page is a **mock DeepSeek**: the request format, the response format and the error codes are the same as the real one, so the code calls the real API once you take it to your own computer and add a real key (the last exercise does exactly that).
+--- checklist
+- Clear your Review list first
+- Read all 7 knowledge cards, change the examples and run them
+- Pass every practice exercise (including the local task at the end: really call DeepSeek once)
+- The 3 closed-book challenges
+- Open the project's `clausecheck/review.py`, find the for loop in `model_review`, and say what each round of it does
+
+@@ concept
+title: Pydantic: rules for your data
+--- body
+Yesterday's hand-written `validate_verdict` was tedious. Pydantic lets you **describe your data with type hints**, and it does the checking for you:
+
+```python
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    confidence: float = 0.5
+```
+
+- `Literal[...]` means "must be one of these values"
+- A field with a default value can be left out
+- The object is validated automatically when you create it; values that can be converted safely are converted (the string `"0.9"` → `0.9`), and anything invalid raises `ValidationError`
+- `v.model_dump()` turns it back into a dictionary
+--- code
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    confidence: float = 0.5
+
+v = Verdict(clause_id="8.1", verdict="flag")
+print(v.verdict, v.confidence)
+print(v.model_dump())
+w = Verdict(clause_id="12", verdict="accept", confidence="0.9")
+print(w.confidence, type(w.confidence))
+
+@@ concept
+title: Failed validation: ValidationError
+--- body
+JSON text from the model can be parsed and validated in one step:
+
+```python
+v = Verdict.model_validate_json(raw)
+```
+
+Broken JSON, a missing field, an invalid value: each of them raises `ValidationError`. `e.errors()` is the list of problems; each item has `loc` (which field) and `msg` (the reason).
+
+In Clause Check, a failed validation does not crash the program. Instead, the error message is **sent back to the model** so it can correct its answer. This is called "validation feedback".
+--- code
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+
+for raw in ['{"clause_id": "8.1", "verdict": "flag"}', '{"clause_id": "8.1", "verdict": "HIGH"}', "not json"]:
+    try:
+        print("ok:", Verdict.model_validate_json(raw))
+    except ValidationError as e:
+        err = e.errors()[0]
+        print("invalid:", err["loc"], err["msg"])
+
+@@ concept
+title: What a Chat API request and response look like
+--- body
+Almost every model API (DeepSeek, OpenAI, LM Studio) uses the same format. DeepSeek's current model names are `deepseek-flash` (fast and cheap; this course uses it throughout) and `deepseek-v4-pro` (bigger, slower, more expensive). DeepSeek has officially announced that the old model names `deepseek-chat` / `deepseek-reasoner` are retired as of 2026-07-24: tested in 2026-09, they can still be called (and `deepseek-flash` answers), but they are no longer in the model list and may stop working at any time. Many tutorials online still use them; when you copy from one, change the name to `deepseek-flash`.
+
+**Request**: POST to `.../chat/completions` with the header `Authorization: Bearer <API key>`, and this request body:
+
+```python
+{
+    "model": "deepseek-flash",
+    "messages": [
+        {"role": "system", "content": "You are a contract review assistant..."},
+        {"role": "user", "content": "Please review this clause: ..."},
+    ],
+    "thinking": {"type": "disabled"},
+    "temperature": 0.3,
+}
+```
+
+**Thinking mode**: by default, DeepSeek "thinks it over" before it answers. The answer is still in `content`, and the thinking is in `reasoning_content`; the tokens spent on thinking are billed as **output**, and `temperature` has no effect in this mode. For calls like reviewing a clause, add `"thinking": {"type": "disabled"}` to turn it off: it is faster and cheaper, `temperature` works again, and judging one clause doesn't need long reasoning anyway.
+
+The three places in the **response** you will use most:
+
+- `data["choices"][0]["message"]["content"]` what the model said
+- `data["choices"][0]["finish_reason"]` why it stopped: `"stop"` means it finished, `"tool_calls"` means it wants to call a tool
+- `data["usage"]["total_tokens"]` how many tokens it used (this is what you pay for)
+--- code
+import json
+
+messages = [
+    {"role": "system", "content": "You review contract clauses."},
+    {"role": "user", "content": "Review clause 8.1: liability is unlimited."},
+]
+body = {"model": "deepseek-flash", "messages": messages, "thinking": {"type": "disabled"}, "temperature": 0.3}
+print(json.dumps(body, indent=2))
+
+@@ concept
+title: Sending requests with requests
+mock: yes
+--- body
+```python
+import os
+import requests
+
+resp = requests.post(URL, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=60)
+resp.status_code   # 200 means success
+data = resp.json() # the response as a dictionary
+```
+
+- `json=body` turns the dictionary into JSON and sends it for you
+- Read the API key from an environment variable: `os.getenv("DEEPSEEK_API_KEY")`. **Never write it into your code**
+- On this page, `requests` talks to a mock server; on your own computer it talks to the real DeepSeek
+- The hello example below doesn't turn thinking mode off, so the response has an extra `reasoning_content`; in `usage`, the `reasoning_tokens` inside `completion_tokens_details` are the tokens spent on thinking (already counted in `completion_tokens`)
+--- code
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+key = os.getenv("DEEPSEEK_API_KEY")
+body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "Say hello"}]}
+resp = requests.post(URL, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=60)
+print(resp.status_code)
+data = resp.json()
+print(data["choices"][0]["message"]["content"])
+print(data["choices"][0]["message"]["reasoning_content"])
+print(data["usage"])
+
+@@ concept
+title: Status codes and retries
+mock: yes
+--- body
+- `200` success
+- `400` the request is wrong (a missing field, a wrong model name): **don't retry**, fix the code
+- `401` the API key is wrong or `Bearer` is missing: **don't retry**
+- `429` too many requests, `500` / `503` a server problem: **you can retry**; wait a moment and try again
+
+Retries need a **limit** (for example 3 attempts); otherwise, if the service stays down, you stay stuck in the loop. In production you also wait longer and longer between retries (exponential backoff).
+
+On this page, `MOCK.fail_next(429, 2)` makes the mock server return 429 for the next two requests, so you can practice retrying.
+--- code
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]}
+
+MOCK.fail_next(429, 2)
+for attempt in range(1, 4):
+    resp = requests.post(URL, headers=HEADERS, json=body)
+    print("attempt", attempt, "status", resp.status_code)
+    if resp.status_code == 200:
+        break
+
+print(requests.post(URL, headers={"Authorization": "wrong"}, json=body).json())
+
+@@ concept
+title: Tool calls: the model asks you to look something up
+mock: yes
+--- body
+Put the tool descriptions (name, description, parameters) in the request's `tools`. When the model decides it needs a tool, it doesn't answer directly; instead it returns:
+
+```python
+finish_reason == "tool_calls"
+message["tool_calls"] = [{"id": "call_1", "function": {"name": "lookup_playbook", "arguments": '{"topic": "liability_cap"}'}}]
+```
+
+Your code has to:
+
+1. Find the Python function with that name
+2. Get the arguments with `json.loads(arguments)` and call the function
+3. Add the model's message and a message `{"role": "tool", "tool_call_id": ..., "content": result}` to messages, then **send the request again**
+
+Once the model sees the tool result, it gives its final answer. This "request → call the tool → request again" loop is what an agent is. The example turns thinking mode off here too: an agent sends several requests back and forth, so speed and cost matter more. Also, with thinking mode on, DeepSeek's docs require the model message you add back in step 3 to keep its `reasoning_content`, and leaving it out returns 400 (the mock server on the practice page follows this rule; in tests in 2026-09 the real API did not reject it yet, but the docs say so, so follow them).
+--- code
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+messages = [{"role": "user", "content": "Is unlimited liability acceptable?"}]
+data = requests.post(URL, headers=HEADERS, json={"model": "deepseek-flash", "messages": messages, "tools": TOOLS, "thinking": {"type": "disabled"}}).json()
+choice = data["choices"][0]
+print("finish_reason:", choice["finish_reason"])
+call = choice["message"]["tool_calls"][0]
+print("tool:", call["function"]["name"], json.loads(call["function"]["arguments"]))
+
+@@ concept
+title: Randomness: one run is not enough
+mock: yes
+--- body
+Given the same input, the model may answer differently from one time to the next. So when you evaluate a function that uses a model, **run it N times and look at the pass rate**, instead of running it once and checking whether it is right.
+
+The mock server on this page deliberately wavers on clauses like an "AS IS" disclaimer (in the long run it says accept about 60% of the time), just like a real model. The example below counts how many of 10 runs say accept: with only 10 runs, a result far from 60% is perfectly normal, and that is exactly why you run many times and look at the pass rate.
+
+This is the core idea of Clause Check's `evals/run_evals.py`.
+--- code
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+clause = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS".'
+results = []
+for _ in range(10):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
+    results.append(json.loads(content)["verdict"])
+print(results)
+print("accept rate:", results.count("accept") / len(results))
+
+@@ item d4-01
+type: choice
+title: What Literal means
+level: 1
+cards: Pydantic: rules for your data
+--- context
+In the real project's `models.py`, the verdict, risk level and topic fields are all written this way. Understand this one pattern first, and the project's data definitions become much easier to read.
+--- prompt
+In a Pydantic model, what does `verdict: Literal["accept", "flag", "redline"]` mean?
+--- options
+- verdict must be a string, with any content
+- verdict can only be one of these three values; any other value fails validation
+- verdict is a list that holds three values
+- verdict can be left out
+answer: 2
+--- explain
+`Literal[...]` limits the value to the ones listed. If the model returns `"HIGH"`, `"Flag"` or anything like that, it is rejected with a `ValidationError`. This is the first gate that makes model output reliable.
+
+@@ item d4-02
+type: code
+title: Define the Verdict model
+level: 2
+cards: Pydantic: rules for your data
+--- context
+Yesterday's hand-written validator was long, and it was easy to miss something. This time, try another way: write down "what a verdict should look like" as one definition, and leave the checking to Pydantic. `ClauseVerdict` in the real project is exactly this kind of definition, just with more fields.
+--- prompt
+Define `Verdict` with Pydantic, with these fields:
+
+- `clause_id`: a string
+- `verdict`: only `accept` / `flag` / `redline`
+- `risk_level`: only `low` / `medium` / `high`
+- `rationale`: a string
+- `confidence`: a decimal number, default `0.5`
+--- starter
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+--- solution
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+    confidence: float = 0.5
+--- tests
+from pydantic import ValidationError
+ok = dict(clause_id="8.1", verdict="flag", risk_level="high", rationale="cap is not mutual")
+expect("valid data creates an object", lambda: Verdict(**ok).verdict, "flag")
+expect("confidence defaults to 0.5", lambda: Verdict(**ok).confidence, 0.5)
+expect_raises("invalid verdict", lambda: Verdict(**{**ok, "verdict": "maybe"}), ValidationError)
+expect_raises("invalid risk_level", lambda: Verdict(**{**ok, "risk_level": "urgent"}), ValidationError)
+expect_raises("missing rationale", lambda: Verdict(clause_id="1", verdict="accept", risk_level="low"), ValidationError)
+--- hints
+- One line per field: `name: type`.
+- With a default value: `confidence: float = 0.5`.
+
+@@ item d4-03
+type: code
+title: Parse and validate the model's output
+level: 2
+cards: Failed validation: ValidationError; Pydantic: rules for your data
+--- context
+When the model's answer comes back, parsing and checking should happen in one step. When the check fails, the real project sends the reason back to the model and asks it to answer again, so the reason has to make sense to the model too.
+--- prompt
+Write `parse_verdict(raw)`:
+
+- `raw` is valid: return a `Verdict` object
+- invalid (broken JSON or wrong fields): return the string `"INVALID: "` followed by the `msg` of the first error
+
+This is the reason that gets "sent back to the model when validation fails".
+--- starter
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+
+def parse_verdict(raw):
+    pass
+--- solution
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+
+def parse_verdict(raw):
+    try:
+        return Verdict.model_validate_json(raw)
+    except ValidationError as e:
+        return "INVALID: " + e.errors()[0]["msg"]
+--- tests
+expect("valid → Verdict", lambda: parse_verdict('{"clause_id": "8.1", "verdict": "flag"}').verdict, "flag")
+expect_true("invalid verdict → starts with INVALID", lambda: parse_verdict('{"clause_id": "8.1", "verdict": "HIGH"}').startswith("INVALID: "))
+expect_true("broken JSON → starts with INVALID", lambda: parse_verdict("Sure! {").startswith("INVALID: "))
+expect_true("the error message mentions the allowed values", lambda: "accept" in parse_verdict('{"clause_id": "1", "verdict": "x"}'))
+--- hints
+- `Verdict.model_validate_json(raw)` parses and validates in one step.
+- Broken JSON also raises `ValidationError` (not JSONDecodeError), so catching that one is enough. The first error: `e.errors()[0]["msg"]`.
+
+@@ item d4-04
+type: predict
+title: Pydantic conversion and default values
+level: 2
+cards: Pydantic: rules for your data
+--- context
+Numbers from the model are sometimes quoted text, and sometimes the model leaves a field out entirely. This code shows how Pydantic handles both cases.
+--- prompt
+Write the output. Notice what the string `"0.9"` is converted into, and what `model_dump()` looks like.
+--- code
+from typing import Literal
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    confidence: float = 0.5
+
+v = Verdict(clause_id="8.1", verdict="flag")
+print(v.confidence)
+print(v.model_dump())
+w = Verdict.model_validate({"clause_id": "12", "verdict": "accept", "confidence": "0.9"})
+print(w.confidence + 0.1)
+
+@@ item d4-05
+type: code
+title: Build the messages
+level: 1
+cards: What a Chat API request and response look like
+--- context
+To talk to a model you don't send one sentence; you send a list of messages, each with a role. The system message sets "who you are and what rules you follow", and the user message holds the specific question for this time. The program builds this list once for every clause it reviews.
+--- prompt
+Write `build_messages(system, clause_text)` that returns a list of two messages:
+
+1. `{"role": "system", "content": system}`
+2. `{"role": "user", "content": "Review this clause:\n" + clause_text}` (`\n` is a line break)
+--- starter
+def build_messages(system, clause_text):
+    pass
+--- solution
+def build_messages(system, clause_text):
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "Review this clause:\n" + clause_text},
+    ]
+--- tests
+m = lambda: build_messages("You review contracts.", "8.1 Cap on Liability ...")
+expect("two messages", lambda: len(m()), 2)
+expect("the first one is system", lambda: m()[0], {"role": "system", "content": "You review contracts."})
+expect("the second one is user", lambda: m()[1], {"role": "user", "content": "Review this clause:\n8.1 Cap on Liability ..."})
+--- hints
+- It returns a list with two dictionaries in it.
+
+@@ item d4-06
+type: code
+title: Build the request body
+level: 1
+cards: What a Chat API request and response look like; d2:Functions: default arguments and early return
+--- context
+Once the messages are ready, they go into a "request body" (everything you send to the API) together with the model name, `temperature` (how random the answer is) and other settings, and then get sent off.
+--- prompt
+Write `build_body(messages, model="deepseek-flash", temperature=0.3)` that returns the request body as a dictionary with four keys: `model`, `messages`, `thinking`, `temperature`.
+
+`thinking` is always `{"type": "disabled"}`: `temperature` only has an effect once thinking mode is off.
+--- starter
+def build_body(messages, model="deepseek-flash", temperature=0.3):
+    pass
+--- solution
+def build_body(messages, model="deepseek-flash", temperature=0.3):
+    return {"model": model, "messages": messages, "thinking": {"type": "disabled"}, "temperature": temperature}
+--- tests
+msgs = [{"role": "user", "content": "hi"}]
+expect("default values", lambda: build_body(msgs), {"model": "deepseek-flash", "messages": msgs, "thinking": {"type": "disabled"}, "temperature": 0.3})
+expect("thinking mode is off", lambda: build_body(msgs)["thinking"], {"type": "disabled"})
+expect("custom temperature", lambda: build_body(msgs, temperature=0)["temperature"], 0)
+--- hints
+- The default arguments are already written; build the dictionary straight from them.
+- The value of `thinking` is itself a dictionary: `{"type": "disabled"}`.
+
+@@ item d4-07
+type: code
+title: Your first API call
+level: 2
+mock: yes
+cards: Sending requests with requests; What a Chat API request and response look like
+--- context
+This is the most central step of the whole project: send the question to the model and get its answer back. This page talks to a mock server, but the code is exactly the same as for the real server.
+--- prompt
+Write `ask(prompt)`:
+
+1. Call `API_URL` with `requests.post`
+2. Headers: `{"Authorization": f"Bearer {API_KEY}"}`
+3. Request body: model `deepseek-flash`, and messages holds just one user message whose content is `prompt`
+4. Return the text of the model's answer (`content`, not `reasoning_content`)
+
+For an ordinary question, the mock server answers `"Mock reply: " + your question`.
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def ask(prompt):
+    pass
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def ask(prompt):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
+    resp = requests.post(API_URL, headers={"Authorization": f"Bearer {API_KEY}"}, json=body, timeout=60)
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+--- tests
+expect("the answer", lambda: ask("hello"), "Mock reply: hello")
+expect("the model used", lambda: MOCK.calls[-1]["body"]["model"], "deepseek-flash")
+expect("only one message", lambda: MOCK.calls[-1]["body"]["messages"], [{"role": "user", "content": "hello"}])
+--- hints
+- `resp = requests.post(API_URL, headers=..., json=body)`, then `data = resp.json()`.
+- Where the answer is: `data["choices"][0]["message"]["content"]`.
+
+@@ item d4-08
+type: fix
+title: Fix the bug: 401
+level: 2
+mock: yes
+cards: Status codes and retries; Sending requests with requests
+--- context
+The most common result of a first API call is being stopped at the door by the server, without a single word of an answer. Retrying this kind of error won't help, however many times you try; the only way is to read the error message the server sends back, find the cause and fix the code.
+--- prompt
+This function fails. Run it first, look at the status code and the server's error message printed in the output, find the cause, then fix it.
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def ask(prompt):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
+    resp = requests.post(API_URL, headers={"Authorization": API_KEY}, json=body)
+    print(resp.status_code, resp.json())
+    return resp.json()["choices"][0]["message"]["content"]
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def ask(prompt):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
+    resp = requests.post(API_URL, headers={"Authorization": f"Bearer {API_KEY}"}, json=body)
+    print(resp.status_code)
+    return resp.json()["choices"][0]["message"]["content"]
+--- tests
+expect("gets an answer once fixed", lambda: ask("ping"), "Mock reply: ping")
+expect("the model name in the request body is unchanged", lambda: (ask("x"), MOCK.calls[-1]["body"]["model"])[1], "deepseek-flash")
+--- hints
+- The status code in the output is 401, and the server says what format the header should have.
+- The header should be `"Bearer " + API key`, with one space in between.
+
+@@ item d4-09
+type: code
+title: Record the token usage too
+level: 2
+mock: yes
+cards: Sending requests with requests; What a Chat API request and response look like
+--- context
+Models charge by the token (a token is the unit a model uses to measure the text it reads and writes). The real project records how many tokens each clause used, and when it adds up the results it works out how much reviewing the whole contract cost.
+--- prompt
+Write `ask_with_usage(prompt)`: return `{"text": the answer text, "tokens": the total_tokens this call used}`.
+
+Use the model `deepseek-flash`. The token usage is in the response's `usage`; recording it is the first step toward calculating cost. Thinking mode is not turned off here, so the tokens spent on thinking are included too (billed as output).
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def ask_with_usage(prompt):
+    pass
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def ask_with_usage(prompt):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return {"text": data["choices"][0]["message"]["content"], "tokens": data["usage"]["total_tokens"]}
+--- tests
+r = lambda: ask_with_usage("How much does this cost?")
+expect("text", lambda: r()["text"], "Mock reply: How much does this cost?")
+expect_true("tokens is a positive integer", lambda: isinstance(r()["tokens"], int) and r()["tokens"] > 0)
+def _is_total():
+    import os, requests
+    out = r()
+    again = requests.post("https://api.deepseek.com/v1/chat/completions", headers={"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}, json=MOCK.calls[-1]["body"]).json()
+    return out["tokens"] == again["usage"]["total_tokens"]
+expect("it is total_tokens (not completion_tokens or reasoning_tokens)", _is_total, True)
+expect("only two keys", lambda: sorted(r().keys()), ["text", "tokens"])
+--- hints
+- `data["usage"]["total_tokens"]`.
+
+@@ item d4-10
+type: code
+title: Raise an error when the status code is wrong
+level: 2
+mock: yes
+cards: Status codes and retries; d3:raise: report an error on purpose
+--- context
+When an API call fails, the server replies with a status code and a short error description. Report them exactly as they are: then, when something goes wrong, one look at the log tells you whether the API key is wrong, the request is wrong, or the server is busy.
+--- prompt
+Write `call_api(body)`: send the request; if the status code is 200, return the parsed dictionary; otherwise `raise RuntimeError(f"API error {status code}: {the server's error message}")`.
+
+The server's error message is in `resp.json()["error"]["message"]`.
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def call_api(body):
+    pass
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def call_api(body):
+    resp = requests.post(API_URL, headers=HEADERS, json=body)
+    if resp.status_code != 200:
+        raise RuntimeError(f"API error {resp.status_code}: {resp.json()['error']['message']}")
+    return resp.json()
+--- tests
+GOOD = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]}
+expect("success returns a dictionary", lambda: call_api(GOOD)["choices"][0]["message"]["content"], "Mock reply: hi")
+expect_raises("wrong model name → RuntimeError", lambda: call_api({"model": "gpt-9", "messages": [{"role": "user", "content": "x"}]}), RuntimeError)
+def _message():
+    MOCK.fail_next(500)
+    try:
+        call_api(GOOD)
+    except RuntimeError as e:
+        return str(e)
+expect("error message format", _message, "API error 500: Internal server error")
+--- hints
+- First check `resp.status_code != 200`; if it is, raise.
+- Inside the f-string, use single quotes to index the dictionary: `resp.json()['error']['message']` (the outside already uses double quotes).
+
+@@ item d4-11
+type: code
+title: Retry when it fails
+level: 3
+mock: yes
+cards: Status codes and retries; d2:for loops
+--- context
+Reviewing one contract means calling the API dozens of times in a row, so running into "too many requests" or a temporary server failure along the way is normal, and waiting a moment and trying again usually works. But some errors won't go away however many times you retry, and retrying them only wastes time.
+--- prompt
+Write `ask_with_retry(prompt, max_attempts=3)`:
+
+- status code 200: return the answer text
+- status code 429, 500 or 503: retry, with at most `max_attempts` attempts
+- any other status code (for example 400, 401): don't retry, `raise RuntimeError` right away
+- all attempts used up without success: `raise RuntimeError`
+
+The tests use `MOCK.fail_next(...)` to make the server fail a few times first.
+--- starter
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+RETRYABLE = (429, 500, 503)
+
+def ask_with_retry(prompt, max_attempts=3):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
+    pass
+--- solution
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+RETRYABLE = (429, 500, 503)
+
+def ask_with_retry(prompt, max_attempts=3):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
+    for attempt in range(max_attempts):
+        resp = requests.post(API_URL, headers=HEADERS, json=body)
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"]
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"not retryable: {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+--- tests
+def _two_failures():
+    MOCK.reset()
+    MOCK.fail_next(429, 2)
+    text = ask_with_retry("hi")
+    return [text, len(MOCK.calls)]
+expect("two 429s, then the third attempt succeeds (3 requests in total)", _two_failures, ["Mock reply: hi", 3])
+def _always_down():
+    MOCK.reset()
+    MOCK.fail_next(503, 5)
+    return ask_with_retry("hi", max_attempts=3)
+expect_raises("always 503 → RuntimeError", _always_down, RuntimeError)
+expect("and only 3 requests were sent", lambda: len(MOCK.calls), 3)
+def _auth_error():
+    MOCK.reset()
+    MOCK.fail_next(401)
+    try:
+        ask_with_retry("hi")
+    except RuntimeError:
+        return len(MOCK.calls)
+expect("401 is not retried (only 1 request)", _auth_error, 1)
+--- hints
+- An outer loop `for attempt in range(max_attempts):`; return as soon as it succeeds.
+- A status code you can't retry: raise right inside the loop. If the loop ends without returning, the attempts are used up, so raise after the loop.
+
+@@ item d4-12
+type: code
+title: Get a structured verdict from the model
+level: 3
+mock: yes
+cards: Pydantic: rules for your data; Sending requests with requests; Failed validation: ValidationError
+--- context
+This exercise connects the previous ones: send a clause to the model and get back a checked verdict object, which everything after it (the summary, the sorting) relies on. The real project's `review.py` does the same thing, just with tool calls on top.
+--- prompt
+Write `classify(clause_text)`:
+
+1. Model `deepseek-flash`; add `"response_format": {"type": "json_object"}` to the request body (it tells the model to return only JSON)
+2. Also add `"thinking": {"type": "disabled"}` to turn thinking mode off: judging a clause should be fast and cheap, and doesn't need long reasoning
+3. The content of the user message is `clause_text`
+4. Parse the answer text with `Verdict.model_validate_json(...)` and return the `Verdict` object
+
+The mock server gives a verdict based on what the clause says; for example, a clause containing `unlimited` gets `redline`. The real DeepSeek docs also require the word "json" in the prompt, plus an example of the output (usually in the system message); otherwise a real model may keep outputting blank space until it runs out of tokens. The mock server doesn't check this, so it is left out here.
+--- starter
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+
+def classify(clause_text):
+    pass
+--- solution
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+
+def classify(clause_text):
+    body = {
+        "model": "deepseek-flash",
+        "messages": [{"role": "user", "content": clause_text}],
+        "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
+    }
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
+--- tests
+v = lambda: classify("Review clause 8.1: Customer's liability shall be unlimited.")
+expect("unlimited → redline", lambda: v().verdict, "redline")
+expect("clause number", lambda: v().clause_id, "8.1")
+expect("returns a Verdict object", lambda: type(v()).__name__, "Verdict")
+expect("the request includes response_format", lambda: MOCK.calls[-1]["body"].get("response_format"), {"type": "json_object"})
+expect("thinking mode is off", lambda: MOCK.calls[-1]["body"].get("thinking"), {"type": "disabled"})
+--- hints
+- The request body is a dictionary with four keys: `model`, `messages`, `response_format`, `thinking`.
+- The answer text is at `["choices"][0]["message"]["content"]`, and it is a JSON string.
+- `Verdict.model_validate_json(that text)`.
+
+@@ item d4-13
+type: code
+title: Dig the JSON out of a chatty answer
+level: 2
+cards: d3:JSON: the bridge between text and dictionaries; d1:Strings
+--- context
+Some models (especially small models running on your own computer) don't follow the rules very well and wrap the JSON in a few polite sentences, so parsing the answer directly fails. `_extract_json` in the real project's `review.py` exists to handle exactly this.
+--- prompt
+Some models add filler before and after the JSON: `'Sure! Here is the JSON:\n{"verdict": "flag"}'`.
+
+Write `extract_json(text)`: take everything from the first `{` to the last `}` (both included), parse it with `json.loads` and return the dictionary. If there are no braces, return `None`.
+--- starter
+import json
+
+def extract_json(text):
+    pass
+--- solution
+import json
+
+def extract_json(text):
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        return None
+    return json.loads(text[start:end + 1])
+--- tests
+expect("filler before", lambda: extract_json('Sure! Here is the JSON:\n{"verdict": "flag"}'), {"verdict": "flag"})
+expect("filler before and after", lambda: extract_json('Result: {"a": {"b": 1}} Hope this helps.'), {"a": {"b": 1}})
+expect("clean JSON", lambda: extract_json('{"x": 1}'), {"x": 1})
+expect("no braces", lambda: extract_json("no json here"), None)
+--- hints
+- `text.find("{")` finds the first one, and `text.rfind("}")` searches from the right for the last one; both return -1 when nothing is found.
+- The slice must include that last `}`: `text[start:end + 1]`.
+
+@@ item d4-14
+type: code
+title: Run one tool call
+level: 2
+cards: Tool calls: the model asks you to look something up
+--- context
+While reviewing a clause, the model can ask the program to do things for it, such as looking up the company's review rules (`lookup_playbook`). The model only says the tool's name and the arguments; your code is what actually runs it.
+--- prompt
+A tool call returned by the model looks like this:
+
+```python
+call = {"id": "call_1", "type": "function",
+        "function": {"name": "lookup_playbook", "arguments": '{"topic": "payment"}'}}
+```
+
+Write `run_tool_call(call, tools)`: `tools` is a dictionary from names to Python functions. Find the matching function, parse `arguments` (a JSON string) into a dictionary, call the function with it as keyword arguments, and return the result. If there is no tool with that name, return `"UNKNOWN_TOOL: "` followed by the name.
+--- starter
+import json
+
+def run_tool_call(call, tools):
+    pass
+--- solution
+import json
+
+def run_tool_call(call, tools):
+    name = call["function"]["name"]
+    if name not in tools:
+        return f"UNKNOWN_TOOL: {name}"
+    args = json.loads(call["function"]["arguments"])
+    return tools[name](**args)
+--- tests
+def lookup_playbook(topic):
+    return f"rule for {topic}"
+def add(a, b):
+    return a + b
+TOOLS = {"lookup_playbook": lookup_playbook, "add": add}
+call = lambda name, args: {"id": "c", "type": "function", "function": {"name": name, "arguments": args}}
+expect("look up the playbook", lambda: run_tool_call(call("lookup_playbook", '{"topic": "payment"}'), TOOLS), "rule for payment")
+expect("two arguments", lambda: run_tool_call(call("add", '{"a": 2, "b": 3}'), TOOLS), 5)
+expect("a tool that doesn't exist", lambda: run_tool_call(call("delete_all", "{}"), TOOLS), "UNKNOWN_TOOL: delete_all")
+--- hints
+- The name: `call["function"]["name"]`; the arguments: `json.loads(call["function"]["arguments"])`.
+- `**args` unpacks the dictionary `args` into keyword arguments: `func(**{"topic": "x"})` is the same as `func(topic="x")`.
+
+@@ item d4-15
+type: code
+title: Pass rate
+level: 2
+mock: yes
+cards: Randomness: one run is not enough
+--- context
+Ask the model about the same clause five times and you may get two different verdicts. To know whether the model can be trusted on a clause, you have to ask several times and look at the proportion. The real project's `evals/run_evals.py` does exactly that: it runs each test case N times and computes the pass rate.
+--- prompt
+Write `pass_rate(clause_text, expected, n)`: call `classify(clause_text)` `n` times and return the fraction of verdicts equal to `expected` (a decimal number between 0 and 1).
+
+`classify` is already written (it is exercise 12).
+--- starter
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+
+def classify(clause_text):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
+
+def pass_rate(clause_text, expected, n):
+    pass
+--- solution
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str
+
+def classify(clause_text):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
+
+def pass_rate(clause_text, expected, n):
+    hits = 0
+    for _ in range(n):
+        if classify(clause_text).verdict == expected:
+            hits += 1
+    return hits / n
+--- tests
+UNLIMITED = "Review clause 8.1: Customer's liability shall be unlimited."
+AS_IS = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS".'
+expect("a stable clause: right all 5 times", lambda: pass_rate(UNLIMITED, "redline", 5), 1.0)
+expect("the wrong expected verdict: 0", lambda: pass_rate(UNLIMITED, "accept", 3), 0.0)
+expect_true("a wavering clause: between 0 and 1", lambda: 0 < pass_rate(AS_IS, "accept", 20) < 1)
+expect("really called n times", lambda: (MOCK.reset(), pass_rate(UNLIMITED, "redline", 4), len(MOCK.calls))[2], 4)
+--- hints
+- Set up `hits = 0`, loop n times, and add 1 whenever the verdict is right.
+- At the end, `hits / n`. In Python 3, dividing whole numbers gives a decimal.
+
+@@ item d4-16
+type: code
+title: A mini agent: request → call the tool → request again
+level: 3
+mock: yes
+cards: Tool calls: the model asks you to look something up; What a Chat API request and response look like
+--- context
+In the real project, reviewing one clause often means the model first looks up rules and reads the clauses it refers to, and only then decides, going back and forth for several rounds. The number of rounds must have a limit; otherwise, if the model keeps asking for tools, the program never stops and the money keeps being spent.
+--- prompt
+Put everything so far together. Write `mini_agent(question)`:
+
+1. Send a request (model `deepseek-flash`) with `TOOLS`, and turn thinking mode off with `"thinking": {"type": "disabled"}`
+2. If `finish_reason == "tool_calls"`: run the first tool call (with `run_tool_call`); add the model's message to `messages` exactly as it is, then add `{"role": "tool", "tool_call_id": the call's id, "content": the tool result}`; then go back to step 1
+3. Otherwise, return the answer text
+4. Send at most `max_steps` requests; past that, return `"STOPPED"`
+
+This is the loop with a limit in Clause Check's `review.py`.
+--- starter
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+def lookup_playbook(topic):
+    return f"rule for {topic}: cap at 100% of annual fees"
+
+def run_tool_call(call, tools):
+    return tools[call["function"]["name"]](**json.loads(call["function"]["arguments"]))
+
+def mini_agent(question, max_steps=3):
+    messages = [{"role": "user", "content": question}]
+    pass
+--- solution
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+def lookup_playbook(topic):
+    return f"rule for {topic}: cap at 100% of annual fees"
+
+def run_tool_call(call, tools):
+    return tools[call["function"]["name"]](**json.loads(call["function"]["arguments"]))
+
+def mini_agent(question, max_steps=3):
+    messages = [{"role": "user", "content": question}]
+    for _ in range(max_steps):
+        body = {"model": "deepseek-flash", "messages": messages, "tools": TOOLS, "thinking": {"type": "disabled"}}
+        choice = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]
+        message = choice["message"]
+        if choice["finish_reason"] != "tool_calls":
+            return message["content"]
+        call = message["tool_calls"][0]
+        result = run_tool_call(call, {"lookup_playbook": lookup_playbook})
+        messages.append(message)
+        messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+    return "STOPPED"
+--- tests
+def _run():
+    MOCK.reset()
+    return [mini_agent("Is unlimited liability acceptable?"), len(MOCK.calls)]
+expect("calls the tool, gets the final answer, 2 requests in total", _run, ["Based on the playbook: rule for liability_cap: cap at 100% of annual fees", 2])
+expect("the second request carries the tool result", lambda: MOCK.calls[-1]["body"]["messages"][-1]["role"], "tool")
+expect("every request turns thinking mode off", lambda: [c["body"].get("thinking") for c in MOCK.calls], [{"type": "disabled"}, {"type": "disabled"}])
+expect("returns STOPPED when the steps run out", lambda: mini_agent("Is unlimited liability acceptable?", max_steps=1), "STOPPED")
+--- hints
+- Structure: send the request inside `for _ in range(max_steps):`; if it is not tool_calls, return; if it is, run the tool, add two messages to messages, and go on to the next round.
+- If the loop ends without returning, `return "STOPPED"`.
+
+@@ item d4-17
+type: order
+title: Put the code in order: one complete call
+level: 2
+mock: yes
+cards: Sending requests with requests; d3:JSON: the bridge between text and dictionaries
+--- context
+Asking the model to answer only in JSON, then turning the answer into a dictionary: this is the pattern you will use most often when calling a model. These lines are worth knowing so well that you don't have to think about them.
+--- prompt
+Put `ask_json(prompt)` in order: the request asks for JSON format and turns thinking mode off, and the function returns the parsed dictionary. One line is a distractor.
+--- lines
+import json, os, requests
+URL = "https://api.deepseek.com/v1/chat/completions"
+def ask_json(prompt):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    data = requests.post(URL, headers=headers, json=body).json()
+    return json.loads(data["choices"][0]["message"]["content"])
+--- distractors
+    return data["choices"]["message"]["content"]
+--- tests
+expect("returns a dictionary", lambda: ask_json("Review clause 4.2: renews for twenty-four (24) months")["verdict"], "redline")
+expect("topic", lambda: ask_json("Review clause 4.2: renews for twenty-four (24) months")["topic"], "auto_renewal")
+--- hints
+- The order: imports → constants → def → headers → request body → send the request → parse the response.
+- `choices` is a list, so take `[0]` first.
+
+@@ item d4-18
+type: choice
+title: Is temperature 0 deterministic?
+level: 2
+cards: Randomness: one run is not enough
+--- context
+Some people think that if you turn the randomness of the answers down to the minimum, tests only need to run once, which saves time and money. Whether that idea is right decides whether your evaluation results can be trusted.
+--- prompt
+After you turn thinking mode off (`"thinking": {"type": "disabled"}`) and set `temperature` to 0 in the request:
+--- options
+- The output is always exactly the same, so running the test once is enough
+- It is usually more stable, but not guaranteed to be the same every time; evaluation still needs several runs and a pass rate
+- The model refuses to answer
+- The output becomes more creative
+answer: 2
+--- explain
+The lower the temperature, the more focused the output, but batching on the server, the order of floating-point operations and the provider updating the model all make results change. Also, tests should use the same parameters as production. So "run once, check whether it is right" is unreliable; you need "run N times, look at the pass rate". And remember: with thinking mode on, DeepSeek ignores temperature completely, which is why the question turns thinking mode off first.
+
+@@ item d4-19
+type: local
+title: Local task: really call DeepSeek once
+level: 2
+cards: Sending requests with requests; What a Chat API request and response look like
+--- context
+All the earlier exercises talk to the mock server. This time, on your own computer, call the real model once with a real API key and see the answer and the token usage with your own eyes. Writing it yourself from a blank file is the best test of whether you have learned the last few days' material.
+--- prompt
+On your own computer, **without looking at this page**, write a real call by hand.
+
+1. Check that `G:\Contract Clause Reviewer\.env` contains `DEEPSEEK_API_KEY=sk-...` (this file never goes into git)
+2. In VS Code, create `G:\Contract Clause Reviewer\work\my_first_call.py`
+3. Write it by hand from a blank file: read `.env` (`from dotenv import load_dotenv`, then `load_dotenv()`), build the request (model `deepseek-flash`), call `https://api.deepseek.com/v1/chat/completions`, and print the answer and `total_tokens`
+4. Run it in the terminal:
+
+```
+cd "G:\Contract Clause Reviewer"
+python work/my_first_call.py
+```
+
+5. Paste the complete terminal output below
+
+If you get stuck, you can go back to exercises 7 and 9 and look at the code you wrote there, but don't copy it: make sure you understand it, then type it again.
+
+Optional: also print `completion_tokens_details` from `usage` to see how many tokens the real model spent thinking; then add `"thinking": {"type": "disabled"}` to the request body, run it again and compare `completion_tokens`. Thinking tokens are billed as output: for one hello the difference in cost is tiny, but when you review hundreds of clauses in bulk, it adds up.
+placeholder: Paste the terminal output; it should include the model's answer and total_tokens
+verify: tokens?\D{0,30}\d+
+--- hints
+- The packages you need: `pip install requests python-dotenv` (skip this if they are already installed).
+- If you see 401: check the key in `.env`, and whether the header starts with `Bearer `.
+- If you see 400 and the error says `The supported API model names are ...`: the model name is wrong; use `deepseek-flash`.
+
+@@ item d4-e1
+type: scratch
+title: Closed book: the Rule model
+exam: yes
+level: 2
+cards: Pydantic: rules for your data; Failed validation: ValidationError
+--- context
+The playbook file is written by people, by hand, so it can contain mistakes, such as a severity written as `critical`. Check each rule when you read it; a broken rule must not slip into the review.
+--- prompt
+Write a `Rule` model with Pydantic: `id` (a string), `topic` (a string), `severity` (only `low` / `medium` / `high`).
+
+Then write `load_rule(raw)`: `raw` is JSON text; if it is valid, return a `Rule` object, otherwise return `None`.
+--- solution
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Rule(BaseModel):
+    id: str
+    topic: str
+    severity: Literal["low", "medium", "high"]
+
+def load_rule(raw):
+    try:
+        return Rule.model_validate_json(raw)
+    except ValidationError:
+        return None
+--- tests
+expect("valid", lambda: load_rule('{"id": "PB-01", "topic": "liability_cap", "severity": "high"}').severity, "high")
+expect("invalid severity", lambda: load_rule('{"id": "PB-01", "topic": "x", "severity": "urgent"}'), None)
+expect("broken JSON", lambda: load_rule("{"), None)
+
+@@ item d4-e2
+type: scratch
+title: Closed book: a call that asks for JSON
+exam: yes
+level: 2
+mock: yes
+cards: Sending requests with requests; What a Chat API request and response look like
+--- context
+When you want a structured result from the model, this is the most basic call: send the question and get back a dictionary whose fields you can read directly.
+--- prompt
+Write `ask_json(prompt)`: call `https://api.deepseek.com/v1/chat/completions` (model `deepseek-flash`, with the API key read from the environment variable `DEEPSEEK_API_KEY`), ask for the `json_object` format and turn thinking mode off, and return the parsed dictionary.
+--- solution
+import json
+import os
+import requests
+
+def ask_json(prompt):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
+    return json.loads(data["choices"][0]["message"]["content"])
+--- tests
+expect("verdict", lambda: ask_json("Review clause 10.1: data may be processed in any country")["verdict"], "redline")
+expect("topic", lambda: ask_json("Review clause 10.1: data may be processed in any country")["topic"], "data_processing")
+expect("thinking mode is off", lambda: MOCK.calls[-1]["body"].get("thinking"), {"type": "disabled"})
+
+@@ item d4-e3
+type: scratch
+title: Closed book: how many tokens in total
+exam: yes
+level: 2
+mock: yes
+cards: Sending requests with requests; d2:Accumulating: set up before the loop, update inside it
+--- context
+Reviewing one contract calls the model many times, and every call is billed by the token (a token is the unit a model uses to measure the text it reads and writes). Add up what each call used, and you know how many tokens the whole batch of requests used.
+--- prompt
+Write `total_tokens(prompts)`: call the API once for each prompt in the list (model `deepseek-flash`) and return the sum of `total_tokens` over all the calls. An empty list returns 0.
+--- solution
+import os
+import requests
+
+def total_tokens(prompts):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    total = 0
+    for p in prompts:
+        body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": p}]}
+        data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
+        total += data["usage"]["total_tokens"]
+    return total
+--- tests
+expect_true("two calls use more tokens than one", lambda: total_tokens(["a", "b"]) > total_tokens(["a"]) > 0)
+expect("empty list", lambda: total_tokens([]), 0)
+expect("number of calls", lambda: (MOCK.reset(), total_tokens(["x", "y", "z"]), len(MOCK.calls))[2], 3)

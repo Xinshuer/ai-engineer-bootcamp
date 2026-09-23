@@ -1,0 +1,1365 @@
+@@ day 26
+title: Cloud basics: GCP and AWS, storage, identity, secrets
+lang: py
+hours: 5 hours
+--- goal
+Get to know the core services of GCP and AWS, and be able to match each service on one cloud with its twin on the other; use Python to read and write object storage on both clouds (S3 with boto3, GCS with google-cloud-storage), and list files page by page; tell which cloud errors should be retried and which should not; make the safe defaults a habit: least privilege, no secrets in code, a secret management service, contract data in EU regions. This is what Clause Check looks like once it moves to the cloud: "contracts in a bucket, API keys in Secret Manager, and the worker gets only the permissions it needs".
+
+The cloud SDKs on this page are simulated: you need no cloud account, and it costs nothing.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, change the examples and run them
+- Pass every practice exercise (the local task is optional)
+- The 3 closed-book challenges
+- Without looking anything up, write the 8 pairs of matching GCP ↔ AWS services on paper, then say which two regions Clause Check's contracts should live in
+
+@@ concept
+title: What the cloud is: rented computers, pay as you go
+--- body
+The cloud is **someone else's computers, rented to you through an API**: you don't buy servers; you call operations like `put_object` and `deploy`, and pay for what you use (how many GB you store, how many seconds you run, how many calls you make).
+
+Three words you will see everywhere:
+
+- **Project / account**: GCP calls it a project (for example `clausecheck-dev`), AWS calls it an account. Billing and permissions hang on it; development and production are usually two separate ones
+- **Region**: where the data center is, for example GCP's `europe-north1` (Finland) and AWS's `eu-north-1` (Stockholm). You choose the region when you create a resource; it decides where the data is stored and processed, and compliance (for example "data stays in the EU") depends on it
+- **Zone** (availability zone): several independent data centers inside one region; if one has a problem, the others keep running
+
+The services of the two clouds match almost one to one (run the code below). The projects you work on later may use either one, and being able to say things like "GCS is GCP's S3" in an interview earns you points. Names change, so watch for that when you read: AWS App Runner, common in older material, has not accepted new customers since the end of April 2026, and AWS recommends moving to ECS; GCP's Vertex AI was renamed Gemini Enterprise Agent Platform in April 2026 (the API did not change, and docs and interviews still often call it Vertex AI).
+--- code
+SERVICES = [
+    ("run containers / functions", "Cloud Run", "ECS (Fargate) / Lambda"),
+    ("object storage (files)", "Cloud Storage (GCS)", "S3"),
+    ("data warehouse", "BigQuery", "Redshift / Athena"),
+    ("messages and queues", "Pub/Sub", "SNS / SQS"),
+    ("secrets", "Secret Manager", "Secrets Manager"),
+    ("managed LLMs", "Vertex AI (Gemini)", "Bedrock"),
+    ("logs and monitoring", "Cloud Logging", "CloudWatch"),
+    ("who may do what", "IAM", "IAM"),
+]
+print(f"{'what':<28}{'GCP':<22}AWS")
+for what, gcp, aws in SERVICES:
+    print(f"{what:<28}{gcp:<22}{aws}")
+
+REGIONS = {"GCP": "europe-north1 (Finland)", "AWS": "eu-north-1 (Stockholm)"}
+print()
+for cloud, region in REGIONS.items():
+    print(f"Clause Check contracts on {cloud}: {region}")
+
+@@ concept
+title: Object storage: buckets, keys, and bytes
+cloud: yes
+--- body
+**Files** such as contract PDFs and review reports go in object storage: S3 on AWS, Cloud Storage (GCS) on GCP.
+
+- **Bucket**: a big container whose name is unique worldwide, for example `clausecheck-contracts`
+- **Key**: the full name of an object, for example `contracts/1/103/original.pdf`. **There are no real folders**: `/` is just a character in the name, and "listing a folder" really means "listing the keys that start with this prefix"
+- Object = bytes + metadata: `ContentType` (`application/json`, `application/pdf`) and key-value pairs you add yourself (Metadata; S3 **turns their key names into lowercase**)
+- What you read back is **bytes**: in S3 it is `resp["Body"].read()`, and you need `.decode("utf-8")` to get text
+- A listing returns at most 1000 keys at a time; for more, you **paginate** (fetch them page by page); when nothing matches, the S3 response doesn't even have a `Contents` key
+- With versioning turned on, overwrites and deletes keep the old versions, so you can get back something you deleted by mistake
+
+The boto3 / google-cloud on this page are simulated: the calls and the shape of what they return match the real SDKs (only the parts this course uses are implemented); in a real project you run `pip install boto3 google-cloud-storage` and set up credentials. The two buckets `clausecheck-contracts` and `clausecheck-reports` already exist.
+--- code
+import json
+import boto3
+from google.cloud import storage
+
+report = {"contract_id": 103, "counts": {"redline": 2, "flag": 1}}
+
+# AWS S3: one client; the method names are the API names, and every argument is passed by keyword
+s3 = boto3.client("s3", region_name="eu-north-1")
+s3.put_object(Bucket="clausecheck-reports", Key="reports/103.json",
+              Body=json.dumps(report).encode("utf-8"),
+              ContentType="application/json", Metadata={"Contract-Id": "103"})
+resp = s3.get_object(Bucket="clausecheck-reports", Key="reports/103.json")
+print(resp["ContentType"], resp["Metadata"])
+print(json.loads(resp["Body"].read().decode("utf-8")))
+
+# GCP Cloud Storage: client → bucket → blob (one object)
+gcs = storage.Client()
+blob = gcs.bucket("clausecheck-reports").blob("reports/103.json")
+blob.upload_from_string(json.dumps(report), content_type="application/json")
+print(blob.content_type, json.loads(blob.download_as_text()))
+
+# a "folder" is just a prefix
+page = s3.list_objects_v2(Bucket="clausecheck-reports", Prefix="reports/")
+print([o["Key"] for o in page["Contents"]], page["IsTruncated"])
+print([b.name for b in gcs.list_blobs("clausecheck-reports", prefix="reports/")])
+empty = s3.list_objects_v2(Bucket="clausecheck-reports", Prefix="archive/")
+print("Contents" in empty, empty.get("Contents", []))
+
+@@ concept
+title: Identity and credentials: who is calling
+cloud: yes
+--- body
+Every API call has to answer "who are you?". In the cloud there are two kinds of identity:
+
+- **People**: your own account, used when you develop on your own computer
+- **Machines**: a **service account** on GCP, an **IAM role** on AWS. A Cloud Run service or a Lambda function runs with this identity built in, so the code contains no keys at all
+
+The SDK looks for credentials automatically, in a fixed order (the credential chain), so the same code works unchanged on your computer and in production:
+
+- AWS: environment variables (`AWS_ACCESS_KEY_ID` and so on) → the `~/.aws/` config on your computer (written by `aws configure` or `aws configure sso`) → the role the runtime environment provides
+- GCP: **Application Default Credentials (ADC)**: the file that `GOOGLE_APPLICATION_CREDENTIALS` points to → the account you logged in with via `gcloud auth application-default login` on your computer → the service account attached to the runtime environment
+
+**Never** write access keys or a service account's JSON key file into code, and never commit them to git.
+
+One detail: `boto3.client(...)` doesn't check credentials. Only the **first real call** signs the request and raises `NoCredentialsError`; that is not a `ClientError`, so `except ClientError` won't catch it. Google's client looks for credentials as soon as it is created.
+--- code
+import boto3
+import google.auth.exceptions
+from botocore.exceptions import ClientError, NoCredentialsError
+from google.cloud import storage
+
+# CLOUD exists only in this page's simulation: pretend this computer has no credentials at all
+CLOUD.aws_credentials = False
+CLOUD.gcp_adc = False
+
+s3 = boto3.client("s3", region_name="eu-north-1")
+print("boto3 client created, no credentials checked yet")
+try:
+    s3.list_objects_v2(Bucket="clausecheck-contracts")
+except ClientError as e:
+    print("ClientError:", e)
+except NoCredentialsError as e:
+    print(type(e).__name__, "-", e)
+    print("is it a ClientError?", isinstance(e, ClientError))
+
+try:
+    storage.Client()
+except google.auth.exceptions.DefaultCredentialsError as e:
+    print(type(e).__name__, "-", str(e).split(".")[0])
+
+@@ concept
+title: IAM: grant only what is needed
+--- body
+IAM decides "what this identity may do to which resource". The principle is **least privilege**: grant only the few actions the job needs, and only on the resources that need them.
+
+Clause Check's review worker needs only this: read contracts in `clausecheck-contracts`, write reports to `clausecheck-reports`, read the DeepSeek API key. It doesn't need to delete contracts, and it doesn't need to touch any other bucket.
+
+- AWS: attach a policy to the worker's role. `Action` lists specific actions (`s3:GetObject`), `Resource` lists specific ARNs (`arn:aws:s3:::clausecheck-contracts/*`)
+- GCP: grant roles to the service account **on the bucket**, for example `roles/storage.objectViewer` on the contracts bucket, `roles/storage.objectCreator` on the reports bucket, and `roles/secretmanager.secretAccessor` on the secret. Note that `objectCreator` can only create new objects; it **cannot overwrite** existing ones. If reports have to be rewritten, switch to the broader `roles/storage.objectUser` (which can also delete)
+
+When you see **403 / AccessDenied / PermissionDenied**: most likely the code isn't wrong; the identity is missing a permission. Three questions to ask: which identity made this call (`aws sts get-caller-identity`)? Which action is missing (the error message usually says)? Which resource was the permission granted on?
+
+A trap: when S3 reads a key that **doesn't exist** and the identity doesn't have the `s3:ListBucket` permission, you get 403 AccessDenied, not 404 NoSuchKey.
+
+Below is a **minimal** policy checker that helps you understand the shape of a policy. Real IAM also has Deny (an explicit deny always wins), conditions, and merging of several policies.
+--- code
+from fnmatch import fnmatch
+
+WORKER_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::clausecheck-contracts/*"]},
+        {"Effect": "Allow", "Action": ["s3:PutObject"], "Resource": ["arn:aws:s3:::clausecheck-reports/*"]},
+        {"Effect": "Allow", "Action": ["secretsmanager:GetSecretValue"],
+         "Resource": ["arn:aws:secretsmanager:eu-north-1:123456789012:secret:clausecheck/deepseek-*"]},
+    ],
+}
+
+def allowed(policy, action, resource):
+    for st in policy["Statement"]:
+        if st["Effect"] == "Allow" and action in st["Action"] and any(fnmatch(resource, r) for r in st["Resource"]):
+            return True
+    return False
+
+checks = [
+    ("s3:GetObject", "arn:aws:s3:::clausecheck-contracts/contracts/1/103/original.pdf"),
+    ("s3:PutObject", "arn:aws:s3:::clausecheck-reports/reports/103.json"),
+    ("s3:DeleteObject", "arn:aws:s3:::clausecheck-contracts/contracts/1/103/original.pdf"),
+    ("s3:GetObject", "arn:aws:s3:::clausecheck-billing/invoices/2026-09.csv"),
+]
+for action, resource in checks:
+    verdict = "ALLOW" if allowed(WORKER_POLICY, action, resource) else "DENY "
+    print(verdict, action.ljust(16), resource.split(":::")[1])
+
+@@ concept
+title: Secret management: not in code, not in images
+cloud: yes
+--- body
+When you develop on your own computer, API keys go in `.env` (Day 10). In production you don't do that: no secret may appear in the code repository, in a container image, or in the logs.
+
+In production you use a **secret management service**: Secret Manager on GCP, Secrets Manager on AWS. Secrets are stored encrypted, IAM controls who can read them, reads can be recorded in audit logs (on AWS that is CloudTrail; on GCP you first have to turn on the "Data Access" audit logs for Secret Manager, which are off by default), and secrets can be **rotated** (swap in a new one and retire the old one).
+
+- GCP: the name is `projects/<project>/secrets/<name>/versions/latest`; the `payload.data` you read back is **bytes**, so you need `.decode("utf-8")`
+- AWS: `get_secret_value(SecretId=...)["SecretString"]` is a **string**; when the secret stores key-value pairs it is a piece of JSON, so you need `json.loads`
+- Read it once when the process starts and **cache** it; don't read it on every request: every read adds latency, and reads are billed per call. The price: after a rotation you have to restart (or let the cache expire) before the new secret is used
+- Another common approach: Cloud Run can inject a secret from Secret Manager directly as an environment variable, and the code keeps using `os.getenv` as before
+
+When you print a secret, show only its first few characters; not a single complete secret should end up in the logs.
+--- code
+import json
+import boto3
+from google.cloud import secretmanager
+
+gsm = secretmanager.SecretManagerServiceClient()
+name = "projects/clausecheck-dev/secrets/deepseek-api-key/versions/latest"
+resp = gsm.access_secret_version(name=name)
+print(type(resp.payload.data).__name__, resp.payload.data.decode("utf-8")[:6] + "...")
+
+asm = boto3.client("secretsmanager", region_name="eu-north-1")
+secret = asm.get_secret_value(SecretId="clausecheck/deepseek")
+print(type(secret["SecretString"]).__name__, secret["SecretString"][:14] + "...")
+print(json.loads(secret["SecretString"])["api_key"][:6] + "...")
+
+@@ concept
+title: Errors and retries: retry only temporary errors
+cloud: yes
+--- body
+Cloud API errors come in two kinds, and you handle them in completely different ways:
+
+- **Temporary**: rate limits (429, `ThrottlingException`, S3's `SlowDown`) and server-side 5xx errors (`ServiceUnavailable`). Wait a little and try again, and it usually works
+- **Permanent**: 404 not found, 403 no permission, 400 bad parameters. A hundred retries give the same result, so raise the error right away
+
+The good news: the SDK retries temporary errors by itself. By default (legacy mode) boto3 tries 5 times in total, in standard mode 3 times; you can set this with `Config(retries={"mode": "standard", "total_max_attempts": 3})`. google-cloud-storage also retries reads. So when a rate-limit error reaches your code, it means "the SDK has already tried several times".
+
+When you write retries yourself (for calls the SDK doesn't retry, or when a whole step has to start over): retry only temporary errors, use **exponential backoff** (0.5 s, 1 s, 2 s, …), multiply by **random jitter** (so that many clients don't all retry at the same instant), and set a limit. The operation you retry should ideally be **idempotent**: writing the same content to the same key again leaves the result unchanged.
+
+The two clouds' errors look different: boto3 raises almost nothing but `ClientError`, and you look at `e.response["Error"]["Code"]`; Google has a different exception class for each status code (`NotFound`, `TooManyRequests`), and you look at the class or at `e.code`. Don't match on the text of the error message: it can change at any time.
+--- code
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from google.cloud import storage
+from google.api_core.exceptions import NotFound
+
+s3 = boto3.client("s3", region_name="eu-north-1")
+CLOUD.fail_next("s3", "throttle", 2)            # simulation: the next two requests get rate-limited
+resp = s3.list_objects_v2(Bucket="clausecheck-reports")
+print("succeeded; the SDK retried", resp["ResponseMetadata"]["RetryAttempts"], "times behind the scenes")
+
+no_retry = boto3.client("s3", region_name="eu-north-1", config=Config(retries={"total_max_attempts": 1}))
+CLOUD.fail_next("s3", "throttle", 1)
+try:
+    no_retry.list_objects_v2(Bucket="clausecheck-reports")
+except ClientError as e:
+    print(e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"], "-> transient, retry later")
+
+try:
+    s3.get_object(Bucket="clausecheck-reports", Key="reports/999.json")
+except ClientError as e:
+    print(e.response["Error"]["Code"], "-> permanent, do not retry")
+
+gcs = storage.Client()
+try:
+    gcs.bucket("clausecheck-reports").blob("reports/999.json").download_as_text()
+except NotFound as e:
+    print(type(e).__name__, e.code, "-> permanent, do not retry")
+
+@@ concept
+title: Data residency: contracts stay in the EU
+cloud: yes
+--- body
+Contracts contain names, email addresses and signatories: all of this is **personal data**. The EU's **GDPR**, in plain words: you need a legitimate reason to process personal data, you collect only what you need, and you protect it; moving it outside the EU needs extra legal safeguards. That is why customers often write "data may only be stored and processed in the EU" into their contracts. Rule **PB-03** (Data location and DPA) in the project's playbook reviews exactly this kind of clause, and of course Clause Check itself has to meet it too:
+
+- Buckets, databases, logs and backups are all created in EU regions: AWS `eu-north-1` (Stockholm), GCP `europe-north1` (Finland)
+- Sending contract text to a model is "processing" too: the model's inference also has to run in the EU (Bedrock and Vertex AI, tomorrow)
+- Both clouds do **encryption at rest** by default, but encryption doesn't change which country the data is in
+
+State the region when you create a bucket: to create an S3 bucket outside `us-east-1` you must pass `CreateBucketConfiguration={"LocationConstraint": region}`, or you get `IllegalLocationConstraintException`; when GCS's `create_bucket` is called without a `location`, the default is `US` (a multi-region in the United States).
+--- code
+import boto3
+from botocore.exceptions import ClientError
+from google.cloud import storage
+
+s3 = boto3.client("s3", region_name="eu-north-1")
+try:
+    s3.create_bucket(Bucket="clausecheck-contracts-se")
+except ClientError as e:
+    print(e.response["Error"]["Code"])
+s3.create_bucket(Bucket="clausecheck-contracts-se",
+                 CreateBucketConfiguration={"LocationConstraint": "eu-north-1"})
+print("S3 bucket created in", s3.meta.region_name)
+
+gcs = storage.Client()
+print(gcs.create_bucket("clausecheck-contracts-fi", location="europe-north1").location)
+print(gcs.create_bucket("clausecheck-tmp").location, "<- no location given")
+
+@@ concept
+title: Cost and the command line
+--- body
+A cloud bill mainly comes from: compute (how many seconds things ran), storage (per GB per month), **egress** (data downloaded from the cloud to the outside world, charged per GB, a common source of surprise bills) and the number of API calls. For Clause Check, storing contracts costs almost nothing; most of the money goes to model tokens (run the estimate below).
+
+- **Storage classes**: data you use often goes in Standard; old contracts that are rarely read can move automatically to cheap cold storage (S3 Glacier, GCS Coldline / Archive) through lifecycle rules, but getting them back costs extra
+- **Budgets and alerts**: both clouds let you set a monthly budget and send you an email when you reach 50% and 90% of it. Set one up on the day you open the account. Note that a budget **only warns you; it doesn't stop your services**. For a hard cap you still need limits such as a maximum number of instances (tomorrow)
+- Prices change often; the unit prices in the code are only examples to show the order of magnitude; the official pricing pages are what counts
+
+Command lines show up everywhere in docs and interviews; being able to read them is enough:
+
+```
+gcloud auth list                          # which account is active now
+gcloud auth application-default login     # log in for ADC on your computer
+gcloud storage cp report.json gs://clausecheck-reports/reports/
+aws sts get-caller-identity               # who am I now (the first step when you debug a 403)
+aws s3 cp report.json s3://clausecheck-reports/reports/
+aws s3 ls s3://clausecheck-reports/reports/
+```
+--- code
+# example unit prices (USD), only to show the order of magnitude; the official pricing pages are what counts
+STORAGE_PER_GB_MONTH = 0.02
+EGRESS_PER_GB = 0.1
+TOKENS_PER_CONTRACT = 150_000
+USD_PER_MILLION_TOKENS = 0.5
+
+def monthly_cost(contracts, mb_per_contract=2, downloads_per_contract=3):
+    gb = contracts * mb_per_contract / 1024
+    storage = gb * STORAGE_PER_GB_MONTH
+    egress = gb * downloads_per_contract * EGRESS_PER_GB
+    llm = contracts * TOKENS_PER_CONTRACT / 1_000_000 * USD_PER_MILLION_TOKENS
+    return {"storage": round(storage, 4), "egress": round(egress, 4), "llm": round(llm, 2)}
+
+for n in (100, 1000):
+    print(n, "contracts/month:", monthly_cost(n))
+
+@@ item d26-01
+type: choice
+title: Recap: which step raises the error
+level: 1
+cards: d25:The Python client: queries, parameters, rows; Errors and retries: retry only temporary errors
+--- context
+When the dashboard backend queries BigQuery and something goes wrong, it should show the user a friendly message instead of letting the whole program crash.
+--- prompt
+A review of Day 25. The code below is meant to print `query failed` when the query goes wrong, but the table name `clausecheck.review` is missing an s (`client` is `bigquery.Client()`). What happens when it runs?
+--- code
+from google.api_core.exceptions import GoogleAPICallError
+
+try:
+    job = client.query("SELECT verdict FROM clausecheck.review")
+except GoogleAPICallError:
+    print("query failed")
+rows = list(job.result())
+--- options
+- It prints `query failed`
+- Nothing is printed: `client.query()` only submits a query job; the "table does not exist" error is raised only at `job.result()`, and that line is not inside the `try`, so the program crashes with `NotFound`
+- No error, and `rows` is an empty list
+- `client.query()` immediately raises a Python `SyntaxError`
+answer: 2
+--- explain
+`client.query()` returns a job object right away; wrong SQL, a missing table, going over the byte limit are all raised only at `job.result()`, so the `try` has to wrap `result()` (or use `client.query_and_wait()`, which does it in one step). You'll meet the same thing again today: a boto3 client doesn't check credentials when it is created, and the error comes only at the first call; GCS's `list_blobs` sends the real request, and raises the error, only when you start iterating over it. "Which step the error comes out of" decides where the `try` goes.
+
+@@ item d26-02
+type: code
+title: The key for a contract
+level: 2
+cards: Object storage: buckets, keys, and bytes
+--- context
+Suppose Clause Check has moved to the cloud: contracts that customers upload go into object storage (the place in the cloud where files live), and each file is found by its name (its key). This function decides what each contract is called in the bucket. The file name was chosen by the user, so it can contain any character.
+--- prompt
+A contract's name (key) in the bucket must be **predictable**: with one prefix per customer, listing all of a customer's contracts or granting access for one customer only needs the prefix. Write `contract_key(customer_id, contract_id, filename)` that returns `contracts/<customer_id>/<contract_id>/<cleaned file name>`.
+
+The file name comes from the user's upload and can't be used as it is (a `/` in it would become a fake "folder"). The cleaning rules:
+
+- convert to lowercase
+- replace each run of characters that are "not a–z, 0–9 or `.`" with **one** `-`
+- remove `-` at both ends
+- if the cleaned name is an empty string: `raise ValueError("empty filename")`
+
+Example: `contract_key(2, 103, "Hospital Software License v2.PDF")` → `"contracts/2/103/hospital-software-license-v2.pdf"`
+--- starter
+import re
+
+def contract_key(customer_id, contract_id, filename):
+    return f"contracts/{customer_id}/{contract_id}/{filename}"
+--- solution
+import re
+
+def contract_key(customer_id, contract_id, filename):
+    name = re.sub(r"[^a-z0-9.]+", "-", filename.lower()).strip("-")
+    if not name:
+        raise ValueError("empty filename")
+    return f"contracts/{customer_id}/{contract_id}/{name}"
+--- tests
+expect("the example from the prompt", lambda: contract_key(2, 103, "Hospital Software License v2.PDF"), "contracts/2/103/hospital-software-license-v2.pdf")
+expect("brackets, a dash and spaces in a row become a single -", lambda: contract_key(1, 101, "Contract (final) — Nordlys AB.pdf"), "contracts/1/101/contract-final-nordlys-ab.pdf")
+expect("/ must not become a folder", lambda: contract_key(1, 101, "../reports/x.json"), "contracts/1/101/..-reports-x.json")
+expect("- at both ends is removed", lambda: contract_key(4, 108, "  NDA!  .txt"), "contracts/4/108/nda-.txt")
+expect_raises("empty after cleaning", lambda: contract_key(1, 101, "???"), ValueError)
+--- hints
+- `re.sub(pattern, "-", text)` replaces every match with `-`. "Not one of these characters" is written `[^a-z0-9.]`, and a `+` after it means "a run of them".
+- First `.lower()`, then replace, and finally `.strip("-")` to remove the `-` at both ends.
+
+@@ item d26-03
+type: predict
+title: What S3 gives back
+level: 1
+cloud: yes
+cards: Object storage: buckets, keys, and bytes
+--- context
+Review reports are stored as JSON in S3 (AWS's object storage), and the front end has to read them back to show them. Before you write the reading code, look closely at what S3 really returns.
+--- prompt
+Write the output. Watch three things: what type `Body` gives you when you read it; the case of the metadata key names; where `ContentType` comes from.
+--- code
+import json
+import boto3
+
+s3 = boto3.client("s3", region_name="eu-north-1")
+s3.put_object(
+    Bucket="clausecheck-reports",
+    Key="reports/103.json",
+    Body=json.dumps({"contract_id": 103, "redlines": 2}),
+    ContentType="application/json",
+    Metadata={"Contract-Id": "103", "Prompt-Version": "v2"},
+)
+resp = s3.get_object(Bucket="clausecheck-reports", Key="reports/103.json")
+body = resp["Body"].read()
+print(type(body).__name__, len(body))
+print(resp["ContentType"])
+print(resp["Metadata"])
+print(resp["Metadata"].get("Contract-Id"))
+print(json.loads(body)["redlines"] + 1)
+--- explain
+`Body` is a stream, and `.read()` gives you **bytes** (it can be read only once); `json.loads` accepts bytes too, but to print it or work with it as a string, `.decode("utf-8")` it first. S3 stored the metadata key names in lowercase, so `.get("Contract-Id")` is `None`: in your code, always read them with lowercase names. `ContentType` is what you told S3 at upload time; without it, it is `binary/octet-stream`, and the browser doesn't know how to open the file.
+
+@@ item d26-04
+type: code
+title: Upload a contract
+level: 2
+cloud: yes
+cards: Object storage: buckets, keys, and bytes; Errors and retries: retry only temporary errors
+--- context
+The contract text a customer uploads has to be stored in S3. Next to the file you can also attach a few small labels (metadata) that record the contract number and the prompt version, so later you know which contract it is and which prompt version reviewed it without opening the file.
+--- prompt
+Write `upload_contract(s3, bucket, key, text, contract_id, prompt_version)`: upload the contract text to S3 and return the `ETag` that S3 gives back.
+
+- For `Body`, use the UTF-8 encoded bytes `text.encode("utf-8")` (if you pass a str directly, boto3 also encodes it as UTF-8; writing it out means anyone reading the code sees at once what is stored)
+- `ContentType="text/plain; charset=utf-8"`
+- `Metadata={"contract-id": ..., "prompt-version": ...}`: use lowercase keys from the start, and **the values must be strings** (real boto3 raises `ParamValidationError` for an integer)
+- Write only if the key **doesn't exist yet**: pass `IfNoneMatch="*"`. When it already exists, S3 returns the error code `PreconditionFailed` (412); then don't overwrite, and return `None`; raise any other error as usual
+
+`s3` is the client that is passed in (dependency injection: tests pass a mock one, production passes the real one). Every boto3 argument is passed by keyword.
+--- starter
+from botocore.exceptions import ClientError
+
+def upload_contract(s3, bucket, key, text, contract_id, prompt_version):
+    resp = s3.put_object(Bucket=bucket, Key=key, Body=text)
+    return resp["ETag"]
+--- solution
+from botocore.exceptions import ClientError
+
+def upload_contract(s3, bucket, key, text, contract_id, prompt_version):
+    try:
+        resp = s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=text.encode("utf-8"),
+            ContentType="text/plain; charset=utf-8",
+            Metadata={"contract-id": str(contract_id), "prompt-version": prompt_version},
+            IfNoneMatch="*",
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "PreconditionFailed":
+            return None
+        raise
+    return resp["ETag"]
+--- tests
+import boto3
+from botocore.exceptions import ClientError
+S3 = boto3.client("s3", region_name="eu-north-1")
+KEY = "contracts/2/103/hospital-software-license.txt"
+TEXT = "8.1 Cap on Liability\nLiability is unlimited. Signed in Malmö."
+def _stored():
+    return CLOUD.s3["clausecheck-contracts"][KEY]
+expect_true("returns the ETag", lambda: upload_contract(S3, "clausecheck-contracts", KEY, TEXT, 103, "v2").startswith('"'))
+expect("stores UTF-8 bytes", lambda: _stored()["Body"], TEXT.encode("utf-8"))
+expect("ContentType", lambda: _stored()["ContentType"], "text/plain; charset=utf-8")
+expect("metadata: every value is a string", lambda: _stored()["Metadata"], {"contract-id": "103", "prompt-version": "v2"})
+expect("already exists: no overwrite, returns None", lambda: (upload_contract(S3, "clausecheck-contracts", KEY, "other text", 103, "v3"), _stored()["Body"] == TEXT.encode("utf-8")), (None, True))
+expect_raises("bucket does not exist: the error is raised as usual", lambda: upload_contract(S3, "no-such-bucket", KEY, TEXT, 103, "v2"), ClientError)
+--- hints
+- String to bytes: `text.encode("utf-8")`; for the metadata value use `str(contract_id)`.
+- Put `put_object` inside a `try`; in `except ClientError as e:` check `e.response["Error"]["Code"] == "PreconditionFailed"`: if it is, `return None`, otherwise a `raise` on a line of its own.
+- `IfNoneMatch="*"` means "write only if there is nothing at this key yet". With it, uploading the same contract again (for example when the client retries after a request timed out) won't overwrite the original.
+
+@@ item d26-05
+type: fix
+title: Fix the bug: the error was swallowed
+level: 2
+cloud: yes
+cards: Errors and retries: retry only temporary errors; Object storage: buckets, keys, and bytes
+--- context
+The front end keeps asking "is the report ready?": if it hasn't been generated yet, it gets nothing back and keeps waiting. But if the real problem is a configuration mistake, the front end waits forever, and nobody knows that anything went wrong.
+--- prompt
+A colleague's `read_report_or_none` quietly returns `None` even when the bucket name is misspelled, so the front end kept showing "report being generated", and the team spent an afternoon tracking it down.
+
+Run the tests and fix it: only "key does not exist" (error code `NoSuchKey`) returns `None`; every other error (bucket does not exist, no permission, rate-limit retries used up, …) is raised as it is. Swallow only the one error you expected and know how to handle.
+
+(In production, for S3 to answer `NoSuchKey`, this identity also needs the `s3:ListBucket` permission; without it, a missing key is a 403 `AccessDenied` too, see knowledge card 4.)
+--- starter
+import json
+from botocore.exceptions import ClientError
+
+def read_report_or_none(s3, bucket, key):
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError:
+        return None
+    return json.loads(resp["Body"].read().decode("utf-8"))
+--- solution
+import json
+from botocore.exceptions import ClientError
+
+def read_report_or_none(s3, bucket, key):
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+    return json.loads(resp["Body"].read().decode("utf-8"))
+--- tests
+import json
+import boto3
+from botocore.exceptions import ClientError
+S3 = boto3.client("s3", region_name="eu-north-1")
+S3.put_object(Bucket="clausecheck-reports", Key="reports/103.json", Body=json.dumps({"contract_id": 103, "verdict": "redline"}), ContentType="application/json")
+expect("reads the report", lambda: read_report_or_none(S3, "clausecheck-reports", "reports/103.json"), {"contract_id": 103, "verdict": "redline"})
+expect("not generated yet: None", lambda: read_report_or_none(S3, "clausecheck-reports", "reports/999.json"), None)
+expect_raises("bucket name misspelled (missing s): must raise, not count as not generated yet", lambda: read_report_or_none(S3, "clausecheck-report", "reports/103.json"), ClientError)
+def _throttled():
+    CLOUD.fail_next("s3", "throttle", 5)   # rate-limited 5 times in a row: the SDK's own retries are used up too
+    return read_report_or_none(S3, "clausecheck-reports", "reports/103.json")
+expect_raises("rate-limit retries used up: must raise", _throttled, ClientError)
+--- hints
+- After `except ClientError as e:`, the error code is in `e.response["Error"]["Code"]`.
+- Only `return None` when it is `"NoSuchKey"`; otherwise write a `raise` on its own line to pass the original error on.
+
+@@ item d26-06
+type: code
+title: List every key, page by page
+level: 2
+cloud: yes
+cards: Object storage: buckets, keys, and bytes
+--- context
+To export or clean up a customer's data, you first need the names of all their contract files. A big customer has thousands of contracts, and missing some of them raises no error, so it is the hardest mistake to notice.
+--- prompt
+A customer can have thousands of contracts, but `list_objects_v2` returns at most 1000 keys per call. Write `list_all_keys(s3, bucket, prefix, page_size=1000)` that returns **all** keys starting with `prefix` (a list, in the order S3 returns them):
+
+- Pass `MaxKeys=page_size` on every call (the tests use a very small `page_size` to force pagination)
+- `IsTruncated` being `True` in the response means there is another page: pass this page's `NextContinuationToken` as `ContinuationToken` on the next call
+- When nothing matches, the response **doesn't even have a `Contents` key**; return `[]` instead of raising `KeyError`
+- Don't pass `ContinuationToken=None` on the first call: real boto3 raises `ParamValidationError` (a parameter is either left out or a string)
+
+Example: 7 keys, `page_size=3` → 3 calls, and you get all 7.
+--- starter
+def list_all_keys(s3, bucket, prefix, page_size=1000):
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=page_size)
+    return [obj["Key"] for obj in resp["Contents"]]
+--- solution
+def list_all_keys(s3, bucket, prefix, page_size=1000):
+    keys = []
+    kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": page_size}
+    while True:
+        resp = s3.list_objects_v2(**kwargs)
+        keys += [obj["Key"] for obj in resp.get("Contents", [])]
+        if not resp.get("IsTruncated"):
+            return keys
+        kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+--- tests
+import boto3
+from botocore.exceptions import ParamValidationError
+class StrictS3:
+    """Like real botocore: a parameter is either left out or has the right type; None is rejected."""
+    def __init__(self, s3):
+        self._s3 = s3
+    def list_objects_v2(self, **kwargs):
+        for k, v in kwargs.items():
+            if v is None:
+                raise ParamValidationError(report=f"Invalid type for parameter {k}, value: None, type: <class 'NoneType'>, valid types: <class 'str'>")
+        return self._s3.list_objects_v2(**kwargs)
+    def __getattr__(self, name):
+        return getattr(self._s3, name)
+S3 = StrictS3(boto3.client("s3", region_name="eu-north-1"))
+for i in range(1, 8):
+    S3.put_object(Bucket="clausecheck-contracts", Key=f"contracts/2/{100 + i}/original.txt", Body=b"x")
+S3.put_object(Bucket="clausecheck-contracts", Key="contracts/3/201/original.txt", Body=b"x")
+SEVEN = [f"contracts/2/{100 + i}/original.txt" for i in range(1, 8)]
+def _with_calls(fn):
+    count = lambda: len([c for c in CLOUD.calls if c[0] == "s3.list_objects_v2"])
+    before = count()
+    out = fn()
+    return out, count() - before
+expect("one page is enough (the first call passes no ContinuationToken)", lambda: list_all_keys(S3, "clausecheck-contracts", "contracts/3/"), ["contracts/3/201/original.txt"])
+expect("7 keys, 3 per page: 3 calls, none missing", lambda: _with_calls(lambda: list_all_keys(S3, "clausecheck-contracts", "contracts/2/", page_size=3)), (SEVEN, 3))
+expect("7 per page: 1 call", lambda: _with_calls(lambda: list_all_keys(S3, "clausecheck-contracts", "contracts/2/", page_size=7)), (SEVEN, 1))
+expect("no match: []", lambda: list_all_keys(S3, "clausecheck-contracts", "contracts/6/"), [])
+--- hints
+- First put the arguments in a dictionary: `kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": page_size}`, and call `s3.list_objects_v2(**kwargs)` each time (`**` unpacks the dictionary into keyword arguments).
+- The keys are in `resp.get("Contents", [])`; each element is a dictionary, so take `obj["Key"]`.
+- Use `while True:`: `if not resp.get("IsTruncated"): return keys`; otherwise `kwargs["ContinuationToken"] = resp["NextContinuationToken"]` and go round again.
+
+@@ item d26-07
+type: predict
+title: Attributes of a GCS object
+level: 2
+cloud: yes
+cards: Object storage: buckets, keys, and bytes
+--- context
+The same report can also live in GCS, GCP's object storage. On a different cloud, both the code and what comes back are different, so first understand what its objects look like.
+--- prompt
+Write the output. The key questions: do `bucket.blob(...)` and `client.bucket(...)` send a request? When is the object's size known?
+--- code
+from google.cloud import storage
+
+client = storage.Client()
+bucket = client.bucket("clausecheck-reports")
+blob = bucket.blob("reports/103.json")
+print(blob.size, blob.content_type)
+blob.upload_from_string('{"verdict": "flag"}', content_type="application/json")
+print(blob.size, blob.content_type)
+fresh = bucket.blob("reports/103.json")
+print(fresh.size, fresh.exists())
+loaded = bucket.get_blob("reports/103.json")
+print(loaded.size, loaded.content_type)
+print(bucket.get_blob("reports/999.json"))
+print(client.bucket("no-such-bucket").name)
+--- explain
+`client.bucket(...)` and `bucket.blob(...)` only build an object locally and **send no request**: that is why every attribute starts as `None`, and why a misspelled bucket name raises no error; you get `NotFound` only at the first real read or write. After the upload, the same `blob` knows its size and type; `fresh`, built separately, still knows nothing. To get the size and type, use `bucket.get_blob(name)` (returns `None` when the object doesn't exist) or `blob.reload()`; `exists()` sends one request and only answers whether the object is there.
+
+@@ item d26-08
+type: code
+title: Save and load reports on GCS
+level: 2
+cloud: yes
+cards: Object storage: buckets, keys, and bytes; Errors and retries: retry only temporary errors
+--- context
+When a review is done, the report is saved to GCS, and it is read again when a lawyer opens the web page. Most customers are in the Nordics, and their names often contain letters like `ö`.
+--- prompt
+Save and load review reports on GCS. Write two functions:
+
+- `save_report(client, bucket_name, contract_id, report)`: write the dictionary `report` as JSON to `reports/<contract_id>.json` with `content_type="application/json"`; use `ensure_ascii=False` for the JSON so that `Malmö` is saved as it is; return the object name
+- `load_report(client, bucket_name, contract_id)`: read it back and parse it into a dictionary; return `None` when the object doesn't exist (catch `google.api_core.exceptions.NotFound`)
+
+`client` is `storage.Client()`.
+--- starter
+import json
+from google.api_core.exceptions import NotFound
+
+def save_report(client, bucket_name, contract_id, report):
+    pass
+
+def load_report(client, bucket_name, contract_id):
+    pass
+--- solution
+import json
+from google.api_core.exceptions import NotFound
+
+def save_report(client, bucket_name, contract_id, report):
+    name = f"reports/{contract_id}.json"
+    blob = client.bucket(bucket_name).blob(name)
+    blob.upload_from_string(json.dumps(report, ensure_ascii=False), content_type="application/json")
+    return name
+
+def load_report(client, bucket_name, contract_id):
+    blob = client.bucket(bucket_name).blob(f"reports/{contract_id}.json")
+    try:
+        return json.loads(blob.download_as_text())
+    except NotFound:
+        return None
+--- tests
+from google.cloud import storage
+C = storage.Client()
+R = {"contract_id": 103, "customer": "Nordlys AB, Malmö", "counts": {"redline": 2}}
+def _stored():
+    return CLOUD.gcs["clausecheck-reports"]["reports/103.json"]
+expect("returns the object name", lambda: save_report(C, "clausecheck-reports", 103, R), "reports/103.json")
+expect("stored as application/json", lambda: _stored()["content_type"], "application/json")
+expect("ö saved as it is (ensure_ascii=False)", lambda: "Malmö" in _stored()["data"].decode("utf-8"), True)
+expect("reads back the same as the original", lambda: load_report(C, "clausecheck-reports", 103), R)
+expect("does not exist: None", lambda: load_report(C, "clausecheck-reports", 999), None)
+--- hints
+- The object: `client.bucket(bucket_name).blob(name)`; write: `blob.upload_from_string(text, content_type="application/json")`; read: `blob.download_as_text()`.
+- When reading: `try: return json.loads(...)`, `except NotFound: return None`.
+
+@@ item d26-09
+type: fix
+title: Fix the bug: it can be iterated only once
+level: 2
+cloud: yes
+cards: Object storage: buckets, keys, and bytes
+--- context
+Operations wants a small statistic: how many reports there are under a prefix and how big they are in total, to estimate the storage cost.
+--- prompt
+`storage_summary` should return the number of objects under a prefix, their total size in bytes, and the list of names, but as soon as it runs it fails with `ValueError: Iterator has already started`.
+
+`list_blobs` doesn't return a list; it returns a **lazy iterator that can be iterated only once**: it requests the pages one by one while you iterate (which is also why the `NotFound` for a missing bucket only appears once you start iterating). Run it, read the error, and fix it.
+--- starter
+from google.cloud import storage
+
+def storage_summary(client, bucket_name, prefix):
+    blobs = client.list_blobs(bucket_name, prefix=prefix)
+    total = sum(b.size for b in blobs)
+    names = [b.name for b in blobs]
+    return {"count": len(names), "bytes": total, "names": names}
+--- solution
+from google.cloud import storage
+
+def storage_summary(client, bucket_name, prefix):
+    blobs = list(client.list_blobs(bucket_name, prefix=prefix))
+    total = sum(b.size for b in blobs)
+    names = [b.name for b in blobs]
+    return {"count": len(names), "bytes": total, "names": names}
+--- tests
+from google.cloud import storage
+C = storage.Client()
+for cid, text in [(101, "a" * 10), (102, "b" * 25), (103, "c" * 5)]:
+    C.bucket("clausecheck-reports").blob(f"reports/{cid}.json").upload_from_string(text)
+C.bucket("clausecheck-reports").blob("drafts/104.json").upload_from_string("x")
+expect("three reports", lambda: storage_summary(C, "clausecheck-reports", "reports/"), {"count": 3, "bytes": 40, "names": ["reports/101.json", "reports/102.json", "reports/103.json"]})
+expect("no match", lambda: storage_summary(C, "clausecheck-reports", "archive/"), {"count": 0, "bytes": 0, "names": []})
+--- hints
+- The error happens on the second pass over `blobs`: the iterator was already used up by `sum(...)`.
+- Use `list(...)` to put the results into a list in one go: `blobs = list(client.list_blobs(bucket_name, prefix=prefix))`; after that you can iterate over it as many times as you like.
+
+@@ item d26-10
+type: choice
+title: What permissions the worker should have
+level: 2
+cards: IAM: grant only what is needed
+--- context
+The worker is the review program that keeps running in the background. When it accesses a bucket it uses its own identity (on AWS, a role), and what it can and can't do depends entirely on which permissions are attached to that identity.
+--- prompt
+Clause Check's review worker runs on AWS. It does two things: read the contracts in `clausecheck-contracts`, and write reports to `clausecheck-reports`. Which policy is best to attach to its role?
+--- options
+- `{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}`: simple, and nothing needs to change when features are added later
+- Two statements: `s3:GetObject` on `arn:aws:s3:::clausecheck-contracts/*`; `s3:PutObject` on `arn:aws:s3:::clausecheck-reports/*`
+- `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on every object in both buckets, in case cleanup is needed later
+- No policy; put an administrator's access key in the worker's environment variables
+answer: 2
+--- explain
+Least privilege: grant only the actions needed, only on the resources needed. Then even if the worker is tricked by malicious contract text (Day 12's prompt injection), or the code has a bug, it can't delete contracts or read other buckets. `s3:*` with `*` hands over all of the account's S3; "in case we need it later" is the most common excuse for granting too much; an administrator key in environment variables is not least privilege, and it leaks along with images and logs. The GCP equivalent: grant the service account `roles/storage.objectViewer` on the contracts bucket and `roles/storage.objectCreator` on the reports bucket (it can't overwrite existing reports; if a re-review has to overwrite them, grant `roles/storage.objectUser`).
+
+@@ item d26-11
+type: code
+title: Read a secret and cache it
+level: 2
+cloud: yes
+cards: Secret management: not in code, not in images
+--- context
+In production, the API key for calling the model isn't in `.env`; it lives in GCP's Secret Manager (a service made for keeping secrets), and the program needs it for every request it handles.
+--- prompt
+Write `get_secret(client, secret_id)`: read the **latest version** of a secret from GCP Secret Manager and return it as a string.
+
+- The name: `projects/clausecheck-dev/secrets/<secret_id>/versions/latest`
+- Call `client.access_secret_version(name=...)` with that name; the result's `payload.data` is **bytes**, so you need `.decode("utf-8")`
+- **Cache**: read each `secret_id` for real only once, and after that return it straight from the module-level dictionary `_CACHE` (the tests count how many API calls were made)
+- When a read fails (for example with `NotFound`), put nothing in the cache and let the error propagate
+--- starter
+from google.cloud import secretmanager
+
+PROJECT = "clausecheck-dev"
+_CACHE = {}
+
+def get_secret(client, secret_id):
+    name = f"projects/{PROJECT}/secrets/{secret_id}/versions/latest"
+    return client.access_secret_version(name=name).payload.data
+--- solution
+from google.cloud import secretmanager
+
+PROJECT = "clausecheck-dev"
+_CACHE = {}
+
+def get_secret(client, secret_id):
+    if secret_id in _CACHE:
+        return _CACHE[secret_id]
+    name = f"projects/{PROJECT}/secrets/{secret_id}/versions/latest"
+    value = client.access_secret_version(name=name).payload.data.decode("utf-8")
+    _CACHE[secret_id] = value
+    return value
+--- tests
+from google.cloud import secretmanager
+from google.api_core.exceptions import NotFound
+SM = secretmanager.SecretManagerServiceClient()
+def _reads():
+    return [c[1] for c in CLOUD.calls if c[0] == "secretmanager.access_secret_version"]
+expect("reads a string", lambda: get_secret(SM, "deepseek-api-key"), "sk-mock-0000")
+expect("the second time, no API call", lambda: (get_secret(SM, "deepseek-api-key"), len(_reads())), ("sk-mock-0000", 1))
+expect("reads the latest version", lambda: _reads()[0], "projects/clausecheck-dev/secrets/deepseek-api-key/versions/latest")
+expect_raises("secret does not exist: NotFound", lambda: get_secret(SM, "langfuse-secret-key"), NotFound)
+expect("a failed read does not go into the cache", lambda: "langfuse-secret-key" in _CACHE, False)
+--- hints
+- Check the cache first: `if secret_id in _CACHE: return _CACHE[secret_id]`.
+- `payload.data` is bytes, so you need `.decode("utf-8")`; only after a successful read do `_CACHE[secret_id] = value`, so a failed call never gets into the cache.
+
+@@ item d26-12
+type: code
+title: .env on your computer, a secret service in production
+level: 2
+cloud: yes
+cards: Secret management: not in code, not in images; Identity and credentials: who is calling
+--- context
+The same code has to run on your computer and on AWS, and the key is kept in a different place on each. When the key can't be found, the error should tell people at a glance how to add it.
+--- prompt
+On your computer Clause Check uses `DEEPSEEK_API_KEY` from `.env`; on AWS it reads the key from Secrets Manager. Write `load_api_key(sm, env)`:
+
+- If `env` (a dictionary, just like `os.environ`) has a **non-empty** `DEEPSEEK_API_KEY`: return it directly, and **don't call** Secrets Manager
+- Otherwise read the secret `clausecheck/deepseek`: `sm.get_secret_value(SecretId=...)`. `SecretString` is a JSON string, for example `'{"api_key": "sk-..."}'`; return its `api_key`
+- The secret doesn't exist (error code `ResourceNotFoundException`): `raise RuntimeError("no DeepSeek key: set DEEPSEEK_API_KEY or create secret clausecheck/deepseek")`
+- Raise any other error as it is (including `NoCredentialsError`, which isn't a `ClientError` at all)
+--- starter
+import json
+from botocore.exceptions import ClientError
+
+SECRET_ID = "clausecheck/deepseek"
+
+def load_api_key(sm, env):
+    pass
+--- solution
+import json
+from botocore.exceptions import ClientError
+
+SECRET_ID = "clausecheck/deepseek"
+
+def load_api_key(sm, env):
+    if env.get("DEEPSEEK_API_KEY"):
+        return env["DEEPSEEK_API_KEY"]
+    try:
+        resp = sm.get_secret_value(SecretId=SECRET_ID)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            raise RuntimeError("no DeepSeek key: set DEEPSEEK_API_KEY or create secret clausecheck/deepseek")
+        raise
+    return json.loads(resp["SecretString"])["api_key"]
+--- tests
+import boto3
+SMC = boto3.client("secretsmanager", region_name="eu-north-1")
+def _sm_calls():
+    return len([c for c in CLOUD.calls if c[0] == "secretsmanager.get_secret_value"])
+expect("on your computer: use the environment variable, no API call", lambda: (load_api_key(SMC, {"DEEPSEEK_API_KEY": "sk-local-1234"}), _sm_calls()), ("sk-local-1234", 0))
+expect("in production: read the JSON from Secrets Manager", lambda: load_api_key(SMC, {}), "sk-mock-0000")
+expect("an empty environment variable counts as missing", lambda: load_api_key(SMC, {"DEEPSEEK_API_KEY": ""}), "sk-mock-0000")
+def _missing():
+    del CLOUD.aws_secrets["clausecheck/deepseek"]
+    try:
+        load_api_key(SMC, {})
+    except RuntimeError as e:
+        return str(e)
+    finally:
+        CLOUD.aws_secrets["clausecheck/deepseek"] = '{"api_key": "sk-mock-0000"}'
+    return "no error raised"
+expect("secret does not exist: say clearly what to do", _missing, "no DeepSeek key: set DEEPSEEK_API_KEY or create secret clausecheck/deepseek")
+def _no_credentials():
+    CLOUD.aws_credentials = False
+    try:
+        load_api_key(SMC, {})
+    except Exception as e:
+        return type(e).__name__
+    finally:
+        CLOUD.aws_credentials = True
+    return "no error raised"
+expect("no credentials: NoCredentialsError is raised as it is", _no_credentials, "NoCredentialsError")
+--- hints
+- Step one: `if env.get("DEEPSEEK_API_KEY"): return env["DEEPSEEK_API_KEY"]` (an empty string counts as false, so it is skipped too).
+- `SecretString` is a string: `json.loads(resp["SecretString"])["api_key"]`.
+- Turn it into a RuntimeError only when `e.response["Error"]["Code"] == "ResourceNotFoundException"`; in every other case, a `raise` on its own line.
+
+@@ item d26-13
+type: testwrite
+title: Write tests for is_retryable
+level: 3
+cloud: yes
+cards: Errors and retries: retry only temporary errors
+--- context
+When the worker calls cloud services, it meets all kinds of errors: some go away if you wait a moment, others won't be fixed by a hundred retries. Get this wrong and you either waste time on pointless retries, or give up just when waiting a moment would have worked.
+--- prompt
+Retries should retry only "temporary" errors. The `is_retryable(error)` below decides whether an exception is worth retrying:
+
+- boto3's `ClientError`: look at the error code, and retry only if it is in `RETRYABLE_AWS_CODES`
+- Google's exceptions: retry only `TooManyRequests` (429), `ServiceUnavailable` (503) and `InternalServerError` (500)
+- Never retry anything else (`NotFound`, `ValueError` and the like)
+
+Write tests for it. To make a boto3 error: `ClientError({"Error": {"Code": "SlowDown", "Message": "..."}}, "PutObject")` (the second argument is the operation name); to make a Google error: `NotFound("gone")`. The starter code already has a small function that makes boto3 errors. Your tests must all pass on the correct version and catch every version with a planted bug.
+--- impl
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+--- mutants
+===== Scope: every ClientError is treated as retryable (what about NoSuchKey?)
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return True
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+===== Google: only 429 is recognized, 503 is missed
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, TooManyRequests)
+===== Error codes: S3's rate-limit code is called SlowDown
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+===== Fallback: every unknown error is retried (what about Google's NotFound?)
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return True
+--- starter
+import pytest
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import NotFound, TooManyRequests, ServiceUnavailable
+
+def aws_error(code):
+    return ClientError({"Error": {"Code": code, "Message": "test"}}, "GetObject")
+
+def test_bedrock_throttling_is_retryable():
+    assert is_retryable(aws_error("ThrottlingException")) is True
+--- solution
+import pytest
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import NotFound, TooManyRequests, ServiceUnavailable
+
+def aws_error(code):
+    return ClientError({"Error": {"Code": code, "Message": "test"}}, "GetObject")
+
+def test_bedrock_throttling_is_retryable():
+    assert is_retryable(aws_error("ThrottlingException")) is True
+
+def test_s3_slowdown_is_retryable():
+    assert is_retryable(aws_error("SlowDown")) is True
+
+def test_missing_key_is_not_retryable():
+    assert is_retryable(aws_error("NoSuchKey")) is False
+
+def test_access_denied_is_not_retryable():
+    assert is_retryable(aws_error("AccessDenied")) is False
+
+def test_google_429_and_503_are_retryable():
+    assert is_retryable(TooManyRequests("rate limit")) is True
+    assert is_retryable(ServiceUnavailable("down")) is True
+
+def test_google_not_found_is_not_retryable():
+    assert is_retryable(NotFound("gone")) is False
+
+def test_plain_bug_is_not_retryable():
+    assert is_retryable(ValueError("bad json")) is False
+--- hints
+- One `test_` for each kind of case: AWS codes that should be retried (`ThrottlingException`, `SlowDown`), AWS codes that should not (`NoSuchKey`, `AccessDenied`), Google classes that should be retried, Google classes that should not, and a plain Python exception.
+- Test both sides, "should retry" and "should not retry": if you only test the side that should retry, you won't catch the "retry everything" version.
+- Make Google exceptions straight from the class name plus a short message: `ServiceUnavailable("down")`, `NotFound("gone")`.
+
+@@ item d26-14
+type: code
+title: Exponential backoff
+level: 3
+cloud: yes
+cards: Errors and retries: retry only temporary errors
+--- context
+When the worker calls cloud services or the model, it often runs into rate limits (too many requests, so it is asked to wait a bit). This function wraps those calls so that temporary errors pass on their own and real errors show up right away.
+--- prompt
+Write `with_backoff(fn, sleep, attempts=4, base=0.5)`: call `fn()`, and when it hits a **retryable** error, wait a while and try again.
+
+- `is_retryable(error)` is already written (it is the function under test in the previous exercise)
+- After the 1st failure wait `base` seconds, after the 2nd `base * 2`, after the 3rd `base * 4`, … (exponential backoff). Wait with the `sleep(seconds)` that is passed in: the tests pass a fake function that only records the value and doesn't really sleep
+- Call `fn` at most `attempts` times in total; if the last call still fails, raise **that error** (without sleeping)
+- A non-retryable error: raise it right away, without sleeping
+- On success, return the result of `fn()`
+
+There is no random jitter here yet, to keep it easy to test (the closed-book exercise adds it). The S3 client in the tests is set to `total_max_attempts=1`: the SDK doesn't retry on its own, so every error comes straight to you.
+--- starter
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+
+def with_backoff(fn, sleep, attempts=4, base=0.5):
+    return fn()
+--- solution
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable, InternalServerError
+
+RETRYABLE_AWS_CODES = {"ThrottlingException", "SlowDown", "ServiceUnavailable", "InternalError"}
+
+def is_retryable(error):
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"] in RETRYABLE_AWS_CODES
+    return isinstance(error, (TooManyRequests, ServiceUnavailable, InternalServerError))
+
+def with_backoff(fn, sleep, attempts=4, base=0.5):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if not is_retryable(e) or attempt == attempts - 1:
+                raise
+            sleep(base * 2 ** attempt)
+--- tests
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+S3 = boto3.client("s3", region_name="eu-north-1", config=Config(retries={"total_max_attempts": 1}))
+S3.put_object(Bucket="clausecheck-reports", Key="reports/103.json", Body=b"{}")
+def run(fails, key="reports/103.json", **kw):
+    CLOUD.queue.clear()
+    CLOUD.fail_next("s3", "throttle", fails)
+    delays = []
+    try:
+        resp = with_backoff(lambda: S3.get_object(Bucket="clausecheck-reports", Key=key), delays.append, **kw)
+        return resp["Body"].read(), delays
+    except ClientError as e:
+        return e.response["Error"]["Code"], delays
+expect("succeeds the first time: no waiting", lambda: run(0), (b"{}", []))
+expect("succeeds after two rate limits: waits 0.5, 1.0", lambda: run(2), (b"{}", [0.5, 1.0]))
+expect("rate-limited every time: gives up after 4 calls, waits only 3 times", lambda: run(4), ("SlowDown", [0.5, 1.0, 2.0]))
+expect("NoSuchKey: gives up right away, no waiting", lambda: run(0, key="reports/999.json"), ("NoSuchKey", []))
+expect("attempts and base can be changed", lambda: run(9, attempts=2, base=1), ("SlowDown", [1]))
+--- hints
+- The skeleton: `for attempt in range(attempts):`, with `try: return fn()` inside.
+- `except Exception as e:`: `if not is_retryable(e) or attempt == attempts - 1: raise` (a bare `raise` raises the original error again); otherwise `sleep(base * 2 ** attempt)`.
+
+@@ item d26-15
+type: choice
+title: Where a Swedish customer's contracts go
+level: 1
+cards: Data residency: contracts stay in the EU; What the cloud is: rented computers, pay as you go
+--- context
+Nordlys AB is the Swedish customer in the sample database (the `customers` table from Day 22). When Clause Check moves to the cloud, the first step is deciding which region (where the data center is) the data goes in.
+--- prompt
+Nordlys AB, a law firm in Stockholm, wants to use Clause Check. Their contracts contain the names and contact details of their employees and clients, and the contract they signed with us says "Customer Data is stored and processed within the EU/EEA". How do you choose the regions for the bucket that stores the contracts and for the model used in the review?
+--- options
+- `us-east-1` / `us-central1`: cheapest, new features launch there first, and the data is encrypted anyway
+- Put the bucket in an EU region (AWS `eu-north-1` Stockholm, or GCP `europe-north1` Finland), and also choose an EU region or an EU-wide endpoint for the model calls; logs and backups stay in the EU too
+- Putting the bucket in the EU is enough; the model doesn't keep any data, so it doesn't matter where inference runs
+- Choose the region closest to the developers, so debugging is fastest
+answer: 2
+--- explain
+Data residency is about where data is **stored and processed**: buckets, databases, logs, backups, and also sending contract text to a model for inference, all of which counts as "processing". Encryption at rest is on by default on both clouds, but encryption doesn't change which country the data is in or which country's laws apply to it. This is exactly what playbook rule PB-03 asks for when it reviews customer contracts, and Clause Check has to meet it itself too. Tomorrow you'll see that Vertex AI lets you choose a region, and that Bedrock has inference profiles that route only between EU regions (their IDs start with `eu.`).
+
+@@ item d26-16
+type: fill
+title: Fill in: the paginator
+level: 2
+cloud: yes
+cards: Object storage: buckets, keys, and bytes; Cost and the command line
+--- context
+Operations wants to know how much storage space one customer's contracts take up in total, to estimate the monthly storage cost. There are too many files to list in one go: it takes several pages.
+--- prompt
+boto3's **paginator** handles `ContinuationToken` for you: `for page in paginator.paginate(...)` gives you one page of the response at a time. Use it to count the objects under a prefix and add up their total bytes. `PageSize` is set to 2 so that even the small test data is split into several pages. Fill in the blanks.
+--- template
+def prefix_size(s3, bucket, prefix):
+    paginator = s3.[[get_paginator]]("list_objects_v2")
+    total = 0
+    count = 0
+    for page in paginator.[[paginate]](Bucket=bucket, Prefix=prefix, PaginationConfig={"PageSize": 2}):
+        for obj in page.[[get]]("Contents", []):
+            total += obj["[[Size]]"]
+            count += 1
+    return {"objects": count, "bytes": total}
+--- tests
+import boto3
+S3 = boto3.client("s3", region_name="eu-north-1")
+for i, n in enumerate([100, 250, 50, 600, 1]):
+    S3.put_object(Bucket="clausecheck-contracts", Key=f"contracts/1/{101 + i}/original.pdf", Body=b"x" * n)
+def _pages(fn):
+    count = lambda: len([c for c in CLOUD.calls if c[0] == "s3.list_objects_v2"])
+    before = count()
+    out = fn()
+    return out, count() - before
+expect("5 objects, fetched in 3 pages", lambda: _pages(lambda: prefix_size(S3, "clausecheck-contracts", "contracts/1/")), ({"objects": 5, "bytes": 1001}, 3))
+expect("no match", lambda: prefix_size(S3, "clausecheck-contracts", "contracts/9/"), {"objects": 0, "bytes": 0})
+--- hints
+- Get the paginator from the client: `s3.get_paginator("list_objects_v2")`; `paginate(...)` takes the same arguments as `list_objects_v2`.
+- An empty page has no `Contents` key, so use the dictionary's `get` with the default `[]`; each object's size in bytes is in `obj["Size"]`.
+
+@@ item d26-17
+type: order
+title: Put the code in order: save it, then read it back
+level: 2
+cloud: yes
+cards: Object storage: buckets, keys, and bytes
+--- context
+Reading a report back right after writing it to S3 is a common safety habit in the first weeks after launch: problems where the content changes on the way in (encoding, type) are found early.
+--- prompt
+Put `save_and_check(report)` in order: save the report to S3, read it back, and return the dictionary you read back (to confirm that what was stored is right). There are two distractor lines.
+--- lines
+import json
+import boto3
+s3 = boto3.client("s3", region_name="eu-north-1")
+def save_and_check(report):
+    body = json.dumps(report).encode("utf-8")
+    s3.put_object(Bucket="clausecheck-reports", Key="reports/latest.json", Body=body, ContentType="application/json")
+    resp = s3.get_object(Bucket="clausecheck-reports", Key="reports/latest.json")
+    back = json.loads(resp["Body"].read().decode("utf-8"))
+    return back
+--- distractors
+    s3.put_object("clausecheck-reports", "reports/latest.json", body)
+    back = json.loads(resp["Body"].decode("utf-8"))
+--- tests
+R = {"contract_id": 103, "counts": {"redline": 2, "flag": 1}}
+expect("reads back the same", lambda: save_and_check(R), R)
+expect("stored as application/json", lambda: CLOUD.s3["clausecheck-reports"]["reports/latest.json"]["ContentType"], "application/json")
+--- hints
+- The order: imports → create the client → def → encode → write → read → parse → return.
+- One distractor uses positional arguments (boto3 accepts only keyword arguments and raises `TypeError`); the other forgets to `.read()` first (`Body` is a stream, not bytes).
+
+@@ item d26-18
+type: code
+title: A presigned download link
+level: 3
+cloud: yes
+cards: IAM: grant only what is needed; Object storage: buckets, keys, and bytes
+--- context
+Review reports live in a private S3 bucket that only programs with permission can read. When a lawyer clicks "Download report" on the web page, there has to be a way to give them this one file without opening a cloud account for them.
+--- prompt
+A lawyer wants to download a report, but we don't want to make the bucket public, and we don't want to open an AWS account for the lawyer. The common approach is a **presigned URL**: the worker signs a link locally with its own credentials, the link has an expiry time, and whoever has the link can download this one object until it expires. (Uploads can work the same way: give the browser a presigned URL for `put_object`, and the contract goes straight into the bucket without passing through your server.)
+
+Write `share_link(s3, bucket, key, minutes)`:
+
+- `minutes` less than 1, or more than 7 days (`7 * 24 * 60` minutes, the SDK's signing limit): `raise ValueError("minutes must be between 1 and 10080")`
+- When it generates the link, the SDK does **not** check whether the object exists (it sends no request at all), so call `head_object` first: if the object doesn't exist, `raise FileNotFoundError(key)`. Note that a HEAD response has no body, so the error code is just the string `"404"`, not `NoSuchKey`; raise any other error as it is
+- Return `s3.generate_presigned_url("get_object", Params={"Bucket": ..., "Key": ...}, ExpiresIn=seconds)`
+
+A presigned URL is like a temporary key: anyone who gets it can use it. So keep the expiry as short as you can, and don't write the link to the logs. Also, the link carries the signer's credentials: a link signed somewhere that uses a role's **temporary credentials**, such as Lambda or ECS, stops working when those credentials expire (usually after only a few hours), so even if you ask for 7 days, it won't last 7 days.
+--- starter
+from botocore.exceptions import ClientError
+
+def share_link(s3, bucket, key, minutes):
+    return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key})
+--- solution
+from botocore.exceptions import ClientError
+
+MAX_MINUTES = 7 * 24 * 60
+
+def share_link(s3, bucket, key, minutes):
+    if minutes < 1 or minutes > MAX_MINUTES:
+        raise ValueError(f"minutes must be between 1 and {MAX_MINUTES}")
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            raise FileNotFoundError(key)
+        raise
+    return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=minutes * 60)
+--- tests
+import boto3
+S3 = boto3.client("s3", region_name="eu-north-1")
+S3.put_object(Bucket="clausecheck-reports", Key="reports/103.json", Body=b"{}")
+link = lambda minutes, key="reports/103.json": share_link(S3, "clausecheck-reports", key, minutes)
+expect_true("15 minutes: X-Amz-Expires=900", lambda: "X-Amz-Expires=900" in link(15))
+expect_true("the link points to this object", lambda: link(15).startswith("https://clausecheck-reports.s3.eu-north-1.amazonaws.com/reports/103.json?"))
+expect_raises("object does not exist: FileNotFoundError", lambda: link(15, "reports/999.json"), FileNotFoundError)
+expect_true("exactly 7 days is allowed", lambda: "X-Amz-Expires=604800" in link(7 * 24 * 60))
+expect_raises("more than 7 days: ValueError", lambda: link(7 * 24 * 60 + 1), ValueError)
+expect_raises("0 minutes: ValueError", lambda: link(0), ValueError)
+--- hints
+- Three steps: check `minutes` → `head_object` to confirm the object exists → generate the link. `ExpiresIn` is in **seconds**: `minutes * 60`.
+- `try: s3.head_object(Bucket=bucket, Key=key)`; in `except ClientError as e:`, if `e.response["Error"]["Code"] == "404"`, `raise FileNotFoundError(key)`, otherwise `raise`.
+
+@@ item d26-19
+type: local
+title: Local task (optional): install the real SDKs
+level: 1
+cards: Identity and credentials: who is calling; Cost and the command line
+--- context
+The cloud SDKs used so far (the official Python packages) were all simulated. In this exercise you install the real boto3 and google-cloud-storage on your own computer and see how they behave without a cloud account.
+--- prompt
+Install the real SDKs on your computer, and on the way see with your own eyes that "credentials are checked only at the first call". You need no cloud account, and it costs nothing. Run these one line at a time in PowerShell:
+
+```
+python -m pip install boto3 google-cloud-storage
+python -m pip show boto3 google-cloud-storage
+python -c "import boto3; s3 = boto3.client('s3', region_name='eu-north-1'); print('client ok'); s3.list_objects_v2(Bucket='clausecheck-contracts')"
+```
+
+The third one first prints `client ok`, then fails, and the last line of the error is `botocore.exceptions.NoCredentialsError: Unable to locate credentials`: your computer has no AWS credentials, and the SDK went all the way along the credential chain without finding any. (If you have set up an AWS account before, you may see an error such as AccessDenied instead: that means the request really went out, and that's fine too.)
+
+Then look at the `Requires:` line in the output of `pip show boto3`: which packages does boto3 depend on? Today's `ClientError` comes from one of them.
+
+Paste the terminal output (starting from `pip show`) below.
+placeholder: Paste the terminal output: you should see Name: boto3, Name: google-cloud-storage and client ok
+verify: ^(?=[\s\S]*Name: boto3)(?=[\s\S]*Name: google-cloud-storage)(?=[\s\S]*client ok)
+--- hints
+- Use `python -m pip` rather than plain `pip`: that makes sure the packages go into the same Python that runs when you type `python`.
+- The error from the third command is the expected result; don't fix it. The `botocore` under `Requires:` is the package where `ClientError` and `Config` live.
+
+@@ item d26-e1
+type: scratch
+title: Closed book: archive a customer's contracts
+exam: yes
+level: 3
+cloud: yes
+cards: Object storage: buckets, keys, and bytes; Cost and the command line
+--- context
+After a customer ends their contract with us, their contracts can't be deleted right away (they may still be needed later), but they shouldn't stay in the bucket that is used every day either. Move them to a separate archive bucket, which can later be switched to cheaper cold storage.
+--- prompt
+Write `archive_contracts(s3, customer_id, page_size=1000)`: move all of a customer's contracts from the bucket `clausecheck-contracts` to the archive bucket `clausecheck-archive` (the tests have already created it).
+
+- Move every object whose key starts with `contracts/<customer_id>/` (careful: `contracts/1/` does not include `contracts/12/`)
+- When listing, pass `MaxKeys=page_size` on every `list_objects_v2` call and handle pagination (`IsTruncated` / `NextContinuationToken` → `ContinuationToken`; don't pass `ContinuationToken` on the first call, because passing `None` raises `ParamValidationError`); when nothing matches, the response has no `Contents`
+- **First list all the keys, then move them one by one**: `get_object` to read the bytes and the `ContentType`, `put_object` to the archive bucket with the same key and the same `ContentType`, then `delete_object` to delete the original
+- Return the list of moved keys (in the order they were listed)
+
+Every boto3 argument is passed by keyword. (A real project would use `copy_object` to copy inside S3 without downloading and uploading again; this page's simulation doesn't have it, so here you use get + put.)
+--- solution
+def archive_contracts(s3, customer_id, page_size=1000):
+    src, dst = "clausecheck-contracts", "clausecheck-archive"
+    kwargs = {"Bucket": src, "Prefix": f"contracts/{customer_id}/", "MaxKeys": page_size}
+    keys = []
+    while True:
+        resp = s3.list_objects_v2(**kwargs)
+        keys += [obj["Key"] for obj in resp.get("Contents", [])]
+        if not resp.get("IsTruncated"):
+            break
+        kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+    for key in keys:
+        obj = s3.get_object(Bucket=src, Key=key)
+        s3.put_object(Bucket=dst, Key=key, Body=obj["Body"].read(), ContentType=obj["ContentType"])
+        s3.delete_object(Bucket=src, Key=key)
+    return keys
+--- tests
+import boto3
+from botocore.exceptions import ParamValidationError
+class StrictS3:
+    """Like real botocore: a parameter is either left out or has the right type; None is rejected."""
+    def __init__(self, s3):
+        self._s3 = s3
+    def list_objects_v2(self, **kwargs):
+        for k, v in kwargs.items():
+            if v is None:
+                raise ParamValidationError(report=f"Invalid type for parameter {k}, value: None, type: <class 'NoneType'>, valid types: <class 'str'>")
+        return self._s3.list_objects_v2(**kwargs)
+    def __getattr__(self, name):
+        return getattr(self._s3, name)
+S3 = StrictS3(boto3.client("s3", region_name="eu-north-1"))
+S3.create_bucket(Bucket="clausecheck-archive", CreateBucketConfiguration={"LocationConstraint": "eu-north-1"})
+for cid in (101, 102, 110, 111, 112):
+    S3.put_object(Bucket="clausecheck-contracts", Key=f"contracts/1/{cid}/original.pdf", Body=f"pdf {cid}".encode(), ContentType="application/pdf")
+S3.put_object(Bucket="clausecheck-contracts", Key="contracts/12/120/original.txt", Body=b"another customer", ContentType="text/plain")
+MOVED = [f"contracts/1/{c}/original.pdf" for c in (101, 102, 110, 111, 112)]
+expect("moves 5 contracts (2 per page)", lambda: archive_contracts(S3, 1, page_size=2), MOVED)
+expect("in the archive bucket, with content and type", lambda: (CLOUD.s3["clausecheck-archive"]["contracts/1/110/original.pdf"]["Body"], CLOUD.s3["clausecheck-archive"]["contracts/1/110/original.pdf"]["ContentType"]), (b"pdf 110", "application/pdf"))
+expect("the original bucket has only customer 12's contract left", lambda: sorted(CLOUD.s3["clausecheck-contracts"]), ["contracts/12/120/original.txt"])
+expect("a customer with no contracts: []", lambda: archive_contracts(S3, 6), [])
+
+@@ item d26-e2
+type: scratch
+title: Closed book: add a note to a report
+exam: yes
+level: 3
+cloud: yes
+cards: Object storage: buckets, keys, and bytes; Errors and retries: retry only temporary errors
+--- context
+Lawyers add notes to review reports on the web page, and every note has to be written back into the report in GCS. When the network is unreliable, the same request may be sent twice.
+--- prompt
+Lawyers can add notes to review reports. Write `add_note(client, contract_id, note)` (`client` is `storage.Client()`):
+
+- The report is at `reports/<contract_id>.json` in the GCS bucket `clausecheck-reports`
+- Read the report (`download_as_text` + `json.loads`); when the object doesn't exist (`google.api_core.exceptions.NotFound`), start from `{"contract_id": contract_id, "notes": []}`
+- When the report has no `"notes"` key, treat it as an empty list
+- Add `note` to the end of `notes`; **if the same note is already there, don't add it again** (so when a request is retried, you don't end up with two identical notes)
+- Write it back to the same object: `json.dumps(report, ensure_ascii=False)`, `content_type="application/json"`
+- Return the report dictionary that was written back
+--- solution
+import json
+from google.api_core.exceptions import NotFound
+
+def add_note(client, contract_id, note):
+    blob = client.bucket("clausecheck-reports").blob(f"reports/{contract_id}.json")
+    try:
+        report = json.loads(blob.download_as_text())
+    except NotFound:
+        report = {"contract_id": contract_id, "notes": []}
+    notes = report.setdefault("notes", [])
+    if note not in notes:
+        notes.append(note)
+    blob.upload_from_string(json.dumps(report, ensure_ascii=False), content_type="application/json")
+    return report
+--- tests
+import json
+from google.cloud import storage
+C = storage.Client()
+C.bucket("clausecheck-reports").blob("reports/103.json").upload_from_string(json.dumps({"contract_id": 103, "counts": {"redline": 2}}), content_type="application/json")
+expect("existing report: notes added", lambda: add_note(C, 103, "8.1: ask for a mutual cap"), {"contract_id": 103, "counts": {"redline": 2}, "notes": ["8.1: ask for a mutual cap"]})
+expect("the same note retried: no duplicate", lambda: add_note(C, 103, "8.1: ask for a mutual cap")["notes"], ["8.1: ask for a mutual cap"])
+expect("written back, and the type is JSON", lambda: (json.loads(CLOUD.gcs["clausecheck-reports"]["reports/103.json"]["data"])["notes"], CLOUD.gcs["clausecheck-reports"]["reports/103.json"]["content_type"]), (["8.1: ask for a mutual cap"], "application/json"))
+expect("no report yet: created, ö saved as it is", lambda: (add_note(C, 104, "Kontakt: Åsa i Malmö"), "Malmö" in CLOUD.gcs["clausecheck-reports"]["reports/104.json"]["data"].decode("utf-8")), ({"contract_id": 104, "notes": ["Kontakt: Åsa i Malmö"]}, True))
+
+@@ item d26-e3
+type: scratch
+title: Closed book: retry with jitter
+exam: yes
+level: 3
+cloud: yes
+cards: Errors and retries: retry only temporary errors
+--- context
+When many workers get rate-limited at the same time and all wait exactly as long before retrying, they all crash into the limit again at the same instant. If each worker's wait is a little random, the retries spread out.
+--- prompt
+Write `call_with_retry(fn, sleep, rand, attempts=5, base=0.2, cap=2.0)`:
+
+- Call `fn()`, and return its result on success
+- On failure, first decide whether it can be retried: a `botocore.exceptions.ClientError` whose error code is in `{"ThrottlingException", "SlowDown", "ServiceUnavailable"}`; or `TooManyRequests` or `ServiceUnavailable` from `google.api_core.exceptions`. Raise an error that can't be retried right away
+- After failure number `i` (counting `i` from 0), wait `min(cap, base * 2 ** i) * rand()` seconds (exponential backoff + a cap + random jitter). `sleep(seconds)` and `rand()` (which returns a number between 0 and 1) are both passed in
+- Call `fn` at most `attempts` times in total; when the last call fails, raise that error without waiting
+--- solution
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, ServiceUnavailable
+
+AWS_RETRYABLE = {"ThrottlingException", "SlowDown", "ServiceUnavailable"}
+
+def _retryable(e):
+    if isinstance(e, ClientError):
+        return e.response["Error"]["Code"] in AWS_RETRYABLE
+    return isinstance(e, (TooManyRequests, ServiceUnavailable))
+
+def call_with_retry(fn, sleep, rand, attempts=5, base=0.2, cap=2.0):
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if not _retryable(e) or i == attempts - 1:
+                raise
+            sleep(min(cap, base * 2 ** i) * rand())
+--- tests
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import TooManyRequests, NotFound
+def aws(code):
+    return ClientError({"Error": {"Code": code, "Message": "test"}}, "Converse")
+def run(errors, **kw):
+    queue = list(errors)
+    calls = []
+    def fn():
+        calls.append(1)
+        if queue:
+            raise queue.pop(0)
+        return "ok"
+    delays = []
+    try:
+        out = call_with_retry(fn, delays.append, lambda: 0.5, **kw)
+    except Exception as e:
+        out = type(e).__name__
+    return out, len(calls), delays
+expect("succeeds after three temporary errors", lambda: run([aws("ThrottlingException"), TooManyRequests("x"), aws("SlowDown")]), ("ok", 4, [0.1, 0.2, 0.4]))
+expect("the cap works", lambda: run([aws("SlowDown")] * 9, attempts=6, base=1, cap=2.0), ("ClientError", 6, [0.5, 1.0, 1.0, 1.0, 1.0]))
+expect("attempts used up: the last error is raised", lambda: run([aws("ThrottlingException")] * 9, attempts=3)[:2], ("ClientError", 3))
+expect("NotFound is not retried", lambda: run([NotFound("gone")]), ("NotFound", 1, []))

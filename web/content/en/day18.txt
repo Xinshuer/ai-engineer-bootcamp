@@ -1,0 +1,1628 @@
+@@ day 18
+title: Workflows and state machines: nodes, routing, checkpoints, interrupt and resume
+lang: ts
+hours: 5 hours
+--- goal
+Hand-write a tiny "graph runner": nodes, edges, conditional routing, shared state, a step limit. Then add checkpoints (saved as JSON, so a crashed run can keep going), an interrupt that waits for a person to approve before it continues, and a parallel review with a concurrency limit. This is the core of LangGraph (`clausecheck/graph.py`) and of Mastra workflows. Once you have written it yourself, framework code is no longer a black box.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, change the examples and run them
+- Pass every practice exercise
+- The 3 closed-book challenges
+- Open `clausecheck/graph.py` and match `add_node`, `add_conditional_edges`, `interrupt`, `Command(resume=...)` and `SqliteSaver` each to the function you wrote today
+
+@@ concept
+title: Workflow vs agent
+--- body
+Yesterday's agent let **the model decide** what to do next. Today's workflow lets **the code decide**: the steps and their order are written in advance.
+
+Clause Check uses both, with a clear split. The comment at the top of `review.py` says: "The outer pipeline is a fixed workflow; *this* node is a small bounded agent". The outer steps `load → review → summarise → (approve) → export` always run in this order, so they are a workflow. Only "while reviewing this clause, should I go and read clause 12?" depends on the content, so only that is handed to an agent.
+
+Rule of thumb: **if you know the steps in advance, write a workflow**. It is cheaper, more predictable and easier to test.
+
+So why not just call a few functions in order? Why build a "graph"? The comments in `graph.py` answer that: the first need that really calls for a framework is "pause for a person to approve, then continue hours later from another process". Today you build up to that step by step.
+--- code
+const load = (text: string): string[] => text.split("\n");
+const review = (clauses: string[]): string[] =>
+  clauses.filter((c) => c.includes("unlimited")).map((c) => c.split(" ")[0]);
+const summarise = (clauses: string[], redlines: string[]): string =>
+  `${clauses.length} clauses, ${redlines.length} redline(s)`;
+
+const text = "3.1 Fees are payable within thirty days.\n8.1 Liability shall be unlimited.\n12 Governing law is Sweden.";
+const clauses = load(text);
+const redlines = review(clauses);
+console.log(summarise(clauses, redlines));
+console.log(redlines.length > 0 ? "next: approve" : "next: export");
+
+@@ concept
+title: State: one object passed from start to end
+--- body
+All the nodes in a graph share **one state object**. Each node reads the state and returns **only the fields it changed**; the runner merges them in:
+
+```ts
+type Node = (s: State) => Partial<State>;   // Partial: Day 15
+state = { ...state, ...node(state) };       // later values overwrite earlier ones
+```
+
+That is exactly how `graph.py` works: `summarise_node` returns only `{"summary": ...}`, and `approve` returns only `{"approved": ...}`.
+
+**The classic mistake: changing `s` directly inside a node** (for example `s.redlines.push(...)`). The old state is quietly changed, so the "earlier state" you see in checkpoints, tests and debugging can no longer be trusted. A node only reads `s` and returns new values.
+--- code
+type State = { text: string; clauses: string[]; redlines: string[] };
+
+const load = (s: State): Partial<State> => ({ clauses: s.text.split("\n") });
+const review = (s: State): Partial<State> => ({
+  redlines: s.clauses.filter((c) => c.includes("unlimited")).map((c) => c.split(" ")[0]),
+});
+
+let state: State = { text: "3.1 Fees within 30 days.\n8.1 Liability is unlimited.", clauses: [], redlines: [] };
+const before = state;
+state = { ...state, ...load(state) };
+console.log(state.clauses.length);
+state = { ...state, ...review(state) };
+console.log(state.redlines);
+console.log(before.clauses.length, before === state);
+
+@@ concept
+title: Edges and conditional routing
+--- body
+Nodes are connected by **edges**. An edge is either the fixed name of the next node, or a **routing function** that reads the state and returns the name of the next node. `"END"` means stop.
+
+```ts
+type Edge = string | ((s: State) => string);
+const edges: Record<string, Edge> = {
+  summarise: (s) => (s.redlines.length > 0 ? "approve" : "export"),
+  export: "END",
+};
+```
+
+The runner tells the two kinds of edge apart with `typeof edge === "function"` (type narrowing from Day 15). The `route` in `graph.py` is exactly the same: if there is a redline, go to `approve`; otherwise go straight to `export`.
+
+A routing function only looks at the state and never calls the model, so it is deterministic and can be tested on its own.
+--- code
+type State = { redlines: string[] };
+type Edge = string | ((s: State) => string);
+
+const edges: Record<string, Edge> = {
+  load: "review",
+  review: "summarise",
+  summarise: (s) => (s.redlines.length > 0 ? "approve" : "export"),
+  approve: "export",
+  export: "END",
+};
+
+function nextNode(node: string, state: State): string {
+  const edge = edges[node];
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+console.log(nextNode("load", { redlines: [] }));
+console.log(nextNode("summarise", { redlines: ["8.1"] }));
+console.log(nextNode("summarise", { redlines: [] }));
+console.log(nextNode("export", { redlines: [] }));
+
+@@ concept
+title: The runner: from start to END
+--- body
+The runner is just a loop:
+
+1. Keep going while the current node is not `"END"`
+2. Find the node function (if it is missing, throw: usually a name in the edges is misspelled)
+3. Run it, merge the state, and record the node name in `path`
+4. Work out the next node from the edge
+
+A graph can have **cycles** (for example "validation failed, go back and review again"), so, just like an agent, it needs a **step limit**. Past the limit it throws, and the error message includes the path taken, so when debugging you see at a glance where it goes in circles. In LangGraph this is `recursion_limit`.
+--- code
+type State = { text: string; redlines: string[]; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function runGraph(graph: Graph, state: State, start: string, maxSteps = 10): { state: State; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    if (path.length >= maxSteps) throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    const node = graph.nodes[current];
+    if (!node) throw new Error(`unknown node: ${current}`);
+    state = { ...state, ...node(state) };
+    path.push(current);
+    const edge = graph.edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { state, path };
+}
+
+const graph: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve: () => ({}),
+    export: (s) => ({ exported: `${s.redlines.length} redline(s)` }),
+  },
+  edges: {
+    review: (s) => (s.redlines.length > 0 ? "approve" : "export"),
+    approve: "export",
+    export: "END",
+  },
+};
+
+const r1 = runGraph(graph, { text: "8.1 Liability is unlimited.\n3.1 Fees within 30 days.", redlines: [], exported: "" }, "review");
+console.log(r1.path.join(" -> "), "|", r1.state.exported);
+const r2 = runGraph(graph, { text: "3.1 Fees within 30 days.", redlines: [], exported: "" }, "review");
+console.log(r2.path.join(" -> "), "|", r2.state.exported);
+try {
+  const broken: Graph = { nodes: graph.nodes, edges: { ...graph.edges, export: "review" } };
+  runGraph(broken, { text: "3.1 Fees.", redlines: [], exported: "" }, "review", 5);
+} catch (e) {
+  console.log(e instanceof Error ? e.message : e);
+}
+
+@@ concept
+title: Checkpoints: keep going after a crash
+--- body
+After each node finishes, save `{ next: <the next node>, state }` as JSON. If the program crashes, read the last checkpoint and continue from `next`; the nodes that already finished **don't run again**. Reviewing 30 clauses takes 30 model calls. If the disk fills up during export, you certainly don't want to pay for all of them again.
+
+There are two more reasons: you may have to **wait a long time** (the lawyer approves tomorrow), and you may **continue in another process** (it starts on the command line and finishes in the web backend). `graph.py` uses `SqliteSaver` to store checkpoints in SQLite, with a `thread_id` to tell the runs apart.
+
+**Requirement: the state must be plain JSON data**: strings, numbers, booleans, null, arrays, plain objects. A `Map`, `Set`, `Date`, class instance or `undefined` comes back changed after you save it and read it again. That is why the state in `graph.py` holds the dictionary from `contract.model_dump()`, and a node that needs it turns it back into an object with `Contract.model_validate(...)`.
+--- code
+type State = { clauses: string[]; verdicts: string[]; exported: string };
+let modelCalls = 0;
+let diskFull = true;
+
+const nodes: Record<string, (s: State) => Partial<State>> = {
+  review: (s) => {
+    modelCalls += s.clauses.length;
+    return { verdicts: s.clauses.map((c) => (c.includes("unlimited") ? "redline" : "accept")) };
+  },
+  export: (s) => {
+    if (diskFull) throw new Error("disk full");
+    return { exported: s.verdicts.join(",") };
+  },
+};
+const edges: Record<string, string> = { review: "export", export: "END" };
+
+function run(state: State, start: string, save: (text: string) => void): State {
+  let current = start;
+  while (current !== "END") {
+    state = { ...state, ...nodes[current](state) };
+    current = edges[current];
+    save(JSON.stringify({ next: current, state }));
+  }
+  return state;
+}
+
+let saved = "";
+try {
+  run({ clauses: ["8.1 unlimited", "3.1 fees"], verdicts: [], exported: "" }, "review", (t) => { saved = t; });
+} catch (e) {
+  console.log("crashed:", e instanceof Error ? e.message : e);
+}
+console.log("checkpoint:", saved);
+
+diskFull = false;
+const cp = JSON.parse(saved);
+const final = run(cp.state, cp.next, (t) => { saved = t; });
+console.log("exported:", final.exported, "| model calls:", modelCalls);
+
+@@ concept
+title: Interrupt and resume: stop and wait for a person
+--- body
+A node that needs a person's decision (for example "apply these redlines to the exported file?") returns an `interrupt` field while no decision has been made yet:
+
+```ts
+type Update = Partial<State> & { interrupt?: string };
+approve: (s) => (s.approved === null ? { interrupt: "Apply 2 redline(s)?" } : {}),
+```
+
+When the runner sees `interrupt`, it stops and returns the question and a checkpoint. **`next` records the current node** (`approve`), and then the program can simply exit. Once the lawyer replies, write the decision into the state (`approved: true`) and continue from the checkpoint: `approve` runs again, sees the decision this time and lets it through, and `export` does what was decided.
+
+In `graph.py` this is `decision = interrupt({...})`, followed later by `Command(resume=True)` to continue. LangGraph also runs the `approve` node again from the start. One sentence in the comments matters a lot: "The approved decision is executed by code - the model does not get to re-decide".
+--- code
+type State = { redlines: string[]; approved: boolean | null; exported: string };
+type Update = Partial<State> & { interrupt?: string };
+
+const nodes: Record<string, (s: State) => Update> = {
+  approve: (s) => (s.approved === null ? { interrupt: `Apply ${s.redlines.length} redline(s)?` } : {}),
+  export: (s) => ({ exported: s.approved ? "with redlines" : "without redlines" }),
+};
+const edges: Record<string, string> = { approve: "export", export: "END" };
+
+function run(state: State, start: string): string {
+  let current = start;
+  while (current !== "END") {
+    const out = nodes[current](state);
+    if (out.interrupt) {
+      console.log("paused:", out.interrupt);
+      return JSON.stringify({ next: current, state });
+    }
+    state = { ...state, ...out };
+    current = edges[current];
+  }
+  console.log("done:", state.exported);
+  return "";
+}
+
+const checkpoint = run({ redlines: ["8.1", "12"], approved: null, exported: "" }, "approve");
+console.log("saved:", checkpoint);
+// hours later, maybe in another process: the lawyer clicks "approve"
+const cp = JSON.parse(checkpoint);
+run({ ...cp.state, approved: true }, cp.next);
+
+@@ concept
+title: Parallelism: Promise.all and a concurrency limit
+--- body
+Reviewing 300 clauses one by one is too slow. `Promise.all(items.map(fn))` runs them at the same time, and **the results come back in input order** (no matter which finishes first).
+
+But send all 300 requests at once and you may hit the provider's rate limit and get a 429. (DeepSeek counts how many requests your whole account has running at the same time; OpenAI counts requests and tokens per minute; each provider's docs give the actual limits.) So you **limit concurrency**. The simplest way is batches: run N at a time, and start the next batch only when the whole batch has finished:
+
+```ts
+for (let i = 0; i < items.length; i += limit) {
+  const batch = items.slice(i, i + limit);
+  results.push(...(await Promise.all(batch.map(fn))));
+}
+```
+
+`clausecheck/pipeline.py` currently reviews clauses one at a time, in order; this is how you would change it to go faster. The classic mistake: calling `results.push(...)` as each task finishes. Then the order is "whoever finishes first comes first".
+--- code
+// a few awaits simulate "reviewing takes time"; different clauses take different amounts of time
+async function takeTime(n: number): Promise<void> {
+  for (let i = 0; i < n; i++) await null;
+}
+let active = 0;
+let maxActive = 0;
+const finished: string[] = [];
+
+async function review(id: string, cost: number): Promise<string> {
+  active += 1;
+  maxActive = Math.max(maxActive, active);
+  await takeTime(cost);
+  active -= 1;
+  finished.push(id);
+  return `${id}:done`;
+}
+
+async function main() {
+  const jobs = [["8.1", 30], ["3.1", 5], ["12", 15], ["4.2", 10]] as const;
+  const all = await Promise.all(jobs.map(([id, cost]) => review(id, cost)));
+  console.log("finished in order:", finished.join(" "));
+  console.log("results:", all.join(" "), "| max at once:", maxActive);
+
+  maxActive = 0;
+  const out: string[] = [];
+  for (let i = 0; i < jobs.length; i += 2) {
+    const batch = jobs.slice(i, i + 2);
+    out.push(...(await Promise.all(batch.map(([id, cost]) => review(id, cost)))));
+  }
+  console.log("batches of 2:", out.join(" "), "| max at once:", maxActive);
+}
+main();
+
+@@ concept
+title: Framework comparison: LangGraph and Mastra workflows
+--- body
+Every part you wrote today can be found in `graph.py` (LangGraph, Python):
+
+- `StateGraph(State)`: `State` is a TypedDict, i.e. your state type
+- `g.add_node("review", review)`: your `nodes` table
+- `g.add_edge("load", "review")`, `g.add_edge(START, "load")`: fixed edges and the starting point
+- `g.add_conditional_edges("summarise", route)`: your routing-function edges
+- `g.compile(checkpointer=saver)` + `thread_id`: save a checkpoint after every step
+- `interrupt(...)` and `Command(resume=...)`: your `interrupt` field and resuming
+
+Mastra workflows use the same ideas (a sketch; check the mastra.ai docs for the exact syntax): `createStep` defines a step (its input and output are described with Zod too), `createWorkflow(...)` chains steps with `.then()`, there are also branches and parallel steps, and it ends with `.commit()`. A step can suspend and later resume to continue.
+
+In an interview: "I have hand-written a graph runner, checkpoints, and interrupt and resume, so to me the LangGraph and Mastra APIs are just new names."
+--- code
+const parts = [
+  { mine: "nodes: Record<string, Node>", langgraph: "g.add_node(name, fn)" },
+  { mine: "edges: fixed string", langgraph: "g.add_edge(a, b)" },
+  { mine: "edges: route function", langgraph: "g.add_conditional_edges(a, route)" },
+  { mine: "save({ next, state })", langgraph: "compile(checkpointer=SqliteSaver)" },
+  { mine: "return { interrupt }", langgraph: "interrupt(payload)" },
+  { mine: "resume(cp, decision)", langgraph: "invoke(Command(resume=...))" },
+];
+for (const p of parts) {
+  console.log(`${p.mine.padEnd(28)} ${p.langgraph}`);
+}
+
+@@ item d18-01
+type: predict
+title: Recap: object spread
+level: 1
+cards: State: one object passed from start to end; d15:Utility types: derive one type from another
+--- context
+In today's graph runner, each node hands back only the fields it changed, and the runner merges them into the whole state. The merging is all done with object spread, so first get its rules clear.
+--- prompt
+A recap of the object spread `...` from Days 5 and 15. The runner relies on it to merge state. Write the output.
+--- code
+type Review = { id: string; verdict: string; risk?: string };
+
+const base: Review = { id: "8.1", verdict: "accept", risk: "low" };
+const update: Partial<Review> = { verdict: "flag" };
+const a = { ...base, ...update };
+const b = { ...update, ...base };
+const c = { ...base, risk: undefined };
+console.log(a.verdict, b.verdict);
+console.log(c);
+console.log(base.verdict);
+--- explain
+When spreading, **later values overwrite earlier ones**, so `a` is flag, while in `b` the `base` comes last and sets it back to accept. An `undefined` you write out explicitly also overwrites the old value: a node should not return fields it didn't change, and certainly not return `undefined`. Spreading creates a new object and `base` itself is unchanged. That is the basis of "a node doesn't change the old state".
+
+@@ item d18-02
+type: code
+title: Recap: merging state
+level: 2
+cards: State: one object passed from start to end
+--- context
+Each node in the graph hands back a small update when it finishes. For most fields the new value simply replaces the old one, but a field like the run log gets a few lines added by every node, and earlier entries must not be lost. The old state must also stay exactly as it was: checkpoints and debugging depend on it.
+--- prompt
+Write `mergeState(state, update)` that returns the merged **new** state:
+
+- Plain fields: whatever is in `update` overwrites what is in `state`
+- The `log` field is the exception: it is not overwritten; `update.log` is **appended** after `state.log` (if `update` has no `log`, keep it as it is)
+- Don't change the `state` that was passed in
+
+Example: `mergeState({ stage: "load", redlines: 0, log: ["a"] }, { stage: "review", log: ["b"] })` → `{ stage: "review", redlines: 0, log: ["a", "b"] }`. In LangGraph, a field that is "appended to, not overwritten" like this is called a reducer.
+--- starter
+type State = { stage: string; redlines: number; log: string[] };
+
+function mergeState(state: State, update: Partial<State>): State {
+  return { ...state, ...update };
+}
+--- solution
+type State = { stage: string; redlines: number; log: string[] };
+
+function mergeState(state: State, update: Partial<State>): State {
+  return { ...state, ...update, log: [...state.log, ...(update.log ?? [])] };
+}
+--- tests
+const S: State = { stage: "load", redlines: 0, log: ["loaded 3 clauses"] };
+expect("overwrites plain fields and appends to log", () => mergeState(S, { stage: "review", redlines: 2, log: ["reviewed 3"] }), { stage: "review", redlines: 2, log: ["loaded 3 clauses", "reviewed 3"] });
+expect("no log: kept as it was", () => mergeState(S, { stage: "export" }).log, ["loaded 3 clauses"]);
+expect("the original state is not changed", () => {
+  mergeState(S, { log: ["x"] });
+  return S.log;
+}, ["loaded 3 clauses"]);
+expect("empty update", () => mergeState(S, {}), S);
+--- hints
+- Start with `{ ...state, ...update }`, then write a separate `log: ...` at the end. It overwrites the log that the spread put in before it.
+- A new array: `[...state.log, ...(update.log ?? [])]`. Don't use `push`: that would change the original array.
+
+@@ item d18-03
+type: choice
+title: Which step goes to an agent?
+level: 1
+cards: Workflow vs agent
+--- context
+When you design a pipeline like Clause Check, every step needs a decision: write it as code with a fixed order, or let the model decide what to do next. Choose wrong and you either spend more money and get less predictable results, or lose flexibility where you need it.
+--- prompt
+In the Clause Check pipeline, which step is the best fit for an agent (the model decides what to do next) rather than a fixed workflow node?
+--- options
+- Splitting the contract text into clauses
+- While reviewing a clause, deciding whether to read other clauses it refers to, and which ones
+- Counting how many clauses are accept / flag / redline
+- Writing the report to a JSON file
+answer: 2
+--- explain
+Only in this step does "what to do next" depend on the clause's content (does it say subject to Section 12?), so `review.py` makes it a small agent with limits. The other three steps are the same every time; hard-coding them is cheaper, predictable and easy to test. Wherever deterministic code will do, don't hand it to the model (the pass^k lesson from Day 7).
+
+@@ item d18-04
+type: fill
+title: Fill in: the next node
+level: 1
+cards: Edges and conditional routing
+--- context
+Each time the graph runner finishes a node, it has to ask "where next?". Some nodes are always followed by the same node; others decide based on the current state. For example, after the summary it depends on whether this contract has any clauses that must be rewritten.
+--- prompt
+Fill in the blanks to finish `nextNode(edges, node, state)`: if the edge is a string, return it; if it is a function, call it with the state; if there is no such edge, throw.
+--- template
+type State = { redlines: number };
+type Edge = string | ((s: State) => string);
+
+const EDGES: Record<string, Edge> = {
+  review: "summarise",
+  summarise: (s) => (s.redlines > 0 ? "[[approve]]" : "export"),
+  approve: "export",
+  export: "END",
+};
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "[[function]]" ? [[edge(state)]] : edge;
+}
+--- tests
+expect("fixed edge", () => nextNode(EDGES, "review", { redlines: 0 }), "summarise");
+expect("redlines: go to approval", () => nextNode(EDGES, "summarise", { redlines: 2 }), "approve");
+expect("no redlines: export directly", () => nextNode(EDGES, "summarise", { redlines: 0 }), "export");
+expect("the end", () => nextNode(EDGES, "export", { redlines: 0 }), "END");
+expectThrows("no such edge", () => nextNode(EDGES, "load", { redlines: 0 }));
+--- hints
+- When there are redlines, a person should approve first.
+- `typeof` on a function gives the string `"function"`; a function edge is called with the current state.
+
+@@ item d18-05
+type: code
+title: Graph runner
+level: 2
+cards: The runner: from start to END; State: one object passed from start to end
+--- context
+The runner is the engine of the whole graph. In `graph.py`, the steps load contract → review → summarise → approve → export are pushed along one by one by LangGraph's runner; here you hand-write a small one. It records the path it takes, so when the graph goes wrong you can see at a glance where it got stuck.
+--- prompt
+Write `runGraph(graph, state, start, maxSteps = 10)` that returns `{ state, path }`:
+
+- Start at `start` and keep going until `"END"`
+- Each step: if it has already run `maxSteps` nodes without reaching END, `throw new Error(...)`; if the node doesn't exist, throw; run the node, merge the state, put the node name in `path`; work out the next node with `nextNode`
+- Don't change the `state` that was passed in
+
+`nextNode` is already written (the previous exercise).
+--- starter
+type State = { text: string; redlines: string[]; approved: boolean; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function runGraph(graph: Graph, state: State, start: string, maxSteps = 10): { state: State; path: string[] } {
+  const path: string[] = [];
+  return { state, path };
+}
+--- solution
+type State = { text: string; redlines: string[]; approved: boolean; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function runGraph(graph: Graph, state: State, start: string, maxSteps = 10): { state: State; path: string[] } {
+  const path: string[] = [];
+  let current = start;
+  while (current !== "END") {
+    if (path.length >= maxSteps) {
+      throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    }
+    const node = graph.nodes[current];
+    if (!node) {
+      throw new Error(`unknown node: ${current}`);
+    }
+    state = { ...state, ...node(state) };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+  }
+  return { state, path };
+}
+--- tests
+const G: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve: () => ({ approved: true }),
+    export: (s) => ({ exported: `${s.redlines.length} redline(s), approved=${s.approved}` }),
+  },
+  edges: {
+    review: (s) => (s.redlines.length > 0 ? "approve" : "export"),
+    approve: "export",
+    export: "END",
+  },
+};
+const init = (text: string): State => ({ text, redlines: [], approved: false, exported: "" });
+const RISKY = init("8.1 Liability is unlimited.\n3.1 Fees within 30 days.\n12 Unlimited means unlimited.");
+expect("redlines: goes through approval", () => runGraph(G, RISKY, "review").path, ["review", "approve", "export"]);
+expect("final state", () => runGraph(G, RISKY, "review").state.exported, "2 redline(s), approved=true");
+expect("no redlines: exports directly", () => runGraph(G, init("3.1 Fees within 30 days."), "review").path, ["review", "export"]);
+expect("does not change the state passed in", () => {
+  runGraph(G, RISKY, "review");
+  return RISKY.redlines;
+}, []);
+expectThrows("misspelled node name in the edges", () => runGraph({ nodes: G.nodes, edges: { ...G.edges, approve: "exprot" } }, RISKY, "review"));
+expectThrows("cycle: over the step limit", () => runGraph({ nodes: G.nodes, edges: { ...G.edges, export: "review" } }, RISKY, "review", 6));
+--- hints
+- `let current = start;` then `while (current !== "END") { ... }`.
+- The order inside the loop: check the step count first → get the node and check it → `state = { ...state, ...node(state) }` → `path.push(current)` → `current = nextNode(...)`.
+- `state` is a parameter: assigning a new value to it does not affect the caller's object. What does affect the caller is changing its contents (`state.x = ...`), so don't do that.
+
+@@ item d18-06
+type: code
+title: Check the graph before running it
+level: 2
+cards: Edges and conditional routing; The runner: from start to END
+--- context
+The graph is a hand-written table. Misspell one letter of a node name and you only find out when the run reaches that step, by which time you may already have paid for dozens of model calls. Check it once before running, and the problem shows up right away.
+--- prompt
+A graph is hand-written data, and misspelled names are common. Write `validateGraph(graph, start)` to find problems before running. Return the list of problems (`[]` if there are none):
+
+1. `start` is not a node: `"unknown start node: <name>"`
+2. Check each node in the order of `Object.keys(graph.nodes)`:
+   - no outgoing edge: `"no edge from <name>"`
+   - the outgoing edge is a string that is neither `"END"` nor an existing node: `"edge <name> -> <target>: unknown node"`
+
+Where a routing function's edge goes is only known at run time, so skip those. LangGraph does checks like these in `compile()` too.
+--- starter
+type State = { redlines: number };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function validateGraph(graph: Graph, start: string): string[] {
+  const problems: string[] = [];
+  return problems;
+}
+--- solution
+type State = { redlines: number };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function validateGraph(graph: Graph, start: string): string[] {
+  const problems: string[] = [];
+  if (!(start in graph.nodes)) {
+    problems.push(`unknown start node: ${start}`);
+  }
+  for (const name of Object.keys(graph.nodes)) {
+    const edge = graph.edges[name];
+    if (edge === undefined) {
+      problems.push(`no edge from ${name}`);
+    } else if (typeof edge === "string" && edge !== "END" && !(edge in graph.nodes)) {
+      problems.push(`edge ${name} -> ${edge}: unknown node`);
+    }
+  }
+  return problems;
+}
+--- tests
+const noop: Node = () => ({});
+const NODES: Record<string, Node> = { review: noop, approve: noop, export: noop };
+const GOOD: Graph = { nodes: NODES, edges: { review: (s) => (s.redlines > 0 ? "approve" : "export"), approve: "export", export: "END" } };
+expect("a correct graph", () => validateGraph(GOOD, "review"), []);
+expect("misspelled target", () => validateGraph({ nodes: NODES, edges: { ...GOOD.edges, approve: "exprot" } }, "review"), ["edge approve -> exprot: unknown node"]);
+expect("one edge missing", () => validateGraph({ nodes: NODES, edges: { review: GOOD.edges.review, approve: "export" } }, "review"), ["no edge from export"]);
+expect("start node missing, problems listed in order", () => validateGraph({ nodes: NODES, edges: { review: "summarise", approve: "export" } }, "load"), [
+  "unknown start node: load",
+  "edge review -> summarise: unknown node",
+  "no edge from export",
+]);
+--- hints
+- To check whether an object has a key: `"review" in graph.nodes`.
+- For each node, first get `graph.edges[name]`: `undefined` means there is no outgoing edge; when `typeof edge === "string"`, check the target.
+
+@@ item d18-07
+type: predict
+title: A cycle in the graph
+level: 2
+cards: Edges and conditional routing; The runner: from start to END
+--- context
+Now and then the model gives broken output. A common fix is to let the graph loop back and review again, but the number of retries must be limited. This code simulates such a "validation failed, go back" cycle.
+--- prompt
+This graph simulates "review again when the model's output fails validation": `review` adds 1 to `attempts` each time, and `validate` only passes on the 2nd attempt. Write the output.
+--- code
+type S = { attempts: number; valid: boolean };
+
+const nodes: Record<string, (s: S) => Partial<S>> = {
+  review: (s) => ({ attempts: s.attempts + 1 }),
+  validate: (s) => ({ valid: s.attempts >= 2 }),
+  give_up: () => ({}),
+};
+const edges: Record<string, string | ((s: S) => string)> = {
+  review: "validate",
+  validate: (s) => (s.valid ? "END" : s.attempts < 3 ? "review" : "give_up"),
+  give_up: "END",
+};
+
+let state: S = { attempts: 0, valid: false };
+let current = "review";
+const path: string[] = [];
+while (current !== "END") {
+  state = { ...state, ...nodes[current](state) };
+  path.push(current);
+  const edge = edges[current];
+  current = typeof edge === "function" ? edge(state) : edge;
+}
+console.log(path.join(" -> "));
+console.log(state);
+--- explain
+The first time validate runs, `attempts` is 1, so it fails and `1 < 3` sends it back to review; the second time `attempts` is 2, it passes and goes to END. `give_up` is not reached this time. Just like an agent, a graph with a cycle needs limits as a safety net: here it is `attempts < 3`, and the runner also has `maxSteps`.
+
+@@ item d18-08
+type: fix
+title: Fix the bug: going around in circles
+level: 2
+cards: Edges and conditional routing; The runner: from start to END; State: one object passed from start to end
+--- context
+The number of review attempts is kept in the state, and the route uses that number to decide whether to review again or give up. If the number isn't recorded correctly, the graph keeps going in circles until it hits the step limit. Luckily the runner's error includes the path it took.
+--- prompt
+This graph should do "if the model's output is not valid JSON, review again, at most 3 times". The fake model gives bad output the first time and good output the second time, so the correct path is review → validate → review → validate.
+
+When you run it, the runner throws an error saying it went over the step limit. Read the path in the error, add `console.log(s)` inside the `review` node to see how `attempts` changes, then find the cause and fix it. The runner itself is fine.
+--- starter
+type S = { attempts: number; output: string; valid: boolean };
+type Node = (s: S) => Partial<S>;
+type Edge = string | ((s: S) => string);
+
+const FAKE_MODEL = ["Sure! {", '{"verdict": "flag"}'];
+
+function isJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const nodes: Record<string, Node> = {
+  review: (s) => ({ output: FAKE_MODEL[Math.min(s.attempts, 1)], attempts: s.attempts++ }),
+  validate: (s) => ({ valid: isJson(s.output) }),
+  give_up: () => ({ output: "" }),
+};
+const edges: Record<string, Edge> = {
+  review: "validate",
+  validate: (s) => (s.valid ? "END" : s.attempts < 3 ? "review" : "give_up"),
+  give_up: "END",
+};
+
+function runGraph(state: S, start: string, maxSteps = 10): { state: S; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    if (path.length >= maxSteps) throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    state = { ...state, ...nodes[current](state) };
+    path.push(current);
+    const edge = edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { state, path };
+}
+--- solution
+type S = { attempts: number; output: string; valid: boolean };
+type Node = (s: S) => Partial<S>;
+type Edge = string | ((s: S) => string);
+
+const FAKE_MODEL = ["Sure! {", '{"verdict": "flag"}'];
+
+function isJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const nodes: Record<string, Node> = {
+  review: (s) => ({ output: FAKE_MODEL[Math.min(s.attempts, 1)], attempts: s.attempts + 1 }),
+  validate: (s) => ({ valid: isJson(s.output) }),
+  give_up: () => ({ output: "" }),
+};
+const edges: Record<string, Edge> = {
+  review: "validate",
+  validate: (s) => (s.valid ? "END" : s.attempts < 3 ? "review" : "give_up"),
+  give_up: "END",
+};
+
+function runGraph(state: S, start: string, maxSteps = 10): { state: S; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    if (path.length >= maxSteps) throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    state = { ...state, ...nodes[current](state) };
+    path.push(current);
+    const edge = edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { state, path };
+}
+--- tests
+const START: S = { attempts: 0, output: "", valid: false };
+expect("passes on the second attempt", () => runGraph(START, "review").path, ["review", "validate", "review", "validate"]);
+expect("final state", () => runGraph(START, "review").state, { attempts: 2, output: '{"verdict": "flag"}', valid: true });
+expect("the start state is not changed", () => {
+  runGraph(START, "review");
+  return START.attempts;
+}, 0);
+--- hints
+- The path keeps going review → validate → review…, which means `attempts` never gets bigger.
+- `s.attempts++` returns the old value from **before** the increment (and also quietly changes `s`). A node only reads `s`; it computes the new value and returns it.
+- Change it to `attempts: s.attempts + 1`.
+
+@@ item d18-09
+type: translate
+title: Translate: the summary node and the route
+level: 2
+cards: State: one object passed from start to end; Edges and conditional routing
+--- context
+In the real project's `graph.py`, after the review there is a summary node and a routing function: the first computes the counts for the report, the second decides whether the next step is to wait for a person's approval or to export directly. Here you move the Python code over to TypeScript.
+--- prompt
+Translate these two Python functions in the style of `graph.py` into TypeScript: `summarise` is a node (it returns only the fields it changes), and `route` is a routing function.
+--- source
+def summarise(state):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in state["reviews"]:
+        counts[r["verdict"]] += 1
+    needs = [r["clause_id"] for r in state["reviews"] if r["verdict"] != "accept"]
+    return {"counts": counts, "needs_attention": needs}
+
+
+def route(state):
+    return "approve" if state["counts"]["redline"] > 0 else "export"
+--- starter
+type Review = { clause_id: string; verdict: "accept" | "flag" | "redline" };
+type State = { reviews: Review[]; counts: Record<string, number>; needs_attention: string[] };
+
+function summarise(state: State): Partial<State> {
+  return {};
+}
+
+function route(state: State): string {
+  return "export";
+}
+--- solution
+type Review = { clause_id: string; verdict: "accept" | "flag" | "redline" };
+type State = { reviews: Review[]; counts: Record<string, number>; needs_attention: string[] };
+
+function summarise(state: State): Partial<State> {
+  const counts: Record<string, number> = { accept: 0, flag: 0, redline: 0 };
+  for (const r of state.reviews) {
+    counts[r.verdict] += 1;
+  }
+  const needs = state.reviews.filter((r) => r.verdict !== "accept").map((r) => r.clause_id);
+  return { counts, needs_attention: needs };
+}
+
+function route(state: State): string {
+  return state.counts.redline > 0 ? "approve" : "export";
+}
+--- tests
+const REVIEWS: Review[] = [
+  { clause_id: "3.1", verdict: "accept" },
+  { clause_id: "8.1", verdict: "flag" },
+  { clause_id: "12", verdict: "redline" },
+];
+const S: State = { reviews: REVIEWS, counts: {}, needs_attention: [] };
+expect("summary", () => summarise(S), { counts: { accept: 1, flag: 1, redline: 1 }, needs_attention: ["8.1", "12"] });
+expect("no clauses", () => summarise({ ...S, reviews: [] }), { counts: { accept: 0, flag: 0, redline: 0 }, needs_attention: [] });
+expect("redlines: go to approval", () => route({ ...S, counts: { accept: 1, flag: 1, redline: 1 } }), "approve");
+expect("no redlines: export directly", () => route({ ...S, counts: { accept: 2, flag: 1, redline: 0 } }), "export");
+--- hints
+- The list comprehension `[... for r in ... if ...]` → `filter(...).map(...)`.
+- Python's `a if condition else b` → TypeScript's `condition ? a : b`.
+
+@@ item d18-10
+type: fix
+title: Fix the bug: where did the review results go?
+level: 2
+cards: d6:async / await: wait for the network without freezing; The runner: from start to END
+--- context
+A real review node calls the model and only gets a result a few seconds later. The most dangerous thing about this bug is that there is no error: the report is still produced, it just has no review results at all, and the lawyer may think nothing in the contract needs a look.
+--- prompt
+The `review` node calls the model, so it is async. Run the tests: the export says `0 reviewed`. The review results seem to vanish into thin air, yet there is no error at all. Find the cause and fix `runGraph` (the nodes are all fine).
+
+Hint: spreading a Promise (`{ ...somePromise }`) gives you nothing, and TypeScript doesn't complain either.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+type Review = { id: string; verdict: string };
+type State = { clauses: string[]; reviews: Review[]; redlines: number; exported: string };
+type Node = (s: State) => Partial<State> | Promise<Partial<State>>;
+type Graph = { nodes: Record<string, Node>; edges: Record<string, string> };
+
+async function classify(clause: string): Promise<string> {
+  const body = {
+    model: "deepseek-flash",
+    messages: [{ role: "user", content: `Review clause ${clause}` }],
+    response_format: { type: "json_object" },
+    thinking: { type: "disabled" }, // only one verdict needed: turn off the default thinking mode, it is faster and cheaper
+  };
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content).verdict;
+}
+
+const GRAPH: Graph = {
+  nodes: {
+    review: async (s) => {
+      const reviews: Review[] = [];
+      for (const c of s.clauses) {
+        reviews.push({ id: c.split(" ")[0], verdict: await classify(c) });
+      }
+      return { reviews };
+    },
+    summarise: (s) => ({ redlines: s.reviews.filter((r) => r.verdict === "redline").length }),
+    export: (s) => ({ exported: `${s.reviews.length} reviewed, ${s.redlines} redline(s)` }),
+  },
+  edges: { review: "summarise", summarise: "export", export: "END" },
+};
+
+async function runGraph(graph: Graph, state: State, start: string): Promise<{ state: State; path: string[] }> {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const update = graph.nodes[current](state);
+    state = { ...state, ...update };
+    path.push(current);
+    current = graph.edges[current];
+  }
+  return { state, path };
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+type Review = { id: string; verdict: string };
+type State = { clauses: string[]; reviews: Review[]; redlines: number; exported: string };
+type Node = (s: State) => Partial<State> | Promise<Partial<State>>;
+type Graph = { nodes: Record<string, Node>; edges: Record<string, string> };
+
+async function classify(clause: string): Promise<string> {
+  const body = {
+    model: "deepseek-flash",
+    messages: [{ role: "user", content: `Review clause ${clause}` }],
+    response_format: { type: "json_object" },
+    thinking: { type: "disabled" }, // only one verdict needed: turn off the default thinking mode, it is faster and cheaper
+  };
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content).verdict;
+}
+
+const GRAPH: Graph = {
+  nodes: {
+    review: async (s) => {
+      const reviews: Review[] = [];
+      for (const c of s.clauses) {
+        reviews.push({ id: c.split(" ")[0], verdict: await classify(c) });
+      }
+      return { reviews };
+    },
+    summarise: (s) => ({ redlines: s.reviews.filter((r) => r.verdict === "redline").length }),
+    export: (s) => ({ exported: `${s.reviews.length} reviewed, ${s.redlines} redline(s)` }),
+  },
+  edges: { review: "summarise", summarise: "export", export: "END" },
+};
+
+async function runGraph(graph: Graph, state: State, start: string): Promise<{ state: State; path: string[] }> {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const update = await graph.nodes[current](state);
+    state = { ...state, ...update };
+    path.push(current);
+    current = graph.edges[current];
+  }
+  return { state, path };
+}
+--- tests
+const CLAUSES = ["8.1 Liability shall be unlimited.", "3.1 Fees are payable within thirty days.", "10.1 Data may be processed in any country."];
+const INIT: State = { clauses: CLAUSES, reviews: [], redlines: 0, exported: "" };
+expectAsync("the review results reach the state", async () => {
+  MOCK.reset();
+  const r = await runGraph(GRAPH, INIT, "review");
+  return [r.state.exported, r.path];
+}, ["3 reviewed, 2 redline(s)", ["review", "summarise", "export"]]);
+expectAsync("each clause reviewed once, all finished before returning", async () => {
+  MOCK.reset();
+  await runGraph(GRAPH, INIT, "review");
+  return MOCK.calls.length;
+}, 3);
+expectAsync("verdicts", async () => (await runGraph(GRAPH, INIT, "review")).state.reviews.map((r) => r.verdict), ["redline", "accept", "redline"]);
+--- hints
+- For an async node, `graph.nodes[current](state)` returns a Promise, not the update.
+- Add `await` where the node is called. Awaiting a sync node does no harm: you get the value directly.
+
+@@ item d18-11
+type: predict
+title: What happens when state is saved as JSON
+level: 2
+cards: Checkpoints: keep going after a crash
+--- context
+A checkpoint writes the state out as JSON text and stores it, so that after a crash, or the next day, it can be read back and the run can continue. So first get clear on which values come back different after being saved and read again.
+--- prompt
+A checkpoint is the text that `JSON.stringify` produces. Write the output and see what can't be saved.
+--- code
+const state = {
+  contract: "cloudnotes.txt",
+  done: new Set(["8.1", "12"]),
+  approved: undefined,
+  reviewed: 2,
+};
+const saved = JSON.stringify(state);
+console.log(saved);
+const back = JSON.parse(saved);
+console.log(back.done instanceof Set, "approved" in back);
+console.log(Object.keys(back).length);
+--- explain
+`JSON.stringify` turns a `Set` or a `Map` into `{}`, and the data is quietly lost; a key whose value is `undefined` simply disappears. After resuming, the program throws no error, it just gives wrong results, and that kind of bug is the hardest to find. So put only plain JSON in the state: use an array instead of a Set, and use `null` for "not decided yet" (that is what `approved: bool | None` in `graph.py` does).
+
+@@ item d18-12
+type: code
+title: Checkpoints and crash recovery
+level: 3
+cards: Checkpoints: keep going after a crash; The runner: from start to END
+--- context
+Reviewing 30 clauses takes 30 model calls. If the disk fills up at the final export, starting over means paying for all of them again. Checkpoints let the program continue from where things went wrong. The real project's `graph.py` stores checkpoints in a SQLite database.
+--- prompt
+Write two functions:
+
+1. `run(graph, state, start, save)`: runs to `"END"` like `runGraph` (no step limit needed), but **after each node finishes** it calls `save(JSON.stringify({ next: <the next node>, state: <the merged state> }))`. Return `{ state, path }`
+2. `resume(graph, saved, save)`: `saved` is a checkpoint text. Parse it, then continue from `next` with its `state` (still saving checkpoints), and return `{ state, path }` for this run
+
+The tests make `export` fail the first time (simulating a full disk), then resume from the last checkpoint and check that `review` did not run again.
+--- starter
+type State = { clauses: string[]; verdicts: string[]; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type Checkpoint = { next: string; state: State };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function run(graph: Graph, state: State, start: string, save: (text: string) => void): { state: State; path: string[] } {
+  return { state, path: [] };
+}
+
+function resume(graph: Graph, saved: string, save: (text: string) => void): { state: State; path: string[] } {
+  const cp: Checkpoint = JSON.parse(saved);
+  return { state: cp.state, path: [] };
+}
+--- solution
+type State = { clauses: string[]; verdicts: string[]; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type Checkpoint = { next: string; state: State };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function run(graph: Graph, state: State, start: string, save: (text: string) => void): { state: State; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const node = graph.nodes[current];
+    if (!node) {
+      throw new Error(`unknown node: ${current}`);
+    }
+    state = { ...state, ...node(state) };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+    const cp: Checkpoint = { next: current, state };
+    save(JSON.stringify(cp));
+  }
+  return { state, path };
+}
+
+function resume(graph: Graph, saved: string, save: (text: string) => void): { state: State; path: string[] } {
+  const cp: Checkpoint = JSON.parse(saved);
+  return run(graph, cp.state, cp.next, save);
+}
+--- tests
+let modelCalls = 0;
+let exportFailures = 0;
+const G: Graph = {
+  nodes: {
+    review: (s) => {
+      modelCalls += s.clauses.length;
+      return { verdicts: s.clauses.map((c) => (c.includes("unlimited") ? "redline" : "accept")) };
+    },
+    export: (s) => {
+      if (exportFailures > 0) {
+        exportFailures -= 1;
+        throw new Error("disk full");
+      }
+      return { exported: s.verdicts.join(",") };
+    },
+  },
+  edges: { review: "export", export: "END" },
+};
+const INIT: State = { clauses: ["8.1 unlimited", "3.1 fees"], verdicts: [], exported: "" };
+expect("saves once after each node", () => {
+  const saved: string[] = [];
+  run(G, INIT, "review", (t) => saved.push(t));
+  return saved.map((t) => JSON.parse(t).next);
+}, ["export", "END"]);
+expect("the checkpoint holds the merged state", () => {
+  const saved: string[] = [];
+  run(G, INIT, "review", (t) => saved.push(t));
+  return JSON.parse(saved[0]);
+}, { next: "export", state: { clauses: ["8.1 unlimited", "3.1 fees"], verdicts: ["redline", "accept"], exported: "" } });
+expect("resume after a crash: review does not run again", () => {
+  modelCalls = 0;
+  exportFailures = 1;
+  const saved: string[] = [];
+  try {
+    run(G, INIT, "review", (t) => saved.push(t));
+  } catch {
+    // export crashed; the last checkpoint says what to do next
+  }
+  const r = resume(G, saved[saved.length - 1], (t) => saved.push(t));
+  return [r.path, r.state.exported, modelCalls];
+}, [["export"], "redline,accept", 2]);
+expect("resume from a checkpoint at END: does nothing", () => resume(G, JSON.stringify({ next: "END", state: INIT }), () => {}).path, []);
+--- hints
+- `run` is the loop from `runGraph`; after working out the next node, add `save(JSON.stringify({ next: current, state }))`.
+- `resume` is only two lines: parse the checkpoint, then `return run(graph, cp.state, cp.next, save);`.
+
+@@ item d18-13
+type: choice
+title: The lawyer approves tomorrow
+level: 2
+cards: Interrupt and resume: stop and wait for a person; Checkpoints: keep going after a crash
+--- context
+A contract with redlines needs the lawyer's OK before export, but lawyers often reply only the next day. What the program should do in the meantime is a question you can't avoid when designing an approval flow.
+--- prompt
+The graph reaches the `approve` node and needs the lawyer's approval, but the lawyer won't reply until tomorrow. What should the program do?
+--- options
+- Check the database every second in a loop, and keep waiting until the lawyer clicks approve
+- Save a checkpoint (the state + the next step is approve), then end the run; when the lawyer approves (maybe in another process, such as the web backend), read the checkpoint, write the decision into the state and continue from approve
+- Let the model decide for the lawyer, so there is no waiting
+- After the lawyer approves, run the whole graph again from the start with `approved: true`
+answer: 2
+--- explain
+Waiting with the program running ties up resources, and everything is lost as soon as the process restarts. Running again from the start pays for the model calls a second time, and the results may differ from the first run, so the lawyer would not be approving the version they looked at. `graph.py` does exactly the second option: `SqliteSaver` stores checkpoints, `pending_interrupt(thread_id)` can look up the waiting question from another process, and `resume(thread_id, approved)` continues.
+
+@@ item d18-14
+type: order
+title: Put the code in order: a runner that can pause
+level: 2
+cards: Interrupt and resume: stop and wait for a person; The runner: from start to END
+--- context
+This is how the `approve` node in the real project's `graph.py` works: the graph stops here, the state is saved, and the process can simply exit; when the lawyer's decision arrives, the run continues from here. Here you hand-write a runner that can stop.
+--- prompt
+Put `run` in order: if the update a node returns has an `interrupt`, stop and return the question and a checkpoint; otherwise merge the state and keep going. The types, `nextNode` and the graph used by the tests are already written. One line is a distractor.
+--- lines
+function run(graph: Graph, state: State, start: string): RunResult {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const out = graph.nodes[current](state);
+    if (out.interrupt) {
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: current, state }) };
+    }
+    state = { ...state, ...out };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+  }
+  return { status: "done", state, path };
+}
+--- distractors
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: nextNode(graph.edges, current, state), state }) };
+--- tests
+type State = { text: string; redlines: string[]; approved: boolean | null; exported: string };
+type Update = Partial<State> & { interrupt?: string };
+type Node = (s: State) => Update;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  return typeof edge === "function" ? edge(state) : edge;
+}
+const G: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve: (s) => (s.approved === null ? { interrupt: `Apply ${s.redlines.length} redline(s)?` } : {}),
+    export: (s) => ({ exported: s.approved ? "with redlines" : "without redlines" }),
+  },
+  edges: { review: (s) => (s.redlines.length > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+const init = (text: string): State => ({ text, redlines: [], approved: null, exported: "" });
+expect("redlines: stops at approve", () => {
+  const r = run(G, init("8.1 Liability is unlimited."), "review");
+  return r.status === "interrupted" ? [r.question, JSON.parse(r.checkpoint).next] : r.status;
+}, ["Apply 1 redline(s)?", "approve"]);
+expect("the checkpoint holds review's results", () => {
+  const r = run(G, init("8.1 Liability is unlimited."), "review");
+  return r.status === "interrupted" ? JSON.parse(r.checkpoint).state.redlines : r.status;
+}, ["8.1"]);
+expect("no redlines: runs all the way through", () => run(G, init("3.1 Fees within 30 days."), "review"), {
+  status: "done",
+  state: { text: "3.1 Fees within 30 days.", redlines: [], approved: null, exported: "without redlines" },
+  path: ["review", "export"],
+});
+expect("decision already made: no pause", () => {
+  const r = run(G, { ...init("8.1 Liability is unlimited."), approved: true }, "review");
+  return r.status === "done" ? [r.path, r.state.exported] : r.status;
+}, [["review", "approve", "export"], "with redlines"]);
+--- hints
+- Call the node, then check `out.interrupt` **first**; only when there is no interrupt do you merge the state, record the path and find the next node.
+- On an interrupt, the checkpoint's `next` should be the **current** node: on resume, approve must run once more, and this time it sees the person's decision. The distractor saves the next node, so resuming would skip the approval.
+
+@@ item d18-15
+type: code
+title: The approval node and resuming
+level: 3
+cards: Interrupt and resume: stop and wait for a person
+--- context
+Once the lawyer's decision arrives, the program continues from the approval step, and the review already done doesn't have to be redone. Whether the contract is changed is up to the lawyer's decision; the model plays no part in the export. This is the same principle the comments in `graph.py` state.
+--- prompt
+The `run` from the previous exercise is already written. Complete two functions:
+
+1. `approve(s)`: while there is no decision yet (`s.approved === null`), return `{ interrupt: "Apply N redline(s)?" }` (N is `s.redlines.length`); once there is a decision, return `{}` to let it through
+2. `resume(graph, checkpoint, decision)`: parse the checkpoint, merge `decision` (for example `{ approved: true }`) into its state, then continue with `run` from `next`
+
+The `export` node is already written: it exports **according to the decision in the state**, and the model plays no part.
+--- starter
+type State = { text: string; redlines: string[]; approved: boolean | null; exported: string };
+type Update = Partial<State> & { interrupt?: string };
+type Node = (s: State) => Update;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function run(graph: Graph, state: State, start: string): RunResult {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const out = graph.nodes[current](state);
+    if (out.interrupt) {
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: current, state }) };
+    }
+    state = { ...state, ...out };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+  }
+  return { status: "done", state, path };
+}
+
+function approve(s: State): Update {
+  return {};
+}
+
+function resume(graph: Graph, checkpoint: string, decision: Partial<State>): RunResult {
+  const cp = JSON.parse(checkpoint);
+  return run(graph, cp.state, cp.next);
+}
+
+const GRAPH: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve,
+    export: (s) => ({ exported: s.approved ? `exported with ${s.redlines.length} redline(s) applied` : "exported without redlines" }),
+  },
+  edges: { review: (s) => (s.redlines.length > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+--- solution
+type State = { text: string; redlines: string[]; approved: boolean | null; exported: string };
+type Update = Partial<State> & { interrupt?: string };
+type Node = (s: State) => Update;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function run(graph: Graph, state: State, start: string): RunResult {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const out = graph.nodes[current](state);
+    if (out.interrupt) {
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: current, state }) };
+    }
+    state = { ...state, ...out };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+  }
+  return { status: "done", state, path };
+}
+
+function approve(s: State): Update {
+  if (s.approved === null) {
+    return { interrupt: `Apply ${s.redlines.length} redline(s)?` };
+  }
+  return {};
+}
+
+function resume(graph: Graph, checkpoint: string, decision: Partial<State>): RunResult {
+  const cp = JSON.parse(checkpoint);
+  return run(graph, { ...cp.state, ...decision }, cp.next);
+}
+
+const GRAPH: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve,
+    export: (s) => ({ exported: s.approved ? `exported with ${s.redlines.length} redline(s) applied` : "exported without redlines" }),
+  },
+  edges: { review: (s) => (s.redlines.length > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+--- tests
+const TEXT = "8.1 Liability is unlimited.\n3.1 Fees within 30 days.\n12 Unlimited means unlimited.";
+const init = (text: string): State => ({ text, redlines: [], approved: null, exported: "" });
+function pauseThenResume(decision: Partial<State>): unknown {
+  const first = run(GRAPH, init(TEXT), "review");
+  if (first.status !== "interrupted") return "the first run did not pause";
+  const r = resume(GRAPH, first.checkpoint, decision);
+  return r.status === "done" ? [r.path, r.state.exported] : `paused again after resuming: ${r.question}`;
+}
+expect("the first run stops to ask a person", () => {
+  const r = run(GRAPH, init(TEXT), "review");
+  return r.status === "interrupted" ? r.question : r.status;
+}, "Apply 2 redline(s)?");
+expect("continue after approval: approve runs again, then export", () => pauseThenResume({ approved: true }), [["approve", "export"], "exported with 2 redline(s) applied"]);
+expect("continue after rejection: redlines not applied", () => pauseThenResume({ approved: false }), [["approve", "export"], "exported without redlines"]);
+expect("a contract without redlines doesn't bother anyone", () => run(GRAPH, init("3.1 Fees within 30 days."), "review").status, "done");
+--- hints
+- `approve` is the same as in the knowledge card, just written as a regular function: `if (s.approved === null) return { interrupt: ... }; return {};`.
+- In `resume`, merge the decision in: `run(graph, { ...cp.state, ...decision }, cp.next)`. The order of the spreads decides which overwrites which.
+
+@@ item d18-16
+type: fix
+title: Fix the bug: the report order changes every time
+level: 2
+cards: Parallelism: Promise.all and a concurrency limit
+--- context
+Reviewing 300 clauses one by one is too slow, so it was changed to review them at the same time. The order of clauses in the report must match the original contract, so that the lawyer can read the report while paging through the contract alongside it.
+--- prompt
+A colleague changed the one-by-one review to run in parallel. It is faster, but the lawyer complains: the order of clauses in the report is different every time. The tests reproduce the problem with a fake `review` (different clauses take different amounts of time). Run it and fix it: the order of the results must match `ids`.
+--- starter
+type Verdict = { id: string; verdict: string };
+
+async function reviewAll(ids: string[], review: (id: string) => Promise<Verdict>): Promise<Verdict[]> {
+  const results: Verdict[] = [];
+  await Promise.all(
+    ids.map(async (id) => {
+      const v = await review(id);
+      results.push(v);
+    }),
+  );
+  return results;
+}
+--- solution
+type Verdict = { id: string; verdict: string };
+
+async function reviewAll(ids: string[], review: (id: string) => Promise<Verdict>): Promise<Verdict[]> {
+  return Promise.all(ids.map((id) => review(id)));
+}
+--- tests
+const DELAY: Record<string, number> = { "8.1": 40, "3.1": 5, "12": 20 };
+const fakeReview = (id: string) =>
+  new Promise<Verdict>((resolve) => setTimeout(() => resolve({ id, verdict: id === "3.1" ? "accept" : "redline" }), DELAY[id]));
+expectAsync("same order as the input", async () => (await reviewAll(["8.1", "3.1", "12"], fakeReview)).map((v) => v.id), ["8.1", "3.1", "12"]);
+expectAsync("each verdict stays with its clause", async () => (await reviewAll(["12", "3.1"], fakeReview)).map((v) => v.verdict), ["redline", "accept"]);
+expectAsync("empty list", () => reviewAll([], fakeReview), []);
+--- hints
+- `results.push` happens when each task **finishes**, so whichever is fastest comes first.
+- The value `Promise.all` returns is already the array of results in input order. Use it directly.
+
+@@ item d18-17
+type: code
+title: map with a concurrency limit
+level: 2
+cards: Parallelism: Promise.all and a concurrency limit
+--- context
+Send 300 requests all at once and the provider will very likely rate-limit you with a 429 (too many requests, temporarily refused). The real project's `pipeline.py` currently reviews clauses one at a time, in order. To speed it up without getting rate-limited, you have to control how many requests run at the same time.
+--- prompt
+Write `mapLimit(items, limit, fn)`: call the async `fn` on each element, with **no more than `limit` running at the same time**, and return the array of results in the same order as `items`.
+
+Use batches: take `limit` elements at a time, let `Promise.all` wait for the whole batch to finish, then take the next batch. An empty array returns `[]`.
+--- starter
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  return Promise.all(items.map(fn));
+}
+--- solution
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += limit) {
+    const batch = items.slice(i, i + limit);
+    const done = await Promise.all(batch.map(fn));
+    results.push(...done);
+  }
+  return results;
+}
+--- tests
+let active = 0;
+let maxActive = 0;
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+async function slowDouble(n: number): Promise<number> {
+  active += 1;
+  maxActive = Math.max(maxActive, active);
+  await wait(40 - n * 5);
+  active -= 1;
+  return n * 2;
+}
+expectAsync("results in the same order as the input", () => mapLimit([1, 2, 3, 4, 5], 2, slowDouble), [2, 4, 6, 8, 10]);
+expectAsync("at most 2 at the same time", async () => {
+  maxActive = 0;
+  await mapLimit([1, 2, 3, 4, 5], 2, slowDouble);
+  return maxActive;
+}, 2);
+expectAsync("limit bigger than the number of elements", async () => {
+  maxActive = 0;
+  const r = await mapLimit([1, 2], 10, slowDouble);
+  return [r, maxActive];
+}, [[2, 4], 2]);
+expectAsync("empty array", () => mapLimit([], 3, slowDouble), []);
+--- hints
+- `for (let i = 0; i < items.length; i += limit) { const batch = items.slice(i, i + limit); ... }`
+- The results of one batch: `await Promise.all(batch.map(fn))`, then add them to the end in order with `results.push(...done)`.
+
+@@ item d18-18
+type: choice
+title: Reading graph.py
+level: 2
+cards: Framework comparison: LangGraph and Mastra workflows; Interrupt and resume: stop and wait for a person
+--- context
+An interviewer may well ask you to walk through the `graph.py` in your own project. Being able to match every framework call to a part you hand-wrote today is the best way to show you really understand it rather than copied it.
+--- prompt
+Which of these readings of `clausecheck/graph.py` is **wrong**?
+--- options
+- `g.add_conditional_edges("summarise", route)`: after summarise, call `route(state)` to decide between approve and export. This is your routing-function edge
+- `g.compile(checkpointer=checkpointer)`: makes the graph save the state after every step (here into SQLite). This is your `save(...)`
+- Calling `interrupt(...)` inside `approve` pauses; when you later continue with `Command(resume=True)`, the approve node runs again, and this time `interrupt(...)` directly returns the person's decision
+- When you continue with `Command(resume=...)`, LangGraph reruns the whole graph from load, only skipping the interrupt
+answer: 4
+--- explain
+Resuming continues from the checkpoint: load, review and summarise do not run again (that would call the model a second time). Only the approve node, where it paused, runs again from its start. This is exactly what you wrote today: the checkpoint's `next` is approve, and on resume it sees the decision and lets it through.
+
+@@ item d18-e1
+type: scratch
+title: Closed book: graph runner
+exam: yes
+level: 3
+cards: The runner: from start to END; Edges and conditional routing
+--- context
+Hand-write a graph runner, closed book. Clause Check's review flow is a graph: after the summary it takes a different path depending on whether there are redlines. Once you can write it from a blank page, LangGraph is no longer a black box to you.
+--- prompt
+First define these types exactly as shown:
+
+```ts
+type State = Record<string, any>;
+type Node = (s: State) => State;               // returns the fields to update
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+```
+
+Write `runGraph(graph: Graph, state: State, start: string, maxSteps: number): { state: State; path: string[] }`:
+
+- Go from `start` to `"END"`; merge each node's return value into the state (later values overwrite), and put the node names into `path` in order
+- If the edge is a string, go there; if it is a function, call it with the **merged** state
+- If it has already run `maxSteps` nodes without reaching END, if a node doesn't exist, or if there is no outgoing edge: `throw new Error(...)` in each case
+- Don't change the `state` object that was passed in
+--- solution
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function runGraph(graph: Graph, state: State, start: string, maxSteps: number): { state: State; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    if (path.length >= maxSteps) {
+      throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    }
+    const node = graph.nodes[current];
+    if (!node) {
+      throw new Error(`unknown node: ${current}`);
+    }
+    state = { ...state, ...node(state) };
+    path.push(current);
+    const edge = graph.edges[current];
+    if (edge === undefined) {
+      throw new Error(`no edge from ${current}`);
+    }
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { state, path };
+}
+--- tests
+const G: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.includes("unlimited") ? 1 : 0 }),
+    approve: () => ({ approved: true }),
+    export: (s) => ({ exported: `redlines=${s.redlines} approved=${s.approved}` }),
+  },
+  edges: { review: (s) => (s.redlines > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+const RISKY = { text: "Liability is unlimited.", approved: false };
+expect("conditional routing: with redlines", () => runGraph(G, RISKY, "review", 10), {
+  state: { text: "Liability is unlimited.", approved: true, redlines: 1, exported: "redlines=1 approved=true" },
+  path: ["review", "approve", "export"],
+});
+expect("conditional routing: no redlines, original state unchanged", () => [runGraph(G, { text: "Fees.", approved: false }, "review", 10).path, RISKY], [["review", "export"], { text: "Liability is unlimited.", approved: false }]);
+expectThrows("no outgoing edge", () => runGraph({ nodes: G.nodes, edges: { review: "export" } }, RISKY, "review", 10));
+expectThrows("cycle over the limit", () => runGraph({ nodes: G.nodes, edges: { ...G.edges, export: "review" } }, RISKY, "review", 5));
+
+@@ item d18-e2
+type: scratch
+title: Closed book: checkpoints and resuming
+exam: yes
+level: 3
+cards: Checkpoints: keep going after a crash
+--- context
+Write checkpoints, closed book: the review of a contract may crash halfway, and model calls you have already paid for must not be made again. The saved text must be readable in another run so it can carry on from there.
+--- prompt
+The types are the same as in closed-book challenge 1 (define them exactly as shown):
+
+```ts
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+```
+
+Write two functions:
+
+- `runWithCheckpoints(graph, state, start, save: (text: string) => void)`: go from `start` to `"END"` and return `{ state, path }`. After each node runs and the next node has been worked out, call `save(JSON.stringify({ next, state }))`
+- `resume(graph, saved: string, save)`: parse the checkpoint, continue from its `next` with its `state` (saving checkpoints the same way), and return `{ state, path }` for this run
+--- solution
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function runWithCheckpoints(graph: Graph, state: State, start: string, save: (text: string) => void): { state: State; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    state = { ...state, ...graph.nodes[current](state) };
+    path.push(current);
+    const edge = graph.edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+    save(JSON.stringify({ next: current, state }));
+  }
+  return { state, path };
+}
+
+function resume(graph: Graph, saved: string, save: (text: string) => void): { state: State; path: string[] } {
+  const cp = JSON.parse(saved);
+  return runWithCheckpoints(graph, cp.state, cp.next, save);
+}
+--- tests
+let reviews = 0;
+let failNext = false;
+const G: Graph = {
+  nodes: {
+    review: (s) => {
+      reviews += 1;
+      return { verdicts: s.clauses.map((c: string) => (c.includes("unlimited") ? "redline" : "accept")) };
+    },
+    summarise: (s) => ({ redlines: s.verdicts.filter((v: string) => v === "redline").length }),
+    export: (s) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("network down");
+      }
+      return { exported: `redlines=${s.redlines}` };
+    },
+  },
+  edges: { review: "summarise", summarise: "export", export: "END" },
+};
+const INIT = { clauses: ["8.1 unlimited", "3.1 fees"] };
+expect("sequence of checkpoints", () => {
+  const saved: string[] = [];
+  runWithCheckpoints(G, INIT, "review", (t) => saved.push(t));
+  return saved.map((t) => JSON.parse(t).next);
+}, ["summarise", "export", "END"]);
+expect("resume after a crash without rerunning review", () => {
+  reviews = 0;
+  failNext = true;
+  const saved: string[] = [];
+  try {
+    runWithCheckpoints(G, INIT, "review", (t) => saved.push(t));
+  } catch {
+    // crashed in export
+  }
+  const r = resume(G, saved[saved.length - 1], (t) => saved.push(t));
+  return [r.path, r.state.exported, reviews, JSON.parse(saved[saved.length - 1]).next];
+}, [["export"], "redlines=1", 1, "END"]);
+
+@@ item d18-e3
+type: scratch
+title: Closed book: conditional routing + interrupt
+exam: yes
+level: 3
+cards: Interrupt and resume: stop and wait for a person; Edges and conditional routing
+--- context
+Write a graph that can pause, closed book: a contract with redlines stops before export to ask the lawyer. The lawyer's decision may only arrive the next day, and the program must be able to carry on from nothing but a checkpoint text.
+--- prompt
+First define these types exactly as shown (the update a node returns may include an `interrupt` field, meaning "stop and ask a person"):
+
+```ts
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+```
+
+Write two functions:
+
+- `run(graph, state, start): RunResult`: go from `start` to `"END"`. After calling a node, if its return value has an `interrupt`, immediately return `{ status: "interrupted", question: <its value>, checkpoint: JSON.stringify({ next: <the current node>, state: <the current state> }) }` (this node's update is not merged); otherwise merge the state, record the path, and move on along the edge (a string or a routing function). On reaching END, return `{ status: "done", state, path }`
+- `resume(graph, checkpoint: string, decision: State): RunResult`: parse the checkpoint, merge `decision` into its state, and continue with `run` from `next`
+--- solution
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+
+function run(graph: Graph, state: State, start: string): RunResult {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const out = graph.nodes[current](state);
+    if (out.interrupt) {
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: current, state }) };
+    }
+    state = { ...state, ...out };
+    path.push(current);
+    const edge = graph.edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { status: "done", state, path };
+}
+
+function resume(graph: Graph, checkpoint: string, decision: State): RunResult {
+  const cp = JSON.parse(checkpoint);
+  return run(graph, { ...cp.state, ...decision }, cp.next);
+}
+--- tests
+const G: Graph = {
+  nodes: {
+    summarise: (s) => ({ redlines: s.verdicts.filter((v: string) => v === "redline").length }),
+    approve: (s) => (s.approved === null ? { interrupt: `Apply ${s.redlines} redline(s)?` } : {}),
+    export: (s) => ({ exported: s.approved ? "applied" : "not applied" }),
+  },
+  edges: { summarise: (s) => (s.redlines > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+const RISKY = { verdicts: ["redline", "accept", "redline"], approved: null };
+expect("pauses and asks", () => {
+  const r = run(G, RISKY, "summarise");
+  return r.status === "interrupted" ? [r.question, JSON.parse(r.checkpoint).next] : r.status;
+}, ["Apply 2 redline(s)?", "approve"]);
+expect("resumes after approval", () => {
+  const r = run(G, RISKY, "summarise");
+  if (r.status !== "interrupted") return r.status;
+  const done = resume(G, r.checkpoint, { approved: true });
+  return done.status === "done" ? [done.path, done.state.exported] : done.status;
+}, [["approve", "export"], "applied"]);
+expect("no redlines: finishes directly", () => {
+  const r = run(G, { verdicts: ["accept"], approved: null }, "summarise");
+  return r.status === "done" ? r.path : r.status;
+}, ["summarise", "export"]);

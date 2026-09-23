@@ -1,0 +1,1383 @@
+@@ day 13
+title: Evals and tracing: pass rate, recall, decorators, spans, A/B
+lang: py
+hours: 4–5 hours
+--- goal
+Turn "it seems to work" into numbers: write eval cases as data, run each one N times to get a pass rate, compute precision and recall, and compare two prompt versions side by side. Then add tracing to your code: decorators, timing spans, context managers, and token and latency summaries.
+
+In the project these are `evals/cases.json` (the test cases), `evals/harness.py` (`check`, `high_risk_recall`), `evals/run_evals.py` (the pass-rate table) and `clausecheck/tracing.py` (the `@observe` decorator).
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change one thing in each before you run it
+- Pass every practice exercise (including the local task: really compare v1 and v2 once with DeepSeek)
+- The 3 closed-book challenges
+- Open `evals/harness.py` and say what the numerator and the denominator of `high_risk_recall` are, and why it returns 1.0 when the denominator is 0
+
+@@ concept
+title: Eval cases are data, not gut feeling
+--- body
+"I tried a few and they looked fine" is not evidence. Eval cases write down "what counts as right" as **data**, so anyone can rerun them at any time.
+
+In Clause Check's `evals/cases.json`, each test case has an `id`, a `kind`, a `clause` and an `expect`:
+
+- `kind`: `must_flag` (risky, must be stopped), `must_accept` (ordinary boilerplate, must be let through), `trap` (a cross-reference trap), `injection` (prompt injection)
+- `expect` lists the **set of allowed answers** `verdict_in`, not one single answer: flag and redline both count as "stopped"
+- The right answers come from **human judgment**, not from what the model says
+- Every time something goes wrong in production, first turn it into a test case (bootcamp: `lessons/04_failure_to_dataset.md`)
+
+`check()` in `harness.py` returns a **list of failure reasons**; an empty list means it passed. The benefit: when it fails, you know why.
+--- code
+CASES = [
+    {"id": "unlimited-liability", "kind": "must_flag", "clause": "Customer's liability shall be unlimited.",
+     "expect": {"verdict_in": ["flag", "redline"], "risk_in": ["high"]}},
+    {"id": "payment-net-30", "kind": "must_accept", "clause": "Fees are payable within thirty (30) days.",
+     "expect": {"verdict_in": ["accept"]}},
+]
+
+def check(case, result):
+    fails = []
+    e = case["expect"]
+    if result["verdict"] not in e["verdict_in"]:
+        fails.append(f"verdict {result['verdict']} not in {e['verdict_in']}")
+    return fails
+
+results = {
+    "unlimited-liability": {"verdict": "accept", "risk_level": "low"},
+    "payment-net-30": {"verdict": "accept", "risk_level": "low"},
+}
+for case in CASES:
+    fails = check(case, results[case["id"]])
+    print(f"{case['id']:<22} {'PASS' if not fails else 'FAIL'} {fails}")
+
+@@ concept
+title: Run N times, look at the pass rate
+mock: yes
+--- body
+The same test case can be right this time and wrong the next. So you run each test case N times and report a **pass rate** (passes ÷ N), not just "right" or "wrong".
+
+- N at least 5: one correct run may just be luck; 3 right out of 5 (60%) says this case is unstable
+- Remember Day 7: pass@k (right at least once in k runs) easily gets close to 100%; pass^k (right all k times) is what counts when nobody is watching. The table from `run_evals.py` has a `pass^k` column
+- The mock server on this page deliberately wavers on the AS IS disclaimer clause (about 60% accept). `MOCK.reset()` resets its random seed, so the same code gives the same numbers every run, and the tests can fix the expected values
+
+As yesterday, the `classify` request carries `"thinking": {"type": "disabled"}`: evals call each test case many times, and judging one clause doesn't need long reasoning, so with thinking mode off it is faster and cheaper, and `temperature` works again.
+
+In the example below, 1 run gives 100%; only more runs show that it is actually unstable.
+--- code
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def classify(clause_text):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}],
+            "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+AS_IS = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS" AND EACH PARTY DISCLAIMS ALL OTHER WARRANTIES.'
+for n in [1, 5, 20]:
+    MOCK.reset()
+    verdicts = [classify(AS_IS)["verdict"] for _ in range(n)]
+    print("runs =", n, " accept rate =", verdicts.count("accept") / n, " all passed:", all(v == "accept" for v in verdicts))
+
+@@ concept
+title: Confusion matrix, precision, recall
+--- body
+Treat "is this clause risky?" as a yes/no question. The true answer comes from the test case (`must_flag` means risky); the model's answer is "did it flag it?" (the verdict is not accept). That gives four combinations:
+
+- **TP**: risky, and flagged (caught correctly)
+- **FP**: not risky, but flagged (a false alarm: the lawyer takes a look for nothing)
+- **FN**: risky, but let through (a miss: the most dangerous one)
+- **TN**: not risky, and let through
+
+**Precision** = TP ÷ (TP + FP): of the clauses flagged, how many are real problems.
+**Recall** = TP ÷ (TP + FN): of the clauses that really are risky, how many were caught.
+
+In contract review, missing an unlimited-liability clause (FN) costs far more than flagging one clause too many (FP), so the project cares most about **high-risk recall** (`high_risk_recall` in `harness.py`; `run_evals.py` requires at least 0.9). The denominator can be 0 (no risky test cases at all), so check for that first; the project returns 1.0 in that case.
+--- code
+truth = [True, True, True, False, False]     # really risky? (from the test cases)
+flagged = [True, True, False, True, False]   # did the model flag it?
+pairs = list(zip(truth, flagged))
+tp = sum(1 for t, f in pairs if t and f)
+fp = sum(1 for t, f in pairs if not t and f)
+fn = sum(1 for t, f in pairs if t and not f)
+tn = sum(1 for t, f in pairs if not t and not f)
+print("TP FP FN TN =", tp, fp, fn, tn)
+print("precision =", round(tp / (tp + fp), 2))
+print("recall    =", round(tp / (tp + fn), 2))
+
+@@ concept
+title: Functions are values: decorators
+--- body
+Functions can be passed around as values (Day 2's `sorted(key=...)`, yesterday's `ask=call_model`), and a function can also **return a new function**.
+
+A decorator is exactly such a function: it takes a function in and returns a new function that "wraps" it. The new function does something before and after the call (timing, counting, logging), calls the original function in the middle as usual, and **returns its result**.
+
+```python
+@logged
+def section_of(clause_id): ...
+# exactly the same as: section_of = logged(section_of)
+```
+
+`*args, **kwargs` (from Day 8) let the wrapper accept any arguments and pass them on unchanged. `@functools.wraps(fn)` copies the original function's name and docstring onto the wrapper; otherwise `section_of.__name__` becomes `"wrapper"`, and your traces are full of wrapper.
+
+`@observe` in `clausecheck/tracing.py` is a decorator: when Langfuse keys are configured it uses Langfuse's version and records each call as a span; when they are not, it falls back to a wrapper that just calls the function and does nothing else.
+--- code
+import functools
+
+def logged(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        print("->", fn.__name__, args)
+        result = fn(*args, **kwargs)
+        print("<-", fn.__name__, result)
+        return result
+    return wrapper
+
+@logged
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+
+print(section_of("8.1"))
+print("name:", section_of.__name__)
+
+@@ concept
+title: Timing, fake clocks, decorators with arguments
+--- body
+`time.perf_counter()` returns a number of seconds made for measuring time differences: read it once before and once after, and subtract: `ms = round((end - start) * 1000)`. One timing is recorded as a **span**, for example `{"name": "review_clause", "ms": 250}`. What you see in Langfuse is a series of spans.
+
+Real time is different on every run, so a test can't fix the expected value. The fix: **pass the clock in as a parameter**. By default it is `time.perf_counter`; in tests you swap in a fake clock that hands out prepared times in order. `iter(list)` turns a list into an iterator that gives its items out "one at a time", and `next(it)` takes the next one.
+
+When a decorator needs arguments (`@timed(clock=...)`, like `@observe(name="review_clause")` in `tracing.py`), you need **one more layer**: `timed(clock)` first returns a decorator, and the decorator returns the wrapper.
+--- code
+import functools
+import time
+
+def fake_clock(times):
+    it = iter(times)
+    return lambda: next(it)
+
+def measure(fn, clock=time.perf_counter):
+    start = clock()
+    result = fn()
+    return result, round((clock() - start) * 1000)
+
+print(measure(lambda: "flag", clock=fake_clock([10.0, 10.25])))
+print("real clock is fast:", measure(lambda: "flag")[1] < 1000)
+
+def tagged(label):                        # layer 1: takes the arguments
+    def decorator(fn):                    # layer 2: takes the function
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):     # layer 3: runs on every call
+            print(f"[{label}] {fn.__name__}{args}")
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@tagged("eval")
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+
+print(section_of("8.1"))
+
+@@ concept
+title: with and context managers
+--- body
+`with open(...) as f:` makes sure the file is closed when you are done, even if an error happens in the middle. You can write this kind of thing yourself too: "do one thing on the way in, and **always** do another on the way out":
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def span(name):
+    start = time.perf_counter()
+    try:
+        yield            # the code inside the with runs here
+    finally:
+        record(name, start)   # runs whether or not there was an error
+```
+
+`yield` hands control to the code inside the `with`; `finally` makes sure the span is recorded even on an error. What tracing needs most is exactly the record of the call that **failed**.
+
+A classic mistake: using `except Exception:` instead of `finally`. The error is swallowed, and the caller thinks everything went fine.
+--- code
+from contextlib import contextmanager
+
+SPANS = []
+
+@contextmanager
+def span(name):
+    ok = False
+    try:
+        yield
+        ok = True
+    finally:
+        SPANS.append({"name": name, "ok": ok})
+
+with span("split"):
+    parts = "8.1 Cap\n8.2 Exclusions".split("\n")
+
+try:
+    with span("review"):
+        raise RuntimeError("API error 503")
+except RuntimeError as e:
+    print("caught:", e)
+
+for s in SPANS:
+    print(s)
+
+@@ concept
+title: Tokens, cache hit rate, latency percentiles
+--- body
+Add up the `usage` of every call, and you have the full bill for this eval run (or this contract):
+
+- **Total tokens** and the **cache hit rate** `hit ÷ (hit + miss)`: a low hit rate means something at the start of the request keeps changing (what you learned yesterday)
+- **Cost**: Day 7's `estimate_cost`; when quoting a customer, convert it to "how much per 100 contracts". With thinking mode on, reasoning tokens are counted in `completion_tokens` too (how many of them are reasoning: see `usage["completion_tokens_details"]["reasoning_tokens"]`) and billed at the output price
+- **Don't look only at the average latency**: one 30-second stall gets averaged away by a pile of 1-second calls. Look at **p50** (half of the calls are faster than this) and **p95** (95% of the calls are faster than this; it shows how slow "the slow ones" are)
+
+The simplest percentile method (nearest-rank): sort the values and take item number `ceil(p ÷ 100 × n)` (counting from 1). For the 10 latencies below, p50 is item 5 and p95 is item 10.
+--- code
+latencies = [1450, 820, 30000, 1010, 1200, 950, 1100, 2100, 1300, 1600]
+ordered = sorted(latencies)
+print("mean:", sum(latencies) / len(latencies))
+print("p50: ", ordered[4])
+print("p95: ", ordered[9])
+
+usage = [
+    {"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 900},
+    {"prompt_cache_hit_tokens": 832, "prompt_cache_miss_tokens": 70},
+    {"prompt_cache_hit_tokens": 832, "prompt_cache_miss_tokens": 95},
+]
+hit = sum(u["prompt_cache_hit_tokens"] for u in usage)
+miss = sum(u["prompt_cache_miss_tokens"] for u in usage)
+print("cache hit ratio:", round(hit / (hit + miss), 2))
+
+@@ concept
+title: A/B comparison: change one thing at a time
+--- body
+You changed the prompt. How do you know it got better? Run both versions on **the same test cases with the same N**, and compare them side by side, case by case. Three rules (bootcamp: `lessons/05_prompt_ab.md`):
+
+- **Change only one thing at a time**, otherwise you can't tell which change made the difference
+- First check whether high-risk recall dropped, then whether false alarms went down
+- Even if the total score goes up, look case by case: one case dropping from 3/3 to 1/3 is a regression, and you have to look into it
+
+`run_evals.py` lines up the table with f-strings: `{x:<10}` left-aligns in 10 characters, `{x:>6}` right-aligns in 6, `{rate:.0%}` shows 0.8 as `80%`; together that is `{rate:>6.0%}`.
+--- code
+A = {"unlimited-liability": 1.0, "mutual-warranty-disclaimer": 0.4, "payment-net-30": 1.0}
+B = {"unlimited-liability": 1.0, "mutual-warranty-disclaimer": 0.8, "payment-net-30": 0.6}
+print(f"{'case':<28}{'v1':>6}{'v2':>6}")
+for case_id in A:
+    a, b = A[case_id], B[case_id]
+    note = "  <- worse" if b < a else ""
+    print(f"{case_id:<28}{a:>6.0%}{b:>6.0%}{note}")
+
+@@ item d13-01
+type: predict
+title: Recap: Counter, all and any
+level: 1
+cards: d8:More on dictionaries: comprehensions, Counter, defaultdict; d8:any and all; Run N times, look at the pass rate
+--- context
+The model reviewed the same clause 5 times and gave back 5 verdicts. From this list, the evals need to see: which verdict is most common, what share was accepted, and whether every run gave the same answer.
+--- prompt
+Write the output. Review Day 8's `Counter` and `all` / `any`, and think about how the last line relates to pass^k and pass@k.
+--- code
+from collections import Counter
+
+verdicts = ["accept", "flag", "accept", "accept", "flag"]
+counts = Counter(verdicts)
+print(counts.most_common(1))
+print(counts["accept"] / len(verdicts))
+print(all(v == "accept" for v in verdicts), any(v == "accept" for v in verdicts))
+--- explain
+accept came up 3 times out of 5, a pass rate of 0.6. `all` means "right all 5 times" (pass^k), False here; `any` means "right at least once" (pass@k), True here. A test case where pass@k is true and pass^k is false is unstable: run it more times and look at the pass rate.
+
+@@ item d13-02
+type: code
+title: Check one test case
+level: 2
+cards: Eval cases are data, not gut feeling
+--- context
+Clause Check's eval cases live in `evals/cases.json`. Each one says which answers count as right; for example, a risky clause may get flag or redline. Checking a result must say not only whether it passed but also which part was wrong, so that when you tune the prompt you know where to start.
+--- prompt
+Write `check_case(case, result)` that, like `check()` in `harness.py`, returns a **list of failure reasons** (empty list = passed). Check in this order:
+
+1. `result["verdict"]` is not in `case["expect"]["verdict_in"]` → add `f"verdict {verdict} not in {allowed list}"`
+2. `expect` has `"risk_in"`, and `result["risk_level"]` is not in it → add `f"risk {risk} not in {allowed list}"`
+3. `expect` has `"topic"`, and `result["topic"]` is not equal to it → add `f"topic {actual} != {expected}"`
+
+```python
+check_case(UNLIMITED, {"verdict": "accept", "risk_level": "low", "topic": "other"})
+# ["verdict accept not in ['flag', 'redline']", "risk low not in ['high']", "topic other != liability_cap"]
+```
+--- starter
+def check_case(case, result):
+    fails = []
+    return fails
+--- solution
+def check_case(case, result):
+    fails = []
+    e = case["expect"]
+    if result["verdict"] not in e["verdict_in"]:
+        fails.append(f"verdict {result['verdict']} not in {e['verdict_in']}")
+    if "risk_in" in e and result["risk_level"] not in e["risk_in"]:
+        fails.append(f"risk {result['risk_level']} not in {e['risk_in']}")
+    if "topic" in e and result["topic"] != e["topic"]:
+        fails.append(f"topic {result['topic']} != {e['topic']}")
+    return fails
+--- tests
+UNLIMITED = {"id": "unlimited-liability", "kind": "must_flag", "clause": "Customer's liability shall be unlimited.",
+             "expect": {"verdict_in": ["flag", "redline"], "topic": "liability_cap", "risk_in": ["high"]}}
+NET30 = {"id": "payment-net-30", "kind": "must_accept", "clause": "Fees are payable within thirty (30) days.",
+         "expect": {"verdict_in": ["accept"]}}
+expect("all three wrong: three reasons, in order", lambda: check_case(UNLIMITED, {"verdict": "accept", "risk_level": "low", "topic": "other"}), ["verdict accept not in ['flag', 'redline']", "risk low not in ['high']", "topic other != liability_cap"])
+expect("all right: empty list", lambda: check_case(UNLIMITED, {"verdict": "redline", "risk_level": "high", "topic": "liability_cap"}), [])
+expect("redline and flag both count as stopped", lambda: check_case(UNLIMITED, {"verdict": "flag", "risk_level": "high", "topic": "liability_cap"}), [])
+expect("only the risk is wrong", lambda: check_case(UNLIMITED, {"verdict": "redline", "risk_level": "medium", "topic": "liability_cap"}), ["risk medium not in ['high']"])
+expect("no risk_in / topic in expect: not checked", lambda: check_case(NET30, {"verdict": "flag", "risk_level": "high", "topic": "other"}), ["verdict flag not in ['accept']"])
+--- hints
+- Start with `e = case["expect"]`, then three separate `if`s (not elif: there can be several problems at once).
+- "expect has this key" is `"risk_in" in e`; join it to the next condition with `and`.
+- Put the list straight into the f-string; it prints like `['flag', 'redline']`.
+
+@@ item d13-03
+type: code
+title: Pass rate of one test case
+level: 2
+mock: yes
+cards: Run N times, look at the pass rate
+--- context
+The model reviews the same clause, right this time and wrong the next, and one run can't show that. The project's `run_evals.py` runs every test case several times and the table reports the pass rate. The model mocked on this page deliberately flips between flagging and accepting the AS IS disclaimer clause.
+--- prompt
+Write `pass_rate(case, runs, review=classify)`:
+
+- Give `case["clause"]` to `review`, `runs` times
+- Judge each result with `check_case(case, result)`; an empty list means it passed
+- Return the share that passed (a decimal from 0 to 1)
+- `runs` less than 1: `raise ValueError("runs must be at least 1")`
+
+`classify` (calls the mock server) and `check_case` (the previous exercise) are already written. The tests use the wavering AS IS clause and call `MOCK.reset()` first, so the results are fixed.
+--- starter
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def classify(clause_text):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}],
+            "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+def check_case(case, result):
+    fails = []
+    e = case["expect"]
+    if result["verdict"] not in e["verdict_in"]:
+        fails.append(f"verdict {result['verdict']} not in {e['verdict_in']}")
+    if "risk_in" in e and result["risk_level"] not in e["risk_in"]:
+        fails.append(f"risk {result['risk_level']} not in {e['risk_in']}")
+    return fails
+
+def pass_rate(case, runs, review=classify):
+    pass
+--- solution
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def classify(clause_text):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": clause_text}],
+            "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+def check_case(case, result):
+    fails = []
+    e = case["expect"]
+    if result["verdict"] not in e["verdict_in"]:
+        fails.append(f"verdict {result['verdict']} not in {e['verdict_in']}")
+    if "risk_in" in e and result["risk_level"] not in e["risk_in"]:
+        fails.append(f"risk {result['risk_level']} not in {e['risk_in']}")
+    return fails
+
+def pass_rate(case, runs, review=classify):
+    if runs < 1:
+        raise ValueError("runs must be at least 1")
+    passed = 0
+    for _ in range(runs):
+        if not check_case(case, review(case["clause"])):
+            passed += 1
+    return passed / runs
+--- tests
+UNLIMITED = {"id": "unlimited-liability", "clause": "Review clause 8.1: Customer's liability shall be unlimited.", "expect": {"verdict_in": ["flag", "redline"], "risk_in": ["high"]}}
+AS_IS = {"id": "mutual-warranty-disclaimer", "clause": 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS" AND EACH PARTY DISCLAIMS ALL OTHER WARRANTIES.', "expect": {"verdict_in": ["accept"]}}
+def _rate(case, runs):
+    MOCK.reset()
+    return pass_rate(case, runs)
+expect("stable case: 5/5", lambda: _rate(UNLIMITED, 5), 1.0)
+expect("wavering case: 5 runs", lambda: _rate(AS_IS, 5), 0.8)
+expect("wavering case: 10 runs", lambda: _rate(AS_IS, 10), 0.9)
+expect("really reviewed runs times", lambda: (_rate(UNLIMITED, 4), len(MOCK.calls))[1], 4)
+expect("a fake reviewer that always accepts: 0", lambda: pass_rate(UNLIMITED, 3, review=lambda text: {"verdict": "accept", "risk_level": "low"}), 0.0)
+expect_raises("runs is 0", lambda: pass_rate(UNLIMITED, 0), ValueError)
+--- hints
+- `check_case` returns an empty list when the case passes, so write the check as `if not check_case(...):`.
+- Call the reviewer through the parameter, `review(case["clause"])`, not `classify(...)` directly; otherwise the tests can't swap in a fake one.
+
+@@ item d13-04
+type: code
+title: Confusion matrix
+level: 2
+cards: Confusion matrix, precision, recall
+--- context
+After an eval run, each test case's result goes into one of four boxes: was what should be stopped stopped, and was anything stopped that should have gone through? What lawyers fear most is a risky clause slipping through.
+--- prompt
+Write `confusion(cases, predictions)`:
+
+- `cases`: a list of test cases. A `kind` of `"must_accept"` means "not risky"; every other kind means "risky" (they all expect to be stopped)
+- `predictions`: `{case id: verdict}`. Any verdict other than `"accept"` counts as "flagged"
+- Return `{"TP": ..., "FP": ..., "FN": ..., "TN": ...}` with all four keys; a box with nothing in it is 0
+
+```python
+confusion([{"id": "a", "kind": "must_flag"}, {"id": "b", "kind": "must_accept"}], {"a": "accept", "b": "flag"})
+# {"TP": 0, "FP": 1, "FN": 1, "TN": 0}
+```
+--- starter
+def confusion(cases, predictions):
+    counts = {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
+    return counts
+--- solution
+def confusion(cases, predictions):
+    counts = {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
+    for case in cases:
+        risky = case["kind"] != "must_accept"
+        flagged = predictions[case["id"]] != "accept"
+        if risky and flagged:
+            counts["TP"] += 1
+        elif not risky and flagged:
+            counts["FP"] += 1
+        elif risky and not flagged:
+            counts["FN"] += 1
+        else:
+            counts["TN"] += 1
+    return counts
+--- tests
+CASES = [
+    {"id": "unlimited-liability", "kind": "must_flag"},
+    {"id": "cross-reference-trap", "kind": "trap"},
+    {"id": "prompt-injection", "kind": "injection"},
+    {"id": "payment-net-30", "kind": "must_accept"},
+    {"id": "service-levels", "kind": "must_accept"},
+]
+PRED = {"unlimited-liability": "redline", "cross-reference-trap": "accept", "prompt-injection": "flag", "payment-net-30": "accept", "service-levels": "flag"}
+expect("the example from the prompt", lambda: confusion([{"id": "a", "kind": "must_flag"}, {"id": "b", "kind": "must_accept"}], {"a": "accept", "b": "flag"}), {"TP": 0, "FP": 1, "FN": 1, "TN": 0})
+expect("five test cases", lambda: confusion(CASES, PRED), {"TP": 2, "FP": 1, "FN": 1, "TN": 1})
+expect("all judged right", lambda: confusion(CASES, {"unlimited-liability": "flag", "cross-reference-trap": "flag", "prompt-injection": "redline", "payment-net-30": "accept", "service-levels": "accept"}), {"TP": 3, "FP": 0, "FN": 0, "TN": 2})
+expect("no test cases", lambda: confusion([], {}), {"TP": 0, "FP": 0, "FN": 0, "TN": 0})
+--- hints
+- For each test case, first compute two booleans: `risky = case["kind"] != "must_accept"` and `flagged = predictions[case["id"]] != "accept"`.
+- Then use if / elif to split into the four cases and add 1 to the matching key.
+
+@@ item d13-05
+type: code
+title: Precision and recall
+level: 2
+cards: Confusion matrix, precision, recall
+--- context
+The four box counts still have to become two ratios to answer the two things lawyers care about most: how many of the flagged clauses are real problems, and how many of the really risky ones were caught. The project's `run_evals.py` requires a high-risk recall of at least 0.9.
+--- prompt
+Write `precision_recall(counts)`: `counts` is the dictionary returned by the previous exercise. Return the tuple `(precision, recall)`, both rounded with `round(x, 2)`:
+
+- precision = TP ÷ (TP + FP); when the denominator is 0 (nothing was flagged), return `1.0`
+- recall = TP ÷ (TP + FN); when the denominator is 0 (no risky test cases at all), return `1.0`, just like `high_risk_recall` in `harness.py`
+
+`precision_recall({"TP": 3, "FP": 1, "FN": 1, "TN": 5})` → `(0.75, 0.75)`
+--- starter
+def precision_recall(counts):
+    pass
+--- solution
+def precision_recall(counts):
+    tp, fp, fn = counts["TP"], counts["FP"], counts["FN"]
+    precision = tp / (tp + fp) if tp + fp else 1.0
+    recall = tp / (tp + fn) if tp + fn else 1.0
+    return round(precision, 2), round(recall, 2)
+--- tests
+expect("the example from the prompt", lambda: precision_recall({"TP": 3, "FP": 1, "FN": 1, "TN": 5}), (0.75, 0.75))
+expect("no false alarms, one miss", lambda: precision_recall({"TP": 2, "FP": 0, "FN": 1, "TN": 4}), (1.0, 0.67))
+expect("caught nothing", lambda: precision_recall({"TP": 0, "FP": 2, "FN": 3, "TN": 0}), (0.0, 0.0))
+expect("both denominators are 0", lambda: precision_recall({"TP": 0, "FP": 0, "FN": 0, "TN": 6}), (1.0, 1.0))
+--- hints
+- First take out the three numbers: `tp, fp, fn = counts["TP"], counts["FP"], counts["FN"]`.
+- The zero-denominator check fits on one line: `tp / (tp + fp) if tp + fp else 1.0` (0 counts as false).
+- Returning two values returns a tuple: `return round(p, 2), round(r, 2)`.
+
+@@ item d13-06
+type: choice
+title: Which number comes first in contract review
+level: 2
+cards: Confusion matrix, precision, recall
+--- context
+When you tune a prompt, one number often gets worse as another gets better, so before you start you have to decide which one matters most.
+--- prompt
+A lawyer says: "If we miss one unlimited-liability clause, the customer could lose millions; if you flag one clause too many, I spend 30 seconds looking at it." When you tune Clause Check, which number should you watch first?
+--- options
+- Precision: everything flagged must be a real problem
+- Recall on the high-risk test cases: not a single really risky clause may be missed
+- Accuracy: the share of all test cases judged right
+- Average latency
+answer: 2
+--- explain
+A miss (FN) costs far more than a false alarm (FP), so protect recall first: `run_evals.py` only passes when high-risk recall is at least 0.9. Accuracy can fool you: if only 1 of 10 test cases is risky, accepting everything still gives 90% accuracy. But false alarms are not free either: flagging everything gives a recall of 1.0, and the tool becomes useless. So the must_accept test cases matter too, which is exactly why the project fixed its false alarms on boilerplate clauses.
+
+@@ item d13-07
+type: testwrite
+title: Write tests for recall
+level: 3
+cards: Confusion matrix, precision, recall; d9:How to come up with test cases; d9:Testing errors and floats: raises, approx
+--- context
+Recall is the most important number in the evals. If it is computed wrong, the report says "nothing was missed" when several clauses were. Writing tests means catching the ways it is easy to compute it wrong.
+--- prompt
+Write tests for `recall(results)`. `results` is a list of `(really risky?, flagged?)` tuples; recall = risky clauses caught ÷ all risky clauses; when there are no risky clauses at all, it returns `1.0`.
+
+Your tests must all pass on the correct function and catch the few hidden buggy versions. The starter code has only one weak test. Think about:
+
+- Should a false alarm (not risky but flagged) change the recall?
+- How do you compare a result like 1/3 that doesn't divide evenly?
+- What about an empty list?
+--- impl
+def recall(results):
+    tp = sum(1 for risky, flagged in results if risky and flagged)
+    fn = sum(1 for risky, flagged in results if risky and not flagged)
+    if tp + fn == 0:
+        return 1.0
+    return tp / (tp + fn)
+--- mutants
+===== Wrong denominator: uses the flagged clauses as the denominator (that is precision)
+def recall(results):
+    tp = sum(1 for risky, flagged in results if risky and flagged)
+    fp = sum(1 for risky, flagged in results if not risky and flagged)
+    if tp + fp == 0:
+        return 1.0
+    return tp / (tp + fp)
+===== Edge case: when there are no risky clauses at all
+def recall(results):
+    tp = sum(1 for risky, flagged in results if risky and flagged)
+    fn = sum(1 for risky, flagged in results if risky and not flagged)
+    if tp + fn == 0:
+        return 0.0
+    return tp / (tp + fn)
+===== Counting: only half of the "caught" condition is written
+def recall(results):
+    tp = sum(1 for risky, flagged in results if flagged)
+    fn = sum(1 for risky, flagged in results if risky and not flagged)
+    if tp + fn == 0:
+        return 1.0
+    return tp / (tp + fn)
+--- starter
+import pytest
+
+def test_all_caught():
+    assert recall([(True, True), (False, False)]) == 1.0
+--- solution
+import pytest
+
+def test_all_caught():
+    assert recall([(True, True), (False, False)]) == 1.0
+
+def test_false_alarm_does_not_change_recall():
+    results = [(True, True), (True, False), (True, False), (False, True)]
+    assert recall(results) == pytest.approx(1 / 3)
+
+def test_no_risky_clauses():
+    assert recall([]) == 1.0
+    assert recall([(False, True), (False, False)]) == 1.0
+--- hints
+- Use data that mixes "risky but missed" with "not risky but flagged": for example 3 risky clauses with only 1 caught, plus 1 false alarm. The right answer is 1/3.
+- 1/3 doesn't divide evenly, so use `assert recall(...) == pytest.approx(1 / 3)`.
+- Then write a separate test for the empty list: the prompt says it returns `1.0` then.
+
+@@ item d13-08
+type: predict
+title: When does a decorator run?
+level: 2
+cards: Functions are values: decorators
+--- context
+Clause Check's `tracing.py` adds tracing to the review function with the decorator `@observe`: once the keys for the tracing platform are set, every call gets recorded. Before you write your own decorator, get clear on when each line inside one runs.
+--- prompt
+Write the output. Notice when the `decorating` line is printed.
+--- code
+def shout(fn):
+    print("decorating", fn.__name__)
+    def wrapper(text):
+        print("before")
+        result = fn(text)
+        print("after")
+        return result.upper()
+    return wrapper
+
+@shout
+def verdict(text):
+    print("inside")
+    return "flag" if "unlimited" in text else "accept"
+
+print("start")
+print(verdict("liability is unlimited"))
+--- explain
+`@shout` runs **at the moment the function is defined** (it is the same as `verdict = shout(verdict)`), so `decorating verdict` comes before `start`. After that, every call to `verdict(...)` actually runs `wrapper`: first before, then the original function (inside), then after, and finally it returns the changed result.
+
+@@ item d13-09
+type: code
+title: A decorator that counts calls
+level: 2
+cards: Functions are values: decorators
+--- context
+During evals you want to know how many times the model was really called: twice the calls means twice the money. Counting from the outside without changing a single line of the original function is exactly what decorators are good at.
+--- prompt
+Write the decorator `count_calls(fn)`: each time the returned wrapper is called, it adds 1 to its own attribute `calls` (starting at 0), then calls the original function and returns its result. Use `functools.wraps` to keep the original function's name.
+
+```python
+@count_calls
+def classify(text): ...
+
+classify("a"); classify("b")
+classify.calls      # 2
+classify.__name__   # "classify"
+```
+
+Functions are objects too, so you can give them attributes: write `wrapper.calls = 0` before `return wrapper`.
+--- starter
+import functools
+
+def count_calls(fn):
+    pass
+--- solution
+import functools
+
+def count_calls(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        wrapper.calls += 1
+        return fn(*args, **kwargs)
+    wrapper.calls = 0
+    return wrapper
+--- tests
+@count_calls
+def classify(text):
+    return "flag" if "unlimited" in text else "accept"
+expect("returns the original function's result", lambda: classify("liability is unlimited"), "flag")
+expect("keyword arguments work too", lambda: classify(text="fees"), "accept")
+expect("the name is kept", lambda: classify.__name__, "classify")
+def _fresh():
+    @count_calls
+    def f(x):
+        return x
+    before = f.calls
+    f(1); f(2); f(3)
+    return [before, f.calls]
+expect("0 before any call, 3 after 3 calls", _fresh, [0, 3])
+def _separate():
+    @count_calls
+    def a():
+        return 1
+    @count_calls
+    def b():
+        return 2
+    a(); a(); b()
+    return [a.calls, b.calls]
+expect("two functions keep separate counts", _separate, [2, 1])
+--- hints
+- The shape: inside `def count_calls(fn):` define `def wrapper(*args, **kwargs):`, and end with `return wrapper`.
+- Inside wrapper: first `wrapper.calls += 1`, then `return fn(*args, **kwargs)`.
+- Don't forget to set the starting value `wrapper.calls = 0` before `return wrapper`, and to put `@functools.wraps(fn)` above `def wrapper`.
+
+@@ item d13-10
+type: fix
+title: Fix the bug: adding tracing makes it return None
+level: 2
+cards: Functions are values: decorators
+--- context
+In the project, `@observe` wraps the review function to trace the whole pipeline. A tracing decorator should only take notes on the side: with it added, the program must behave exactly as without it, and each trace record must show which function it belongs to.
+--- prompt
+A colleague wrote a tracing decorator `traced`. Once it is added, `review` returns nothing but `None`, and `review.__name__` has become `wrapper` (the logs and traces are full of wrapper, so you can't tell what is what).
+
+Run it, look at the output, and fix both bugs.
+--- starter
+import time
+
+SPANS = []
+
+def traced(fn):
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        fn(*args, **kwargs)
+        SPANS.append({"name": fn.__name__, "ms": round((time.perf_counter() - start) * 1000)})
+    return wrapper
+
+@traced
+def review(clause_text):
+    """Review one clause and return a verdict."""
+    return "redline" if "unlimited" in clause_text else "accept"
+
+print(review("Customer's liability shall be unlimited."))
+print(review.__name__, review.__doc__)
+--- solution
+import functools
+import time
+
+SPANS = []
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = fn(*args, **kwargs)
+        SPANS.append({"name": fn.__name__, "ms": round((time.perf_counter() - start) * 1000)})
+        return result
+    return wrapper
+
+@traced
+def review(clause_text):
+    """Review one clause and return a verdict."""
+    return "redline" if "unlimited" in clause_text else "accept"
+
+print(review("Customer's liability shall be unlimited."))
+print(review.__name__, review.__doc__)
+--- tests
+expect("returns the original function's result", lambda: review("Customer's liability shall be unlimited."), "redline")
+expect("another clause", lambda: review("Fees are payable within thirty (30) days."), "accept")
+expect("the name is kept", lambda: review.__name__, "review")
+expect("the docstring is kept too", lambda: review.__doc__, "Review one clause and return a verdict.")
+expect("the span is still recorded", lambda: SPANS[-1]["name"], "review")
+--- hints
+- The original function's return value is thrown away: store the result of `fn(...)` in a variable and `return` it at the end.
+- Name and docstring: `import functools`, and put `@functools.wraps(fn)` above `def wrapper`.
+
+@@ item d13-11
+type: code
+title: A timing decorator with a fake clock
+level: 3
+cards: Timing, fake clocks, decorators with arguments
+--- context
+To find out which step is slowest when reviewing a contract, you have to time every step, and each timing is recorded as a span. A real clock reads differently every time, so tests can't fix the answer; the clock has to be swappable for a fake one.
+--- prompt
+Write a decorator **with arguments**, `timed(clock=time.perf_counter)`, used like this:
+
+```python
+@timed()
+def review(text): ...
+
+@timed(clock=fake_clock([10.0, 10.25]))
+def classify(text): ...
+```
+
+On every call to the decorated function:
+
+- Read `clock()` once before and once after the call
+- Append `{"name": original function name, "ms": elapsed milliseconds}` to the global list `SPANS`, with the milliseconds turned into a whole number with `round(...)`; return the original function's result
+- When the original function **raises an error**, record a span too, with one more key `"error": the exception's class name` (`type(e).__name__`), then re-raise the error unchanged: a bare `raise` on its own line inside `except` does that
+- Use `functools.wraps` to keep the name
+--- starter
+import functools
+import time
+
+SPANS = []
+
+def timed(clock=time.perf_counter):
+    pass
+--- solution
+import functools
+import time
+
+SPANS = []
+
+def timed(clock=time.perf_counter):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            start = clock()
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as e:
+                SPANS.append({"name": fn.__name__, "ms": round((clock() - start) * 1000), "error": type(e).__name__})
+                raise
+            SPANS.append({"name": fn.__name__, "ms": round((clock() - start) * 1000)})
+            return result
+        return wrapper
+    return decorator
+--- tests
+def fake_clock(times):
+    it = iter(times)
+    return lambda: next(it)
+def classify(text):
+    return "flag" if "unlimited" in text else "accept"
+def _one():
+    SPANS.clear()
+    f = timed(clock=fake_clock([10.0, 10.25]))(classify)
+    return [f("liability is unlimited"), SPANS]
+expect("result and span", _one, ["flag", [{"name": "classify", "ms": 250}]])
+def _two():
+    SPANS.clear()
+    f = timed(clock=fake_clock([1.0, 1.1, 5.0, 5.5]))(classify)
+    f("a")
+    f("b")
+    return [s["ms"] for s in SPANS]
+expect("two calls, two spans", _two, [100, 500])
+def call_model(text):
+    raise TimeoutError("model took too long")
+def _error():
+    SPANS.clear()
+    f = timed(clock=fake_clock([2.0, 32.0]))(call_model)
+    try:
+        f("x")
+    except TimeoutError:
+        return SPANS
+    return "the error was not raised"
+expect("an error is recorded too, and still raised", _error, [{"name": "call_model", "ms": 30000, "error": "TimeoutError"}])
+def _default():
+    SPANS.clear()
+    @timed()
+    def section_of(clause_id):
+        return clause_id.split(".")[0]
+    return [section_of("8.1"), section_of.__name__, SPANS[0]["ms"] < 1000]
+expect("real clock by default, name kept", _default, ["8", "section_of", True])
+--- hints
+- Three layers: `timed(clock)` returns `decorator`; `decorator(fn)` returns `wrapper`; the work happens in `wrapper(*args, **kwargs)`. Model it on `tagged` from the knowledge card.
+- Inside wrapper: `start = clock()`, then `try: result = fn(*args, **kwargs)`; in `except Exception as e:` record a span with `"error"`, then `raise` on a line of its own.
+- After the try (the path with no error): record a normal span and `return result`.
+
+@@ item d13-12
+type: order
+title: Put the code in order: a span that records errors too
+level: 2
+cards: with and context managers
+--- context
+Sometimes what you want to time is not a whole function but a small part of it, such as the few lines that call the model; wrapping them in a `with` is the easiest way. What tracing needs most is the record of the call that failed, so an error must not mean a missing record.
+--- prompt
+Put together the context manager `span(name, clock=time.perf_counter)`: whenever the code inside the `with` finishes (**including with an error**), it appends one `{"name": ..., "ms": ...}` to `SPANS`, and errors are still raised.
+
+Two lines are distractors.
+--- lines
+import time
+from contextlib import contextmanager
+SPANS = []
+@contextmanager
+def span(name, clock=time.perf_counter):
+    start = clock()
+    try:
+        yield
+    finally:
+        SPANS.append({"name": name, "ms": round((clock() - start) * 1000)})
+--- distractors
+    except Exception:
+    yield
+--- tests
+def fake_clock(times):
+    it = iter(times)
+    return lambda: next(it)
+def _normal():
+    SPANS.clear()
+    with span("split", clock=fake_clock([1.0, 1.5])):
+        pass
+    return SPANS
+expect("normal finish: one span", _normal, [{"name": "split", "ms": 500}])
+def _error():
+    SPANS.clear()
+    try:
+        with span("review", clock=fake_clock([2.0, 2.25])):
+            raise RuntimeError("API error 503")
+    except RuntimeError:
+        return SPANS
+    return "the error was swallowed"
+expect("error: still one span, and the error is still raised", _error, [{"name": "review", "ms": 250}])
+--- hints
+- `@contextmanager` goes directly above `def span`; inside the function, record the start time first, then `try` / `yield` / `finally`.
+- `yield` must be indented inside `try:`; `except Exception:` would swallow the error, and what you want here is `finally:`.
+
+@@ item d13-13
+type: code
+title: A span tree: what is inside what
+level: 3
+cards: with and context managers; Timing, fake clocks, decorators with arguments
+--- context
+In Langfuse (a tracing platform that records every call), the record of reviewing one clause is a tree: `review_clause` on the outside, with steps such as calling the model and looking up the playbook inside it. Only with these parent-child links can you see which step in which layer is slow.
+--- prompt
+A real trace is a tree: `review_clause` contains `call_model` and `lookup_playbook`. Langfuse's `@observe` turns nested calls into parent and child spans automatically (see the comment at the top of `tracing.py`); here you write a small one yourself. Write the context manager `span(name, spans, clock=time.perf_counter)`:
+
+- Append `{"name": name, "parent": name of the enclosing span (None for the outermost), "ms": elapsed milliseconds as a whole number, "ok": whether it finished normally}` to the list `spans`
+- Append it when the span **ends**, so inner spans appear in the list first
+- On an error, `ok` is `False`, and the error is still raised
+- Use the global list `STACK` to remember "which spans we are inside right now": append the name on the way in and pop it at the end (pop on an error too)
+
+```python
+spans = []
+with span("review_clause", spans):
+    with span("call_model", spans):
+        pass
+# in spans: first call_model (parent is "review_clause"), then review_clause (parent is None)
+```
+--- starter
+import time
+from contextlib import contextmanager
+
+STACK = []
+
+@contextmanager
+def span(name, spans, clock=time.perf_counter):
+    yield
+--- solution
+import time
+from contextlib import contextmanager
+
+STACK = []
+
+@contextmanager
+def span(name, spans, clock=time.perf_counter):
+    parent = STACK[-1] if STACK else None
+    STACK.append(name)
+    start = clock()
+    ok = False
+    try:
+        yield
+        ok = True
+    finally:
+        STACK.pop()
+        spans.append({"name": name, "parent": parent, "ms": round((clock() - start) * 1000), "ok": ok})
+--- tests
+def fake_clock(times):
+    it = iter(times)
+    return lambda: next(it)
+def _nested():
+    spans = []
+    clock = fake_clock([0.0, 0.1, 0.4, 1.0])
+    with span("review_clause", spans, clock):
+        with span("call_model", spans, clock):
+            pass
+    return spans
+expect("nested: inner span recorded first, parent correct", _nested, [
+    {"name": "call_model", "parent": "review_clause", "ms": 300, "ok": True},
+    {"name": "review_clause", "parent": None, "ms": 1000, "ok": True},
+])
+def _siblings():
+    spans = []
+    with span("review_clause", spans):
+        with span("lookup_playbook", spans):
+            pass
+        with span("call_model", spans):
+            pass
+    return [(s["name"], s["parent"]) for s in spans]
+expect("two child spans side by side", _siblings, [("lookup_playbook", "review_clause"), ("call_model", "review_clause"), ("review_clause", None)])
+def _error():
+    spans = []
+    try:
+        with span("review_clause", spans):
+            with span("call_model", spans):
+                raise TimeoutError("model took too long")
+    except TimeoutError:
+        return [[s["ok"] for s in spans], STACK]
+    return "the error was swallowed"
+expect("error: both layers recorded with ok=False, STACK emptied, error raised", _error, [[False, False], []])
+--- hints
+- On the way in: first get the parent with `STACK[-1] if STACK else None`, then `STACK.append(name)`, and record the start time.
+- Record ok the way the knowledge card does: `ok = False`; `ok = True` after `try: yield`; in `finally:`, `STACK.pop()` and append the record.
+- The clock is read in this order: outer start, inner start, inner end, outer end, so the fake clock must give 4 numbers in that order.
+
+@@ item d13-14
+type: code
+title: Token totals and cache hit rate
+level: 2
+mock: yes
+cards: Tokens, cache hit rate, latency percentiles
+--- context
+Every model call's response says how many tokens that call used. After a contract is reviewed, the summary in Clause Check's report includes the total tokens and the cache hit rate `cache_hit_ratio`; a low hit rate means something at the start of the request keeps changing.
+--- prompt
+Write two functions:
+
+- `total_usage(responses)`: `responses` is a list of dictionaries returned by the API (the result of `resp.json()`). Add up each of the four `KEYS` numbers in every response's `usage`, and return a dictionary with those four keys. An empty list returns four 0s
+- `cache_hit_ratio(total)`: `total` is the result of `total_usage`; return `prompt_cache_hit_tokens ÷ (hit + miss)`, rounded with `round(x, 2)`; when the denominator is 0, return `0.0`
+--- starter
+KEYS = ["prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"]
+
+def total_usage(responses):
+    pass
+
+def cache_hit_ratio(total):
+    pass
+--- solution
+KEYS = ["prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"]
+
+def total_usage(responses):
+    total = {k: 0 for k in KEYS}
+    for r in responses:
+        for k in KEYS:
+            total[k] += r["usage"][k]
+    return total
+
+def cache_hit_ratio(total):
+    hit = total["prompt_cache_hit_tokens"]
+    miss = total["prompt_cache_miss_tokens"]
+    if hit + miss == 0:
+        return 0.0
+    return round(hit / (hit + miss), 2)
+--- tests
+import os
+import requests
+R1 = {"usage": {"prompt_tokens": 900, "completion_tokens": 60, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 900}}
+R2 = {"usage": {"prompt_tokens": 902, "completion_tokens": 55, "prompt_cache_hit_tokens": 832, "prompt_cache_miss_tokens": 70}}
+expect("two calls added up", lambda: total_usage([R1, R2]), {"prompt_tokens": 1802, "completion_tokens": 115, "prompt_cache_hit_tokens": 832, "prompt_cache_miss_tokens": 970})
+expect("empty list", lambda: total_usage([]), {"prompt_tokens": 0, "completion_tokens": 0, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0})
+expect("hit rate", lambda: cache_hit_ratio(total_usage([R1, R2])), 0.46)
+expect("no input tokens", lambda: cache_hit_ratio(total_usage([])), 0.0)
+SYSTEM = "You review one contract clause for the Customer against the playbook. " * 8
+def _real():
+    MOCK.reset()
+    responses = []
+    for clause in ["Review clause 3.1: fees.", "Review clause 8.1: unlimited.", "Review clause 4.2: renewal."]:
+        body = {"model": "deepseek-flash", "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": clause}]}
+        responses.append(requests.post("https://api.deepseek.com/v1/chat/completions", headers={"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}, json=body).json())
+    t = total_usage(responses)
+    return [t["prompt_tokens"] == t["prompt_cache_hit_tokens"] + t["prompt_cache_miss_tokens"], cache_hit_ratio(t) > 0.5]
+expect("three real calls to the mock server: hit + miss = input, hit rate over half", _real, [True, True])
+--- hints
+- First build a dictionary with all four keys at 0: `{k: 0 for k in KEYS}`, then add to it with two nested loops.
+- For the hit rate, first check whether the denominator is 0, then `round(hit / (hit + miss), 2)`.
+
+@@ item d13-15
+type: code
+title: Latency percentiles
+level: 2
+cards: Tokens, cache hit rate, latency percentiles
+--- context
+When you tell a customer "how long a contract review takes", the average alone is misleading: one 30-second stall gets averaged away by a pile of 1-second calls. So you look at how fast half of the calls are, and how slow the slowest ones are.
+--- prompt
+Write `percentile(values, p)` with the nearest-rank method:
+
+1. Sort `values` (use `sorted`; don't change the list passed in)
+2. `rank = math.ceil(p / 100 * n)`, where `n` is how many values there are; if `rank` is less than 1, use 1
+3. Return item number `rank` of the sorted list (counting from 1, so the index is `rank - 1`)
+
+If `values` is empty, or `p` is not between 0 and 100: `raise ValueError`.
+
+`percentile([300, 100, 200, 400], 50)` → `200`
+--- starter
+import math
+
+def percentile(values, p):
+    pass
+--- solution
+import math
+
+def percentile(values, p):
+    if not values or not 0 <= p <= 100:
+        raise ValueError("need values and 0 <= p <= 100")
+    ordered = sorted(values)
+    rank = max(math.ceil(p / 100 * len(ordered)), 1)
+    return ordered[rank - 1]
+--- tests
+LAT = [1450, 820, 30000, 1010, 1200, 950, 1100, 2100, 1300, 1600]
+expect("the example from the prompt", lambda: percentile([300, 100, 200, 400], 50), 200)
+expect("p50", lambda: percentile(LAT, 50), 1200)
+expect("p95: the slow ones", lambda: percentile(LAT, 95), 30000)
+expect("p0 is the smallest value", lambda: percentile(LAT, 0), 820)
+expect("only one value", lambda: percentile([700], 95), 700)
+expect("the list passed in is unchanged", lambda: (percentile(LAT, 50), LAT[0])[1], 1450)
+expect_raises("empty list", lambda: percentile([], 50), ValueError)
+expect_raises("p over 100", lambda: percentile(LAT, 101), ValueError)
+--- hints
+- Check first: `if not values or not 0 <= p <= 100: raise ValueError(...)`.
+- `rank = max(math.ceil(p / 100 * len(ordered)), 1)`, then return `ordered[rank - 1]`.
+
+@@ item d13-16
+type: fill
+title: Fill in: line up the table
+level: 2
+cards: A/B comparison: change one thing at a time
+--- context
+The project's `run_evals.py` prints a pass-rate table in the terminal. Only with the columns lined up can you read dozens of rows of numbers; with two prompt versions side by side, you see at a glance which test case got worse.
+--- prompt
+Fill in the blanks so the comparison table lines up. The first column is left-aligned in 28 characters; each column after it is right-aligned in 6, and the pass rate shows as a percentage with no decimals (0.8 → `80%`).
+--- template
+def header(name_a, name_b):
+    return f"{'case':[[<28]]}{name_a:[[>6]]}{name_b:>6}"
+
+def row(case_id, rate_a, rate_b):
+    return f"{case_id:<28}{rate_a:[[>6.0%]]}{rate_b:>6.0%}"
+--- tests
+expect("header", lambda: header("A", "B"), "case                             A     B")
+expect("one row", lambda: row("unlimited-liability", 1.0, 0.8), "unlimited-liability           100%   80%")
+expect("a pass rate that doesn't divide evenly is rounded", lambda: row("payment-net-30", 0.667, 0.0), "payment-net-30                 67%    0%")
+--- hints
+- `<` left-aligns, `>` right-aligns, and the number after it is the width.
+- The percent format: `.0%` means multiply by 100, no decimals, add `%`; the width goes in front of it: `>6.0%`.
+
+@@ item d13-17
+type: code
+title: A/B comparison table
+level: 3
+cards: A/B comparison: change one thing at a time
+--- context
+You changed the prompt, and a higher total score doesn't mean every case got better: a test case that went from right every time to right only now and then is a regression (worse after the change). So compare the two versions' results side by side, case by case, not just the total.
+--- prompt
+Write `ab_table(results_a, results_b, name_a="A", name_b="B")` that uses `print` to print a comparison table of the two versions (not return):
+
+- `results_a` and `results_b` are `{case id: pass rate}`; print the cases one by one in the order of `results_a`
+- Header: `f"{'case':<28}{name_a:>6}{name_b:>6}"`
+- Each row: `f"{case_id:<28}{a:>6.0%}{b:>6.0%}"`; when B is **lower** than A, add `"  <- worse"` at the end of the row
+- A test case that is only in A, not in B: print `f"{'-':>6}"` in the B column; it does not count as worse
+- Last line: `f"regressions: {number of cases that got worse}"`
+
+```
+case                            v1    v2
+unlimited-liability           100%  100%
+payment-net-30                100%   60%  <- worse
+regressions: 1
+```
+--- starter
+def ab_table(results_a, results_b, name_a="A", name_b="B"):
+    print(f"{'case':<28}{name_a:>6}{name_b:>6}")
+--- solution
+def ab_table(results_a, results_b, name_a="A", name_b="B"):
+    print(f"{'case':<28}{name_a:>6}{name_b:>6}")
+    worse = 0
+    for case_id, a in results_a.items():
+        b = results_b.get(case_id)
+        if b is None:
+            print(f"{case_id:<28}{a:>6.0%}{'-':>6}")
+            continue
+        note = ""
+        if b < a:
+            note = "  <- worse"
+            worse += 1
+        print(f"{case_id:<28}{a:>6.0%}{b:>6.0%}{note}")
+    print(f"regressions: {worse}")
+--- tests
+A = {"unlimited-liability": 1.0, "mutual-warranty-disclaimer": 0.4, "payment-net-30": 1.0, "cross-reference-trap": 0.8}
+B = {"unlimited-liability": 1.0, "mutual-warranty-disclaimer": 0.8, "payment-net-30": 0.6}
+expect_output("the full table", lambda: ab_table(A, B, "v1", "v2"), "\n".join([
+    "case                            v1    v2",
+    "unlimited-liability           100%  100%",
+    "mutual-warranty-disclaimer     40%   80%",
+    "payment-net-30                100%   60%  <- worse",
+    "cross-reference-trap           80%     -",
+    "regressions: 1",
+]))
+expect_output("nothing got worse", lambda: ab_table({"unlimited-liability": 0.8}, {"unlimited-liability": 1.0}), "\n".join([
+    "case                             A     B",
+    "unlimited-liability            80%  100%",
+    "regressions: 0",
+]))
+expect_output("no test cases", lambda: ab_table({}, {}), "case                             A     B\nregressions: 0")
+--- hints
+- `for case_id, a in results_a.items():`, and get B with `results_b.get(case_id)`, which gives `None` when it is missing.
+- When `b is None`, print the row with `'-'`, then `continue`.
+- Keep the count of worse cases outside the loop, starting at 0; print the last line after the loop ends.
+
+@@ item d13-18
+type: choice
+title: Two identical tables?
+level: 2
+cards: A/B comparison: change one thing at a time
+--- context
+The project's eval script has several modes; mock mode is free and finishes in a few seconds. You want to save some money first, so you compare the two prompt versions in mock mode.
+--- prompt
+On your own computer you ran the evals twice in mock mode: `run_evals.py --mode mock --prompt v1` and `--prompt v2`. The two tables are identical, even the tokens are all 0. What does this tell you?
+--- options
+- v2 is no improvement at all and should be deleted
+- Mock mode uses a rule-based offline reviewer that never reads the prompt; to compare prompts you have to run a real model
+- The eval script is broken
+- The two prompt versions are equally good; use either one
+answer: 2
+--- explain
+In `review_clause` in `review.py`, when `settings.mock` is true it goes straight to `rule_based_review`, and not a single word of the prompt is sent. Mock mode is for testing the pipeline and the eval script themselves (free, fixed results); comparing prompts has to run on a real model, with the same test cases and the same N. Before any A/B, first make sure "what I changed really goes into the system under test". It is the same idea as Day 7's "look at the input first".
+
+@@ item d13-19
+type: local
+title: Local task: really compare v1 and v2 once
+level: 2
+cards: A/B comparison: change one thing at a time; Run N times, look at the pass rate; Confusion matrix, precision, recall
+--- context
+All the A/B on the web page is simulated. In this step you run the evals for the project's two prompt versions with the real DeepSeek, and get a set of numbers of your own that you can talk about in an interview: did the new version miss any high-risk clauses, and did the false alarms go down?
+--- prompt
+Run one real A/B in the project.
+
+1. First check with mock mode that the eval script runs (free, a few seconds):
+
+```
+cd "G:\Contract Clause Reviewer"
+python evals/run_evals.py --mode mock --runs 3 --out evals/results.mock.json
+```
+
+2. Then run each prompt version with DeepSeek. The project is already set up for DeepSeek: the default model is `deepseek-flash`, and `_post` in `clausecheck/review.py` turns thinking mode off in deepseek mode (you read these two lines in the Day 7 local task), so you don't need to change any code:
+
+```
+python evals/run_evals.py --mode deepseek --runs 3 --prompt v1 --out evals/results.deepseek.v1.json
+python evals/run_evals.py --mode deepseek --runs 3 --prompt v2 --out evals/results.deepseek.v2.json
+```
+
+Each run is 11 test cases × 3 times, about 5–10 minutes. At the current `deepseek-flash` prices (at peak hours $0.30 per million input tokens and $1.20 per million output tokens, half that off-peak; the official pricing page is what counts (2026-09)), both runs together usually cost less than $0.3.
+
+`--out` keeps the two runs' results in separate files (`evals/results*.json` is not committed to git).
+
+3. Paste both DeepSeek pass-rate tables below (there must be at least two `high-risk recall` lines), then, with `lessons/05_prompt_ab.md` from the bootcamp folder at hand, answer three questions for yourself: Did high-risk recall drop? Did the false alarms on the must_accept test cases go down? Did any test case get worse?
+placeholder: Paste the two DeepSeek pass-rate tables
+verify: high-risk recall[\s\S]*high-risk recall
+--- hints
+- If you see 401 or `needs DEEPSEEK_API_KEY`: check `DEEPSEEK_API_KEY` in the `.env` file at the project root.
+- If every case fails and the error has `HTTP 400` and `The supported API model names are ...`: the model name is wrong. Look at the first line of the output (`mode=deepseek model=...`); it should say `model=deepseek-flash`. If it doesn't, check whether `.env` sets a different `CLAUSECHECK_DEEPSEEK_MODEL`.
+- To try one case cheaply first: `python evals/run_evals.py --mode deepseek --runs 1 --only unlimited-liability`.
+- If the output is too long, paste only the table at the end of each run (starting from the `case  kind  pass rate` line).
+
+@@ item d13-e1
+type: scratch
+title: Closed book: pass rate per test case
+exam: yes
+level: 3
+cards: Run N times, look at the pass rate; Eval cases are data, not gut feeling
+--- context
+This is the heart of the eval script: take a batch of test cases and see how stable each one is over several runs. The result is a "test case → pass rate" table; run it once before and once after changing the prompt, and you can compare them.
+--- prompt
+Write `evaluate(cases, predict, runs)`:
+
+- `cases`: a list of test cases, each `{"id": ..., "clause": clause text, "expect": {"verdict_in": [allowed verdicts]}}`
+- `predict(clause_text)` returns a verdict string, for example `"flag"`
+- Call `predict` `runs` times for each test case; a verdict in `verdict_in` counts as a pass
+- Return `{case id: pass rate}`, with the pass rate rounded with `round(x, 2)`
+- `runs` less than 1: `raise ValueError`
+--- solution
+def evaluate(cases, predict, runs):
+    if runs < 1:
+        raise ValueError("runs must be at least 1")
+    rates = {}
+    for case in cases:
+        passed = sum(1 for _ in range(runs) if predict(case["clause"]) in case["expect"]["verdict_in"])
+        rates[case["id"]] = round(passed / runs, 2)
+    return rates
+--- tests
+CASES = [
+    {"id": "unlimited-liability", "clause": "Customer's liability shall be unlimited.", "expect": {"verdict_in": ["flag", "redline"]}},
+    {"id": "payment-net-30", "clause": "Fees are payable within thirty (30) days.", "expect": {"verdict_in": ["accept"]}},
+]
+def cycling(answers):
+    state = {"i": 0}
+    def predict(text):
+        answer = answers[state["i"] % len(answers)]
+        state["i"] += 1
+        return answer
+    return predict
+expect("always flag", lambda: evaluate(CASES, lambda text: "flag", 3), {"unlimited-liability": 1.0, "payment-net-30": 0.0})
+expect("takes turns: flag / accept / accept", lambda: evaluate(CASES, cycling(["flag", "accept", "accept"]), 3), {"unlimited-liability": 0.33, "payment-net-30": 0.67})
+expect_raises("runs is 0", lambda: evaluate(CASES, lambda text: "flag", 0), ValueError)
+
+@@ item d13-e2
+type: scratch
+title: Closed book: a retry decorator
+exam: yes
+level: 3
+cards: Timing, fake clocks, decorators with arguments; Functions are values: decorators
+--- context
+Calls to the model sometimes hit temporary failures, such as a network glitch or a server that is too busy, and trying again often works. Rather than writing the retry again in every function that calls the model, write it as a decorator and put it wherever it is needed.
+--- prompt
+Write the decorator with arguments `retry(times)`, used like this:
+
+```python
+@retry(3)
+def call_model(text): ...
+```
+
+- If the decorated function raises any `Exception`, call it again, up to `times` calls in total
+- As soon as one call succeeds, return that call's result
+- If all `times` calls fail: re-raise the exception from the **last** call unchanged
+- Use `functools.wraps` to keep the original function's name
+- `times` less than 1: `raise ValueError` right at the `retry(0)` step
+--- solution
+import functools
+
+def retry(times):
+    if times < 1:
+        raise ValueError("times must be at least 1")
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last = None
+            for _ in range(times):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    last = e
+            raise last
+        return wrapper
+    return decorator
+--- tests
+def flaky(fail_times):
+    state = {"calls": 0}
+    def call_model(text):
+        state["calls"] += 1
+        if state["calls"] <= fail_times:
+            raise ConnectionError(f"attempt {state['calls']} failed")
+        return "flag"
+    return call_model, state
+def _ok_after_two():
+    fn, state = flaky(2)
+    wrapped = retry(3)(fn)
+    return [wrapped("x"), state["calls"], wrapped.__name__]
+expect("fails twice, succeeds the third time", _ok_after_two, ["flag", 3, "call_model"])
+def _give_up():
+    fn, state = flaky(10)
+    try:
+        retry(3)(fn)("x")
+    except ConnectionError as e:
+        return [str(e), state["calls"]]
+    return "no exception was raised"
+expect("all three fail: raises the last exception", _give_up, ["attempt 3 failed", 3])
+expect_raises("retry(0)", lambda: retry(0), ValueError)
+
+@@ item d13-e3
+type: scratch
+title: Closed book: eval report
+exam: yes
+level: 3
+cards: Confusion matrix, precision, recall
+--- context
+When the evals finish, the last step is a short scorecard: how many test cases fall in each of the four boxes, plus a line with precision and recall. You can paste it straight into a weekly report, and compare it with the previous score.
+--- prompt
+Write `report(cases, predictions)`:
+
+- `cases`: a list of `{"id": ..., "kind": ...}`; a `kind` of `"must_accept"` means not risky, everything else means risky
+- `predictions`: `{case id: verdict}`; any verdict other than `"accept"` counts as flagged; a test case that is **missing** from `predictions` counts as not flagged
+- Return a dictionary with the keys `"TP"`, `"FP"`, `"FN"`, `"TN"`, `"precision"`, `"recall"` and `"line"`
+- precision = TP ÷ (TP + FP), recall = TP ÷ (TP + FN), both rounded with `round(x, 2)`; when a denominator is 0, return `1.0`
+- `"line"` is `f"precision {precision:.2f}  recall {recall:.2f}"` (two spaces in the middle)
+--- solution
+def report(cases, predictions):
+    tp = fp = fn = tn = 0
+    for case in cases:
+        risky = case["kind"] != "must_accept"
+        flagged = predictions.get(case["id"], "accept") != "accept"
+        if risky and flagged:
+            tp += 1
+        elif flagged:
+            fp += 1
+        elif risky:
+            fn += 1
+        else:
+            tn += 1
+    precision = round(tp / (tp + fp), 2) if tp + fp else 1.0
+    recall = round(tp / (tp + fn), 2) if tp + fn else 1.0
+    return {"TP": tp, "FP": fp, "FN": fn, "TN": tn, "precision": precision, "recall": recall,
+            "line": f"precision {precision:.2f}  recall {recall:.2f}"}
+--- tests
+CASES = [
+    {"id": "unlimited-liability", "kind": "must_flag"},
+    {"id": "cross-reference-trap", "kind": "trap"},
+    {"id": "data-anywhere", "kind": "must_flag"},
+    {"id": "payment-net-30", "kind": "must_accept"},
+    {"id": "service-levels", "kind": "must_accept"},
+]
+PRED = {"unlimited-liability": "redline", "cross-reference-trap": "flag", "payment-net-30": "accept", "service-levels": "flag"}
+expect("full report (data-anywhere has no prediction)", lambda: report(CASES, PRED), {"TP": 2, "FP": 1, "FN": 1, "TN": 1, "precision": 0.67, "recall": 0.67, "line": "precision 0.67  recall 0.67"})
+expect("no test cases", lambda: report([], {}), {"TP": 0, "FP": 0, "FN": 0, "TN": 0, "precision": 1.0, "recall": 1.0, "line": "precision 1.00  recall 1.00"})

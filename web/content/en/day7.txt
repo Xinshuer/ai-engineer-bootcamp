@@ -1,0 +1,807 @@
+@@ day 7
+title: Putting it together: write the core of Clause Check from scratch
+lang: py
+langs: Python + TypeScript
+hours: 5–6 hours
+--- goal
+Without hints, write the core Clause Check pipeline once in each language: split clauses → call the model for each clause → validate → summarize; then make one complete change in the real project: "add a rule → add a test case → run the tests". Finally, the Week 1 weekly exam: 6 exercises in 72 minutes.
+--- checklist
+- Clear your Review list
+- Pass every capstone exercise (three in Python, three in TypeScript)
+- Two local tasks: change the real project and run its tests; run the evals once with DeepSeek
+- Week 1 weekly exam: pass at least 4 of the 6 exercises
+- Prepare what you'll say in an interview: in 2 minutes, explain clearly which Clause Check file each piece of code you wrote corresponds to
+
+@@ concept
+title: Five steps for a new problem
+--- body
+In a live interview or a take-home, don't rush into writing code:
+
+1. **Read the problem, find the input and the output**: what types are the parameters? What does it return? What does it return when the input is empty?
+2. **Write the function signature**: name, parameters and return type come first
+3. **Work out two or three examples by hand**: include one edge case (empty list, not found, bad format). The code below shows how to write your own tests with `assert`
+4. **Write the simplest version that runs**, and run it
+5. **Then handle the edge cases**, running it after every change
+
+Say out loud what you are thinking: the process is what the interviewer is watching.
+--- code
+def section_of(clause_id: str) -> str:
+    return clause_id.split(".")[0]
+
+assert section_of("8.1") == "8"
+assert section_of("12") == "12"
+assert section_of("10.2.1") == "10"
+print("all good")
+
+@@ concept
+title: Reading Clause Check: a roadmap
+--- body
+Every kind of code you wrote in these seven days has a matching file in the project. Read them in this order:
+
+- `clausecheck/split.py`: splitting clauses with regex, finding cross-references ← Day 3 regex, today's exercise 1
+- `clausecheck/models.py`: Pydantic models ← Day 4
+- `clausecheck/tools.py`: tool definitions and dispatch, sending validation failures back to the model ← Day 3 exceptions, Day 4 tool calls
+- `clausecheck/review.py`: the call loop with a limit ← Day 4 mini_agent
+- `clausecheck/pipeline.py`: counting and sorting in `summarise` ← Day 2
+- `evals/harness.py`, `evals/run_evals.py`: run N times and look at the pass rate ← Day 4 pass_rate
+
+As you read, ask three questions about every function: what goes in, what comes out, and which line calls the model.
+--- code
+routes = {
+    "split.py": "regex, day 3 + day 7",
+    "models.py": "pydantic, day 4",
+    "tools.py": "tool dispatch, day 4",
+    "review.py": "bounded loop, day 4",
+    "pipeline.py": "counting + sorting, day 2",
+}
+for f, what in routes.items():
+    print(f"{f:<12} {what}")
+
+@@ concept
+title: Writing code live in an interview
+--- body
+- **Talk first, then write**: "Let me confirm the input and output first... I'll start with a version that doesn't handle the edge cases"
+- **Use meaningful variable names**: `clause`, `verdict`, `counts`, not `x`, `d`
+- **Say so when you don't know an API**: "I remember Zod has safeParse; I'd check the docs for the exact signature" is much better than guessing
+- **Test it yourself when you're done**: say "Let me try it with an empty list and a broken JSON string"
+- **Be honest about your level**: "I haven't been studying programming for long, but I can explain every line of this project and change it on the spot." A couple of follow-up questions are enough for an interviewer to tell whether it's true, and honesty itself counts in your favor
+--- code
+def needs_attention(verdicts: list[str]) -> list[int]:
+    # return the indexes that need a person to look; write the simplest version first
+    return [i for i, v in enumerate(verdicts) if v != "accept"]
+
+print(needs_attention(["accept", "flag", "redline", "accept"]))
+print(needs_attention([]))
+
+@@ item d7-01
+type: code
+title: Capstone 1: split clauses (Python)
+level: 3
+cards: Reading Clause Check: a roadmap; d3:Regex basics: find patterns in text; Five steps for a new problem
+--- context
+Once a contract has been turned into text, the first job is to cut it into individual clauses. Calling the model, validating and summarizing all happen one clause at a time, so if this step cuts wrong, everything after it is wrong. This is exactly what `split.py` does in the real project; today you write it from a blank page, without hints.
+--- prompt
+Write `split_clauses(text)`. In the contract text, a line that **stands on its own**, starts with a number, and continues with a space and a heading that begins with a capital letter is a clause heading, for example `8.1 Cap on Liability` or `12 Exclusions`. The lines under a heading, up to the next heading, are its body text.
+
+Return a list where each item is `{"id": number, "heading": heading, "text": body}`; the body is those lines joined with `"\n"`, with the whitespace at both ends removed. Ignore everything before the first heading.
+--- starter
+import re
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z].*)$")
+
+def split_clauses(text):
+    clauses = []
+    return clauses
+--- solution
+import re
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z].*)$")
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = {"id": m.group(1), "heading": m.group(2), "lines": []}
+            clauses.append(current)
+        elif current is not None:
+            current["lines"].append(line)
+    return [{"id": c["id"], "heading": c["heading"], "text": "\n".join(c["lines"]).strip()} for c in clauses]
+--- tests
+DOC = """CLOUDNOTES AGREEMENT
+Preamble text.
+8 Limitation of Liability
+8.1 Cap on Liability
+Subject to Section 12, liability shall not exceed the fees.
+It applies to both parties.
+12 Exclusions
+The limitations in Section 8 shall not apply to Customer."""
+expect("number of clauses", lambda: len(split_clauses(DOC)), 3)
+expect("a section heading has an empty body", lambda: split_clauses(DOC)[0], {"id": "8", "heading": "Limitation of Liability", "text": ""})
+expect("body over several lines", lambda: split_clauses(DOC)[1]["text"], "Subject to Section 12, liability shall not exceed the fees.\nIt applies to both parties.")
+expect("the last clause", lambda: split_clauses(DOC)[2]["id"], "12")
+expect("no headings", lambda: split_clauses("just text\nmore"), [])
+--- hints
+- Scan line by line and use `HEAD.match(line.strip())` to check whether a line is a heading. If it is, start a new clause; if not, add the line to the body of "the current clause".
+- Collect the body lines in a list first, and only at the end do `"\n".join(...).strip()`.
+
+@@ item d7-02
+type: code
+title: Capstone 2: review in bulk and summarize (Python)
+level: 3
+mock: yes
+cards: d2:The standard way to count; d2:Sorting and while; Reading Clause Check: a roadmap
+--- context
+Once the clauses are split, each one goes to the model for a verdict, and the results are summarized into the numbers at the top of the report and a to-review list, so the lawyer starts with the most urgent clauses. In the real project these two steps are in `review.py` and in `summarise` in `pipeline.py`. This exercise talks to a mock model server, so it costs nothing.
+--- prompt
+Write `review_all(clauses)`: `clauses` has the output format of the previous exercise. For each clause, call `classify(f"Review clause {id}: {text}")` (already written) and return:
+
+```python
+{
+    "counts": {verdict: count},
+    "needs_attention": [numbers of the clauses that are not accept: high first, then medium, low last; within the same level keep the original order],
+}
+```
+
+`classify` uses `deepseek-flash` with thinking mode turned off (`"thinking": {"type": "disabled"}`): a bulk review has to be fast and cheap, and judging a single clause doesn't need long reasoning.
+--- starter
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def classify(text):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return json.loads(data["choices"][0]["message"]["content"])
+
+def review_all(clauses):
+    pass
+--- solution
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def classify(text):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    data = requests.post(API_URL, headers=HEADERS, json=body).json()
+    return json.loads(data["choices"][0]["message"]["content"])
+
+def review_all(clauses):
+    results = []
+    for c in clauses:
+        v = classify(f"Review clause {c['id']}: {c['text']}")
+        results.append({"id": c["id"], "verdict": v["verdict"], "risk": v["risk_level"]})
+    counts = {}
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    flagged = [r for r in results if r["verdict"] != "accept"]
+    ordered = sorted(flagged, key=lambda r: RISK_ORDER[r["risk"]])
+    return {"counts": counts, "needs_attention": [r["id"] for r in ordered]}
+--- tests
+CLAUSES = [
+    {"id": "3.1", "heading": "Invoicing", "text": "Fees are payable within thirty days."},
+    {"id": "6.2", "heading": "Duration", "text": "Obligations survive in perpetuity."},
+    {"id": "8.1", "heading": "Cap", "text": "Customer's liability shall be unlimited."},
+    {"id": "10.1", "heading": "Location", "text": "Data may be processed in any country."},
+]
+expect("counts", lambda: review_all(CLAUSES)["counts"], {"accept": 1, "redline": 3})
+expect("high risk first, same level keeps the original order", lambda: review_all(CLAUSES)["needs_attention"], ["8.1", "10.1", "6.2"])
+expect("one model call per clause", lambda: (MOCK.reset(), review_all(CLAUSES), len(MOCK.calls))[2], 4)
+--- hints
+- First collect `{id, verdict, risk}` for each clause in one list, then do the counting and the sorting separately.
+- The mock server calls the risk field `risk_level`.
+
+@@ item d7-03
+type: code
+title: Capstone 3: estimate the cost
+level: 2
+cards: Five steps for a new problem; d4:What a Chat API request and response look like
+--- context
+In the real project, `summarise` estimates from the token usage (models charge by the token) how many dollars a review cost, and writes it into the report. When reviewing clause by clause, the big opening part of every request (the review instructions and the contract) is the same each time. The server recognizes that it has just processed this part, which is called a "cache hit", and charges much less for it.
+--- prompt
+Write `estimate_cost(usage, price)`:
+
+- `usage`: `{"prompt_cache_hit_tokens": input that hit the cache, "prompt_cache_miss_tokens": input that missed the cache, "completion_tokens": output}`, possibly also with `completion_tokens_details`
+- `price`: the price in dollars per million tokens, `{"input": ..., "cache": ..., "output": ...}`
+
+Return the cost in dollars, rounded to 6 decimal places (use `round(x, 6)`). Formula: misses × input + hits × cache + output × output, then divide by 1,000,000.
+
+The tests use the peak price of `deepseek-flash`; the official pricing page is the authority (2026-09): cache miss $0.30, cache hit $0.006, output $1.20, half price off-peak. In thinking mode, the thinking tokens (`completion_tokens_details.reasoning_tokens`) are **already included** in `completion_tokens`; don't add them a second time.
+--- starter
+def estimate_cost(usage, price):
+    pass
+--- solution
+def estimate_cost(usage, price):
+    cost = (
+        usage["prompt_cache_miss_tokens"] * price["input"]
+        + usage["prompt_cache_hit_tokens"] * price["cache"]
+        + usage["completion_tokens"] * price["output"]
+    ) / 1_000_000
+    return round(cost, 6)
+--- tests
+PRICE = {"input": 0.30, "cache": 0.006, "output": 1.20}
+expect("no cache", lambda: estimate_cost({"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1000000, "completion_tokens": 0}, PRICE), 0.3)
+expect("one call with thinking mode off", lambda: estimate_cost({"prompt_cache_hit_tokens": 2944, "prompt_cache_miss_tokens": 166, "completion_tokens": 120}, PRICE), 0.000211)
+expect("thinking on: the thinking tokens are already in completion_tokens", lambda: estimate_cost({"prompt_cache_hit_tokens": 2944, "prompt_cache_miss_tokens": 166, "completion_tokens": 620, "completion_tokens_details": {"reasoning_tokens": 500}}, PRICE), 0.000811)
+expect("all cache hits is 50 times cheaper", lambda: estimate_cost({"prompt_cache_hit_tokens": 1000000, "prompt_cache_miss_tokens": 0, "completion_tokens": 0}, PRICE), 0.006)
+--- hints
+- Multiply the three pairs, add them up, then divide by `1_000_000` (the underscores are only there to make it easier to read).
+- Use only `completion_tokens` for the output; ignore `completion_tokens_details`.
+
+@@ item d7-04
+type: code
+title: Capstone 4: split clauses (TypeScript)
+level: 3
+lang: ts
+cards: d5:From Python to TypeScript; d5:Arrays, objects, and type; d3:Regex basics: find patterns in text
+--- context
+The company you are interviewing with writes agents in TypeScript (with the Mastra framework). Suppose Clause Check moves to TypeScript: once it has the contract text, it still has to cut it into clauses first.
+--- prompt
+Translate exercise 1 into TypeScript as `splitClauses(text)`, with exactly the same rules.
+--- starter
+type Clause = { id: string; heading: string; text: string };
+const HEAD = /^(\d+(?:\.\d+)*)\s+([A-Z].*)$/;
+
+function splitClauses(text: string): Clause[] {
+  return [];
+}
+--- solution
+type Clause = { id: string; heading: string; text: string };
+const HEAD = /^(\d+(?:\.\d+)*)\s+([A-Z].*)$/;
+
+function splitClauses(text: string): Clause[] {
+  const found: { id: string; heading: string; lines: string[] }[] = [];
+  for (const line of text.split("\n")) {
+    const m = HEAD.exec(line.trim());
+    if (m) {
+      found.push({ id: m[1], heading: m[2], lines: [] });
+    } else if (found.length > 0) {
+      found[found.length - 1].lines.push(line);
+    }
+  }
+  return found.map((c) => ({ id: c.id, heading: c.heading, text: c.lines.join("\n").trim() }));
+}
+--- tests
+const DOC = [
+  "CLOUDNOTES AGREEMENT",
+  "Preamble text.",
+  "8 Limitation of Liability",
+  "8.1 Cap on Liability",
+  "Subject to Section 12, liability shall not exceed the fees.",
+  "It applies to both parties.",
+  "12 Exclusions",
+  "The limitations in Section 8 shall not apply to Customer.",
+].join("\n");
+expect("number of clauses", () => splitClauses(DOC).length, 3);
+expect("section heading", () => splitClauses(DOC)[0], { id: "8", heading: "Limitation of Liability", text: "" });
+expect("body over several lines", () => splitClauses(DOC)[1].text, "Subject to Section 12, liability shall not exceed the fees.\nIt applies to both parties.");
+expect("no headings", () => splitClauses("just text"), []);
+--- hints
+- A regex object's `exec(string)` returns a match or `null`; `m[1]` and `m[2]` are the two parenthesized groups.
+- "The current clause" is the last element of the array: `found[found.length - 1]`.
+
+@@ item d7-05
+type: code
+title: Capstone 5: review in bulk and summarize (TypeScript)
+level: 3
+lang: ts
+cards: d6:async / await: wait for the network without freezing; d6:fetch: the requests.post of TypeScript; d5:Record and counting
+--- context
+Continuing from the previous exercise: the TypeScript pipeline also has to call the model for each clause and then summarize the results into a report. In TypeScript you have to wait for the result of every network request, and in a batch of calls the order and the waiting are the easiest things to get wrong.
+--- prompt
+Translate exercise 2 into TypeScript as `reviewAll(clauses)` (async). Await the clauses **in order**, one at a time.
+--- starter
+type Clause = { id: string; heading: string; text: string };
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+async function classify(text: string): Promise<{ verdict: string; risk_level: string }> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function reviewAll(clauses: Clause[]): Promise<{ counts: Record<string, number>; needs_attention: string[] }> {
+  return { counts: {}, needs_attention: [] };
+}
+--- solution
+type Clause = { id: string; heading: string; text: string };
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+async function classify(text: string): Promise<{ verdict: string; risk_level: string }> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function reviewAll(clauses: Clause[]): Promise<{ counts: Record<string, number>; needs_attention: string[] }> {
+  const results: { id: string; verdict: string; risk: string }[] = [];
+  for (const c of clauses) {
+    const v = await classify(`Review clause ${c.id}: ${c.text}`);
+    results.push({ id: c.id, verdict: v.verdict, risk: v.risk_level });
+  }
+  const counts: Record<string, number> = {};
+  for (const r of results) {
+    counts[r.verdict] = (counts[r.verdict] ?? 0) + 1;
+  }
+  const needs_attention = results
+    .filter((r) => r.verdict !== "accept")
+    .sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk])
+    .map((r) => r.id);
+  return { counts, needs_attention };
+}
+--- tests
+const CLAUSES: Clause[] = [
+  { id: "3.1", heading: "Invoicing", text: "Fees are payable within thirty days." },
+  { id: "6.2", heading: "Duration", text: "Obligations survive in perpetuity." },
+  { id: "8.1", heading: "Cap", text: "Customer's liability shall be unlimited." },
+  { id: "10.1", heading: "Location", text: "Data may be processed in any country." },
+];
+expectAsync("counts", async () => (await reviewAll(CLAUSES)).counts, { accept: 1, redline: 3 });
+expectAsync("sorting", async () => (await reviewAll(CLAUSES)).needs_attention, ["8.1", "10.1", "6.2"]);
+expectAsync("number of calls", async () => { MOCK.reset(); await reviewAll(CLAUSES); return MOCK.calls.length; }, 4);
+--- hints
+- Same structure as the Python version: collect first, then count, then filter + sort + map.
+- `for (const c of clauses) { const v = await classify(...); ... }` keeps the calls in order.
+
+@@ item d7-06
+type: code
+title: Capstone 6: the agent loop (TypeScript)
+level: 3
+lang: ts
+cards: d4:Tool calls: the model asks you to look something up; d6:Tool dispatch: a table from names to functions; d6:async / await: wait for the network without freezing
+--- context
+A real review is not a single question: the model first calls `lookup_playbook` to look up the customer's rule, and gives its verdict after seeing the result. This back-and-forth is an agent. In `review.py` it is a loop with a step limit; without a limit, if the model keeps asking for tools, the program never stops.
+--- prompt
+Translate Day 4's `mini_agent` into TypeScript as `miniAgent(question, maxSteps = 3)`: send the request with `TOOLS` (model `deepseek-flash`, thinking mode off, the same as on Day 4); if `finish_reason` is `"tool_calls"`, run the first tool, add the model's message and `{ role: "tool", tool_call_id, content }` to messages, and send the request again; otherwise return the answer; when the steps run out, return `"STOPPED"`.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+const IMPL: Record<string, (args: any) => string> = {
+  lookup_playbook: (args) => `rule for ${args.topic}: cap at 100% of annual fees`,
+};
+
+async function miniAgent(question: string, maxSteps = 3): Promise<string> {
+  const messages: any[] = [{ role: "user", content: question }];
+  return "";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+const IMPL: Record<string, (args: any) => string> = {
+  lookup_playbook: (args) => `rule for ${args.topic}: cap at 100% of annual fees`,
+};
+
+async function miniAgent(question: string, maxSteps = 3): Promise<string> {
+  const messages: any[] = [{ role: "user", content: question }];
+  for (let step = 0; step < maxSteps; step++) {
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages, tools: TOOLS, thinking: { type: "disabled" } }) });
+    const choice = (await res.json()).choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return choice.message.content;
+    }
+    const call = choice.message.tool_calls[0];
+    const result = IMPL[call.function.name](JSON.parse(call.function.arguments));
+    messages.push(choice.message);
+    messages.push({ role: "tool", tool_call_id: call.id, content: result });
+  }
+  return "STOPPED";
+}
+--- tests
+expectAsync("final answer after 2 requests", async () => {
+  MOCK.reset();
+  const answer = await miniAgent("Is unlimited liability acceptable?");
+  return [answer, MOCK.calls.length];
+}, ["Based on the playbook: rule for liability_cap: cap at 100% of annual fees", 2]);
+expectAsync("thinking mode is off on every request", async () => {
+  MOCK.reset();
+  await miniAgent("Is unlimited liability acceptable?");
+  return MOCK.calls.map((c) => c.body.thinking);
+}, [{ type: "disabled" }, { type: "disabled" }]);
+expectAsync("out of steps", () => miniAgent("Is unlimited liability acceptable?", 1), "STOPPED");
+--- hints
+- `for (let step = 0; step < maxSteps; step++) { ... }`, and return as soon as it isn't tool_calls.
+- `messages` is typed `any[]` because it holds messages of several shapes.
+
+@@ item d7-07
+type: choice
+title: Debugging: what to suspect first
+level: 2
+cards: Reading Clause Check: a roadmap
+--- context
+The most common situation after launch: a lawyer says a clause got the wrong verdict, and you have to decide where to look first. A trace is the program's record of "what went into the model each time, and what the model answered".
+--- prompt
+After launch, a lawyer says: "Clause 8.1 of this contract clearly says liability is unlimited, yet the tool gave it accept." You open the trace and find that the 8.1 text sent to the model is `CloudNotes Confidential / Page 3 of 5`. What should you fix first?
+--- options
+- Change the prompt to stress reading liability clauses carefully
+- Switch to a stronger model
+- Fix the PDF parsing and splitting: the model never saw the clause text at all
+- Set temperature to 0
+answer: 3
+--- explain
+This is a **retrieval / input problem**: the model got a page footer, so it cannot possibly judge correctly. Changing the prompt or the model will never fix it. The order for debugging: first look at what went into the model, then at how the model reasoned. See hands-on lesson 01 (`lessons/01_parse.md` in this repo) and Clause Check's `parse.py` (join the pages and remove headers and footers first, then split).
+
+@@ item d7-08
+type: choice
+title: pass@k and pass^k
+level: 2
+cards: d4:Randomness: one run is not enough
+--- context
+The table that the project's `run_evals.py` prints has, besides the pass rate of each test case, a `pass^k` column. This exercise is the arithmetic behind that column, and interviews often ask about it too.
+--- prompt
+A step succeeds 90% of the time. An unattended agent has to get it right 5 times in a row. Roughly how likely is that?
+--- options
+- About 99%
+- About 90%
+- About 59%
+- About 10%
+answer: 3
+--- explain
+0.9 to the power of 5 ≈ 0.59. "At least one right out of 5" (pass@k) is close to 100%, but "all 5 right" (pass^k) is only 59%. So evals must be run several times, and for an unattended system you look at pass^k. This is also why a step that can be written as deterministic code should not be handed to the model.
+
+@@ item d7-09
+type: predict
+title: Capstone: predict the output (Python)
+level: 2
+cards: d2:List comprehensions: filter and transform in one line; d2:Sorting and while; d2:Dictionaries: look up values by name
+--- context
+This code is a shrunk-down version of the report summary; it does the same thing as today's exercise 2. Interviews often have "read the code, say the output" questions.
+--- prompt
+Write the output.
+--- code
+reviews = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "8.1", "verdict": "flag", "risk": "high"},
+    {"id": "4.2", "verdict": "redline", "risk": "medium"},
+]
+order = {"high": 0, "medium": 1, "low": 2}
+flagged = sorted([r for r in reviews if r["verdict"] != "accept"], key=lambda r: order[r["risk"]])
+print([r["id"] for r in flagged])
+print({r["id"]: r["risk"][0].upper() for r in reviews})
+print(f"{len(flagged)}/{len(reviews)} need attention")
+
+@@ item d7-10
+type: predict
+title: Capstone: predict the output (TypeScript)
+level: 2
+lang: ts
+cards: d5:Array methods: map, filter, find; d5:Record and counting
+--- context
+The TypeScript version of the report summary. Besides the verdict, each review result records how many tokens that call used, which is what the cost is computed from.
+--- prompt
+Write the output. `reduce` "folds" an array into a single value: starting from the initial value 0, it adds each element to the running total.
+--- code
+const reviews = [
+  { id: "3.1", verdict: "accept", tokens: 120 },
+  { id: "8.1", verdict: "flag", tokens: 340 },
+  { id: "4.2", verdict: "redline", tokens: 260 },
+];
+const flagged = reviews.filter((r) => r.verdict !== "accept").map((r) => r.id);
+const total = reviews.reduce((sum, r) => sum + r.tokens, 0);
+console.log(flagged, total);
+console.log(`${flagged.length}/${reviews.length} need attention`);
+
+@@ item d7-11
+type: local
+title: Local task: add a rule to the real project
+level: 3
+cards: Reading Clause Check: a roadmap; d4:Randomness: one run is not enough
+--- context
+The most common change in real work: the customer has one more review requirement. Changing the playbook is not enough: you also need an eval case that proves the program really judges by the new rule, and then you run all the tests to confirm that nothing that used to work is broken. When an interviewer asks "how would you change this project", this whole routine is the answer.
+--- prompt
+Make one complete change in the Clause Check project, doing every step yourself:
+
+1. Open `data/playbook.json` and, following the format of the existing rules, add a new rule `PB-11` with the topic `"governing_law"` and the content "disputes must not be sent to arbitration outside the EU" (write one entry in `never_accept`); in `red_flags`, write one regex, for example `"arbitration in (singapore|new york)"`
+2. Open `evals/cases.json` and add a `must_flag` case: a clause that sets arbitration in Singapore, expecting a verdict other than accept
+3. In the project root folder, run the offline tests and evals:
+
+```
+cd "G:\Contract Clause Reviewer"
+$env:CLAUSECHECK_MODE="mock"; python -m pytest
+python evals/run_evals.py --mode mock --runs 1
+```
+
+4. Paste the output of both commands below (you should see `passed` and the pass-rate table)
+
+If the tests fail: that is exactly the practice. Read the error and work out whether the JSON is written wrong (commas, quotes) or the rule's regex didn't match.
+placeholder: Paste the output of pytest and run_evals
+verify: \d+ passed[\s\S]*high-risk recall
+--- hints
+- The most common JSON mistakes: an extra comma after the last item, or single quotes.
+- `python -c "import json; json.load(open('data/playbook.json', encoding='utf-8')); print('ok')"` checks the JSON format on its own.
+
+@@ item d7-12
+type: local
+title: Local task: run the evals with DeepSeek
+level: 2
+cards: d4:Randomness: one run is not enough; Reading Clause Check: a roadmap
+--- context
+Evals in mock mode (offline, no model calls, verdicts from keywords only) only prove that the code path works. Whether the model really judges by your rules, you only find out by running every test case a few rounds with the real model. Afterwards, see which test cases are unstable, and learn to tell from the failure reason which kind of problem it is.
+--- prompt
+Run the project's evals once with the real model, and see how your rules hold up with a real model.
+
+First spend a few minutes understanding how the project calls DeepSeek. Open `clausecheck/config.py`: DeepSeek uses `deepseek-flash` by default, and `PRICES` holds its unit prices, which the cost in the report is computed from. Then open `clausecheck/review.py` and find `_post` in `OpenAICompatBackend`. Just before it sends the request there are these two lines:
+
+```python
+        if self.settings.mode == "deepseek":
+            body["thinking"] = {"type": "disabled"}
+```
+
+`deepseek-flash` has thinking mode on by default. Reviewing a clause doesn't need long reasoning; with thinking off it is faster and cheaper (the tokens spent on thinking are billed as output), and the project's `temperature` (0.3) takes effect again. There is one more reason: with thinking mode on, DeepSeek's docs require a conversation with tools to send back every turn's `reasoning_content`, but when this tool loop sends the model's messages back it keeps only `role`, `content` and `tool_calls`. The `if` only applies to DeepSeek; the same class is not affected when it connects to LM Studio.
+
+Once you understand it, run:
+
+```
+cd "G:\Contract Clause Reviewer"
+python evals/run_evals.py --mode deepseek --runs 3
+```
+
+11 test cases × 3 runs = 33 reviews, which takes a few minutes. Estimated from the tokens per clause in an earlier real run of the project (`data/deepseek.report.json`), it costs a few cents (`deepseek-flash` peak price: input that misses the cache $0.30, output $1.20 per million tokens, half price off-peak; the official pricing page is the authority (2026-09)).
+
+Paste the final pass-rate table below, then ask yourself three questions:
+
+- Which test case is not 3/3? What is its failure reason (see the `most common failure` column)?
+- Is it a retrieval, reasoning, format or tool problem?
+- If you were to fix it, what would you look at first?
+placeholder: Paste the pass-rate table
+verify: high-risk recall
+--- hints
+- Getting a 401: the `DEEPSEEK_API_KEY` in `.env` is wrong.
+- Every case fails, and the reason includes `HTTP 400` and `The supported API model names are ...`: the model name is wrong. Look at `model=` in the first line of the output; it should be `deepseek-flash`. If it isn't, check whether `.env` sets a different `CLAUSECHECK_DEEPSEEK_MODEL`; delete that line and the default is used.
+- To try a single case cheaply first: `python evals/run_evals.py --mode deepseek --runs 1 --only unlimited-liability`.
+
+@@ item d7-e1
+type: scratch
+title: Weekly exam 1: parse and count (Python)
+exam: yes
+level: 3
+cards: d3:JSON: the bridge between text and dictionaries; d3:try / except: catch the errors you expect; d2:The standard way to count
+--- context
+In a batch of JSON answers from the model, there are always a few that are malformed or missing fields. Before summarizing, you need to know how many are usable and how many must be reviewed again; the program must not stop entirely because of one bad answer.
+--- prompt
+Write `parse_and_count(raw_list)`: `raw_list` is a list of JSON strings returned by the model; some are malformed, some lack the `verdict` field. Return:
+
+`{"valid": number of valid ones, "invalid": number of invalid ones, "counts": {verdict: count}}`
+
+Valid = parses into a dictionary and has a `verdict` key.
+--- solution
+import json
+
+def parse_and_count(raw_list):
+    valid = 0
+    invalid = 0
+    counts = {}
+    for raw in raw_list:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            invalid += 1
+            continue
+        if not isinstance(data, dict) or "verdict" not in data:
+            invalid += 1
+            continue
+        valid += 1
+        counts[data["verdict"]] = counts.get(data["verdict"], 0) + 1
+    return {"valid": valid, "invalid": invalid, "counts": counts}
+--- tests
+RAW = ['{"verdict": "flag"}', "Sure! {", '{"verdict": "accept"}', '{"clause_id": "1"}', '{"verdict": "flag"}']
+expect("mixed input", lambda: parse_and_count(RAW), {"valid": 3, "invalid": 2, "counts": {"flag": 2, "accept": 1}})
+expect("empty", lambda: parse_and_count([]), {"valid": 0, "invalid": 0, "counts": {}})
+
+@@ item d7-e2
+type: scratch
+title: Weekly exam 2: bulk loading with Pydantic (Python)
+exam: yes
+level: 3
+cards: d4:Pydantic: rules for your data; d4:Failed validation: ValidationError
+--- context
+The real project's `models.py` uses Pydantic to set rules for each kind of data. This batch of clause data comes from a JSON string and has entries with a wrong risk level mixed in; if bad entries get into the report, the sorting and counting after that all go wrong.
+--- prompt
+Use Pydantic to define `Clause`: `id` is a string, `risk` is `low` / `medium` / `high`.
+
+Write `load_clauses(raw)`: `raw` is the text of a JSON array. Return a list of `Clause` made from its **valid** entries, skipping the invalid ones. If `raw` as a whole is not valid JSON, return `[]`.
+--- solution
+import json
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Clause(BaseModel):
+    id: str
+    risk: Literal["low", "medium", "high"]
+
+def load_clauses(raw):
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    result = []
+    for item in items:
+        try:
+            result.append(Clause.model_validate(item))
+        except ValidationError:
+            pass
+    return result
+--- tests
+RAW = '[{"id": "8.1", "risk": "high"}, {"id": "3.1", "risk": "urgent"}, {"id": "4.2", "risk": "medium"}, {"risk": "low"}]'
+expect("skips invalid entries", lambda: [c.id for c in load_clauses(RAW)], ["8.1", "4.2"])
+expect("returns Clause objects", lambda: type(load_clauses(RAW)[0]).__name__, "Clause")
+expect("broken JSON", lambda: load_clauses("[{"), [])
+
+@@ item d7-e3
+type: scratch
+title: Weekly exam 3: bulk verdicts with retries (Python)
+exam: yes
+level: 3
+mock: yes
+cards: d4:Status codes and retries; d4:Sending requests with requests
+--- context
+Reviewing one contract in bulk calls the model dozens of times in a row, and when the server is busy it now and then answers 429 (too many requests, try again later). Giving up on the whole contract after a single 429 is a waste, but retrying without end might never stop. This exercise talks to a mock server.
+--- prompt
+Write `classify_all(texts)`: for each text, call DeepSeek (`https://api.deepseek.com/v1/chat/completions`, model `deepseek-flash`, `json_object` format, thinking mode off, API key read from the environment variable `DEEPSEEK_API_KEY`) and return the list of each text's `verdict`.
+
+Retry a call that gets a 429; try each text at most 3 times, and if it still fails, `raise RuntimeError`.
+--- solution
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+
+def classify_one(text):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}}
+    for _ in range(3):
+        resp = requests.post(URL, headers=headers, json=body)
+        if resp.status_code == 200:
+            return json.loads(resp.json()["choices"][0]["message"]["content"])["verdict"]
+        if resp.status_code != 429:
+            break
+    raise RuntimeError("classify failed")
+
+def classify_all(texts):
+    return [classify_one(t) for t in texts]
+--- tests
+TEXTS = ["Review clause 8.1: liability is unlimited", "Review clause 3.1: fees within thirty days"]
+expect("two texts", lambda: classify_all(TEXTS), ["redline", "accept"])
+expect("thinking mode is off", lambda: MOCK.calls[-1]["body"].get("thinking"), {"type": "disabled"})
+def _retry():
+    MOCK.reset()
+    MOCK.fail_next(429, 2)
+    return classify_all(TEXTS[:1])
+expect("succeeds after two 429s", _retry, ["redline"])
+def _give_up():
+    MOCK.reset()
+    MOCK.fail_next(429, 3)
+    return classify_all(TEXTS[:1])
+expect_raises("429 all three times", _give_up, RuntimeError)
+
+@@ item d7-e4
+type: scratch
+title: Weekly exam 4: parse and count (TypeScript)
+exam: yes
+level: 3
+lang: ts
+cards: d6:try / catch / throw; d5:Record and counting
+--- context
+The TypeScript version of weekly exam 1. If this step of the pipeline were written in TypeScript, it would likewise have to sort out which of the model's answers in a batch are usable and which are not.
+--- prompt
+Write `parseAndCount(rawList: string[])` with the same rules as weekly exam 1, returning `{ valid, invalid, counts }`.
+--- solution
+function parseAndCount(rawList: string[]): { valid: number; invalid: number; counts: Record<string, number> } {
+  let valid = 0;
+  let invalid = 0;
+  const counts: Record<string, number> = {};
+  for (const raw of rawList) {
+    let data: any;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      invalid += 1;
+      continue;
+    }
+    if (typeof data !== "object" || data === null || !("verdict" in data)) {
+      invalid += 1;
+      continue;
+    }
+    valid += 1;
+    counts[data.verdict] = (counts[data.verdict] ?? 0) + 1;
+  }
+  return { valid, invalid, counts };
+}
+--- tests
+const RAW = ['{"verdict": "flag"}', "Sure! {", '{"verdict": "accept"}', '{"clause_id": "1"}', '{"verdict": "flag"}'];
+expect("mixed", () => parseAndCount(RAW), { valid: 3, invalid: 2, counts: { flag: 2, accept: 1 } });
+expect("empty", () => parseAndCount([]), { valid: 0, invalid: 0, counts: {} });
+
+@@ item d7-e5
+type: scratch
+title: Weekly exam 5: bulk loading with Zod (TypeScript)
+exam: yes
+level: 3
+lang: ts
+cards: d6:Zod: the Pydantic of TypeScript; d6:z.infer: one definition, two uses
+--- context
+The TypeScript version of weekly exam 2. In TypeScript, Zod plays the role of Pydantic, keeping entries that break the rules out of the report.
+--- prompt
+Use Zod to define `ClauseSchema`: `id` is a string, `risk` is `low` / `medium` / `high`. Write `loadClauses(raw: string)`: return the valid entries of the JSON array, skipping the invalid ones; if the whole thing is not valid JSON, return `[]`.
+--- solution
+import { z } from "zod";
+
+const ClauseSchema = z.object({ id: z.string(), risk: z.enum(["low", "medium", "high"]) });
+type Clause = z.infer<typeof ClauseSchema>;
+
+function loadClauses(raw: string): Clause[] {
+  let items: unknown[];
+  try {
+    items = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const result: Clause[] = [];
+  for (const item of items) {
+    const r = ClauseSchema.safeParse(item);
+    if (r.success) {
+      result.push(r.data);
+    }
+  }
+  return result;
+}
+--- tests
+const RAW = '[{"id": "8.1", "risk": "high"}, {"id": "3.1", "risk": "urgent"}, {"id": "4.2", "risk": "medium"}, {"risk": "low"}]';
+expect("skips invalid entries", () => loadClauses(RAW).map((c) => c.id), ["8.1", "4.2"]);
+expect("broken JSON", () => loadClauses("[{"), []);
+
+@@ item d7-e6
+type: scratch
+title: Weekly exam 6: bulk verdicts with retries (TypeScript)
+exam: yes
+level: 3
+lang: ts
+cards: d6:fetch: the requests.post of TypeScript; d6:async / await: wait for the network without freezing; d4:Status codes and retries
+--- context
+The TypeScript version of weekly exam 3: again calling the model text by text and now and then getting a 429 (the server saying there are too many requests), only this time written in TypeScript.
+--- prompt
+Write `classifyAll(texts: string[]): Promise<string[]>` with the same rules as weekly exam 3 (the same URL, `deepseek-flash`, `json_object` format, thinking mode off, API key from `process.env.DEEPSEEK_API_KEY`): call the model for each text in order, retry on 429, at most 3 times per text, and throw if it still fails.
+--- solution
+const URL_ = "https://api.deepseek.com/v1/chat/completions";
+
+async function classifyOne(text: string): Promise<string> {
+  const body = JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } });
+  for (let i = 0; i < 3; i++) {
+    const res = await fetch(URL_, { method: "POST", headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` }, body });
+    if (res.status === 200) {
+      const data = await res.json();
+      return JSON.parse(data.choices[0].message.content).verdict;
+    }
+    if (res.status !== 429) break;
+  }
+  throw new Error("classify failed");
+}
+
+async function classifyAll(texts: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const t of texts) {
+    out.push(await classifyOne(t));
+  }
+  return out;
+}
+--- tests
+const TEXTS = ["Review clause 8.1: liability is unlimited", "Review clause 3.1: fees within thirty days"];
+expectAsync("two texts", () => classifyAll(TEXTS), ["redline", "accept"]);
+expectAsync("thinking mode is off", async () => { await classifyAll(TEXTS.slice(0, 1)); return MOCK.calls[MOCK.calls.length - 1].body.thinking; }, { type: "disabled" });
+expectAsync("succeeds after two 429s", async () => { MOCK.reset(); MOCK.failNext(429, 2); return classifyAll(TEXTS.slice(0, 1)); }, ["redline"]);
+expectRejects("429 all three times", async () => { MOCK.reset(); MOCK.failNext(429, 3); return classifyAll(TEXTS.slice(0, 1)); });

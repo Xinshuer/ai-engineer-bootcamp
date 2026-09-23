@@ -15,6 +15,13 @@ _MAX_OUT = 20000
 _MAX_REPR = 300
 
 
+
+def _tr(zh, en):
+    """The page's language: __main__._CC_LANG is "en" when the page is in English."""
+    import __main__
+    return en if getattr(__main__, "_CC_LANG", "zh") == "en" else zh
+
+
 def _short(text):
     text = str(text)
     return text if len(text) <= _MAX_REPR else text[:_MAX_REPR] + " ..."
@@ -100,7 +107,7 @@ _install_pytest_shim()
 
 
 def _no_input(*_args, **_kwargs):
-    raise RuntimeError("这里不能用 input()：请直接给变量赋值，例如 name = \"8.1\"")
+    raise RuntimeError(_tr("这里不能用 input()：请直接给变量赋值，例如 name = \"8.1\"", "input() does not work here: assign the value directly, for example name = \"8.1\""))
 
 
 def _same_kind(got, expected):
@@ -136,15 +143,15 @@ def _make_asserts(results):
         _record(label, fn, judge)
 
     def expect_raises(label, fn, exc_type):
-        rec = {"label": label, "passed": False, "expected": f"抛出 {exc_type.__name__}"}
+        rec = {"label": label, "passed": False, "expected": _tr(f"抛出 {exc_type.__name__}", f"raises {exc_type.__name__}")}
         try:
             got = fn()
-            rec["got"] = "没有报错，返回了 " + _short(repr(got))
+            rec["got"] = _tr("没有报错，返回了 ", "no error, returned ") + _short(repr(got))
         except exc_type:
             rec["passed"] = True
-            rec["got"] = f"抛出了 {exc_type.__name__}"
+            rec["got"] = _tr(f"抛出了 {exc_type.__name__}", f"raised {exc_type.__name__}")
         except BaseException as exc:
-            rec["got"] = f"抛出了 {type(exc).__name__}"
+            rec["got"] = _tr(f"抛出了 {type(exc).__name__}", f"raised {type(exc).__name__}")
             rec["error"] = _fmt_exc(exc)
         results.append(rec)
 
@@ -197,7 +204,7 @@ def run(user_code, test_code="", setup_code=""):
             if setup_code:
                 exec(compile(setup_code, "setup.py", "exec"), ns)
         except BaseException as exc:
-            res["error"] = "（题目环境出错，请告诉出题人）\n" + _fmt_exc(exc, ("setup.py",))
+            res["error"] = _tr("（题目环境出错，请告诉出题人）\n", "(the exercise setup failed: please tell the course author)\n") + _fmt_exc(exc, ("setup.py",))
         if res["error"] is None:
             try:
                 exec(compile(user_code, "main.py", "exec"), ns)
@@ -212,7 +219,7 @@ def run(user_code, test_code="", setup_code=""):
                 exec(compile(test_code, "tests.py", "exec"), ns)
             except BaseException as exc:
                 res["tests"].append({
-                    "label": "测试没法运行：通常是函数名、参数个数或返回值和题目要求不一致",
+                    "label": _tr("测试没法运行：通常是函数名、参数个数或返回值和题目要求不一致", "The tests could not run: usually the function name, the number of parameters or the return value differs from what the exercise asks for"),
                     "passed": False,
                     "error": _fmt_exc(exc, ("main.py", "tests.py")),
                 })
@@ -220,6 +227,6 @@ def run(user_code, test_code="", setup_code=""):
         sys.stdout, sys.stderr = old_out, old_err
     text = out.getvalue()
     if len(text) > _MAX_OUT:
-        text = text[:_MAX_OUT] + "\n……（输出太长，已截断）"
+        text = text[:_MAX_OUT] + _tr("\n……（输出太长，已截断）", "\n... (output too long, cut off)")
     res["stdout"] = text
     return json.dumps(res, ensure_ascii=False)

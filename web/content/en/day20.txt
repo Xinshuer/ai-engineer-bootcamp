@@ -1,0 +1,1031 @@
+@@ day 20
+title: Interview practice: predict, find bugs, refactor, implement, design
+lang: py
+langs: Python + TypeScript
+hours: 5 hours
+--- goal
+Practice the five kinds of technical interview questions: read code and predict its output, find bugs in agent loops and async code, refactor without changing behavior and then add a requirement, implement small contract-domain functions against the clock, and answer design questions in an organized way. It's roughly half Python and half TypeScript, and every example comes from Clause Check. Today the point is not only to get it right, but also to **talk while you work**.
+--- checklist
+- Clear your Review list first
+- Read all 6 knowledge cards
+- Before you start each exercise, say your plan out loud (or write it on paper)
+- Pass every practice exercise
+- The 3 closed-book challenges: time yourself, 12 minutes each
+- Answer this out loud once, using the six-step framework for design questions: "Clause Check has to review 1,000 contracts a day. How would you do it?"
+
+@@ concept
+title: Five kinds of interview questions
+--- body
+Technical interviews for AI Engineer roles usually have five kinds of questions, and each one tests something different:
+
+1. **Predict the output**: read some code and say what it prints. Tests whether you can "run" code in your head
+2. **Find the bug**: code that sometimes goes wrong, very often an agent loop. Tests the order in which you track the problem down
+3. **Refactor**: the code works but is messy, and there's a small new requirement. Tests whether you can tidy it up **without changing behavior**
+4. **Implement**: write a small function in 15–20 minutes. Tests edge cases and whether you think about testing
+5. **Design**: "What do you do with a 300-page contract?" There's no single right answer; it tests whether your thinking is organized
+
+For every kind, **talk while you work**: restate the question with its inputs and outputs, say what you plan to do, and when you're done, check it with an example before anyone asks. Writing in silence for ten minutes is the worst thing you can do.
+--- code
+forms = {
+    "predict": "I look at the input first, then track each variable's value line by line",
+    "debug": "Reproduce it first, then rule things out one by one with a checklist",
+    "refactor": "Lock in the current behavior with tests first, then change in small steps",
+    "implement": "Write the signature and two or three examples first, including one edge case",
+    "design": "requirements → data flow → failures → evals → cost → first step",
+}
+for i, (form, opener) in enumerate(forms.items(), 1):
+    print(f"{i}. {form:<10} {opener}")
+
+@@ concept
+title: Reading code in the right order
+--- body
+When you get code you don't know, don't force your way from the first line to the last. Ask four questions, in this order:
+
+1. **Input**: what types are the parameters? Can they be empty?
+2. **Output**: what does it return? Does every path have a return?
+3. **Loops**: how many times does it loop? When does it stop? Could it never stop?
+4. **Side effects**: does it change a list or dictionary that was passed in? Does it write files or send requests?
+
+These four questions match the four most common kinds of bug: empty input, a missing return, a loop that never stops, and quietly changing someone else's data. The example below "looks like it only picks out clauses". Run it and look at the last line.
+--- code
+def needs_review(reviews, limit=2):
+    # 1 input: reviews is a list of dicts, may be empty
+    picked = []
+    for r in reviews:                 # 3 loop: looks at each one once, always stops
+        if r["verdict"] != "accept":
+            r["seen"] = True          # 4 side effect: changes the caller's dict!
+            picked.append(r["id"])
+    return picked[:limit]             # 2 output: at most limit clause numbers
+
+reviews = [{"id": "8.1", "verdict": "redline"}, {"id": "3.1", "verdict": "accept"}, {"id": "9.1", "verdict": "flag"}]
+print(needs_review(reviews))
+print(needs_review([]))
+print(reviews[0])
+
+@@ concept
+title: A bug-hunting checklist
+lang: ts
+--- body
+When an interviewer gives you code that "is sometimes wrong", going through a checklist one item at a time works much better than staring at it:
+
+- **Off by one**: `range(n)` vs `range(n + 1)`, `<` vs `<=`, the slice `[:k]`
+- **Changing a list while looping over it**: `remove` from the same list inside a `for`
+- **Forgetting await** (TS): `forEach(async ...)` doesn't wait at all
+- **Forgetting return**: some path returns `None` / `undefined`
+- **A misspelled key**: `risk` vs `risk_level`; `.get()` quietly returns None
+- **A loop with no limit**: the agent has no `max_steps`, or the counter never goes up
+- **Swallowed errors**: `except Exception: pass`, and on failure it even defaults to `accept`
+
+The three most common in agent loops: the tool result isn't put back into messages, the assistant and tool messages are in the wrong order, and the step count never goes up. Below is a demo of "forgetting await": `forEach` starts the callbacks and moves on, so when it prints, the results haven't come back yet.
+--- code
+async function review(id: string): Promise<string> {
+  await Promise.resolve(); // pretend to wait for the model
+  return `${id}:ok`;
+}
+async function main() {
+  const ids = ["8.1", "4.2"];
+  const bad: string[] = [];
+  ids.forEach(async (id) => {
+    bad.push(await review(id));
+  });
+  console.log("forEach, right after:", bad);
+  const good: string[] = [];
+  for (const id of ids) {
+    good.push(await review(id));
+  }
+  console.log("for...of:", good);
+  console.log("forEach, later:", bad);
+}
+main();
+
+@@ concept
+title: Refactoring principles
+--- body
+Refactoring = **the same behavior**, a better structure. Refactoring questions in interviews usually add a small new requirement too: they test whether you tidy up first and then add, instead of piling one more layer of if onto messy code.
+
+1. **Tests first**: lock in the current behavior with a few examples
+2. **Change in small steps, and run the tests after each one**: rename (`x` → `verdict`), extract a function, return early to cut nesting, remove duplication (three nearly identical blocks → one loop or one table)
+3. **Add the new requirement last**, ideally changing only one place
+
+Say it out loud: "I won't change the behavior yet. I'll fold these three repeated checks into one table, and then the new requirement is just one more line." The old and new versions below give the same result for every input.
+--- code
+def label_old(v):
+    if v["verdict"] == "redline":
+        if v["risk"] == "high":
+            return "URGENT"
+        else:
+            return "REVIEW"
+    else:
+        if v["verdict"] == "flag":
+            return "REVIEW"
+        else:
+            return "OK"
+
+def label_new(v):
+    if v["verdict"] == "redline" and v["risk"] == "high":
+        return "URGENT"
+    if v["verdict"] in ("redline", "flag"):
+        return "REVIEW"
+    return "OK"
+
+cases = [{"verdict": a, "risk": b} for a in ["accept", "flag", "redline"] for b in ["low", "high"]]
+print(all(label_old(c) == label_new(c) for c in cases))
+print([label_new(c) for c in cases])
+
+@@ concept
+title: A feel for complexity
+--- body
+When the interviewer asks "what is the complexity of this code?", you should be able to give your intuition:
+
+- One loop over n elements: **O(n)**
+- A loop inside a loop, or `in` on a **list** inside a loop: **O(n²)**. `x in some_list` compares one element at a time; `x in some_set` / `x in some_dict` gets there almost in one step
+- Sorting: O(n log n)
+
+A contract has 300 clauses, and n² is only 90,000 comparisons, which a computer does in the blink of an eye. **What's really slow is 300 model calls** (a few seconds each). So say it clearly: "O(n²) is fine here. The bottleneck is the network calls, so I'd start with bounded concurrency and caching." Only when the data grows to hundreds of thousands (for example, deduplicating across all contracts) do you need to swap the list for a set or a dictionary.
+--- code
+ids = [f"{i}.1" for i in range(300)]
+cited = ids[::2]             # 150 of them were cited
+
+comparisons = 0
+for i in ids:
+    for c in cited:           # list: compare one at a time
+        comparisons += 1
+print("comparisons with two loops:", comparisons)
+
+cited_set = set(cited)       # set: look it up directly
+missing = [i for i in ids if i not in cited_set]
+print("with a set:", len(ids), "lookups,", len(missing), "not cited")
+
+@@ concept
+title: A framework for answering design questions
+lang: ts
+--- body
+Answer a design question ("You need to review 1,000 contracts a day. How would you do it?") in six steps, one or two sentences each, using Clause Check as the example:
+
+1. **Requirements**: who uses it? How fast must it be? How costly is a mistake? (For lawyers, missing a risky clause is worse than flagging one extra)
+2. **Data flow**: upload → parse → split into clauses → review each clause (model + playbook retrieval) → summarize → a person approves → export
+3. **Failure modes**: parsing errors, a broken output format, 429, prompt injection, the model missing a risk
+4. **Evals**: run the test cases N times and look at the pass rate; keep a close eye on recall for high-risk clauses
+5. **Cost and latency**: turn off thinking mode for per-clause classification, prefix cache, bounded concurrency, review duplicate clauses only once
+6. **First step**: "I'd first add tracing to measure how long each step takes, then decide what to optimize"
+
+Step 6 matters most: the interviewer wants to hear that you **measure first, then act**.
+--- code
+const answer: [string, string][] = [
+  ["requirements", "lawyers; a missed risky clause costs most"],
+  ["data flow", "parse -> split -> review -> summarize -> approve"],
+  ["failure modes", "bad JSON, 429, injection, missed risk"],
+  ["evals", "cases x N runs, high-risk recall"],
+  ["cost/latency", "thinking off, prefix cache, bounded concurrency, dedupe"],
+  ["first step", "add tracing, measure, then optimize"],
+];
+answer.forEach(([step, note], i) => console.log(`${i + 1}. ${step.padEnd(14)} ${note}`));
+
+@@ item d20-01
+type: predict
+title: Recap: default arguments
+level: 1
+cards: d9:Common bug patterns; d2:Functions: default arguments and early return; Reading code in the right order
+--- context
+During a review, the numbers of the clauses that need attention are collected into a list. This is a very natural way to write it, and a regular guest in Python interviews.
+--- prompt
+Recap of Days 8 and 9. Write the output. Interviewers love asking this one.
+--- code
+def add_flag(clause_id, flags=[]):
+    flags.append(clause_id)
+    return flags
+
+a = add_flag("8.1")
+b = add_flag("4.2")
+c = add_flag("9.1", [])
+print(a)
+print(b is a, c)
+--- explain
+The default value `[]` is created only once, at the moment `def` runs. After that, every call that doesn't pass `flags` uses that same list, so a and b are the same object and both appends are in it; c, which was given a new list of its own, is not affected. The standard way is `flags=None`, and inside the function `if flags is None: flags = []`. In the interview, say the key sentence: default arguments are evaluated when the function is defined.
+
+@@ item d20-02
+type: predict
+title: Closures in a loop
+level: 2
+cards: d13:Functions are values: decorators; Reading code in the right order
+--- context
+The exercise wants a batch of check functions, one for each of several thresholds, all made in one loop. Interviewers often use this pattern to test how well you understand functions and variables.
+--- prompt
+Write the output. Is the `limit` used inside the `lambda` the value at the time it was created, or at the time it is called?
+--- code
+checks = []
+for limit in [1, 2, 3]:
+    checks.append(lambda n: n > limit)
+print([check(2) for check in checks])
+
+fixed = []
+for limit in [1, 2, 3]:
+    fixed.append(lambda n, limit=limit: n > limit)
+print([check(2) for check in fixed])
+--- explain
+A lambda remembers the **variable**, not its value at that moment. By the time it is called, the loop has long finished and `limit` is 3, so all three are `2 > 3`: all False. The second block uses the default argument `limit=limit` to "snapshot" the current value when the lambda is created: the trap from the previous exercise turns out to be useful here. You'll run into this when you generate one check function for each playbook rule.
+
+@@ item d20-03
+type: predict
+title: Sort stability
+level: 2
+cards: d8:Sorting by several keys; d2:Sorting and while
+--- context
+The report puts high-risk clauses first, so the lawyer sees the most urgent ones first. Sorting looks simple, but interviews often test its details.
+--- prompt
+Write the output. Python's sort is **stable**: elements with the same key keep their original order, and that stays true with `reverse=True`.
+--- code
+reviews = [
+    ("3.2", "medium"), ("8.1", "high"), ("4.2", "medium"),
+    ("9.1", "high"), ("1.1", "low"),
+]
+RANK = {"low": 0, "medium": 1, "high": 2}
+by_risk = sorted(reviews, key=lambda r: RANK[r[1]], reverse=True)
+print([cid for cid, _ in by_risk])
+by_id = sorted(reviews)
+print([cid for cid, _ in by_id][:3])
+print(sorted(["10.1", "9.1", "8.2"]))
+--- explain
+Sorted by risk in reverse, 8.1 and 9.1 (both high) and 3.2 and 4.2 (both medium) keep their original order, so "same risk keeps the original order" in `summarise` needs no extra work. Sorting tuples compares the first element first, which here is the clause number string. The last line is an old trap: strings are compared character by character, and "1" is less than "8", so "10.1" comes first. To sort by number, use the key `tuple(int(p) for p in cid.split("."))`.
+
+@@ item d20-04
+type: predict
+title: var and let
+level: 2
+lang: ts
+cards: d5:From Python to TypeScript; Reading code in the right order
+--- context
+You still often see `var` in old JavaScript code and in examples online. Interviewers like to use this code to test which value each function in a batch made in a loop remembers.
+--- prompt
+Write the output. `var` is the old-style declaration: the whole function shares **one** variable. With `let`, a for loop gets **a new copy every round**.
+--- code
+const withVar: (() => number)[] = [];
+for (var i = 0; i < 3; i++) {
+  withVar.push(() => i);
+}
+const withLet: (() => number)[] = [];
+for (let j = 0; j < 3; j++) {
+  withLet.push(() => j);
+}
+console.log(withVar.map((f) => f()).join(","));
+console.log(withLet.map((f) => f()).join(","));
+--- explain
+All three arrow functions refer to the same `i`; by the time they are called, the loop has finished and `i` is 3. `let j` is a new copy every round, so each one remembers 0, 1 and 2. Python's loop variable behaves more like `var`, which is why the closure exercise earlier gave three Falses. In TypeScript, always use `let` / `const`.
+
+@@ item d20-05
+type: predict
+title: The order async code runs in
+level: 3
+lang: ts
+cards: d6:async / await: wait for the network without freezing
+--- context
+Review code is full of `await`: call the model, wait for the answer. Once you know the order they really run in, you won't be guessing when you debug problems like "why are the log lines out of order?".
+--- prompt
+Write the output, one line each. Three rules:
+
+1. All the synchronous code runs first
+2. The part after an `await`, and `.then` callbacks, go into the "microtask" queue; once the synchronous code has finished, they run in the order they were queued
+3. `setTimeout`, even with 0 milliseconds, comes after all the microtasks
+--- code
+async function review(id: string): Promise<string> {
+  console.log(`start ${id}`);
+  await Promise.resolve();
+  console.log(`end ${id}`);
+  return id;
+}
+console.log("A");
+setTimeout(() => console.log("timeout"), 0);
+review("8.1").then((id) => console.log(`then ${id}`));
+review("4.2");
+console.log("B");
+--- explain
+The synchronous phase: A, the two starts (each review runs until its await and then hands back control), B. Then the microtasks: 8.1 was queued first, so it ends first, then 4.2 ends. Only after 8.1's Promise has completed is the `.then` callback queued, so it comes after both ends. The timeout line comes last. In an interview, explaining the three layers "synchronous → microtasks → timers" clearly is enough.
+
+@@ item d20-06
+type: fix
+title: Fix the bug: the tool result got lost
+level: 2
+mock: yes
+cards: A bug-hunting checklist; d17:Agent = loop + limits
+--- context
+The most common bug-hunting question in interviews is a broken agent loop. This loop fails on its second request, right after looking up the playbook. Going through the checklist one item at a time is much faster than staring at the code.
+--- prompt
+This agent loop has a bug. Run the tests: the second request fails with `KeyError: 'choices'`, because the server answered 400, and its error message says the assistant message with `tool_calls` is not followed by a tool message. Go through the agent loop checklist, find the cause and fix it.
+
+After the fix, the messages of the second request should be user → assistant (with tool_calls) → tool. The real DeepSeek behaves like this page's mock server: a request in the wrong order, or one missing its tool message, simply gets a 400.
+
+`"thinking": {"type": "disabled"}` in the request body turns off DeepSeek's thinking mode, which is on by default: a tool loop sends one request per step, and choosing a tool needs no long reasoning, so turning it off is faster and cheaper.
+--- starter
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic. Call it before deciding.", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+def lookup_playbook(topic):
+    return f"rule for {topic}: cap at 12 months of fees"
+
+def agent(question, max_steps=4):
+    messages = [{"role": "user", "content": question}]
+    for step in range(max_steps):
+        body = {"model": "deepseek-flash", "messages": messages, "tools": TOOLS, "thinking": {"type": "disabled"}}
+        message = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]["message"]
+        if not message.get("tool_calls"):
+            return message["content"]
+        call = message["tool_calls"][0]
+        result = lookup_playbook(**json.loads(call["function"]["arguments"]))
+        messages.append(message)
+    return "STOPPED"
+--- solution
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic. Call it before deciding.", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+def lookup_playbook(topic):
+    return f"rule for {topic}: cap at 12 months of fees"
+
+def agent(question, max_steps=4):
+    messages = [{"role": "user", "content": question}]
+    for step in range(max_steps):
+        body = {"model": "deepseek-flash", "messages": messages, "tools": TOOLS, "thinking": {"type": "disabled"}}
+        message = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]["message"]
+        if not message.get("tool_calls"):
+            return message["content"]
+        call = message["tool_calls"][0]
+        result = lookup_playbook(**json.loads(call["function"]["arguments"]))
+        messages.append(message)
+        messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+    return "STOPPED"
+--- tests
+def _run():
+    MOCK.reset()
+    answer = agent("Is unlimited liability acceptable?")
+    return [answer, len(MOCK.calls)]
+expect("gets an answer, with 2 requests in total", _run, ["Based on the playbook: rule for liability_cap: cap at 12 months of fees", 2])
+expect("message order of the second request", lambda: [m["role"] for m in MOCK.calls[1]["body"]["messages"]], ["user", "assistant", "tool"])
+def _ids_match():
+    ms = MOCK.calls[1]["body"]["messages"]
+    return ms[2]["tool_call_id"] == ms[1]["tool_calls"][0]["id"]
+expect_true("the tool message's tool_call_id matches the id of the model's call", _ids_match)
+--- hints
+- What does the 400 error message say is missing? Think about what the model sees in the second request: once `result` is computed, where does it go?
+- After each tool call, add **two** messages to messages: first the model's message, then `{"role": "tool", "tool_call_id": call["id"], "content": result}`. The order can't be reversed.
+
+@@ item d20-07
+type: fix
+title: Fix the bug: swallowed errors
+level: 2
+cards: A bug-hunting checklist; d3:try / except: catch the errors you expect
+--- context
+Quietly treating an error as accept means letting a possibly risky clause straight through, and the lawyer doesn't even see a warning. When the automatic review can't finish, the real project marks the clause flag and says that a person needs to look at it.
+--- prompt
+A week after this function went live, the lawyers found that several clearly risky clauses had been judged accept, yet the logs showed no errors at all. The cause: `except Exception` swallows every error, and on top of that defaults to accept, the most dangerous verdict. Change it so that:
+
+- when the model's answer is not valid JSON, or has no `verdict`: return `{"clause_id": ..., "verdict": "flag", "error": "bad_output"}`, so a person looks at it
+- any other error (for example the network is down and `call_model` raises `ConnectionError`): don't catch it; let it propagate, and the code above will retry or raise an alert
+
+`call_model` is a function that is passed in; the tests pass in fake ones.
+--- starter
+import json
+
+def review_one(clause_id, text, call_model):
+    try:
+        raw = call_model(f"Review clause {clause_id}: {text}")
+        data = json.loads(raw)
+        return {"clause_id": clause_id, "verdict": data["verdict"]}
+    except Exception:
+        return {"clause_id": clause_id, "verdict": "accept"}
+--- solution
+import json
+
+def review_one(clause_id, text, call_model):
+    raw = call_model(f"Review clause {clause_id}: {text}")
+    try:
+        data = json.loads(raw)
+        return {"clause_id": clause_id, "verdict": data["verdict"]}
+    except (json.JSONDecodeError, KeyError):
+        return {"clause_id": clause_id, "verdict": "flag", "error": "bad_output"}
+--- tests
+ok = lambda prompt: '{"verdict": "redline"}'
+chatty = lambda prompt: "Sure! This clause looks risky."
+missing = lambda prompt: '{"risk": "high"}'
+def down(prompt):
+    raise ConnectionError("network down")
+expect("normal", lambda: review_one("8.1", "unlimited", ok), {"clause_id": "8.1", "verdict": "redline"})
+expect("not JSON → flag", lambda: review_one("8.1", "x", chatty), {"clause_id": "8.1", "verdict": "flag", "error": "bad_output"})
+expect("no verdict → flag", lambda: review_one("8.1", "x", missing), {"clause_id": "8.1", "verdict": "flag", "error": "bad_output"})
+expect_raises("network errors must propagate", lambda: review_one("8.1", "x", down), ConnectionError)
+--- hints
+- Put only the two lines that parse the model's answer inside `try`, and move the `call_model` call outside the `try`; then its errors propagate on their own.
+- Bad JSON raises `json.JSONDecodeError`, a missing key raises `KeyError`: `except (json.JSONDecodeError, KeyError):`.
+
+@@ item d20-08
+type: fix
+title: Fix the bug: forEach doesn't wait
+level: 2
+lang: ts
+cards: A bug-hunting checklist; d6:async / await: wait for the network without freezing
+--- context
+When clauses are reviewed one by one, each one has to wait for the model's answer. This kind of bug raises no error; the results handed back are simply empty, so the report looks like "no clauses need attention". That is very dangerous.
+--- prompt
+`reviewAll` should review all the clauses in order and then return the results, but the tests get an empty array. Run it, read the test output, and fix it.
+--- starter
+type Verdict = { id: string; verdict: string };
+
+async function reviewClause(id: string): Promise<Verdict> {
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  return { id, verdict: id.startsWith("8") ? "redline" : "accept" };
+}
+
+async function reviewAll(ids: string[]): Promise<Verdict[]> {
+  const results: Verdict[] = [];
+  ids.forEach(async (id) => {
+    results.push(await reviewClause(id));
+  });
+  return results;
+}
+--- solution
+type Verdict = { id: string; verdict: string };
+
+async function reviewClause(id: string): Promise<Verdict> {
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  return { id, verdict: id.startsWith("8") ? "redline" : "accept" };
+}
+
+async function reviewAll(ids: string[]): Promise<Verdict[]> {
+  const results: Verdict[] = [];
+  for (const id of ids) {
+    results.push(await reviewClause(id));
+  }
+  return results;
+}
+--- tests
+expectAsync("all three reviewed", async () => (await reviewAll(["3.1", "8.1", "9.1"])).length, 3);
+expectAsync("same order as the input", async () => (await reviewAll(["8.1", "3.1"])).map((v) => `${v.id}:${v.verdict}`), ["8.1:redline", "3.1:accept"]);
+expectAsync("empty list", () => reviewAll([]), []);
+--- hints
+- `forEach` doesn't wait for async callbacks: it starts each callback and moves on, so when `return results` runs, not a single clause has been reviewed yet.
+- Change it to `for (const id of ids) { results.push(await reviewClause(id)); }`. If you want them to run at the same time, you can use `Promise.all(ids.map(reviewClause))`; its results also keep the input order.
+
+@@ item d20-09
+type: fix
+title: Fix the bug: every snapshot changed
+level: 2
+lang: ts
+cards: A bug-hunting checklist; d18:State: one object passed from start to end
+--- context
+The approval screen in this exercise saves the state after every step, so the lawyer can look back and undo. The idea is the same as with checkpoints: old records must always stay exactly as they were.
+--- prompt
+`replay` should save a snapshot of the state after every step (like a checkpoint, so you can look back and undo). The tests find that every snapshot looks like the last step. The cause is in `apply`: it changes the state that was passed in directly. Make it return a **new object** and leave the old one alone.
+--- starter
+type State = { counts: Record<string, number>; seen: string[] };
+type ReviewEvent = { clauseId: string; verdict: "accept" | "flag" | "redline" };
+
+function apply(state: State, e: ReviewEvent): State {
+  state.counts[e.verdict] = (state.counts[e.verdict] ?? 0) + 1;
+  state.seen.push(e.clauseId);
+  return state;
+}
+
+function replay(events: ReviewEvent[]): State[] {
+  const history: State[] = [];
+  let state: State = { counts: {}, seen: [] };
+  for (const e of events) {
+    state = apply(state, e);
+    history.push(state);
+  }
+  return history;
+}
+--- solution
+type State = { counts: Record<string, number>; seen: string[] };
+type ReviewEvent = { clauseId: string; verdict: "accept" | "flag" | "redline" };
+
+function apply(state: State, e: ReviewEvent): State {
+  return {
+    counts: { ...state.counts, [e.verdict]: (state.counts[e.verdict] ?? 0) + 1 },
+    seen: [...state.seen, e.clauseId],
+  };
+}
+
+function replay(events: ReviewEvent[]): State[] {
+  const history: State[] = [];
+  let state: State = { counts: {}, seen: [] };
+  for (const e of events) {
+    state = apply(state, e);
+    history.push(state);
+  }
+  return history;
+}
+--- tests
+const EVENTS: ReviewEvent[] = [
+  { clauseId: "3.1", verdict: "accept" },
+  { clauseId: "8.1", verdict: "redline" },
+  { clauseId: "9.1", verdict: "redline" },
+];
+expect("snapshot after the first step", () => replay(EVENTS)[0], { counts: { accept: 1 }, seen: ["3.1"] });
+expect("the last step", () => replay(EVENTS)[2], { counts: { accept: 1, redline: 2 }, seen: ["3.1", "8.1", "9.1"] });
+expect("apply doesn't change the state passed in (nor the counts and seen inside it)", () => {
+  const before: State = { counts: { flag: 1 }, seen: ["4.2"] };
+  apply(before, { clauseId: "8.1", verdict: "redline" });
+  return before;
+}, { counts: { flag: 1 }, seen: ["4.2"] });
+--- hints
+- All the snapshots are **the same object**: after making its changes, `apply` returns the very object that was passed in.
+- Writing just `{ ...state }` isn't enough: spreading copies only one level, so the `counts` and `seen` inside are still the original ones.
+- The new object: `{ counts: { ...state.counts, [e.verdict]: newCount }, seen: [...state.seen, e.clauseId] }`.
+
+@@ item d20-10
+type: code
+title: Refactor: add a verdict
+level: 3
+cards: Refactoring principles
+--- context
+The code that summarizes a report often grows bit by bit: each new verdict gets a copied block. The business will keep adding verdicts and risk levels, and if the structure isn't cleaned up, every addition means changing several places, and it's easy to miss one.
+--- prompt
+The `summary` below works but is messy: three counters and three nearly identical loops. New requirements:
+
+1. A new verdict `needs_info` (not enough information, the customer has to send more documents): its count line goes after redline; it also counts as "needs a person to look"
+2. A new risk level `critical`: it comes before high
+
+First clean it up so it is "table-driven": a list of verdicts `VERDICTS` and a risk order `RISK_ORDER`; then each of the two new requirements changes only one line. The output format stays the same (see the tests), and within the same risk level the original order is kept.
+--- starter
+def summary(reviews):
+    out = []
+    a = 0
+    f = 0
+    r = 0
+    for x in reviews:
+        if x["verdict"] == "accept":
+            a = a + 1
+        if x["verdict"] == "flag":
+            f = f + 1
+        if x["verdict"] == "redline":
+            r = r + 1
+    out.append("accept: " + str(a))
+    out.append("flag: " + str(f))
+    out.append("redline: " + str(r))
+    hi = []
+    for x in reviews:
+        if x["verdict"] != "accept":
+            if x["risk"] == "high":
+                hi.append(x["id"])
+    for x in reviews:
+        if x["verdict"] != "accept":
+            if x["risk"] == "medium":
+                hi.append(x["id"])
+    for x in reviews:
+        if x["verdict"] != "accept":
+            if x["risk"] == "low":
+                hi.append(x["id"])
+    out.append("attention: " + ", ".join(hi))
+    return "\n".join(out)
+--- solution
+VERDICTS = ["accept", "flag", "redline", "needs_info"]
+RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+def summary(reviews):
+    lines = [f"{v}: {sum(1 for r in reviews if r['verdict'] == v)}" for v in VERDICTS]
+    attention = [r for r in reviews if r["verdict"] != "accept"]
+    attention.sort(key=lambda r: RISK_ORDER[r["risk"]])
+    lines.append("attention: " + ", ".join(r["id"] for r in attention))
+    return "\n".join(lines)
+--- tests
+OLD = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "4.2", "verdict": "flag", "risk": "medium"},
+    {"id": "8.1", "verdict": "redline", "risk": "high"},
+    {"id": "6.2", "verdict": "flag", "risk": "low"},
+]
+expect("old data: counts and order unchanged, plus a needs_info line", lambda: summary(OLD), "accept: 1\nflag: 2\nredline: 1\nneeds_info: 0\nattention: 8.1, 4.2, 6.2")
+NEW = OLD + [
+    {"id": "12", "verdict": "redline", "risk": "critical"},
+    {"id": "5.1", "verdict": "needs_info", "risk": "medium"},
+]
+expect("new verdict and new risk level", lambda: summary(NEW), "accept: 1\nflag: 2\nredline: 2\nneeds_info: 1\nattention: 12, 8.1, 4.2, 5.1, 6.2")
+expect("empty list", lambda: summary([]), "accept: 0\nflag: 0\nredline: 0\nneeds_info: 0\nattention: ")
+--- hints
+- Three counters → loop over `VERDICTS` and make one line `f"{v}: {count}"` per verdict; the count can be `sum(1 for r in reviews if r["verdict"] == v)`.
+- Three loops → first pick out the ones that aren't accept, then `sort(key=lambda r: RISK_ORDER[r["risk"]])`. Sorting is stable, so clauses with the same risk keep their original order automatically.
+- The new requirements: add `"needs_info"` at the end of `VERDICTS`; add `"critical": 0` to `RISK_ORDER` and move the others down by one.
+
+@@ item d20-11
+type: code
+title: Refactor: a tool dispatch table
+level: 3
+lang: ts
+cards: Refactoring principles; d6:Tool dispatch: a table from names to functions
+--- context
+An agent's tools keep multiplying; the real project also has `mark_for_review` (hand a clause to a person). One more else if for every tool soon becomes hard to maintain. The message for a misspelled tool name is read by the model, so it should help the model get it right.
+--- prompt
+`runTool` works, but every new tool needs one more `else if`. New requirements:
+
+1. A new tool `mark_for_review` with the required argument `reason`, which returns `marked: <reason>`
+2. The error for an unknown tool must tell the model which tools there are: `ERROR: unknown tool delete_all (available: lookup_playbook, get_clause, mark_for_review)`
+3. When the arguments aren't valid JSON, return `ERROR: bad arguments` (right now it crashes)
+
+Check the tool name first, then parse the arguments. The original behavior (including messages like `ERROR: missing clause_id`) stays the same. Suggestion: first turn it into a table `TOOLS: Record<string, ToolDef>`; then a new tool is just one more line, and the list of available tools can be generated from the table.
+--- starter
+type ToolDef = { required: string; run: (args: any) => string };
+
+function runTool(name: string, argsText: string): string {
+  const args = JSON.parse(argsText);
+  if (name === "lookup_playbook") {
+    if (!args.topic) {
+      return "ERROR: missing topic";
+    }
+    return `rule for ${args.topic}`;
+  } else if (name === "get_clause") {
+    if (!args.clause_id) {
+      return "ERROR: missing clause_id";
+    }
+    return `text of clause ${args.clause_id}`;
+  } else {
+    return "ERROR: unknown tool";
+  }
+}
+--- solution
+type ToolDef = { required: string; run: (args: any) => string };
+
+const TOOLS: Record<string, ToolDef> = {
+  lookup_playbook: { required: "topic", run: (a) => `rule for ${a.topic}` },
+  get_clause: { required: "clause_id", run: (a) => `text of clause ${a.clause_id}` },
+  mark_for_review: { required: "reason", run: (a) => `marked: ${a.reason}` },
+};
+
+function runTool(name: string, argsText: string): string {
+  const tool = TOOLS[name];
+  if (!tool) {
+    return `ERROR: unknown tool ${name} (available: ${Object.keys(TOOLS).join(", ")})`;
+  }
+  let args: any;
+  try {
+    args = JSON.parse(argsText);
+  } catch {
+    return "ERROR: bad arguments";
+  }
+  if (!args[tool.required]) {
+    return `ERROR: missing ${tool.required}`;
+  }
+  return tool.run(args);
+}
+--- tests
+expect("original: look up the playbook", () => runTool("lookup_playbook", '{"topic": "payment"}'), "rule for payment");
+expect("original: missing argument", () => runTool("get_clause", "{}"), "ERROR: missing clause_id");
+expect("new tool", () => runTool("mark_for_review", '{"reason": "ambiguous"}'), "marked: ambiguous");
+expect("new tool, missing argument", () => runTool("mark_for_review", "{}"), "ERROR: missing reason");
+expect("an unknown tool lists the available tools", () => runTool("delete_all", "{}"), "ERROR: unknown tool delete_all (available: lookup_playbook, get_clause, mark_for_review)");
+expect("bad JSON doesn't crash", () => runTool("get_clause", '{"clause_id": '), "ERROR: bad arguments");
+--- hints
+- One entry in the table: `lookup_playbook: { required: "topic", run: (a) => "rule for " + a.topic }`.
+- `runTool` becomes four steps: look it up in the table (not there → unknown) → `JSON.parse` inside try/catch (fails → bad arguments) → check `args[tool.required]` → `tool.run(args)`.
+- The list of available tools: `Object.keys(TOOLS).join(", ")`, in the order you wrote the table.
+
+@@ item d20-12
+type: code
+title: Deduplicate clauses
+level: 2
+cards: A feel for complexity; d8:More on dictionaries: comprehensions, Counter, defaultdict
+--- context
+Contract templates often contain word-for-word identical boilerplate clauses, for example the same confidentiality clause appearing several times. The exercise assumes that once one has been reviewed, its duplicates simply reuse its result, which saves the cost of the model calls.
+--- prompt
+Contract templates often repeat boilerplate clauses: once one has been reviewed, an identical one doesn't need to be paid for again. Write two functions:
+
+- `normalize(text)`: convert to lowercase → remove every character that isn't a letter, a digit or whitespace → collapse whitespace into single spaces and remove it from both ends
+- `dedupe_clauses(clauses)`: `clauses` is `[{"id": "2.1", "text": "..."}, ...]`; two clauses are duplicates if their text is the same after normalizing. Return `{"unique": [<numbers of the clauses kept, i.e. the first clause with each text>], "duplicates": {<number of a duplicate>: <number of the clause kept>}}`
+
+Use a dictionary of "normalized text → number of its first occurrence" and do it all in one loop: O(n).
+
+Example: `normalize("  This Agreement,\nis GOVERNED.  ")` → `"this agreement is governed"`
+--- starter
+import re
+
+def normalize(text):
+    pass
+
+def dedupe_clauses(clauses):
+    pass
+--- solution
+import re
+
+def normalize(text):
+    text = re.sub(r"[^a-z0-9\s]", "", text.lower())
+    return " ".join(text.split())
+
+def dedupe_clauses(clauses):
+    first = {}
+    unique = []
+    duplicates = {}
+    for c in clauses:
+        key = normalize(c["text"])
+        if key in first:
+            duplicates[c["id"]] = first[key]
+        else:
+            first[key] = c["id"]
+            unique.append(c["id"])
+    return {"unique": unique, "duplicates": duplicates}
+--- tests
+CLAUSES = [
+    {"id": "2.1", "text": "This Agreement is governed by the laws of Sweden."},
+    {"id": "7.4", "text": "This agreement is governed by the  laws of Sweden"},
+    {"id": "3.1", "text": "Fees are payable within thirty days."},
+    {"id": "15.2", "text": "THIS AGREEMENT IS GOVERNED BY THE LAWS OF SWEDEN."},
+]
+expect("normalize", lambda: normalize("  This Agreement,\nis GOVERNED.  "), "this agreement is governed")
+expect("keeps the first occurrence", lambda: dedupe_clauses(CLAUSES)["unique"], ["2.1", "3.1"])
+expect("duplicates point to the clause kept", lambda: dedupe_clauses(CLAUSES)["duplicates"], {"7.4": "2.1", "15.2": "2.1"})
+expect("merely similar is not a duplicate", lambda: dedupe_clauses([{"id": "a", "text": "Fees are payable within thirty days."}, {"id": "b", "text": "Fees are payable within sixty days."}])["unique"], ["a", "b"])
+expect("empty list", lambda: dedupe_clauses([]), {"unique": [], "duplicates": {}})
+--- hints
+- Remove punctuation: `re.sub(r"[^a-z0-9\s]", "", text.lower())`; `[^...]` means "not one of these characters". Collapse whitespace: `" ".join(text.split())`.
+- In the loop: if the normalized text is already in the dictionary → record the clause in `duplicates`; if not → store it in the dictionary and add its number to `unique`.
+
+@@ item d20-13
+type: code
+title: Merge redline spans
+level: 2
+lang: ts
+cards: Five kinds of interview questions
+--- context
+A clause may need changes in several places, each given as a range of character positions. When the real project's `graph.py` exports, it replaces text from back to front so the earlier positions don't shift; but if two changes overlap, the original text still gets mangled.
+--- prompt
+A clause may need changes in several places, each a character range `[start, end]` (start included, end not). If ranges overlap, replacing text from back to front the way `graph.py` does goes wrong, so they have to be merged first. Write `mergeSpans(spans)`:
+
+- sort by start, and merge ranges that overlap or **touch end to start** (the next start ≤ the current end) into one
+- return a new array, sorted by start from smallest to largest; don't change the array that was passed in
+
+Example: `mergeSpans([[10, 20], [15, 30], [40, 50]])` → `[[10, 30], [40, 50]]`
+--- starter
+function mergeSpans(spans: [number, number][]): [number, number][] {
+  return [];
+}
+--- solution
+function mergeSpans(spans: [number, number][]): [number, number][] {
+  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+  const out: [number, number][] = [];
+  for (const [start, end] of sorted) {
+    const last = out[out.length - 1];
+    if (last && start <= last[1]) {
+      last[1] = Math.max(last[1], end);
+    } else {
+      out.push([start, end]);
+    }
+  }
+  return out;
+}
+--- tests
+expect("overlapping ranges merge", () => mergeSpans([[10, 20], [15, 30], [40, 50]]), [[10, 30], [40, 50]]);
+expect("the input is out of order", () => mergeSpans([[40, 50], [10, 20], [18, 25]]), [[10, 25], [40, 50]]);
+expect("touching ranges merge too", () => mergeSpans([[0, 5], [5, 9]]), [[0, 9]]);
+expect("one range entirely inside another", () => mergeSpans([[0, 100], [10, 20]]), [[0, 100]]);
+expect("empty array", () => mergeSpans([]), []);
+expect("doesn't change the array passed in", () => {
+  const input: [number, number][] = [[5, 8], [1, 3], [2, 6]];
+  mergeSpans(input);
+  return input;
+}, [[5, 8], [1, 3], [2, 6]]);
+--- hints
+- Copy first, then sort: `[...spans].sort((a, b) => a[0] - b[0])`, because `sort` changes the original array.
+- Look at the ranges one by one: if one overlaps the last range in the result, make the last one's end bigger; otherwise push a **new** `[start, end]` (a new array, so the input doesn't get changed).
+- Change the end with `Math.max(last[1], end)`; otherwise the "one range entirely inside another" case would make the range smaller.
+
+@@ item d20-14
+type: code
+title: Split into batches for rate limits
+level: 3
+cards: Five kinds of interview questions; d11:Token estimates and budgets
+--- context
+Providers limit how many requests and how many tokens (what the model bills by) you can send per minute. Sending all of a contract's clauses at once gets rejected, so you plan ahead which clauses go out in each minute.
+--- prompt
+Services such as OpenAI apply rate limits on "requests per minute" and "tokens per minute" (see each provider's docs for the numbers). Write `plan_batches(clauses, max_requests, max_tokens)` to plan which clauses to send in each minute:
+
+- `clauses`: `[{"id": "1.1", "tokens": 400}, ...]`; handle them in their original order, don't reorder them
+- in one minute, no more than `max_requests` clauses and no more than `max_tokens` tokens in total (exactly equal is fine)
+- when the next clause doesn't fit into the current minute, start a new minute
+- a clause that on its own is over `max_tokens` can never be sent: `raise ValueError`
+- return a list with one list of clause numbers per minute; empty input returns `[]`
+
+Example: `plan_batches(C, 10, 800)` → `[["1.1", "2.1"], ["3.1", "4.1", "5.1"]]` (the first minute is 400 + 300 = 700; adding 500 more would go over)
+--- starter
+def plan_batches(clauses, max_requests, max_tokens):
+    pass
+--- solution
+def plan_batches(clauses, max_requests, max_tokens):
+    batches = []
+    current = []
+    used = 0
+    for c in clauses:
+        if c["tokens"] > max_tokens:
+            raise ValueError(f"clause {c['id']} needs {c['tokens']} tokens, limit is {max_tokens}")
+        if current and (len(current) >= max_requests or used + c["tokens"] > max_tokens):
+            batches.append(current)
+            current, used = [], 0
+        current.append(c["id"])
+        used += c["tokens"]
+    if current:
+        batches.append(current)
+    return batches
+--- tests
+C = [{"id": "1.1", "tokens": 400}, {"id": "2.1", "tokens": 300}, {"id": "3.1", "tokens": 500}, {"id": "4.1", "tokens": 100}, {"id": "5.1", "tokens": 100}]
+expect("split by the token limit", lambda: plan_batches(C, 10, 800), [["1.1", "2.1"], ["3.1", "4.1", "5.1"]])
+expect("split by the request limit", lambda: plan_batches(C, 2, 10_000), [["1.1", "2.1"], ["3.1", "4.1"], ["5.1"]])
+expect("exactly the token limit fits", lambda: plan_batches(C[:2], 2, 700), [["1.1", "2.1"]])
+expect("empty list", lambda: plan_batches([], 5, 100), [])
+expect_raises("one clause alone is over the token limit", lambda: plan_batches([{"id": "9.1", "tokens": 900}], 5, 800), ValueError)
+--- hints
+- Keep track of three things: `batches` (the minutes planned so far), `current` (the clause numbers in this minute), `used` (the tokens used in this minute).
+- Before adding a clause, check: if `current` isn't empty and either "the count is full" or "adding this one would go over", put `current` into `batches` and start a new minute.
+- After the loop, don't forget the last minute: `if current: batches.append(current)`.
+
+@@ item d20-15
+type: choice
+title: Design question: which metric first
+level: 2
+cards: A framework for answering design questions; d13:Confusion matrix, precision, recall
+--- context
+Design questions in interviews often lead to the follow-up "how do you measure whether it's good?". Clause Check's evals compute several numbers, and each metric corresponds to a different cost of a mistake.
+--- prompt
+The lawyer says: "Missing a risky clause is much worse than flagging one clause that's fine." Your evals treat "risky" as the positive class. Which metric do you watch first, and which way do you push it?
+--- options
+- Raise precision: make sure as many of the flagged clauses as possible are truly risky
+- Raise recall: make sure as many of the truly risky clauses as possible get flagged, accepting some more false alarms
+- Raise accuracy: the share of all answers that are correct
+- Lower the token cost
+answer: 2
+--- explain
+A missed risk is an FN, and recall = TP / (TP + FN) directly reflects misses. That is why Clause Check's `run_evals.py` specifically prints `high-risk recall`. The price is more false alarms (precision drops), so the lawyer has a few more clauses to look at. Common approaches: when unsure, answer flag; add a red-flag regex as a safety net (a clause it matches can't be accept). Accuracy lies when risky clauses are rare: answering accept for everything can still score 90% accuracy.
+
+@@ item d20-16
+type: choice
+title: Design question: contracts are too slow
+level: 2
+cards: A framework for answering design questions; A feel for complexity
+--- context
+This is the classic opening of a design question: the system works, but the customer finds it slow. The interviewer will keep following up on whatever you say first.
+--- prompt
+A customer uploads a 300-page contract with 600 clauses, and the review takes 40 minutes. The interviewer asks: "What's your first step?" The best answer is:
+--- options
+- Switch to a faster model
+- Put all the clauses into one request and send it to the model in one go
+- Switch from Python to TypeScript so it runs faster
+- Look at the trace first and measure which step the time goes to (parsing? the model call for each clause? the steps of the tool loop? retries?), then work on the slowest step; if it's 600 calls made one after another, switch to bounded concurrency
+answer: 4
+--- explain
+The first step in a design question is always to measure. 600 clauses × 4 seconds each ≈ 40 minutes: the bottleneck is model calls over the network, not the speed of the code itself, so changing the language won't help. Concurrency needs a limit (for example 8 at a time; otherwise you easily hit the rate limit and get 429s). Per-clause classification needs no long reasoning, so turn off thinking mode and every call gets faster and cheaper; put the stable prefix first so it hits the cache; review repeated boilerplate clauses only once (today's deduplication exercise). Sending everything at once: the output is too long, quality drops, and one error means redoing the whole contract. Switching models might help, but first confirm with evals that recall hasn't dropped.
+
+@@ item d20-e1
+type: scratch
+title: Closed book: clauses to recheck (Python)
+exam: yes
+level: 3
+cards: Five kinds of interview questions; d8:Sorting by several keys
+--- context
+Clause 8.1 says "subject to Section 12": on its own it looks fine, but once clause 12 has to be rewritten, the meaning of 8.1 changes with it. The real project also reads the referenced clauses during a review; this kind of knock-on risk is the easiest to miss.
+--- prompt
+Clauses refer to each other (for example "subject to Section 12"). If a clause itself was judged accept but a clause it refers to was judged redline, it needs a recheck.
+
+Write `needs_recheck(verdicts, refs)`:
+
+- `verdicts`: clause number → verdict, for example `{"8.1": "accept", "12": "redline"}`
+- `refs`: clause number → list of the numbers it refers to, for example `{"8.1": ["12"]}`; a clause with no references may be missing from `refs`
+- return: the numbers of the clauses whose verdict is accept and that **directly** refer to at least one redline clause, sorted in **numeric** clause order ("9.2" before "10.1", "8.1" before "8.10")
+- references to numbers that aren't in `verdicts`: ignore them
+--- solution
+def clause_key(cid):
+    return tuple(int(p) for p in cid.split("."))
+
+def needs_recheck(verdicts, refs):
+    result = []
+    for cid, verdict in verdicts.items():
+        if verdict != "accept":
+            continue
+        if any(verdicts.get(r) == "redline" for r in refs.get(cid, [])):
+            result.append(cid)
+    return sorted(result, key=clause_key)
+--- tests
+V = {"8.1": "accept", "12": "redline", "9.2": "accept", "10.1": "accept", "4.2": "redline", "11.2": "flag", "6.1": "accept"}
+R = {"8.1": ["12"], "10.1": ["4.2", "99"], "9.2": ["4.2"], "11.2": ["4.2"], "6.1": ["11.2"]}
+expect("finds them, in numeric order", lambda: needs_recheck(V, R), ["8.1", "9.2", "10.1"])
+expect("no references", lambda: needs_recheck(V, {}), [])
+expect("only refers to a number that doesn't exist", lambda: needs_recheck({"1.1": "accept"}, {"1.1": ["7"]}), [])
+expect("8.1 before 8.10", lambda: needs_recheck({"8.10": "accept", "8.1": "accept", "3": "redline"}, {"8.10": ["3"], "8.1": ["3"]}), ["8.1", "8.10"])
+
+@@ item d20-e2
+type: scratch
+title: Closed book: apply redlines (TypeScript)
+exam: yes
+level: 3
+lang: ts
+cards: Five kinds of interview questions
+--- context
+Once the lawyer has approved them, the redlines have to be actually written into the exported copy of the contract; that is exactly what the real project's `graph.py` does on export. Every change position is computed on the original text, and a clause often needs changes in more than one place.
+--- prompt
+Define `type Edit = { start: number; end: number; replacement: string }` and write `applyRedlines(text: string, edits: Edit[]): string`: replace the range of each edit (start included, end not) with its `replacement`.
+
+- `edits` come in no fixed order; all positions are relative to the **original** text (what `graph.py` does: replace from back to front, so the earlier positions don't get shifted)
+- after sorting by start, if the next start is less than the previous end, they overlap: `throw new Error(...)`; touching end to start is fine
+- don't change the `edits` array that was passed in; with no edits, return the text unchanged
+--- solution
+type Edit = { start: number; end: number; replacement: string };
+
+function applyRedlines(text: string, edits: Edit[]): string {
+  const sorted = [...edits].sort((a, b) => a.start - b.start);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].start < sorted[i - 1].end) {
+      throw new Error(`overlapping edits at ${sorted[i].start}`);
+    }
+  }
+  let out = text;
+  for (const e of sorted.reverse()) {
+    out = out.slice(0, e.start) + e.replacement + out.slice(e.end);
+  }
+  return out;
+}
+--- tests
+const TEXT = "Fees are due in 60 days. Liability is unlimited.";
+const e1 = { start: TEXT.indexOf("60 days"), end: TEXT.indexOf("60 days") + 7, replacement: "30 days" };
+const e2 = { start: TEXT.indexOf("unlimited"), end: TEXT.indexOf("unlimited") + 9, replacement: "capped at 12 months of fees" };
+expect("two replacements", () => applyRedlines(TEXT, [e1, e2]), "Fees are due in 30 days. Liability is capped at 12 months of fees.");
+expect("same result in a shuffled order", () => applyRedlines(TEXT, [e2, e1]), "Fees are due in 30 days. Liability is capped at 12 months of fees.");
+expect("no edits", () => applyRedlines(TEXT, []), TEXT);
+expectThrows("overlapping ranges", () => applyRedlines(TEXT, [e1, { start: e1.start + 2, end: e1.end + 3, replacement: "x" }]));
+expect("doesn't change the array passed in", () => {
+  const edits = [e2, e1];
+  applyRedlines(TEXT, edits);
+  return edits[0].replacement;
+}, "capped at 12 months of fees");
+
+@@ item d20-e3
+type: scratch
+title: Closed book: rewrite the retry function (TypeScript)
+exam: yes
+level: 3
+lang: ts
+cards: A bug-hunting checklist; d4:Status codes and retries
+--- context
+Calls to the model now and then run into network glitches or a 429 (too many requests, temporarily refused); the usual answer is to retry automatically a few times. Every request in the review flow may be wrapped in a layer like this.
+--- prompt
+The `withRetry` below has 3 bugs. Don't patch it: write a correct version from scratch in a blank editor.
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T | undefined> {
+  for (let i = 0; i <= tries; i++) {
+    try {
+      return fn();
+    } catch (e) {
+      console.log("retrying");
+    }
+  }
+}
+```
+
+The signature of the correct version: `withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T>`
+
+- call `fn` at most `tries` times in total; as soon as one call succeeds, return its result
+- when `fn` fails (its Promise is rejected), try again
+- when every call fails: throw the error from the **last** call; never return undefined
+--- solution
+async function withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T> {
+  let lastError: unknown = new Error("tries must be at least 1");
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+--- tests
+function flaky(failures: number) {
+  let calls = 0;
+  const fn = async (): Promise<string> => {
+    calls += 1;
+    if (calls <= failures) throw new Error(`fail ${calls}`);
+    return "ok";
+  };
+  return { fn, count: () => calls };
+}
+expectAsync("succeeds after two failures, 3 calls in total", async () => {
+  const f = flaky(2);
+  const r = await withRetry(f.fn, 3);
+  return [r, f.count()];
+}, ["ok", 3]);
+expectAsync("all fail: throws the last error, calls only tries times", async () => {
+  const f = flaky(10);
+  try {
+    await withRetry(f.fn, 3);
+    return "no error thrown";
+  } catch (e) {
+    return [e instanceof Error ? e.message : String(e), f.count()];
+  }
+}, ["fail 3", 3]);
+expectAsync("succeeds the first time", async () => {
+  const f = flaky(0);
+  return [await withRetry(f.fn, 3), f.count()];
+}, ["ok", 1]);

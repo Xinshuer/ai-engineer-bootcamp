@@ -2,6 +2,7 @@
 //   node build.mjs              parse content, validate every exercise, emit dist/
 //   node build.mjs --day 3      validate only day 3, emit nothing (safe to run several at once)
 //   node build.mjs --day 8,9    validate days 8 and 9
+//   node build.mjs --lang en --day 3   validate only the English day 3 (content/en/day3.txt)
 // Validation runs the SAME runners the page uses: Pyodide for Python, the TS compiler +
 // a sandboxed job for TypeScript. Every solution must pass, every starter must fail,
 // and predict-the-output answers are computed here, never typed by hand.
@@ -18,11 +19,13 @@ const DIST = P("dist");
 const onlyDays = process.argv.includes("--day")
   ? new Set(String(process.argv[process.argv.indexOf("--day") + 1]).split(",").map(Number))
   : null;
-const EMIT = onlyDays === null;
+const onlyLang = process.argv.includes("--lang") ? String(process.argv[process.argv.indexOf("--lang") + 1]) : null;
+if (onlyLang && !["zh", "en"].includes(onlyLang)) throw new Error("--lang must be zh or en");
+const EMIT = onlyDays === null && onlyLang === null;
 const SHOW = process.argv.includes("--show");   // print concept / predict outputs while validating
 
 // ---------------------------------------------------------------- parse
-function parseContent(file) {
+function parseContent(file, DAYS) {
   const text = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
   const blocks = text.split(/^@@ /m).slice(1);
   let day = null;
@@ -86,9 +89,12 @@ function normalize(o, day) {
   return out;
 }
 
-const DAYS = [];
+// two languages of the same course: content/*.txt (Chinese) and content/en/*.txt (English)
+const COURSES = { zh: [], en: [] };
 const dayNum = (f) => Number(/\d+/.exec(f)[0]);
-for (const f of fs.readdirSync(P("content")).filter((f) => /^day\d+\.txt$/.test(f)).sort((a, b) => dayNum(a) - dayNum(b))) parseContent(P("content", f));
+const dayFiles = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => /^day\d+\.txt$/.test(f)).sort((a, b) => dayNum(a) - dayNum(b)) : []);
+for (const f of dayFiles(P("content"))) parseContent(P("content", f), COURSES.zh);
+for (const f of dayFiles(P("content", "en"))) parseContent(P("content", "en", f), COURSES.en);
 // datasets for SQL / database / cloud exercises: content/data/<name>.sql
 const DATASETS = {};
 if (fs.existsSync(P("content", "data")))
@@ -201,7 +207,8 @@ function realNode(js) {
 // ---------------------------------------------------------------- validate
 const problems = [];
 let checked = 0;
-const bad = (id, msg) => problems.push(`${id}: ${msg}`);
+let TAG = "";  // "en:" while the English course is checked
+const bad = (id, msg) => problems.push(`${TAG}${id}: ${msg}`);
 const allPass = (r) => !r.error && !(r.diagnostics || []).length && r.tests.length > 0 && r.tests.every((t) => t.passed);
 const summary = (r) => r.error || (r.diagnostics || []).map((d) => `L${d.line} ${d.message}`).join("; ") || r.tests.filter((t) => !t.passed).map((t) => `${t.label} got=${t.got} exp=${t.expected} ${t.error || ""}`).join(" | ") || "(no tests)";
 
@@ -241,14 +248,12 @@ function lintLangchain(o) {
   if (/\basyncio\.run\(|^\s*await\s|\bainvoke\(|\bastream\(|\babatch\(/m.test(code))
     bad(o.id, "async LangChain calls cannot run in the browser runtime (no asyncio.run); show them in concept text only");
 }
-for (const day of DAYS) for (const c of day.concepts) if (c.langchain && c.code) lintLangchain(c);
 
 // ---------------------------------------------------------------- context, cards, checks
 // `--- context`: a few sentences of background above the task. `cards: 字符串; d1:列表` names the knowledge
 // cards the item uses (same day by title, another day as dN:title); the page links them. `checks` is what the
 // grader looks at, shown before the first run: every expect line's label, plus the call and the value when the
 // line calls the learner's own function with nothing the tests define.
-const conceptByTitle = (dayId, title) => (DAYS.find((d) => Number(d.id) === Number(dayId))?.concepts || []).find((c) => c.title === title);
 function splitTop(s) {
   const out = [];
   let depth = 0, quote = null, cur = "";
@@ -266,7 +271,7 @@ function splitTop(s) {
   return out;
 }
 const unquote = (s) => { const m = /^[rf]?(["'`])([\s\S]*)\1$/.exec(s); return m ? m[2].replace(/\\(["'\\])/g, "$1") : s; };
-function checksOf(it) {
+function checksOf(it, lang) {
   if (!it.tests || !["code", "fix", "fill", "order", "scratch"].includes(it.type) || it.lang === "sql") return [];
   const own = new Set();
   for (const m of (it.solution || "").matchAll(/^(?:export\s+)?(?:async\s+)?(?:def|class|function|const|let)\s+(\w+)/gm)) own.add(m[1]);
@@ -283,7 +288,7 @@ function checksOf(it) {
     const kind = head[1];
     if (args && /^(expect|expect_raises|expectThrows)$/.test(kind) && args.length === (kind === "expectThrows" ? 2 : 3)) {
       const call = args[1].replace(/^lambda\s*:\s*/, "").replace(/^\(\)\s*=>\s*/, "");
-      const value = kind === "expect" ? args[2] : kind === "expect_raises" ? `报错 ${args[2]}` : "报错";
+      const value = kind === "expect" ? args[2] : kind === "expect_raises" ? (lang === "en" ? `raises ${args[2]}` : `报错 ${args[2]}`) : lang === "en" ? "raises an error" : "报错";
       const fn = /^(\w+)\s*\(/.exec(call);
       const words = (call + " " + (kind === "expect" ? value : "")).match(/[A-Za-z_]\w*/g) || [];
       if (fn && own.has(fn[1]) && !words.some((w) => theirs.has(w)) && call.length <= 110 && value.length <= 90 && !/^async|await /.test(call)) Object.assign(check, { call, value });
@@ -292,10 +297,12 @@ function checksOf(it) {
   }
   return out;
 }
+function prepare(DAYS, lang) {
+const conceptByTitle = (dayId, title) => (DAYS.find((d) => Number(d.id) === Number(dayId))?.concepts || []).find((c) => c.title === title);
 for (const day of DAYS) for (const it of day.items) {
   if (it.context !== undefined) {
     if (!it.context.trim()) bad(it.id, "empty --- context");
-    else if ([...it.context].length > 240) bad(it.id, `--- context is ${[...it.context].length} characters; keep it to a few sentences (max 240)`);
+    else if ([...it.context].length > (lang === "en" ? 520 : 240)) bad(it.id, `--- context is ${[...it.context].length} characters; keep it to a few sentences (max ${lang === "en" ? 520 : 240})`);
   }
   if (it.cards !== undefined) {
     it.cardIds = [];
@@ -308,9 +315,45 @@ for (const day of DAYS) for (const it of day.items) {
     }
     delete it.cards;
   }
-  it.checks = checksOf(it);
+  it.checks = checksOf(it, lang);
+}
 }
 
+// the English course must be the Chinese one item for item: same days, cards, items, types, answers,
+// number of options / blanks / lines / tests, and card links (only the words may differ)
+function parity(zh, en) {
+  const zhDays = new Map(zh.map((d) => [Number(d.id), d]));
+  const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  for (const d of en) {
+    const z = zhDays.get(Number(d.id));
+    if (!z) { bad(`day ${d.id}`, "there is no Chinese day with this number"); continue; }
+    for (const k of ["lang", "dataset", "langchain"]) if (!same(d[k], z[k])) bad(`day ${d.id}`, `${k} is ${JSON.stringify(d[k])}, Chinese has ${JSON.stringify(z[k])}`);
+    if (d.checklist.length !== z.checklist.length) bad(`day ${d.id}`, `checklist has ${d.checklist.length} lines, Chinese has ${z.checklist.length}`);
+    if (d.concepts.length !== z.concepts.length) bad(`day ${d.id}`, `${d.concepts.length} knowledge cards, Chinese has ${z.concepts.length}`);
+    d.concepts.forEach((c, i) => {
+      const zc = z.concepts[i];
+      if (!zc) return;
+      if (c.id !== zc.id) bad(c.id, `card ${i + 1} is ${c.id}, Chinese has ${zc.id}`);
+      for (const k of ["lang", "mock", "cloud", "langchain", "dataset", "error_demo"]) if (!same(c[k], zc[k])) bad(c.id, `${k} differs from the Chinese card`);
+      if (!!c.code !== !!zc.code) bad(c.id, "one language has example code, the other not");
+    });
+    if (d.items.length !== z.items.length) bad(`day ${d.id}`, `${d.items.length} items, Chinese has ${z.items.length}`);
+    d.items.forEach((it, i) => {
+      const zi = z.items[i];
+      if (!zi) return;
+      if (it.id !== zi.id) { bad(it.id, `item ${i + 1} is ${it.id}, Chinese has ${zi.id}`); return; }
+      for (const k of ["type", "level", "exam", "lang", "mock", "cloud", "langchain", "dataset", "ordered", "bq", "allow_empty", "skip_starter", "answer", "cardIds"])
+        if (!same(it[k], zi[k])) bad(it.id, `${k} is ${JSON.stringify(it[k])}, Chinese has ${JSON.stringify(zi[k])}`);
+      for (const k of ["options", "fills", "lines", "distractors", "mutants", "checks", "hints"])
+        if ((it[k] || []).length !== (zi[k] || []).length) bad(it.id, `${k}: ${(it[k] || []).length}, Chinese has ${(zi[k] || []).length}`);
+      for (const k of ["starter", "solution", "tests", "code", "template", "impl", "context", "explain", "verify", "schema", "check"])
+        if (!!it[k] !== !!zi[k]) bad(it.id, `--- ${k} is ${it[k] ? "present" : "missing"}, Chinese ${zi[k] ? "has" : "has no"} ${k}`);
+    });
+  }
+}
+
+async function validateCourse(DAYS) {
+for (const day of DAYS) for (const c of day.concepts) if (c.langchain && c.code) lintLangchain(c);
 const ids = new Set();
 for (const day of DAYS) {
   const validate = onlyDays === null || onlyDays.has(Number(day.id));
@@ -410,14 +453,29 @@ for (const day of DAYS) {
     } else if (t !== "scratch" && it.starter === undefined) bad(it.id, "missing starter");
   }
 }
+}
+
+prepare(COURSES.zh, "zh");
+TAG = "en:";
+prepare(COURSES.en, "en");
+parity(COURSES.zh, COURSES.en);
+for (const lang of onlyLang ? [onlyLang] : ["zh", "en"]) {
+  TAG = lang === "en" ? "en:" : "";
+  await validateCourse(COURSES[lang]);
+}
+TAG = "";
 
 // ---------------------------------------------------------------- report + emit
+const DAYS = COURSES.zh;
 const counts = DAYS.map((d) => `D${d.id}:${d.items.length}+${d.concepts.length}c`).join(" ");
 console.log(`checked ${checked} | ${counts} | items ${DAYS.reduce((n, d) => n + d.items.length, 0)}`);
 const allItems = DAYS.flatMap((d) => d.items);
 console.log(`context ${allItems.filter((it) => it.context).length}/${allItems.length} | cards ${allItems.filter((it) => it.cardIds?.length).length} | checks with a call ${allItems.filter((it) => it.checks.some((c) => c.call)).length}/${allItems.filter((it) => it.checks.length).length}`);
+const enProblems = problems.filter((p) => p.startsWith("en:")).length;
+const enComplete = COURSES.en.length === COURSES.zh.length && enProblems === 0;
+console.log(`English: ${COURSES.en.length}/${COURSES.zh.length} days, ${COURSES.en.reduce((n, d) => n + d.items.length, 0)} items, ${enProblems} problem(s)${EMIT && !enComplete ? " (course-en.js not written until every English day is valid)" : ""}`);
 if (problems.length) { console.log(`\n${problems.length} PROBLEM(S):\n- ` + problems.join("\n- ")); process.exitCode = 1; }
-else console.log(EMIT ? "all exercises valid" : `day ${[...onlyDays].join(",")} valid (validation only, dist/ not written)`);
+else console.log(EMIT ? "all exercises valid" : `${onlyLang ? onlyLang + " " : ""}${onlyDays ? "day " + [...onlyDays].join(",") : "all days"} valid (validation only, dist/ not written)`);
 if (!EMIT) process.exit();
 
 fs.rmSync(DIST, { recursive: true, force: true });
@@ -433,6 +491,11 @@ if (LC_WHEELS.length) fs.copyFileSync(P("vendor", "lc", "cl100k_base.tiktoken"),
 fs.writeFileSync(P("dist", "zod.iife.js"), ZOD);
 const course = { builtAt: new Date().toISOString(), days: DAYS, datasets: DATASETS, tables: TABLES };
 fs.writeFileSync(P("dist", "course.js"), "window.CC_COURSE = " + JSON.stringify(course) + ";\n");
+// English: same datasets and tables (the page takes them from course.js), loaded only when the page is in English
+// --preview-en: while the translation is unfinished, fill the missing English days with the Chinese ones
+const PREVIEW_EN = process.argv.includes("--preview-en");
+const enDays = enComplete ? COURSES.en : PREVIEW_EN ? COURSES.zh.map((z) => COURSES.en.find((e) => Number(e.id) === Number(z.id)) || z) : null;
+if (enDays) fs.writeFileSync(P("dist", "course-en.js"), "window.CC_COURSE_EN = " + JSON.stringify({ builtAt: course.builtAt, days: enDays, preview: !enComplete }) + ";\n");
 fs.writeFileSync(P("dist", "harness.js"), [
   "window.CC_HARNESS = " + JSON.stringify({ PY_RUNNER, PY_MOCK, PY_DISCOVER, PY_SQL, PY_CLOUD, PY_LANGCHAIN, TS_RUNTIME, WHEELS, LC_WHEELS, TIKTOKEN }) + ";",
   TS_COMPILE,

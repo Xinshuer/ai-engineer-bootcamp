@@ -1,0 +1,1653 @@
+@@ day 31
+title: RAG and agents: Document, splitting, vector stores, retrieval chains, create_agent
+lang: py
+langchain: yes
+hours: 4–5 hours
+--- goal
+Rebuild the RAG you wrote by hand on Days 11 and 19 from LangChain parts: `Document` with metadata, a splitter, a vector store and a retriever, and make a retrieval chain that can say where its answer came from. Then use `create_agent` to let the model decide for itself when to look things up, and see that it is really a LangGraph graph (tomorrow you draw the graph yourself). In the project this matches `split.py` (one chunk per clause) and `review.py` (a tool loop with a limit).
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change one thing in each before you run it
+- Pass every practice exercise
+- The 3 closed-book challenges
+- Answer this interview question in your own words: "When do you use a fixed RAG chain, when create_agent, and when do you write LangGraph yourself?"
+
+@@ concept
+title: Document: a chunk with its source
+--- body
+On Day 11 you wrote chunks as dictionaries `{"id": "c1", "text": "..."}`. LangChain's retrieval parts (splitters, vector stores, retrievers) all take in and give back `Document`s:
+
+- `page_content`: the chunk text; this is what goes to the embeddings and into the prompt
+- `metadata`: any dictionary; it holds the **source**: `clause_id`, `heading`, the `source` file name, `topic`… It comes back unchanged with every search result, and citations and filtering both depend on it
+
+Contracts have numbers, so the best way to cut them is still the "one chunk per clause" of `split.py`: a regex finds the heading lines, and the text between two heading lines is the body. The regex below follows the same idea as `CLAUSE_HEAD` in `split.py`.
+
+Classic mistake: storing only the text and no metadata. The search finds the chunk but can't say which clause it is, and the citations from Day 19 no longer work.
+--- code
+import re
+from langchain_core.documents import Document
+
+CONTRACT = """3.1 Invoicing
+Fees are invoiced annually and are payable within thirty (30) days of the invoice date.
+8.1 Cap on Liability
+Each party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim.
+11.1 Termination by Provider
+Provider may terminate this Agreement for convenience upon ten (10) days' written notice."""
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$", re.M)
+heads = list(HEAD.finditer(CONTRACT))
+docs = []
+for i, h in enumerate(heads):
+    end = heads[i + 1].start() if i + 1 < len(heads) else len(CONTRACT)
+    body = CONTRACT[h.end():end].strip()
+    docs.append(Document(page_content=body, metadata={"clause_id": h.group(1), "heading": h.group(2), "source": "sample_contract.txt"}))
+
+for d in docs:
+    print(d.metadata["clause_id"], "|", d.metadata["heading"], "|", d.page_content[:40])
+print(repr(docs[0]))
+
+@@ concept
+title: Splitters: by length or by structure
+--- body
+`RecursiveCharacterTextSplitter` is LangChain's most used splitter, a stronger version of `chunk_fixed` from Day 11:
+
+- `chunk_size`: the most characters a chunk may have; `chunk_overlap`: how many characters two neighboring chunks share
+- `separators`: the separators to try, in order; the default is `["\n\n", "\n", " ", ""]`. It first cuts at blank lines; if a piece is still too long, at line breaks, then at spaces… and at the end it **merges** small pieces back into chunks close to `chunk_size`
+- `add_start_index=True`: each chunk's metadata records where the chunk starts in the original text
+- `create_documents(texts, metadatas=[...])` produces Documents directly, and the metadata is copied into every chunk
+
+It only cares about length and knows nothing about clauses: below, the heading and the body of 8.1 end up apart, and the body is cut in the middle. So contracts with numbers are cut by clause (previous card); this splitter is only for long text with no structure (emails, meeting notes).
+
+Parameter checks: a `chunk_overlap` larger than `chunk_size` raises `ValueError` right away; when the two are **equal** there is no error, but each chunk moves forward only a tiny step (about one word), producing a pile of nearly identical chunks. Your `chunk_fixed` from Day 11 is stricter: it raises an error when `overlap >= size`.
+--- code
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+text = ("8.1 Cap on Liability\nEach party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim.\n\n"
+        "8.2 Indirect Damages\nNeither party is liable for indirect or consequential damages.")
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=80, chunk_overlap=20, add_start_index=True)
+for d in splitter.create_documents([text], metadatas=[{"source": "msa.txt"}]):
+    print(d.metadata["start_index"], repr(d.page_content))
+
+same = RecursiveCharacterTextSplitter(chunk_size=80, chunk_overlap=80)
+print(len(same.split_text(text)), "chunks when chunk_overlap == chunk_size")
+
+@@ concept
+title: Vector stores: compute vectors once, search many times
+--- body
+On Day 11 you did this by hand: send the chunks to the embeddings API, get vectors back and store them (`embed_texts`); when a question comes, turn it into a vector too and take the top k by cosine similarity. LangChain packs these steps into two objects:
+
+- `OpenAIEmbeddings(model="text-embedding-3-small")`: calls the OpenAI-format `/v1/embeddings`. DeepSeek has no embeddings API; on this page it is a mock service with the same format (a bag of words plus synonyms, so asking about cancel finds terminate)
+- `InMemoryVectorStore(embeddings)`: a vector store kept in memory. `add_documents(docs)` computes all the vectors in one request; `similarity_search(q, k=2)` returns the k most similar Documents; `similarity_search_with_score` returns the cosine scores with them; `filter=lambda doc: ...` filters by metadata first, then ranks
+
+The ids that `add_documents` returns are random uuids; the clause number is in the metadata. Switch to a real vector store (pgvector, Chroma…) and these method names mostly stay the same. That is what a framework gives you.
+
+Below, look at the second result, 8.3, for the question about canceling the contract: its score is very low, and it really has nothing to do with the question. The embedding on this page is a mock (bag of words + hashing, very rough), so it has more false hits like this than a real model; but a real model is the same in one way: vector search **always** returns k results, even when the last few are irrelevant. So don't set k too large, and filter by metadata whenever you can.
+
+Look at the request body: `input` is a list of numbers. By default `OpenAIEmbeddings` first turns the text into token ids with tiktoken and sends those. A comment in the source code says that many non-OpenAI services (it names OpenRouter, Ollama, vLLM) need `check_embedding_ctx_length=False`, so the text is sent as is.
+--- code
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+CLAUSES = [
+    ("3.1", "payment", "Fees are invoiced annually and are payable within thirty (30) days of the invoice date."),
+    ("8.1", "liability_cap", "Each party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim."),
+    ("8.3", "liability_cap", "Customer's liability for breach of Section 6 shall be unlimited."),
+    ("11.1", "termination", "Provider may terminate this Agreement for convenience upon ten (10) days' written notice."),
+]
+docs = [Document(page_content=text, metadata={"clause_id": cid, "topic": topic}) for cid, topic, text in CLAUSES]
+
+store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+ids = store.add_documents(docs)
+print(len(ids), "documents,", len(MOCK.calls), "embeddings request")
+
+for doc, score in store.similarity_search_with_score("Can the provider cancel the contract?", k=2):
+    print(doc.metadata["clause_id"], round(score, 2))
+
+only_caps = store.similarity_search("liability", k=2, filter=lambda d: d.metadata["topic"] == "liability_cap")
+print("filtered:", [d.metadata["clause_id"] for d in only_caps])
+body = MOCK.calls[-1]["body"]
+print(body["model"], "| input for 'liability':", body["input"])
+
+@@ concept
+title: Retriever and RAG chains
+--- body
+`store.as_retriever(search_kwargs={"k": 2})` wraps the vector store in a **Runnable**: `retriever.invoke("question")` returns a list of Documents. So it can go into a `|` pipe together with a prompt and a model (LCEL from Day 29). The most common RAG chain:
+
+```python
+chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt | model | StrOutputParser()
+)
+```
+
+- The dictionary at the start receives the same question and sends it two ways: `context` goes "search → join into text", `question` is passed through unchanged, and together they make `{"context": ..., "question": ...}` for the prompt
+- `format_docs` is an ordinary function you write yourself: it puts `[clause number]` in front of each chunk, just like the numbered chunks from Day 19
+
+This chain puts out only a string, so **the sources are lost**. To return `sources` as well, plain Python is clearest: call `docs = retriever.invoke(q)` once, and use the same docs both to build the prompt and to get the clause numbers.
+
+Classic mistake: writing `as_retriever(k=2)`. That argument is **silently ignored**: no error, no warning, and you still get the default 4 results.
+--- code
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+
+docs = [
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+]
+store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+store.add_documents(docs)
+retriever = store.as_retriever(search_kwargs={"k": 2})
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the sources. Cite clause ids like [3.1]."),
+    ("user", "Question: {question}\n\nSources:\n{context}"),
+])
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+chain = {"context": retriever | format_docs, "question": RunnablePassthrough()} | prompt | model | StrOutputParser()
+
+print(chain.invoke("When is the invoice due?"))
+print("--- what the model received:")
+print(MOCK.calls[-1]["body"]["messages"][1]["content"])
+
+@@ concept
+title: create_agent: a ready-made tool loop
+--- body
+On Day 17 (TypeScript) and yesterday (LangChain messages) you wrote an agent loop with a limit by hand: call the model → if there are `tool_calls`, run them and add the results back as tool messages → call the model again → stop when there are no `tool_calls`. In LangChain 1.x it is one line:
+
+```python
+agent = create_agent(model, tools=[lookup_playbook], system_prompt="...")
+result = agent.invoke({"messages": [("user", "...")]})
+```
+
+- Input and output are both `{"messages": [...]}`. `system_prompt` is put first every time the model is called, but it is not in the returned messages
+- Reading the trace: `HumanMessage → AIMessage(tool_calls) → ToolMessage → AIMessage` (the final answer)
+- What you get back is a **compiled LangGraph graph**: the nodes `model` and `tools`, and `get_graph().draw_mermaid()` can draw it (solid lines are fixed edges, dotted lines are conditional edges). Tomorrow you build a graph like this yourself
+- Step limit: `agent.invoke(..., {"recursion_limit": 10})`; going over it raises `GraphRecursionError`. In this version the default limit is 10007 (many older tutorials say 25), so not setting it is almost the same as having no limit
+
+Why an agent's model must have thinking turned off (`extra_body={"thinking": {"type": "disabled"}}`): the DeepSeek docs say that in thinking mode, whenever the request includes tools, the `reasoning_content` of every earlier assistant message must be sent back unchanged, or the API returns 400; but LangChain's ChatDeepSeek drops it when it turns messages into a request. So with thinking on, the agent's second model call breaks this rule (this page's mock server answers 400, as the docs say; a test of the real API in 2026-09 showed it does not reject it for now, but you can't count on it never checking). Also, one task calls the model several times, the thinking of every call is billed as output tokens, and it is slower.
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+RULES = {"liability_cap": "PB-01: cap at 12 months of fees; never unlimited."}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return RULES.get(topic, "no rule for this topic")
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+agent = create_agent(model, tools=[lookup_playbook], system_prompt="Check the playbook before you answer.")
+result = agent.invoke({"messages": [("user", "Clause 8.1 caps liability at 12 months of fees. Is that ok?")]})
+
+for m in result["messages"]:
+    print(f"{type(m).__name__:<13}", m.content[:50] or m.tool_calls[0]["name"])
+print(type(agent).__name__, list(agent.get_graph().nodes))
+first = MOCK.calls[0]["body"]
+print([m["role"] for m in first["messages"]], first["thinking"])
+print([line.strip() for line in agent.get_graph().draw_mermaid().splitlines() if "->" in line])
+
+try:   # the same agent, only with thinking left on
+    create_agent(ChatDeepSeek(model="deepseek-flash"), tools=[lookup_playbook]).invoke({"messages": [("user", "Is clause 8.1 ok?")]})
+except Exception as e:
+    print("thinking on:", type(e).__name__, e.status_code)
+
+@@ concept
+title: response_format: a structured final answer
+--- body
+What an agent says at the end is free text, which is hard for a program to use. `response_format` makes it hand in a Pydantic object at the end, which lands in the result's `structured_response`.
+
+For DeepSeek, write it as `ToolStrategy(ClauseReview)`:
+
+- It adds `ClauseReview` to the tools as **one more tool**, and sets `tool_choice: "required"` (the model must call a tool in every round). After looking up the playbook, the model "calls" ClauseReview, and the arguments are the answer; LangChain validates them and puts them in `structured_response`. The trace gets one more AIMessage + ToolMessage pair (`Returning structured response: ...`)
+- When the arguments fail validation, by default it writes the error into a ToolMessage and sends it back so the model can hand it in again (just like Day 17's "errors are messages for the model"). If the model keeps getting it wrong, it keeps retrying, so you need `recursion_limit` here too
+- When you write just `response_format=ClauseReview`, LangChain picks a strategy automatically from the model's profile data: in this version (langchain 1.4 + langchain-deepseek 1.1) the profile says deepseek-flash supports structured output, so it picks ProviderStrategy and sends `response_format: {"type": "json_schema", ...}`. But in the DeepSeek docs, JSON Output has only one kind, `json_object`, and this page's mock server answers json_schema with 400
+
+A framework's "automatic" sometimes guesses wrong, and it changes from version to version. When something goes wrong, first look at what `MOCK.calls[-1]["body"]` actually sent; in a real project that means the request log or the trace.
+--- code
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+agent = create_agent(model, tools=[lookup_playbook], response_format=ToolStrategy(ClauseReview))
+result = agent.invoke({"messages": [("user", "Review clause 8.3: Customer's liability shall be unlimited.")]})
+
+print(repr(result["structured_response"]))
+print([type(m).__name__ for m in result["messages"]])
+print(result["messages"][-1].content)
+body = MOCK.calls[-1]["body"]
+print([t["function"]["name"] for t in body["tools"]], body["tool_choice"])
+
+@@ concept
+title: Middleware: step in before and after calls
+--- body
+In 1.x, `create_agent` customizes the loop with **middleware**: hooks that run "before and after calling the model" and "before and after calling a tool". A few ready-made ones:
+
+- `HumanInTheLoopMiddleware(interrupt_on={"send_redline": True})`: when the model wants to call `send_redline`, the graph stops first (interrupt) and waits for a person to approve / edit / reject / respond. It needs a `checkpointer` (where the state is kept while it is stopped), every call carries the same `thread_id`, and `Command(resume={"decisions": [{"type": "approve"}]})` continues it. This is the approval gate from Day 17; Day 34 covers interrupt in detail
+- `ModelCallLimitMiddleware(run_limit=5)`, `ToolCallLimitMiddleware(...)`: limits on the number of calls
+- `ModelRetryMiddleware`, `ModelFallbackMiddleware`, `SummarizationMiddleware`, `PIIMiddleware`: retries, switching to a fallback model, compressing a long history, masking personal information
+
+Every layer you add is one more layer to check when something goes wrong. First ask: can plain code do this? When you do use one, read its constructor arguments in the source code; the way older tutorials write it has often changed.
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+SENT = []
+
+@tool
+def send_redline(clause_id: str) -> str:
+    """Email the proposed redline for one clause to the counterparty."""
+    SENT.append(clause_id)
+    return f"redline for {clause_id} sent"
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+agent = create_agent(model, tools=[send_redline], checkpointer=InMemorySaver(),
+                     middleware=[HumanInTheLoopMiddleware(interrupt_on={"send_redline": True})])
+cfg = {"configurable": {"thread_id": "review-42"}}
+
+result = agent.invoke({"messages": [("user", "Send the redline for clause 8.3")]}, cfg)
+request = result["__interrupt__"][0].value["action_requests"][0]
+print("paused:", request["name"], request["args"], "| sent so far:", SENT)
+
+result = agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), cfg)
+print("after approve:", SENT, "|", result["messages"][-1].content)
+
+@@ concept
+title: Which one to use when
+--- body
+A common interview question: a fixed chain, create_agent, or writing LangGraph yourself: how do you choose?
+
+- **Fixed chain** (`prompt | model | parser`, or the RAG chain above): the steps are known in advance. Cheapest, most predictable, easiest to test. "Always fetch the playbook rule for the topic before reviewing a clause" is written straight into the code
+- **create_agent**: whether to look something up, what, and how many times depends on the content (8.1 says subject to Section 12, so the model has to go and read clause 12 itself). The cost: more calls, a path that may be different every time, so you need a limit and have to read the trace
+- **Writing LangGraph yourself**: the flow itself has branches, parallel steps, pauses to wait for a person, resuming from a checkpoint
+
+Clause Check's own choice: the bounded tool loop in `review.py` is hand-written (≤ 6 steps), the outer `pipeline.py` is plain Python, and only the approval flow uses LangGraph (the README gives the reason: the first requirement that really needed a framework was "stop and wait for a person to approve, then continue hours later from another process").
+
+A one-sentence answer: "Hard-code whatever you can; use an agent only when the model really needs to decide for itself; bring in a graph framework only when the flow has to pause, resume or run in parallel." Below, for the same question, the fixed chain calls the model once and the agent calls it twice.
+--- code
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+RULES = {"payment": "PB-04: net 30 is fine."}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return RULES.get(topic, "no rule for this topic")
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+question = "Clause 3.1: fees are payable within 30 days. Is that ok?"
+
+MOCK.reset()
+prompt = ChatPromptTemplate.from_messages([("system", "Playbook rule: {rule}"), ("user", "{question}")])
+(prompt | model | StrOutputParser()).invoke({"rule": RULES["payment"], "question": question})
+print("fixed chain:", len(MOCK.calls), "model call(s)")
+
+MOCK.reset()
+create_agent(model, tools=[lookup_playbook]).invoke({"messages": [("user", question)]})
+print("agent:      ", len(MOCK.calls), "model call(s)")
+
+@@ item d31-01
+type: code
+title: Recap: structured output
+level: 1
+cards: d30:with_structured_output: get an object back directly; d30:method, include_raw, and None
+--- context
+Today you will hand the review over to an agent, but what you want at the end is still a verdict object. First review yesterday's structured output, and the fallback for when the model's answer is broken.
+--- prompt
+Recap of Day 30. Write `review(text)`:
+
+- Use `MODEL.with_structured_output(ClauseReview)` to review `text`, and return the `ClauseReview` object
+- When the arguments the model gives are broken JSON, the result is `None` (no exception: the Day 30 trap). Then return `ClauseReview(clause_id="unknown", verdict="flag", risk_level="medium")`: when unsure, hand it to a person
+
+Example: `review("Review clause 8.3: Customer's liability shall be unlimited.").verdict` → `"redline"`
+--- starter
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_deepseek import ChatDeepSeek
+
+class ClauseReview(BaseModel):
+    """Review of one contract clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def review(text):
+    pass
+--- solution
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_deepseek import ChatDeepSeek
+
+class ClauseReview(BaseModel):
+    """Review of one contract clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def review(text):
+    result = MODEL.with_structured_output(ClauseReview).invoke(text)
+    if result is None:
+        return ClauseReview(clause_id="unknown", verdict="flag", risk_level="medium")
+    return result
+--- tests
+expect("unlimited liability → redline", lambda: review("Review clause 8.3: Customer's liability shall be unlimited.").verdict, "redline")
+expect("returns a ClauseReview object", lambda: type(review("Review clause 3.1: Fees are payable within 30 days.")).__name__, "ClauseReview")
+expect("broken arguments → hand it to a person", lambda: review("[bad-args] Review clause 9.1").model_dump(), {"clause_id": "unknown", "verdict": "flag", "risk_level": "medium"})
+expect("the request forces a call to ClauseReview", lambda: (review("Review clause 3.1"), MOCK.calls[-1]["body"]["tool_choice"])[1], {"type": "function", "function": {"name": "ClauseReview"}})
+--- hints
+- `MODEL.with_structured_output(ClauseReview)` returns a new Runnable; `.invoke(text)` gives the object or `None`.
+- Check with `if result is None:`, not `if not result:` (a good habit: handle only the case you mean to handle).
+
+@@ item d31-02
+type: predict
+title: Recap: tool_calls and ToolMessage
+level: 1
+cards: d30:bind_tools and tool_calls
+--- context
+Today's agent still runs yesterday's tool loop underneath. Read some code to remember: when the model wants a tool, what does the program get, and what does it hand back after running it?
+--- prompt
+Recap of Day 30. Write the output. When the mock server sees fee in the question, it has the model call the first tool with `topic="payment"`; the call ids the mock server gives are `call_1`, `call_2`, … in order.
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return {"payment": "PB-04: net 30 is fine."}.get(topic, "no rule")
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+ai = model.bind_tools([lookup_playbook]).invoke("Clause 3.1: fees are payable in 30 days. Check the playbook.")
+print(repr(ai.content))
+call = ai.tool_calls[0]
+print(call["name"], call["args"], call["id"])
+msg = lookup_playbook.invoke(call)
+print(type(msg).__name__, "|", msg.content, "|", msg.tool_call_id)
+--- explain
+When the model wants to call a tool, `content` is an empty string, and what it wants done is in `tool_calls`: `name`, `args` (already a dictionary), `id`. Pass the whole call to `tool.invoke` and you get a `ToolMessage` whose `tool_call_id` is filled in automatically with the same id, so the model can match them up in the next round. This is what today's `create_agent` does in every round.
+
+@@ item d31-03
+type: predict
+title: How the splitter cuts
+level: 2
+cards: Splitters: by length or by structure
+--- context
+To answer questions about a contract, the long text first has to be cut into small chunks, so they can be stored in a vector store and searched. LangChain comes with a splitter that cuts by length; first see exactly how it cuts some contract text.
+--- prompt
+Write the output. Remember the card: it first cuts at `"\n\n"`; if a piece is longer than `chunk_size`, it cuts that piece at `"\n"`; at the end it merges neighboring small pieces, as long as the merged piece (counting the separator between them) is no longer than `chunk_size`. `start_index` counts from 0.
+--- code
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+text = "3.1 Invoicing\nFees are payable within thirty days.\n\n3.2 Late Payment\nInterest accrues at 3% per month."
+splitter = RecursiveCharacterTextSplitter(chunk_size=40, chunk_overlap=0, add_start_index=True)
+docs = splitter.create_documents([text])
+print(len(docs))
+for d in docs:
+    print(d.metadata["start_index"], repr(d.page_content))
+--- explain
+Cutting at the blank line gives two pieces of 50 characters each. Both are over 40, so each is cut again at the line break. The heading is 13 characters and the body 36; together (plus the line break) that is 50, over 40, so they can't be merged, and the heading and the body each become a chunk. This is exactly why cutting by length is bad for contracts. The second piece starts at position 52 (the 50 characters before it plus two line breaks).
+
+@@ item d31-04
+type: code
+title: Turn a contract into Documents
+level: 2
+cards: Document: a chunk with its source; d19:Answers with citations
+--- context
+For the program to find clauses in a contract, the contract first has to be cut into pieces. Here, following the idea of `split.py`, each clause becomes one chunk, and its source information is stored with it, so that after a search the program can say which clause it is.
+--- prompt
+Write `split_contract(text, source)` that, like `split.py`, makes one `Document` per clause:
+
+- Find the heading lines with the ready-made `HEAD` regex: group 1 is the clause number, group 2 the heading
+- Body: the text between the end of this heading line (`h.end()`) and the start of the next heading line (`.start()`), with `.strip()`; the last clause runs to the end of the text
+- `metadata = {"clause_id": clause number, "heading": heading, "source": source}`
+- No heading found at all: `raise ValueError("no numbered clauses")` (same as `load_contract`: don't guess)
+
+Example: `split_contract(CONTRACT, "msa.txt")[1].metadata` → `{"clause_id": "8.1", "heading": "Cap on Liability", "source": "msa.txt"}`
+--- starter
+import re
+from langchain_core.documents import Document
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$", re.M)
+
+CONTRACT = """3.1 Invoicing
+Fees are invoiced annually and are payable within thirty (30) days of the invoice date.
+8.1 Cap on Liability
+Each party's aggregate liability shall not exceed the Fees paid
+in the twelve (12) months before the claim.
+11.1 Termination by Provider
+Provider may terminate this Agreement upon ten (10) days' notice."""
+
+def split_contract(text, source):
+    return []
+--- solution
+import re
+from langchain_core.documents import Document
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$", re.M)
+
+CONTRACT = """3.1 Invoicing
+Fees are invoiced annually and are payable within thirty (30) days of the invoice date.
+8.1 Cap on Liability
+Each party's aggregate liability shall not exceed the Fees paid
+in the twelve (12) months before the claim.
+11.1 Termination by Provider
+Provider may terminate this Agreement upon ten (10) days' notice."""
+
+def split_contract(text, source):
+    heads = list(HEAD.finditer(text))
+    if not heads:
+        raise ValueError("no numbered clauses")
+    docs = []
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        body = text[h.end():end].strip()
+        docs.append(Document(page_content=body, metadata={"clause_id": h.group(1), "heading": h.group(2), "source": source}))
+    return docs
+--- tests
+expect("three clauses", lambda: [d.metadata["clause_id"] for d in split_contract(CONTRACT, "msa.txt")], ["3.1", "8.1", "11.1"])
+expect("metadata", lambda: split_contract(CONTRACT, "msa.txt")[1].metadata, {"clause_id": "8.1", "heading": "Cap on Liability", "source": "msa.txt"})
+expect("body without the heading, multi-line body kept", lambda: split_contract(CONTRACT, "msa.txt")[1].page_content, "Each party's aggregate liability shall not exceed the Fees paid\nin the twelve (12) months before the claim.")
+expect("the last clause runs to the end of the text", lambda: split_contract(CONTRACT, "msa.txt")[-1].page_content, "Provider may terminate this Agreement upon ten (10) days' notice.")
+expect("returns Documents", lambda: type(split_contract(CONTRACT, "x")[0]).__name__, "Document")
+expect_raises("no numbers: don't guess", lambda: split_contract("This agreement has no numbered clauses.", "x"), ValueError)
+--- hints
+- `heads = list(HEAD.finditer(text))`; if the list is empty, raise first.
+- Use `enumerate` to get the index i: the next heading is `heads[i + 1]`; the last one ends at `len(text)`.
+- `Document(page_content=body, metadata={...})`; `h.group(1)` is the clause number, `h.group(2)` the heading.
+
+@@ item d31-05
+type: fix
+title: Fix the bug: the wrong number of results
+level: 2
+cards: Retriever and RAG chains
+--- context
+Every clause the search returns goes into the prompt, so twice as many results means twice as many tokens (which is what the model bills by). A colleague's retriever returns the wrong number of results, and the program doesn't say a word.
+--- prompt
+A colleague's `make_retriever(docs, k=2)` should return k results each time, but the prompt always gets 4, doubling the tokens for nothing. The code raises no error and gives no warning. Run the tests, find the cause, and change one line.
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+DOCS = [
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="This Agreement renews automatically for successive periods of twenty-four (24) months.", metadata={"clause_id": "4.2"}),
+    Document(page_content="Customer's liability for breach of Section 6 shall be unlimited.", metadata={"clause_id": "8.3"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+]
+
+def make_retriever(docs, k=2):
+    store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+    store.add_documents(docs)
+    return store.as_retriever(k=k)
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+DOCS = [
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="This Agreement renews automatically for successive periods of twenty-four (24) months.", metadata={"clause_id": "4.2"}),
+    Document(page_content="Customer's liability for breach of Section 6 shall be unlimited.", metadata={"clause_id": "8.3"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+]
+
+def make_retriever(docs, k=2):
+    store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+    store.add_documents(docs)
+    return store.as_retriever(search_kwargs={"k": k})
+--- tests
+expect("returns 2 by default", lambda: len(make_retriever(DOCS).invoke("When is the invoice due?")), 2)
+expect("k=1 returns only 1, the most relevant", lambda: [d.metadata["clause_id"] for d in make_retriever(DOCS, k=1).invoke("When is the invoice due?")], ["3.1"])
+expect("k=3", lambda: len(make_retriever(DOCS, k=3).invoke("Can the provider cancel the contract?")), 3)
+--- hints
+- Read the last paragraph of the card "Retriever and RAG chains". `as_retriever` raises no error for arguments it doesn't recognize.
+- Search arguments go into the dictionary `search_kwargs`, which is passed unchanged to `similarity_search`.
+- `store.as_retriever(search_kwargs={"k": k})`.
+
+@@ item d31-06
+type: code
+title: Build the store and search for clause numbers
+level: 2
+cards: Vector stores: compute vectors once, search many times; Document: a chunk with its source
+--- context
+Question answering over the contract in these exercises first needs a vector store: compute a vector for each clause and store it, then for every question find the few most similar clauses in it. Sometimes a lawyer cares only about one kind of clause, for example only the liability clauses, and then the search has to be narrowed.
+--- prompt
+Write two functions:
+
+- `build_store(docs)`: create an `InMemoryVectorStore` (embeddings from `OpenAIEmbeddings(model="text-embedding-3-small")`), put the docs in, and return the store. Put all the documents in with **one** `add_documents` call (one embeddings request), not one at a time
+- `search_ids(store, query, k=2, topic=None)`: return the list of `clause_id`s of the k most relevant documents. When `topic` is not `None`, search only the documents whose `metadata["topic"]` equals it (use `filter`)
+
+Example: `search_ids(store, "Is liability unlimited?", k=2, topic="liability_cap")` → `["8.3", "8.1"]`
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+CLAUSES = [
+    ("3.1", "payment", "Fees are invoiced annually and are payable within thirty (30) days of the invoice date."),
+    ("4.2", "auto_renewal", "This Agreement renews automatically for successive periods of twenty-four (24) months."),
+    ("8.1", "liability_cap", "Each party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim."),
+    ("8.3", "liability_cap", "Customer's liability for breach of Section 6 shall be unlimited."),
+    ("10.1", "data_processing", "Customer Data may be stored and processed in any country."),
+    ("11.1", "termination", "Provider may terminate this Agreement for convenience upon ten (10) days' written notice."),
+]
+DOCS = [Document(page_content=text, metadata={"clause_id": cid, "topic": topic}) for cid, topic, text in CLAUSES]
+
+def build_store(docs):
+    pass
+
+def search_ids(store, query, k=2, topic=None):
+    pass
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+CLAUSES = [
+    ("3.1", "payment", "Fees are invoiced annually and are payable within thirty (30) days of the invoice date."),
+    ("4.2", "auto_renewal", "This Agreement renews automatically for successive periods of twenty-four (24) months."),
+    ("8.1", "liability_cap", "Each party's aggregate liability shall not exceed the Fees paid in the twelve (12) months before the claim."),
+    ("8.3", "liability_cap", "Customer's liability for breach of Section 6 shall be unlimited."),
+    ("10.1", "data_processing", "Customer Data may be stored and processed in any country."),
+    ("11.1", "termination", "Provider may terminate this Agreement for convenience upon ten (10) days' written notice."),
+]
+DOCS = [Document(page_content=text, metadata={"clause_id": cid, "topic": topic}) for cid, topic, text in CLAUSES]
+
+def build_store(docs):
+    store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+    store.add_documents(docs)
+    return store
+
+def search_ids(store, query, k=2, topic=None):
+    if topic is None:
+        hits = store.similarity_search(query, k=k)
+    else:
+        hits = store.similarity_search(query, k=k, filter=lambda d: d.metadata["topic"] == topic)
+    return [d.metadata["clause_id"] for d in hits]
+--- tests
+def _embed_requests():
+    MOCK.reset()
+    build_store(DOCS)
+    return len([c for c in MOCK.calls if c["url"].endswith("/embeddings")])
+expect("6 documents, only 1 embeddings request", _embed_requests, 1)
+STORE = build_store(DOCS)
+expect("the most relevant one", lambda: search_ids(STORE, "When is the invoice due?", k=1), ["3.1"])
+expect("no filter: second place is 11.1, a false hit", lambda: search_ids(STORE, "Is liability unlimited?"), ["8.3", "11.1"])
+expect("filtering by topic leaves only liability clauses", lambda: search_ids(STORE, "Is liability unlimited?", topic="liability_cap"), ["8.3", "8.1"])
+expect("fewer than k left after filtering", lambda: search_ids(STORE, "When is the invoice due?", k=3, topic="payment"), ["3.1"])
+--- hints
+- `build_store`: create the store first, then `store.add_documents(docs)`, and finally `return store`.
+- `filter` is a function that receives a Document and returns True to keep it: `lambda d: d.metadata["topic"] == topic`.
+- Return `[d.metadata["clause_id"] for d in hits]`.
+
+@@ item d31-07
+type: testwrite
+title: Write tests: format_docs
+level: 2
+cards: Retriever and RAG chains; d19:Answers with citations; d9:How to come up with test cases
+--- context
+The retrieved clauses are joined into one text for the prompt, each labeled with its number, so the model can cite its sources when it answers. If the format is even slightly off, the citations won't match, so pin it down with tests.
+--- prompt
+The function under test, `format_docs(docs)`, joins retrieved Documents into the text that goes into the prompt: one line per document, each line starting with `[clause number]` (from `metadata["clause_id"]`), and a single line break between lines.
+
+Write test functions (`def test_...():` with `assert` inside) that all pass on the correct function and catch the hidden buggy versions. Build a few `Document`s yourself in the tests (already imported). The starter tests are too weak.
+--- impl
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+--- mutants
+===== Source: each line must start with [clause number]
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n".join(d.page_content for d in docs)
+===== Separator: one document per line, a single line break only
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+===== The last document must be there too
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs[:-1])
+===== The clause number comes from metadata, not from the document's own id
+from langchain_core.documents import Document
+
+def format_docs(docs):
+    return "\n".join(f"[{d.id}] {d.page_content}" for d in docs)
+--- starter
+from langchain_core.documents import Document
+
+def test_contains_text():
+    doc = Document(page_content="Fees are payable in 30 days.", metadata={"clause_id": "3.1"})
+    assert "Fees are payable" in format_docs([doc, doc])
+--- solution
+from langchain_core.documents import Document
+
+A = Document(page_content="Fees are payable in 30 days.", metadata={"clause_id": "3.1"})
+B = Document(page_content="Liability is unlimited.", metadata={"clause_id": "8.3"})
+
+def test_exact_two_docs():
+    assert format_docs([A, B]) == "[3.1] Fees are payable in 30 days.\n[8.3] Liability is unlimited."
+
+def test_single_doc():
+    assert format_docs([B]) == "[8.3] Liability is unlimited."
+
+def test_empty():
+    assert format_docs([]) == ""
+--- hints
+- The strongest test compares the **whole string**: two documents, write out the full text you expect, and a single `==` catches several kinds of bugs at once.
+- With only one document, the "drops the last one" version returns an empty string.
+- The clause number is in `metadata`; a `Document`'s own `id` is `None` by default.
+
+@@ item d31-08
+type: predict
+title: What flows through the chain
+level: 2
+cards: Retriever and RAG chains
+--- context
+This is the first half of the contract question-answering chain: a question comes in, the search runs first, and then the question and the search results are filled into the prompt together. Read the code and see exactly what the model will receive.
+--- prompt
+Write the output. This chain stops at `prompt` and doesn't call the model. The vector store holds only two clauses, `k=1`, and the question asks when the invoice is due, so the search returns 3.1.
+--- code
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+store.add_documents([
+    Document(page_content="Fees are payable within 30 days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Provider may terminate upon ten days' notice.", metadata={"clause_id": "11.1"}),
+])
+retriever = store.as_retriever(search_kwargs={"k": 1})
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+prompt = ChatPromptTemplate.from_messages([("system", "Cite clause ids."), ("user", "Q: {question}\nSources: {context}")])
+chain = {"context": retriever | format_docs, "question": RunnablePassthrough()} | prompt
+value = chain.invoke("When is the invoice due?")
+for m in value.to_messages():
+    print(type(m).__name__, "->", m.content)
+--- explain
+The dictionary at the start sends the same question two ways: the `context` way is "retriever → format_docs", which gives one numbered line of text; the `question` way, `RunnablePassthrough()`, passes it through unchanged. The two results form `{"context": ..., "question": ...}`, which fills exactly the prompt's two variables. When you debug RAG, look at this step first: when the model answers wrongly, it is often because it never received the right chunks.
+
+@@ item d31-09
+type: fill
+title: Fill in: the RAG chain
+level: 1
+cards: Retriever and RAG chains; d29:LCEL: chain steps with |
+--- context
+A lawyer asks a question about the contract; the program first finds the relevant clauses, then has the model answer only from them. This is RAG (retrieve first, then answer), and here you build it the way LangChain most often does.
+--- prompt
+Complete the RAG chain: `context` goes "search → join into numbered text", `question` is passed through unchanged, and at the end the model's AIMessage is turned into a string.
+--- template
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+
+store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+store.add_documents([
+    Document(page_content="Fees are payable within 30 days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Provider may terminate upon ten days' notice.", metadata={"clause_id": "11.1"}),
+])
+retriever = store.as_retriever(search_kwargs={"k": 1})
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+prompt = ChatPromptTemplate.from_messages([("system", "Cite clause ids."), ("user", "Question: {question}\nSources: {context}")])
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+chain = {"context": retriever | [[format_docs]], "question": [[RunnablePassthrough()]]} | prompt | model | [[StrOutputParser()]]
+--- tests
+expect("the answer is a string", lambda: chain.invoke("When is the invoice due?"), "Mock reply: Question: When is the invoice due?\nSources: [3.1] Fees are p")
+expect("the model received the numbered chunks", lambda: (chain.invoke("Can the provider terminate?"), MOCK.calls[-1]["body"]["messages"][1]["content"])[1], "Question: Can the provider terminate?\nSources: [11.1] Provider may terminate upon ten days' notice.")
+--- hints
+- The `context` way: the search result (a list of Documents) must become text first; use the ready-made `format_docs`. An ordinary function put into `|` automatically becomes a Runnable.
+- The `question` way must "pass it through unchanged": `RunnablePassthrough()`; don't forget the parentheses.
+- The last step turns the AIMessage into a string: `StrOutputParser()`.
+
+@@ item d31-10
+type: code
+title: An answer with its sources
+level: 3
+cards: Retriever and RAG chains; d19:Answers with citations
+--- context
+An answer for a lawyer must say which clauses it is based on, so the lawyer can go back and check the original text. The answer and the sources are returned together, and the sources must be exactly the clauses that were actually used this time.
+--- prompt
+Write `answer_with_sources(question, retriever, model)` that returns `{"answer": answer text, "sources": [clause numbers, ...]}`:
+
+1. If `question.strip()` is empty: don't search, don't call the model, return `{"answer": "", "sources": []}`
+2. `docs = retriever.invoke(question)`, **search only once** (every search costs one embeddings request)
+3. Answer with `PROMPT | model | StrOutputParser()`: the variable `question` is the question, `context` is `format_docs(docs)`
+4. `sources`: the `metadata["clause_id"]` of these docs, in the order they were retrieved
+
+`PROMPT`, `format_docs`, a `RETRIEVER` with k=2 and `MODEL` are already written. Inside the function use the parameters `retriever` and `model`, not the globals `RETRIEVER` / `MODEL`: the tests pass in other ones (dependency injection, Day 19).
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the sources. Cite clause ids like [3.1]."),
+    ("user", "Question: {question}\n\nSources:\n{context}"),
+])
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+def answer_with_sources(question, retriever, model):
+    pass
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_deepseek import ChatDeepSeek
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the sources. Cite clause ids like [3.1]."),
+    ("user", "Question: {question}\n\nSources:\n{context}"),
+])
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+def answer_with_sources(question, retriever, model):
+    if not question.strip():
+        return {"answer": "", "sources": []}
+    docs = retriever.invoke(question)
+    chain = PROMPT | model | StrOutputParser()
+    answer = chain.invoke({"question": question, "context": format_docs(docs)})
+    return {"answer": answer, "sources": [d.metadata["clause_id"] for d in docs]}
+--- tests
+Q = "When is the invoice due?"
+expect("sources: the two retrieved, in order", lambda: answer_with_sources(Q, RETRIEVER, MODEL)["sources"], ["3.1", "10.1"])
+expect("the answer is the model's string", lambda: answer_with_sources(Q, RETRIEVER, MODEL)["answer"], "Mock reply: Question: When is the invoice due?\n\nSources:\n[3.1] Fees are ")
+def _sent():
+    answer_with_sources(Q, RETRIEVER, MODEL)
+    return MOCK.calls[-1]["body"]["messages"][1]["content"].split("Sources:\n")[1]
+expect("the numbered chunks went into the prompt", _sent, "[3.1] Fees are invoiced annually and are payable within thirty (30) days of the invoice date.\n[10.1] Customer Data may be stored and processed in any country.")
+def _count():
+    MOCK.reset()
+    answer_with_sources(Q, RETRIEVER, MODEL)
+    return {"embeddings": len([c for c in MOCK.calls if c["url"].endswith("/embeddings")]), "chat": len([c for c in MOCK.calls if c["url"].endswith("/chat/completions")])}
+expect("one search, one model call", _count, {"embeddings": 1, "chat": 1})
+def _blank():
+    MOCK.reset()
+    return [answer_with_sources("   ", RETRIEVER, MODEL), len(MOCK.calls)]
+expect("blank question: nothing is called", _blank, [{"answer": "", "sources": []}, 0])
+from langchain_core.runnables import RunnableLambda
+def _own_parts():
+    fixed = RunnableLambda(lambda q: [Document(page_content="Either party may terminate on 30 days' notice.", metadata={"clause_id": "11.2"})])
+    pro = ChatDeepSeek(model="deepseek-v4-pro", extra_body={"thinking": {"type": "disabled"}})
+    result = answer_with_sources("Can we exit early?", fixed, pro)
+    return [result["sources"], MOCK.calls[-1]["body"]["model"]]
+expect("uses the retriever and model passed in, not the globals", _own_parts, [["11.2"], "deepseek-v4-pro"])
+--- hints
+- Write the early return from step 1 first, then `docs = retriever.invoke(question)`.
+- The answer: `(PROMPT | model | StrOutputParser()).invoke({"question": question, "context": format_docs(docs)})`.
+- Take `sources` from the same `docs`; don't search again just to get the clause numbers.
+
+@@ item d31-11
+type: code
+title: Make the search a tool
+level: 2
+cards: d30:@tool: turn a function into a tool; create_agent: a ready-made tool loop
+--- context
+Next, the agent will decide for itself whether to search the contract and what to search for. The model can act only through tools, and all it can see of a tool is its name, its description and its parameters.
+--- prompt
+The agent must be able to decide for itself when to search the contract. Wrap the search in a tool:
+
+Use `@tool` to write `search_contract(query: str) -> str`:
+
+- The docstring is `"Search the contract and return the most relevant clauses with their ids."` (this sentence is the tool description the model sees)
+- Search for `query` with the ready-made `RETRIEVER`, and return the result of `format_docs(docs)`
+- When nothing is found, return `"no matching clauses"`
+
+The parameter must be named `query`: the model (and the mock server) fills in values by parameter name.
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.tools import tool
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+def search_contract(query: str) -> str:
+    return ""
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.tools import tool
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+
+def format_docs(docs):
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+
+@tool
+def search_contract(query: str) -> str:
+    """Search the contract and return the most relevant clauses with their ids."""
+    docs = RETRIEVER.invoke(query)
+    if not docs:
+        return "no matching clauses"
+    return format_docs(docs)
+--- tests
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.retrievers import BaseRetriever
+expect("is a LangChain tool", lambda: type(search_contract).__name__, "StructuredTool")
+expect("name and description", lambda: [search_contract.name, search_contract.description], ["search_contract", "Search the contract and return the most relevant clauses with their ids."])
+expect("the parameters the model sees", lambda: convert_to_openai_tool(search_contract)["function"]["parameters"], {"properties": {"query": {"type": "string"}}, "required": ["query"], "type": "object"})
+expect("calling it returns numbered chunks", lambda: search_contract.invoke({"query": "Can the provider cancel the contract?"}).split("\n")[0], "[11.1] Provider may terminate this Agreement for convenience upon ten (10) days' written notice.")
+class _Empty(BaseRetriever):
+    def _get_relevant_documents(self, query, *, run_manager=None):
+        return []
+def _nothing():
+    global RETRIEVER
+    saved, RETRIEVER = RETRIEVER, _Empty()
+    try:
+        return search_contract.invoke({"query": "governing law"})
+    finally:
+        RETRIEVER = saved
+expect("nothing found", _nothing, "no matching clauses")
+--- hints
+- Put `@tool` above the function, and make the docstring (in triple quotes) the first line of the function body; without a docstring you get an error.
+- `docs = RETRIEVER.invoke(query)`; for an empty list return `"no matching clauses"`.
+- The type hint `query: str` becomes the description of the tool's parameter; don't delete it.
+
+@@ item d31-12
+type: code
+title: Run create_agent once
+level: 2
+cards: create_agent: a ready-made tool loop
+--- context
+In earlier days you wrote the tool loop by hand. LangChain 1.x has a ready-made agent that you set up in one line; run it once and see whether its trace is the same thing as your hand-written loop.
+--- prompt
+Build an agent with the tool from the previous exercise:
+
+- `AGENT = create_agent(MODEL, tools=[search_contract], system_prompt=SYSTEM)` (a global variable in the module)
+- Write `run_agent(question)`: call AGENT and return `{"trace": [the type name of each message], "answer": the text of the last message}`
+
+Example: `run_agent("When is the invoice due?")["trace"]` → `["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"]`
+
+`MODEL` already has thinking turned off (the card "create_agent: a ready-made tool loop": with thinking on, the agent's second model call gets a 400).
+--- starter
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+
+@tool
+def search_contract(query: str) -> str:
+    """Search the contract and return the most relevant clauses with their ids."""
+    docs = RETRIEVER.invoke(query)
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs) or "no matching clauses"
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You answer questions about one contract. Search the contract first and cite clause ids."
+
+AGENT = None
+
+def run_agent(question):
+    pass
+--- solution
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+STORE = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+STORE.add_documents([
+    Document(page_content="Fees are invoiced annually and are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Customer Data may be stored and processed in any country.", metadata={"clause_id": "10.1"}),
+    Document(page_content="Provider may terminate this Agreement for convenience upon ten (10) days' written notice.", metadata={"clause_id": "11.1"}),
+])
+RETRIEVER = STORE.as_retriever(search_kwargs={"k": 2})
+
+@tool
+def search_contract(query: str) -> str:
+    """Search the contract and return the most relevant clauses with their ids."""
+    docs = RETRIEVER.invoke(query)
+    return "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs) or "no matching clauses"
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You answer questions about one contract. Search the contract first and cite clause ids."
+
+AGENT = create_agent(MODEL, tools=[search_contract], system_prompt=SYSTEM)
+
+def run_agent(question):
+    result = AGENT.invoke({"messages": [("user", question)]})
+    return {"trace": [type(m).__name__ for m in result["messages"]], "answer": result["messages"][-1].content}
+--- tests
+Q = "When is the invoice due?"
+expect("trace", lambda: run_agent(Q)["trace"], ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"])
+expect("the final answer uses the tool's result", lambda: run_agent(Q)["answer"], "Based on the playbook: [3.1] Fees are invoiced annually and are payable within thirty (30) days of the ")
+def _first_request():
+    MOCK.reset()
+    run_agent(Q)
+    body = [c for c in MOCK.calls if c["url"].endswith("/chat/completions")][0]["body"]
+    return [body["messages"][0], [t["function"]["name"] for t in body["tools"]], body["thinking"]]
+expect("first request: system prompt comes first, tools included, thinking off", _first_request, [{"role": "system", "content": SYSTEM}, ["search_contract"], {"type": "disabled"}])
+expect("AGENT is a compiled graph", lambda: list(AGENT.get_graph().nodes), ["__start__", "model", "tools", "__end__"])
+--- hints
+- Write `create_agent(MODEL, tools=[search_contract], system_prompt=SYSTEM)` in the module (outside the function), in place of `AGENT = None`.
+- The call: `result = AGENT.invoke({"messages": [("user", question)]})`; the messages are in `result["messages"]`.
+- Type name: `type(m).__name__`; the last message: `result["messages"][-1].content`.
+
+@@ item d31-13
+type: order
+title: Put the code in order: build an agent
+level: 2
+cards: create_agent: a ready-made tool loop
+--- context
+In an interview you may be asked to write a minimal agent without looking anything up. If you can write it from start to finish from memory, it shows you can tell what the tool, the model and the agent each are.
+--- prompt
+Put together a complete small program: define the playbook tool, build the agent, ask a question, and store the final answer in `ANSWER`. Two lines are distractors.
+--- lines
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+RULES = {"liability_cap": "PB-01: cap at 12 months of fees."}
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return RULES.get(topic, "no rule for this topic")
+agent = create_agent(MODEL, tools=[lookup_playbook], system_prompt="Check the playbook before answering.")
+result = agent.invoke({"messages": [("user", "Clause 8.1 caps liability at 12 months of fees. OK?")]})
+ANSWER = result["messages"][-1].content
+--- distractors
+agent = create_agent(MODEL, tools=[lookup_playbook()], system_prompt="Check the playbook before answering.")
+ANSWER = result.content
+--- tests
+expect("final answer", lambda: ANSWER, "Based on the playbook: PB-01: cap at 12 months of fees.")
+expect("two model calls: one to decide on the tool, one to answer", lambda: len(MOCK.calls), 2)
+expect("the model called the tool with topic=liability_cap", lambda: result["messages"][1].tool_calls[0]["args"], {"topic": "liability_cap"})
+--- hints
+- Names must be defined before they are used: `RULES` and `MODEL` come before the tool and the agent.
+- `tools=[...]` holds the tool objects themselves, not the result of calling them.
+- `agent.invoke` returns a dictionary; the messages are in `result["messages"]`.
+
+@@ item d31-14
+type: fix
+title: Fix the bug: response_format on DeepSeek
+level: 2
+cards: response_format: a structured final answer
+--- context
+What the agent says at the end is free text, which is hard for a program to use. A colleague wants it to hand in a verdict object at the end instead, but the call fails right away.
+--- prompt
+A colleague wants the agent to hand in a `ClauseReview` object at the end. Run the tests: the model call fails straight away with 400, and the error message mentions `json_schema`.
+
+Read the card "response_format: a structured final answer", work out which strategy LangChain picked for you and why DeepSeek doesn't accept it, then change just one thing.
+--- starter
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+AGENT = create_agent(MODEL, tools=[lookup_playbook], response_format=ClauseReview)
+
+def review_clause(text):
+    return AGENT.invoke({"messages": [("user", text)]})["structured_response"]
+--- solution
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+AGENT = create_agent(MODEL, tools=[lookup_playbook], response_format=ToolStrategy(ClauseReview))
+
+def review_clause(text):
+    return AGENT.invoke({"messages": [("user", text)]})["structured_response"]
+--- tests
+expect("unlimited liability → redline", lambda: review_clause("Review clause 8.3: Customer's liability shall be unlimited.").model_dump(), {"clause_id": "8.3", "verdict": "redline", "risk_level": "high"})
+expect("an ordinary clause → accept", lambda: review_clause("Review clause 8.1: liability is capped at 12 months of fees.").verdict, "accept")
+def _request():
+    review_clause("Review clause 3.1: Fees are payable within 30 days.")
+    body = MOCK.calls[-1]["body"]
+    return [[t["function"]["name"] for t in body["tools"]], body["tool_choice"], "response_format" in body]
+expect("the answer is an extra tool, tool_choice is required", _request, [["lookup_playbook", "ClauseReview"], "required", False])
+--- hints
+- The error says `response_format type 'json_schema' is not supported`. Who sent json_schema? Given just a class, LangChain automatically picked ProviderStrategy from the model's profile.
+- Structured output on DeepSeek has to go through tool calls. `ToolStrategy` is already imported.
+- `response_format=ToolStrategy(ClauseReview)`.
+
+@@ item d31-15
+type: code
+title: The agent hands in a structured answer
+level: 3
+cards: response_format: a structured final answer; create_agent: a ready-made tool loop; d13:Eval cases are data, not gut feeling
+--- context
+The project's evals check the review process: 8.1 looks like an ordinary liability cap, but clause 12 means the cap no longer applies to the customer, so reviewing 8.1 must include reading clause 12. To check this, you need to know which tools the agent called along the way.
+--- prompt
+Write `review_with_agent(text)` that returns:
+
+```python
+{"review": ClauseReview object (structured_response),
+ "tools": [names of the tools the model called, in order, without the answer tool "ClauseReview"]}
+```
+
+- Use `create_agent(MODEL, tools=[lookup_playbook, get_clause], response_format=ToolStrategy(ClauseReview))`
+- Take the tool names from the trace: the `tool_calls` of each `AIMessage`, and the `"name"` of each call
+
+This is where the data for the "trace assertions" in the project's evals comes from (README: reviewing 8.1 must call `get_clause`).
+
+Example: `review_with_agent("Review clause 8.1 with get_clause: subject to section 12, liability is capped.")["tools"]` → `["get_clause"]` (the question names the tool, so the mock server picks it)
+--- starter
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_core.messages import AIMessage
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+@tool
+def get_clause(clause_id: str) -> str:
+    """Return the full text of another clause, e.g. one it cross-references."""
+    return "12. The limitations in Section 8 shall not apply to Customer's payment obligations."
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def review_with_agent(text):
+    pass
+--- solution
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_core.messages import AIMessage
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+
+@tool
+def get_clause(clause_id: str) -> str:
+    """Return the full text of another clause, e.g. one it cross-references."""
+    return "12. The limitations in Section 8 shall not apply to Customer's payment obligations."
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+AGENT = create_agent(MODEL, tools=[lookup_playbook, get_clause], response_format=ToolStrategy(ClauseReview))
+
+def review_with_agent(text):
+    result = AGENT.invoke({"messages": [("user", text)]})
+    tools = []
+    for m in result["messages"]:
+        if isinstance(m, AIMessage):
+            for call in m.tool_calls:
+                if call["name"] != "ClauseReview":
+                    tools.append(call["name"])
+    return {"review": result["structured_response"], "tools": tools}
+--- tests
+T81 = "Review clause 8.1 with get_clause: subject to section 12, liability is capped."
+expect("the trace for 8.1 includes get_clause", lambda: review_with_agent(T81)["tools"], ["get_clause"])
+expect("the review of 8.1", lambda: review_with_agent(T81)["review"].model_dump(), {"clause_id": "8.1", "verdict": "flag", "risk_level": "high"})
+expect("no tool named: the mock server picks the first one", lambda: review_with_agent("Review clause 8.3: Customer's liability shall be unlimited.")["tools"], ["lookup_playbook"])
+expect("review is a ClauseReview object", lambda: type(review_with_agent("Review clause 3.1: Fees are due in 30 days.")["review"]).__name__, "ClauseReview")
+--- hints
+- Build the agent first (outside the function, only once): `response_format=ToolStrategy(ClauseReview)`.
+- Loop over `result["messages"]`; only the ones where `isinstance(m, AIMessage)` is true have `tool_calls`.
+- Calls to the answer tool show up in the trace too (named `"ClauseReview"`); skip them.
+
+@@ item d31-16
+type: code
+title: Set a limit on the agent
+level: 2
+cards: create_agent: a ready-made tool loop
+--- context
+An agent sometimes gets stuck and calls tools over and over, and every step costs money. A live service can't keep spinning along with it forever, and when this happens the caller still needs a clear result.
+--- prompt
+Write `ask_safely(agent, question, limit)`:
+
+- Call `agent.invoke({"messages": [("user", question)]}, {"recursion_limit": limit})`
+- Finishes normally: return `{"status": "ok", "answer": the text of the last message}`
+- Goes over the limit (`GraphRecursionError`, imported from `langgraph.errors`): return `{"status": "stopped", "answer": ""}`, and don't let the exception escape
+
+When a question in the tests contains `[loop]`, the mock server makes the model call tools forever and never stop, like a stuck agent.
+--- starter
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees."
+
+AGENT = create_agent(ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}), tools=[lookup_playbook])
+
+def ask_safely(agent, question, limit):
+    pass
+--- solution
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langgraph.errors import GraphRecursionError
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees."
+
+AGENT = create_agent(ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}), tools=[lookup_playbook])
+
+def ask_safely(agent, question, limit):
+    try:
+        result = agent.invoke({"messages": [("user", question)]}, {"recursion_limit": limit})
+    except GraphRecursionError:
+        return {"status": "stopped", "answer": ""}
+    return {"status": "ok", "answer": result["messages"][-1].content}
+--- tests
+# the tests give AGENT a safety limit of 40: if you forget to pass the config, the tests fail quickly instead of running to the default 10007 steps
+_GUARDED = AGENT.with_config(recursion_limit=40)
+expect("a normal question", lambda: ask_safely(_GUARDED, "Is the liability cap ok?", 10), {"status": "ok", "answer": "Based on the playbook: PB-01: cap at 12 months of fees."})
+def _stuck(limit):
+    MOCK.reset()
+    result = ask_safely(_GUARDED, "[loop] check the liability cap", limit)
+    return [result, len(MOCK.calls)]
+expect("stuck agent: with limit 6 it stops after only 3 model calls", lambda: _stuck(6), [{"status": "stopped", "answer": ""}, 3])
+expect("a smaller limit means fewer calls", lambda: _stuck(3)[1], 2)
+--- hints
+- `from langgraph.errors import GraphRecursionError`, then `try: ... except GraphRecursionError: ...`.
+- The limit goes in the second argument (the config): `{"recursion_limit": limit}`. Every node that runs (model or tools) counts as one step.
+- Never leave out the config: in a real project a stuck agent would run up to the default limit of 10007 steps and call the model thousands of times. (The tests here add a safety limit of 40, so leaving it out only makes the tests fail.)
+
+@@ item d31-17
+type: code
+title: Send only after approval
+level: 3
+cards: Middleware: step in before and after calls; d17:Human in the loop: risky tools need a person to approve
+--- context
+In this exercise `send_redline` really sends the proposed changes to the other party of the contract, and once sent they can't be taken back. Clause Check's principle: the model only makes suggestions; a person decides.
+--- prompt
+`send_redline` really sends the proposed changes to the other party, so a person must approve it. `AGENT` is already set up with `HumanInTheLoopMiddleware` and `InMemorySaver`. Write two functions:
+
+- `start(question, thread_id)`: call AGENT with `{"configurable": {"thread_id": thread_id}}`. When the result has `"__interrupt__"`, return the list of actions waiting for approval, `[(name, args), ...]`, taken from the `"name"` and `"args"` of each entry in `result["__interrupt__"][0].value["action_requests"]`; with no interrupt, return `[]`
+- `finish(thread_id, approve)`: resume with the **same** thread_id: when `approve` is True the decision is `{"type": "approve"}`, otherwise `{"type": "reject", "message": "Rejected by the reviewer."}`; return the text of the last message
+
+How to resume: `AGENT.invoke(Command(resume={"decisions": [decision]}), config)`.
+--- starter
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+SENT = []
+
+@tool
+def send_redline(clause_id: str) -> str:
+    """Email the proposed redline for one clause to the counterparty."""
+    SENT.append(clause_id)
+    return f"redline for {clause_id} sent"
+
+AGENT = create_agent(
+    ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}),
+    tools=[send_redline],
+    middleware=[HumanInTheLoopMiddleware(interrupt_on={"send_redline": True})],
+    checkpointer=InMemorySaver(),
+)
+
+def start(question, thread_id):
+    pass
+
+def finish(thread_id, approve):
+    pass
+--- solution
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+SENT = []
+
+@tool
+def send_redline(clause_id: str) -> str:
+    """Email the proposed redline for one clause to the counterparty."""
+    SENT.append(clause_id)
+    return f"redline for {clause_id} sent"
+
+AGENT = create_agent(
+    ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}),
+    tools=[send_redline],
+    middleware=[HumanInTheLoopMiddleware(interrupt_on={"send_redline": True})],
+    checkpointer=InMemorySaver(),
+)
+
+def start(question, thread_id):
+    config = {"configurable": {"thread_id": thread_id}}
+    result = AGENT.invoke({"messages": [("user", question)]}, config)
+    if "__interrupt__" not in result:
+        return []
+    requests = result["__interrupt__"][0].value["action_requests"]
+    return [(r["name"], r["args"]) for r in requests]
+
+def finish(thread_id, approve):
+    config = {"configurable": {"thread_id": thread_id}}
+    if approve:
+        decision = {"type": "approve"}
+    else:
+        decision = {"type": "reject", "message": "Rejected by the reviewer."}
+    result = AGENT.invoke(Command(resume={"decisions": [decision]}), config)
+    return result["messages"][-1].content
+--- tests
+def _approve():
+    SENT.clear()
+    pending = start("Send the redline for clause 8.3", "t-approve")
+    before = list(SENT)
+    answer = finish("t-approve", True)
+    return [pending, before, SENT, answer]
+expect("stops first, sends only after approval", _approve, [[("send_redline", {"clause_id": "8.3"})], [], ["8.3"], "Based on the playbook: redline for 8.3 sent"])
+def _reject():
+    SENT.clear()
+    start("Send the redline for clause 9.1", "t-reject")
+    answer = finish("t-reject", False)
+    return [SENT, answer]
+expect("rejected: nothing sent, the model gets the reason", _reject, [[], "Based on the playbook: User rejected the tool call for `send_redline` with reason: Rejected by the revi"])
+def _two_threads():
+    SENT.clear()
+    start("Send the redline for clause 8.3", "t-a")
+    start("Send the redline for clause 9.1", "t-b")
+    finish("t-b", True)
+    return SENT
+expect("two threads don't affect each other: only t-b is approved", _two_threads, ["9.1"])
+--- hints
+- Both functions use the same kind of config: `{"configurable": {"thread_id": thread_id}}`. The checkpointer uses the thread_id to find the run that stopped.
+- `start`: `if "__interrupt__" not in result: return []`; otherwise take name and args from `result["__interrupt__"][0].value["action_requests"]`.
+- `finish`: first build the decision dictionary from approve, then `AGENT.invoke(Command(resume={"decisions": [decision]}), config)`.
+
+@@ item d31-18
+type: choice
+title: overlap equal to size
+level: 2
+cards: Splitters: by length or by structure
+--- context
+While setting up the splitter for contract question answering, a colleague wants neighboring chunks to overlap more, so that when a sentence happens to be cut in two, no information is lost.
+--- prompt
+To "overlap more and not miss anything", a colleague wrote `RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=200)`. What happens?
+--- options
+- It raises `ValueError` when it is created, because the overlap can't be greater than or equal to the chunk size
+- No error, but each chunk moves only a tiny step past the previous one (about one word), producing a huge pile of nearly identical chunks: more embedding requests, and at search time the same passage fills up the top k
+- An infinite loop; the program hangs
+- LangChain automatically changes the overlap to 10% of chunk_size
+answer: 2
+--- explain
+This version raises an error only when `chunk_overlap > chunk_size`; equal is allowed (the 80/80 example in the card produced 8 chunks). On Day 11, when you wrote `chunk_fixed` yourself, `overlap >= size` went straight to `raise ValueError`, which is stricter than the framework. Duplicate chunks cost money (every chunk needs an embedding) and crowd out search slots: the top 3 may be three versions of the same sentence. A common choice is an overlap of 10%–20% of the chunk size.
+
+@@ item d31-19
+type: choice
+title: Which approach to pick
+level: 2
+cards: Which one to use when
+--- context
+A common interview question: when to use a fixed chain, when an agent, and when to bring in LangGraph. Practice on three of Clause Check's requirements.
+--- prompt
+Clause Check has three requirements:
+
+- A: before reviewing each clause, fetch the playbook rule for its topic and put it into the prompt; this happens for every clause
+- B: while reviewing 8.1, the model reads subject to Section 12 and must decide for itself to fetch the full text of clause 12
+- C: after the whole contract has been reviewed, if there is a redline, stop and wait for a lawyer to approve; the lawyer approves the next day on another computer, and then the export continues
+
+Which combination fits best?
+--- options
+- A with a fixed chain, B with create_agent (or your own bounded tool loop), C with LangGraph's interrupt + checkpointer
+- create_agent for all three; middleware can do anything
+- A with create_agent, B with a fixed chain, C with a plain while loop that waits for input
+- A fixed chain for all three; agents are too hard to control
+answer: 1
+--- explain
+The steps of A are known in advance, so hard-coding them is cheapest and easiest to test. (The real `review.py` also makes `lookup_playbook` a tool, and the system prompt tells the model to call it first for every clause; following the idea of this exercise, you could instead fetch the rule in code first and save one call per clause.) For B, whether to fetch a clause and which one depends on the clause text, which is exactly what an agent is for (in the project it is the hand-written bounded loop in `review.py`). C has to resume across processes and across time, which needs checkpoints and interrupts; that is exactly the reason the README gives for bringing in LangGraph in `graph.py`. Using agents for everything costs more calls and makes the path unpredictable; a "while loop that waits for input" loses everything as soon as the process exits.
+
+@@ item d31-e1
+type: scratch
+title: Closed book: clause index and search
+exam: yes
+level: 3
+cards: Document: a chunk with its source; Vector stores: compute vectors once, search many times
+--- context
+Step one of contract question answering: build a searchable index of a contract, one entry per clause. After that, whatever the lawyer asks, the program can find the numbers of the most relevant clauses.
+--- prompt
+Write two functions:
+
+`index_contract(text)`:
+
+- Heading lines match the regex `^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$` (multiline mode `re.M`); group 1 is the clause number
+- One `Document` per clause (`from langchain_core.documents import Document`): `page_content` is the body after the heading line and before the next heading line (`.strip()`), `metadata={"clause_id": clause number}`
+- Put all the Documents into an `InMemoryVectorStore` in one go (`from langchain_core.vectorstores import InMemoryVectorStore`), with embeddings from `OpenAIEmbeddings(model="text-embedding-3-small")` (`from langchain_openai import OpenAIEmbeddings`), and return the store
+- No heading at all: `raise ValueError`
+
+`find(store, question, k=2)`: return the list of clause numbers of the k most relevant clauses.
+--- solution
+import re
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{0,80})$", re.M)
+
+def index_contract(text):
+    heads = list(HEAD.finditer(text))
+    if not heads:
+        raise ValueError("no numbered clauses")
+    docs = []
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        docs.append(Document(page_content=text[h.end():end].strip(), metadata={"clause_id": h.group(1)}))
+    store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+    store.add_documents(docs)
+    return store
+
+def find(store, question, k=2):
+    return [d.metadata["clause_id"] for d in store.similarity_search(question, k=k)]
+--- tests
+TEXT = """3.1 Invoicing
+Fees are invoiced annually and are payable within thirty (30) days of the invoice date.
+4.2 Automatic Renewal
+This Agreement renews automatically for successive periods of twenty-four (24) months.
+10.1 Location of Processing
+Customer Data may be stored and processed in any country.
+11.1 Termination by Provider
+Provider may terminate this Agreement for convenience upon ten (10) days' written notice."""
+expect("cancel → the termination clause", lambda: find(index_contract(TEXT), "Can the provider cancel the contract?", k=1), ["11.1"])
+expect("personal data", lambda: find(index_contract(TEXT), "Where is personal data stored?", k=1), ["10.1"])
+expect("body without the heading", lambda: index_contract(TEXT).similarity_search("renew", k=1)[0].page_content, "This Agreement renews automatically for successive periods of twenty-four (24) months.")
+expect_raises("no numbers", lambda: index_contract("no headings at all"), ValueError)
+def _one_request():
+    MOCK.reset()
+    index_contract(TEXT)
+    return len([c for c in MOCK.calls if c["url"].endswith("/embeddings")])
+expect("all clauses added at once: 1 embeddings request", _one_request, 1)
+
+@@ item d31-e2
+type: scratch
+title: Closed book: RAG with sources
+exam: yes
+level: 3
+cards: Retriever and RAG chains; d19:Answers with citations
+--- context
+A lawyer asks a question about the contract; the program must find the relevant clauses, have the model answer only from them, and attach the sources. For something the contract never mentions, the model must not make up an answer.
+--- prompt
+Write `rag(question, retriever, model)` that returns `{"answer": ..., "sources": [...]}`:
+
+- Search **once** with `retriever.invoke(question)` to get a list of Documents (each has `metadata["clause_id"]`)
+- Nothing found: don't call the model; return `{"answer": "I could not find this in the contract.", "sources": []}`
+- Otherwise join the chunks into text: one line `[clause number] body` per document, joined with `"\n"`
+- Build a chain from `ChatPromptTemplate.from_messages([("system", "Answer only from the sources and cite clause ids."), ("user", "Question: {question}\nSources:\n{context}")])` (`from langchain_core.prompts import ChatPromptTemplate`), `model` and `StrOutputParser()` (`from langchain_core.output_parsers import StrOutputParser`), and use it to get the answer string
+- `sources`: the retrieved clause numbers, in order
+--- solution
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the sources and cite clause ids."),
+    ("user", "Question: {question}\nSources:\n{context}"),
+])
+
+def rag(question, retriever, model):
+    docs = retriever.invoke(question)
+    if not docs:
+        return {"answer": "I could not find this in the contract.", "sources": []}
+    context = "\n".join(f"[{d.metadata['clause_id']}] {d.page_content}" for d in docs)
+    answer = (PROMPT | model | StrOutputParser()).invoke({"question": question, "context": context})
+    return {"answer": answer, "sources": [d.metadata["clause_id"] for d in docs]}
+--- tests
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+_store = InMemoryVectorStore(OpenAIEmbeddings(model="text-embedding-3-small"))
+_store.add_documents([
+    Document(page_content="Fees are payable within thirty (30) days of the invoice date.", metadata={"clause_id": "3.1"}),
+    Document(page_content="Provider may terminate upon ten (10) days' notice.", metadata={"clause_id": "11.1"}),
+])
+_model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+_r = _store.as_retriever(search_kwargs={"k": 1})
+expect("answer and sources", lambda: rag("When is the invoice due?", _r, _model), {"answer": "Mock reply: Question: When is the invoice due?\nSources:\n[3.1] Fees are p", "sources": ["3.1"]})
+expect("the chunks the model received", lambda: (rag("Can the provider terminate?", _r, _model), MOCK.calls[-1]["body"]["messages"][1]["content"])[1], "Question: Can the provider terminate?\nSources:\n[11.1] Provider may terminate upon ten (10) days' notice.")
+_r2 = _store.as_retriever(search_kwargs={"k": 2})
+expect("two chunks: one per line", lambda: (rag("Can the provider terminate?", _r2, _model), MOCK.calls[-1]["body"]["messages"][1]["content"].split("Sources:\n")[1])[1], "[11.1] Provider may terminate upon ten (10) days' notice.\n[3.1] Fees are payable within thirty (30) days of the invoice date.")
+def _empty():
+    MOCK.reset()
+    return [rag("Governing law?", RunnableLambda(lambda q: []), _model), len(MOCK.calls)]
+expect("nothing found: no model call", _empty, [{"answer": "I could not find this in the contract.", "sources": []}, 0])
+
+@@ item d31-e3
+type: scratch
+title: Closed book: an agent reviews a clause
+exam: yes
+level: 3
+cards: create_agent: a ready-made tool loop; response_format: a structured final answer
+--- context
+Use a ready-made agent to review a clause: it decides for itself whether to look up a rule or read another clause, and at the end hands in a verdict. It must also leave a record of which tools it called, so the evals can check the review process.
+--- prompt
+Given (defined in the tests; your code uses them directly): `MODEL` (a ChatDeepSeek with thinking turned off), `ClauseReview` (a Pydantic model with the fields `clause_id`, `verdict`, `risk_level`), and two tools, `lookup_playbook(topic)` and `get_clause(clause_id)`.
+
+Write `agent_review(text)`:
+
+- Build the agent with `create_agent` (`from langchain.agents import create_agent`): give it both tools, `system_prompt="Review the clause against the playbook."` and `response_format=ToolStrategy(ClauseReview)` (`from langchain.agents.structured_output import ToolStrategy`)
+- Set `{"recursion_limit": 8}` when you call it
+- Return `{"verdict": ..., "risk_level": ..., "tools": [names of the tools called, in order, without "ClauseReview"]}`
+- Over the step limit (`from langgraph.errors import GraphRecursionError`): return `{"verdict": "flag", "risk_level": "medium", "tools": []}` (the tests simulate an agent that never manages to hand in a valid answer and keeps retrying)
+
+Note: names like `MODEL` are defined only in the tests, so build the agent **inside the function**.
+--- solution
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+from langgraph.errors import GraphRecursionError
+
+def agent_review(text):
+    agent = create_agent(MODEL, tools=[lookup_playbook, get_clause], system_prompt="Review the clause against the playbook.",
+                         response_format=ToolStrategy(ClauseReview))
+    try:
+        result = agent.invoke({"messages": [("user", text)]}, {"recursion_limit": 8})
+    except GraphRecursionError:
+        return {"verdict": "flag", "risk_level": "medium", "tools": []}
+    tools = []
+    for m in result["messages"]:
+        for call in getattr(m, "tool_calls", None) or []:
+            if call["name"] != "ClauseReview":
+                tools.append(call["name"])
+    review = result["structured_response"]
+    return {"verdict": review.verdict, "risk_level": review.risk_level, "tools": tools}
+--- tests
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+class ClauseReview(BaseModel):
+    """The final review of one clause."""
+    clause_id: str = Field(description="the clause number, e.g. 8.1")
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees; never unlimited."
+@tool
+def get_clause(clause_id: str) -> str:
+    """Return the full text of another clause."""
+    return "12. The limitations in Section 8 shall not apply to Customer's payment obligations."
+expect("unlimited liability", lambda: agent_review("Review clause 8.3: Customer's liability shall be unlimited."), {"verdict": "redline", "risk_level": "high", "tools": ["lookup_playbook"]})
+expect("cross-reference: get_clause was called", lambda: agent_review("Review clause 8.1 with get_clause: subject to section 12, liability is capped."), {"verdict": "flag", "risk_level": "high", "tools": ["get_clause"]})
+def _system():
+    agent_review("Review clause 3.1: Fees are payable in 30 days.")
+    return MOCK.calls[-1]["body"]["messages"][0]
+expect("system prompt", _system, {"role": "system", "content": "Review the clause against the playbook."})
+from pydantic import field_validator
+class _NeverValid(BaseModel):
+    """The final review of one clause."""
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    @field_validator("verdict")
+    @classmethod
+    def _reject(cls, v):
+        raise ValueError("the review service is down, try again")
+def _stuck():
+    # the answer fails validation every time, so ToolStrategy makes the model hand it in again and again; the safety limit of 30 keeps it from running long if recursion_limit is forgotten
+    g = globals()
+    saved_schema, saved_create = g["ClauseReview"], g.get("create_agent")
+    g["ClauseReview"] = _NeverValid
+    if saved_create is not None:
+        g["create_agent"] = lambda *a, **kw: saved_create(*a, **kw).with_config(recursion_limit=30)
+    MOCK.reset()
+    try:
+        return [agent_review("Review clause 8.3: Customer's liability shall be unlimited."), len(MOCK.calls)]
+    finally:
+        g["ClauseReview"] = saved_schema
+        if saved_create is not None:
+            g["create_agent"] = saved_create
+expect("never a valid answer: stops once the 8 steps are used up, hands it to a person", _stuck, [{"verdict": "flag", "risk_level": "medium", "tools": []}, 7])

@@ -2,7 +2,7 @@
 
 **English** · [中文](#中文)
 
-A 35-day practice course that teaches Python, TypeScript, SQL, cloud basics and LangChain / LangGraph through one real project: [Clause Check](https://github.com/Xinshuer/Contract-Clause-Reviewer), a contract-clause reviewer built on an LLM. Every exercise is a small piece of that project.
+A 35-day practice course that teaches Python, TypeScript, SQL, cloud basics and LangChain / LangGraph through one real project: [Clause Check](https://github.com/Xinshuer/Contract-Clause-Reviewer), a contract-clause reviewer built on an LLM. Every exercise is a small piece of that project. The site comes in English and Chinese: switch at the top right.
 
 | Folder | What it is |
 |---|---|
@@ -29,7 +29,7 @@ Week 5 runs the real LangChain and LangGraph libraries in the browser. Exercises
 
 [English](#clause-check-bootcamp) · **中文**
 
-35 天的练习课：通过一个真实项目 [Clause Check](https://github.com/Xinshuer/Contract-Clause-Reviewer)（用大模型逐条审查合同条款的程序）学 Python、TypeScript、SQL、云服务基础和 LangChain / LangGraph。每道练习题都是这个项目里的一小块。
+35 天的练习课：通过一个真实项目 [Clause Check](https://github.com/Xinshuer/Contract-Clause-Reviewer)（用大模型逐条审查合同条款的程序）学 Python、TypeScript、SQL、云服务基础和 LangChain / LangGraph。每道练习题都是这个项目里的一小块。网站有中文和英文两个版本，页面右上角切换。
 
 | 文件夹 | 内容 |
 |---|---|

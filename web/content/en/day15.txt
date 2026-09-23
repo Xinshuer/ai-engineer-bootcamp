@@ -1,0 +1,1285 @@
+@@ day 15
+title: Intermediate TS types: interface, unions, generics, guards
+lang: ts
+hours: 4–5 hours
+--- goal
+Learn to use types to say exactly what your data is: interface, optional and read-only fields, union types and narrowing, discriminated unions + exhaustiveness checks, generics, utility types, `unknown` and type guards, `as const`. The types in Mastra, Zod and every vendor's SDK are written this way. After today you can read them, and you can write equally precise types for Clause Check's data (verdicts, clauses, model replies).
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards; in each one, cause a type error on purpose, understand the error message, then change it back
+- Pass every practice exercise (the type check must be clean too)
+- Local task: use `tsc` on your own computer to catch a missing case
+- The 3 closed-book challenges
+
+@@ concept
+title: interface and type
+--- body
+On Day 5 you used `type` to give an object a name. `interface` is another way to write it; for describing the shape of an object, the two are almost the same:
+
+```ts
+interface Clause { id: string; text: string }
+type Verdict = "accept" | "flag" | "redline";
+```
+
+You only need to remember two differences:
+
+- **Union types can only be written with `type`**
+- An `interface` can use `extends` to build on another interface and add fields to it
+
+TypeScript only looks at the **shape**: an object fits a type as long as its fields match, no matter where it came from. Pick one style per project and stay consistent. The convention in this course: `interface` for objects, `type` for unions.
+--- code
+type Verdict = "accept" | "flag" | "redline";
+
+interface Clause {
+  id: string;
+  text: string;
+}
+interface ReviewedClause extends Clause {
+  verdict: Verdict;
+}
+
+const c: ReviewedClause = { id: "8.1", text: "Liability is unlimited.", verdict: "redline" };
+const plain: Clause = c; // an extra verdict field is fine: the shape matches
+console.log(c.id, c.verdict);
+console.log(plain.text);
+
+@@ concept
+title: Optional, read-only, and optional chaining
+--- body
+- `heading?: string`: this field may be missing; reading it gives the type `string | undefined`
+- `readonly id: string`: can't be changed after the object is created (to make a whole object read-only, write `Readonly<Clause>`)
+- `c.source?.page`: **optional chaining**. When the left side of `?.` is `null` / `undefined`, the whole expression simply gives `undefined` instead of throwing an error
+- Combine it with `??` from Day 5 to give a default value: `c.source?.page ?? "?"`
+
+The classic mistake: writing `c.heading.toUpperCase()` directly, and TypeScript reports `TS18048: 'c.heading' is possibly 'undefined'`. TypeScript isn't being fussy: fields really do go missing in model output and JSON files. An array's `find` is the same: when nothing matches, it returns `undefined`.
+--- code
+interface Clause {
+  readonly id: string;
+  heading?: string;
+  source?: { file: string; page?: number };
+}
+
+const a: Clause = { id: "8.1", heading: "Cap on Liability", source: { file: "msa.pdf", page: 3 } };
+const b: Clause = { id: "12" };
+
+for (const c of [a, b]) {
+  const heading = c.heading ?? "(no heading)";
+  console.log(c.id, heading, c.source?.page ?? "?", c.source?.file.toUpperCase());
+}
+// a.id = "9.9"; // uncomment this line to try it: Cannot assign to 'id' because it is a read-only property
+
+@@ concept
+title: Union types and narrowing
+--- body
+`string | null` means "maybe a string, maybe null". **Check** it before you use it, and TypeScript follows your if checks and "narrows" the type:
+
+- `x === null`, `x === undefined`
+- `typeof x === "string"` (also `"number"`, `"boolean"`, `"object"`)
+- `Array.isArray(x)`
+- `"verdict" in obj`: does the object have this key?
+
+Inside the if, TypeScript knows exactly what x is; once you leave the if, it's back to the union type. In VS Code on your own computer, hover the mouse over a variable to see its type on each line.
+
+The classic trap: `typeof null` and `typeof []` both give `"object"` (old JavaScript baggage). So check for arrays with `Array.isArray`, and when checking for an object, rule out `null` as well.
+--- code
+function show(x: string | number | string[] | null): string {
+  if (x === null) {
+    return "nothing";
+  }
+  if (typeof x === "string") {
+    return `text: ${x.toUpperCase()}`;
+  }
+  if (Array.isArray(x)) {
+    return `list of ${x.length}`;
+  }
+  return `number: ${x.toFixed(1)}`; // by this point, x can only be a number
+}
+console.log(show("flag"));
+console.log(show(["8.1", "12"]));
+console.log(show(0.5));
+console.log(show(null));
+console.log(typeof null, typeof ["8.1"]);
+
+@@ concept
+title: Discriminated unions and exhaustiveness checks
+--- body
+One reply from the model can be a "final answer", a "please call a tool", or an "error", and each case carries different fields. In Clause Check's `review.py`, `Step` tells them apart with a string field `stop` (`"end"`, `"tool_use"`, `"error"` …).
+
+TypeScript writes this as a **discriminated union**: every case has the same field (often called `kind`, `type` or `stop`), each with a different literal value. In each case of `switch (s.stop)`, TypeScript knows which kind s is, and only the `"tool_use"` branch can read `s.tool`.
+
+**Exhaustiveness check**: in `default`, write
+
+```ts
+const unreachable: never = s;
+```
+
+`never` is the type that "can never have a value". When every case is handled, the s that reaches default is never, so there's no error. If someone later adds a fourth case but forgets to handle it, this line immediately gives a type error, and the bug is caught before the code runs.
+--- code
+type Step =
+  | { stop: "end"; text: string }
+  | { stop: "tool_use"; tool: string; args: string }
+  | { stop: "error"; error: string };
+
+function nextAction(s: Step): string {
+  switch (s.stop) {
+    case "end":
+      return `answer: ${s.text}`;
+    case "tool_use":
+      return `run ${s.tool}(${s.args})`;
+    case "error":
+      return `give up: ${s.error}`;
+    default: {
+      const unreachable: never = s;
+      return unreachable;
+    }
+  }
+}
+
+const steps: Step[] = [
+  { stop: "tool_use", tool: "lookup_playbook", args: '{"topic": "payment"}' },
+  { stop: "end", text: "flag: payment term unclear" },
+  { stop: "error", error: "http 429" },
+];
+for (const s of steps) {
+  console.log(nextAction(s));
+}
+
+@@ concept
+title: Generics: parameters for types
+--- body
+Say you write a function that gets the first element: used on a `string[]` it should return a string, used on a `Clause[]` it should return a Clause. Writing `any` throws the type away. **Generics** are "parameters for types":
+
+```ts
+function first<T>(xs: T[]): T | undefined {
+  return xs[0];
+}
+```
+
+Read `<T>` as "for some type T". When you call it you usually don't write `first<string>(...)`: TypeScript infers T from the arguments. You've actually been using generics for a while: `Promise<string>`, `Record<string, number>`, `Array<string>`; what's inside the angle brackets is the type parameter. A type can take parameters too: `type ApiResult<T> = { ok: true; data: T } | { ok: false; error: string }`.
+
+The classic mistake: writing `const x: T = "8.1"` inside the function. The caller decides what T is; the function itself can't assume it's a string.
+--- code
+function first<T>(xs: T[]): T | undefined {
+  return xs[0];
+}
+
+function countBy<T>(xs: T[], key: (x: T) => string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const x of xs) {
+    const k = key(x);
+    counts[k] = (counts[k] ?? 0) + 1;
+  }
+  return counts;
+}
+
+interface Review {
+  id: string;
+  verdict: string;
+}
+const reviews: Review[] = [
+  { id: "3.1", verdict: "accept" },
+  { id: "8.1", verdict: "flag" },
+  { id: "10.1", verdict: "flag" },
+];
+const none: string[] = [];
+console.log(first(reviews)?.id, first(none) ?? "empty");
+console.log(countBy(reviews, (r) => r.verdict));
+console.log(countBy(["low", "high", "low"], (r) => r));
+
+@@ concept
+title: Utility types: derive one type from another
+--- body
+You can "derive" a new type from an existing one without writing it all out again:
+
+- `Partial<Review>`: every field becomes optional; good for a "patch" (changing only a few fields)
+- `Pick<Review, "id" | "verdict">`: keep only these fields
+- `Omit<Review, "cost_usd">`: remove these fields
+- `Record<K, V>`: you already used it on Day 5
+- `ReturnType<typeof fn>`: the return type of a function (you'll see it when you read other people's code)
+
+The most important point: **these are only types; they don't exist at run time**. `Omit` won't remove a field for you; to really remove it, your code has to build a new object. The usual way is **destructuring with a rest element**:
+
+```ts
+const { cost_usd, ...rest } = review; // rest = every field except cost_usd
+```
+--- code
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  cost_usd: number;
+}
+type ReviewPatch = Partial<Review>;
+type PublicReview = Omit<Review, "cost_usd">;
+
+const r: Review = { id: "8.1", verdict: "flag", risk: "high", cost_usd: 0.0021 };
+const patch: ReviewPatch = { verdict: "redline" };
+const updated: Review = { ...r, ...patch };
+console.log(updated.verdict, r.verdict);
+
+const { cost_usd, ...rest } = r;
+const pub: PublicReview = rest;
+console.log(Object.keys(pub), cost_usd);
+
+@@ concept
+title: unknown and type guards
+--- body
+`JSON.parse` returns `any`: from there on TypeScript stops checking, a misspelled field name gives no error, and things only go wrong at run time. Model output, HTTP responses and file contents are all **external data** and should be treated as `unknown`: "I don't know what this is; check it before using it".
+
+Write the check as a **type guard** function, whose return type is written `x is Verdict`:
+
+```ts
+function isVerdict(x: unknown): x is Verdict { ... }
+```
+
+After `if (isVerdict(data))`, data inside the if is a Verdict.
+
+Two classic mistakes:
+
+- `data as Verdict` only **tells** the compiler "trust me"; nothing is checked at run time
+- If the guard forgets to check a field, the compiler can't notice either: the guard is your own promise. When there are many fields, use Zod from Day 6: one schema does both the checking and the type, so nothing gets missed
+--- code
+const VERDICTS = ["accept", "flag", "redline"];
+interface Verdict {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+}
+
+function isVerdict(x: unknown): x is Verdict {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "clause_id" in x &&
+    typeof x.clause_id === "string" &&
+    "verdict" in x &&
+    typeof x.verdict === "string" &&
+    VERDICTS.includes(x.verdict)
+  );
+}
+
+const inputs = ['{"clause_id": "8.1", "verdict": "flag"}', '{"clause_id": "8.1", "verdict": "maybe"}', "null"];
+for (const raw of inputs) {
+  const data: unknown = JSON.parse(raw);
+  if (isVerdict(data)) {
+    console.log("ok:", data.clause_id, data.verdict);
+  } else {
+    console.log("rejected:", raw);
+  }
+}
+
+@@ concept
+title: as const: one list, two uses
+--- body
+The same list is often needed twice: at run time you need an array (to loop over it, to check values against it), and at compile time you need a union type. Write them separately and sooner or later they'll disagree. `as const` gets both from one definition:
+
+```ts
+const RISKS = ["low", "medium", "high"] as const;
+type Risk = (typeof RISKS)[number]; // "low" | "medium" | "high"
+```
+
+- `as const`: the array becomes read-only, and each element's type is its exact literal rather than string
+- `typeof RISKS`: the type of this **value**; `[number]`: the type of "an element you get with a number index"
+
+The classic trap: when x is a `string`, `RISKS.includes(x)` gives an error (TypeScript thinks RISKS can only contain those three words). To check any string, write `(RISKS as readonly string[]).includes(x)`. Zod's `z.enum(RISKS)` can use this same list directly.
+--- code
+const RISKS = ["low", "medium", "high"] as const;
+type Risk = (typeof RISKS)[number];
+
+function isRisk(x: string): x is Risk {
+  return (RISKS as readonly string[]).includes(x);
+}
+
+function rank(r: Risk): number {
+  return RISKS.indexOf(r);
+}
+
+for (const raw of ["high", "urgent", "low"]) {
+  if (isRisk(raw)) {
+    console.log(raw, "rank", rank(raw));
+  } else {
+    console.log(raw, "is not a risk level");
+  }
+}
+console.log(RISKS.length, RISKS[2]);
+
+@@ item d15-01
+type: code
+title: Recap: async calls + counting
+level: 2
+cards: d6:async / await: wait for the network without freezing; d5:Record and counting; d6:fetch: the requests.post of TypeScript
+--- context
+First sort a batch of clauses by topic and see which topics come up most in this contract (liability caps, automatic renewal, data processing…), so the lawyer gets a rough picture up front. Each passage means one question to the model, and you have to wait for the network to answer.
+--- prompt
+A recap of Days 5 and 6. Write `countTopics(texts)`: for each text, **in order**, await one call to `askJson(text)` (already written), count the `topic` field of the answers, and return `{ <topic>: <count> }`. An empty array returns `{}`.
+
+In `askJson`, `thinking: { type: "disabled" }` turns off DeepSeek's thinking mode, which is on by default: sorting clauses by topic doesn't need long reasoning, so turning it off is faster and cheaper (thinking tokens are billed as output).
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function askJson(text: string): Promise<any> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({
+      model: "deepseek-flash",
+      messages: [{ role: "user", content: text }],
+      response_format: { type: "json_object" },
+      thinking: { type: "disabled" },
+    }),
+  });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function countTopics(texts: string[]): Promise<Record<string, number>> {
+  return {};
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function askJson(text: string): Promise<any> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({
+      model: "deepseek-flash",
+      messages: [{ role: "user", content: text }],
+      response_format: { type: "json_object" },
+      thinking: { type: "disabled" },
+    }),
+  });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function countTopics(texts: string[]): Promise<Record<string, number>> {
+  const counts: Record<string, number> = {};
+  for (const text of texts) {
+    const answer = await askJson(text);
+    counts[answer.topic] = (counts[answer.topic] ?? 0) + 1;
+  }
+  return counts;
+}
+--- tests
+const TEXTS = [
+  "Review clause 4.2: renews for twenty-four months",
+  "Review clause 8.1: liability is unlimited",
+  "Review clause 3.1: fees are due within thirty days",
+  "Review clause 8.2: Subject to Section 12, the cap applies",
+];
+expectAsync("counts", () => countTopics(TEXTS), { auto_renewal: 1, liability_cap: 2, other: 1 });
+expectAsync("empty array", () => countTopics([]), {});
+expectAsync("one call per text", async () => { MOCK.reset(); await countTopics(TEXTS); return MOCK.calls.length; }, 4);
+--- hints
+- `for (const text of texts) { const answer = await askJson(text); ... }`
+- Counting works the same way as on Day 5: `counts[k] = (counts[k] ?? 0) + 1;`, where k is `answer.topic`.
+
+@@ item d15-02
+type: choice
+title: Only type can do this
+level: 1
+cards: interface and type
+--- context
+To describe Clause Check's data (clauses, verdicts, review results) in TypeScript, you can choose between `interface` and `type`, and the team first has to agree on one habit.
+--- prompt
+Which of these can **only** be written with `type`, not with `interface`?
+--- options
+- An object shape `{ id: string; text: string }`
+- A union type `"accept" | "flag" | "redline"`
+- An object with an optional field `{ id: string; heading?: string }`
+- Adding a field on top of another object type
+answer: 2
+--- explain
+`interface` can only describe objects (it can use `extends` to add fields to another interface); union types and literal types can only be written with `type`. The other three can be written either way. When you read the type definitions of Mastra or the OpenAI SDK you'll see both; just read them as the same thing.
+
+@@ item d15-03
+type: fix
+title: Possibly undefined
+level: 2
+cards: Optional, read-only, and optional chaining
+--- context
+The report page shows clause headings by clause number. In this exercise's clause data, some clauses have no heading (for example, ones imported from another system), and a user may also type a clause number that doesn't exist at all.
+--- prompt
+Click Run: the type check reports `possibly 'undefined'` in three places. Fix them, following these rules:
+
+- if the clause number isn't found, return `"(missing)"`
+- if the clause has no `heading`, use `"(no heading)"`
+
+Example: `headingOf(CLAUSES, "8.1")` → `"8.1 CAP ON LIABILITY"`, `headingOf(CLAUSES, "12")` → `"12 (no heading)"`.
+--- starter
+interface Clause {
+  id: string;
+  heading?: string;
+}
+
+function headingOf(clauses: Clause[], id: string): string {
+  const clause = clauses.find((c) => c.id === id);
+  return `${clause.id} ${clause.heading.toUpperCase()}`;
+}
+--- solution
+interface Clause {
+  id: string;
+  heading?: string;
+}
+
+function headingOf(clauses: Clause[], id: string): string {
+  const clause = clauses.find((c) => c.id === id);
+  if (clause === undefined) {
+    return "(missing)";
+  }
+  return `${clause.id} ${clause.heading?.toUpperCase() ?? "(no heading)"}`;
+}
+--- tests
+const CLAUSES: Clause[] = [{ id: "8.1", heading: "Cap on Liability" }, { id: "12" }];
+expect("has a heading", () => headingOf(CLAUSES, "8.1"), "8.1 CAP ON LIABILITY");
+expect("no heading", () => headingOf(CLAUSES, "12"), "12 (no heading)");
+expect("not found", () => headingOf(CLAUSES, "99"), "(missing)");
+--- hints
+- `find` may find nothing. First write `if (clause === undefined) { return ...; }`; after that line, TypeScript knows clause definitely exists.
+- `heading` is optional: `clause.heading?.toUpperCase()` gives undefined when there's no heading; then use `??` to give the default.
+
+@@ item d15-04
+type: predict
+title: What narrowing does
+level: 2
+cards: Union types and narrowing
+--- context
+A field the model hands back isn't always the type you expect: the same field is a number this time, a list next time, and it may even be empty. Before you use it, find out what it actually is this time.
+--- prompt
+Write the output. The last line shows two old JavaScript traps; think about why we use `Array.isArray` and `=== null`.
+--- code
+function kindOf(x: string | number | string[] | null | undefined): string {
+  if (x === null || x === undefined) {
+    return "empty";
+  }
+  if (typeof x === "number") {
+    return x > 0.5 ? "high score" : "low score";
+  }
+  if (Array.isArray(x)) {
+    return `${x.length} ids`;
+  }
+  return x.trim() === "" ? "blank" : `text ${x}`;
+}
+console.log(kindOf(0.8), kindOf(0));
+console.log(kindOf(["8.1"]), kindOf([]));
+console.log(kindOf("  "), kindOf("flag"));
+console.log(kindOf(null), kindOf(undefined));
+console.log(typeof null, typeof [], Array.isArray([]));
+--- explain
+Each if rules out one possibility, so by the last line x can only be a `string`, and you can call `x.trim()` directly. `typeof` returns `"object"` for both `null` and arrays, so check for arrays with `Array.isArray`, and when checking "is it an object", add `x !== null`.
+
+@@ item d15-05
+type: code
+title: Normalize rule_ids
+level: 2
+cards: Union types and narrowing; d5:Array methods: map, filter, find
+--- context
+A verdict's `rule_ids` records which playbook rules the clause was checked against, and the report lists them. But the model hands them back in different formats, and the code that follows only wants to deal with one format.
+--- prompt
+The model sometimes writes `rule_ids` as an array, sometimes as a comma-separated string, and sometimes just gives `null`. Write `normalizeIds(input)` that always returns an array of strings: trim the spaces at both ends of each item and drop empty items.
+
+- `["PB-01", " PB-03 "]` → `["PB-01", "PB-03"]`
+- `"PB-01, PB-03"` → `["PB-01", "PB-03"]`
+- `null`, `""` → `[]`
+--- starter
+function normalizeIds(input: string | string[] | null): string[] {
+  return [];
+}
+--- solution
+function normalizeIds(input: string | string[] | null): string[] {
+  if (input === null) {
+    return [];
+  }
+  const parts = typeof input === "string" ? input.split(",") : input;
+  return parts.map((s) => s.trim()).filter((s) => s !== "");
+}
+--- tests
+expect("array", () => normalizeIds(["PB-01", " PB-03 "]), ["PB-01", "PB-03"]);
+expect("comma-separated string", () => normalizeIds("PB-01, PB-03"), ["PB-01", "PB-03"]);
+expect("null", () => normalizeIds(null), []);
+expect("empty string and extra commas", () => [normalizeIds(""), normalizeIds("PB-01,,")], [[], ["PB-01"]]);
+--- hints
+- Handle `null` first, then use `typeof input === "string"` to tell strings from arrays.
+- Turn the string into an array with `split(",")` first; after that, the two cases are the same: `.map((s) => s.trim()).filter((s) => s !== "")`.
+
+@@ item d15-06
+type: code
+title: Describe a decision
+level: 2
+cards: Discriminated unions and exhaustiveness checks
+--- context
+The three verdicts carry different information: a flag needs a reason, and a redline needs the suggested new wording. The report describes each verdict in one line, and each case may read only the fields it actually has.
+--- prompt
+Write `describe(d)`:
+
+- `{ kind: "accept" }` → `"accept"`
+- `{ kind: "flag", reason: "unclear fee" }` → `"flag: unclear fee"`
+- `{ kind: "redline", replacement: "Cap at 12 months." }` → `"redline -> Cap at 12 months."`
+
+Use `switch (d.kind)`, and add an exhaustiveness check in `default` (you'll see why it's useful in the next exercise).
+--- starter
+type Decision =
+  | { kind: "accept" }
+  | { kind: "flag"; reason: string }
+  | { kind: "redline"; replacement: string };
+
+function describe(d: Decision): string {
+  switch (d.kind) {
+    case "accept":
+      return "accept";
+  }
+  return "";
+}
+--- solution
+type Decision =
+  | { kind: "accept" }
+  | { kind: "flag"; reason: string }
+  | { kind: "redline"; replacement: string };
+
+function describe(d: Decision): string {
+  switch (d.kind) {
+    case "accept":
+      return "accept";
+    case "flag":
+      return `flag: ${d.reason}`;
+    case "redline":
+      return `redline -> ${d.replacement}`;
+    default: {
+      const unreachable: never = d;
+      return unreachable;
+    }
+  }
+}
+--- tests
+expect("accept", () => describe({ kind: "accept" }), "accept");
+expect("flag", () => describe({ kind: "flag", reason: "unclear fee" }), "flag: unclear fee");
+expect("redline", () => describe({ kind: "redline", replacement: "Cap at 12 months." }), "redline -> Cap at 12 months.");
+--- hints
+- In the `case "flag":` branch, TypeScript knows d has `reason`; in the `case "redline":` branch, it has `replacement`.
+- Copy the exhaustiveness check from the knowledge card: `default: { const unreachable: never = d; return unreachable; }`
+
+@@ item d15-07
+type: fix
+title: The missing case
+level: 2
+cards: Discriminated unions and exhaustiveness checks
+--- context
+Requirements change: the team wants some clauses to go straight to a specific person in the legal department, so they added a fourth kind of verdict. The person who changes the type is often not the person who wrote `describe`, so missing one place is normal.
+--- prompt
+The team added a fourth case `{ kind: "escalate"; to: string }` (hand it to a specific person) to `Decision`, but forgot to update `describe`. Click Run: the type check immediately reports an error on the `default` line. Read the error, add this case, and return text like `"escalate to legal"`. **Don't** delete the exhaustiveness check line: it just caught a bug for you.
+--- starter
+type Decision =
+  | { kind: "accept" }
+  | { kind: "flag"; reason: string }
+  | { kind: "redline"; replacement: string }
+  | { kind: "escalate"; to: string };
+
+function describe(d: Decision): string {
+  switch (d.kind) {
+    case "accept":
+      return "accept";
+    case "flag":
+      return `flag: ${d.reason}`;
+    case "redline":
+      return `redline -> ${d.replacement}`;
+    default: {
+      const unreachable: never = d;
+      return unreachable;
+    }
+  }
+}
+--- solution
+type Decision =
+  | { kind: "accept" }
+  | { kind: "flag"; reason: string }
+  | { kind: "redline"; replacement: string }
+  | { kind: "escalate"; to: string };
+
+function describe(d: Decision): string {
+  switch (d.kind) {
+    case "accept":
+      return "accept";
+    case "flag":
+      return `flag: ${d.reason}`;
+    case "redline":
+      return `redline -> ${d.replacement}`;
+    case "escalate":
+      return `escalate to ${d.to}`;
+    default: {
+      const unreachable: never = d;
+      return unreachable;
+    }
+  }
+}
+--- tests
+expect("escalate", () => describe({ kind: "escalate", to: "legal" }), "escalate to legal");
+expect("flag still works", () => describe({ kind: "flag", reason: "late fee" }), "flag: late fee");
+--- hints
+- The error means: the case `{ kind: "escalate"; to: string }` reaches default, where only never is allowed.
+- Add a `case "escalate":` before default and return `` `escalate to ${d.to}` ``.
+
+@@ item d15-08
+type: code
+title: Generic first and last
+level: 1
+cards: Generics: parameters for types
+--- context
+Getting the first or the last item is needed for the list of clause numbers and for the list of review results alike. Writing it once for each type is too repetitive, and writing `any` throws the type away.
+--- prompt
+Write two generic functions: `first(xs)` returns the first element and `last(xs)` returns the last one; both return `undefined` for an empty array. The return type is `T | undefined`. Example: `last(["3.1", "8.1"])` → `"8.1"`.
+--- starter
+function first<T>(xs: T[]): T | undefined {
+  return undefined;
+}
+
+function last<T>(xs: T[]): T | undefined {
+  return undefined;
+}
+--- solution
+function first<T>(xs: T[]): T | undefined {
+  return xs[0];
+}
+
+function last<T>(xs: T[]): T | undefined {
+  return xs[xs.length - 1];
+}
+--- tests
+expect("first", () => first(["3.1", "8.1", "12"]), "3.1");
+expect("last", () => last(["3.1", "8.1", "12"]), "12");
+expect("empty array", () => [first([]), last([])], [undefined, undefined]);
+expect("the type carries through", () => { const c: { id: string } | undefined = last([{ id: "8.1" }]); return c?.id; }, "8.1");
+--- hints
+- When an index is out of range, JavaScript returns `undefined` instead of throwing an error, so an empty array needs no special handling.
+- The last index is `xs.length - 1`. ES2022 also has `xs.at(-1)`, which gives the same result.
+
+@@ item d15-09
+type: code
+title: Generic groupBy
+level: 2
+cards: Generics: parameters for types; d5:Record and counting
+--- context
+On the report page, lawyers sometimes want to see clauses by verdict, and sometimes by risk or by section. Rather than writing one function for each way of grouping, write one general function that works on any data.
+--- prompt
+Write `groupBy(xs, key)`: `key` is a function that works out which group each element belongs to. Return a `Record<string, T[]>`, keeping the original order within each group. Example: `groupBy(reviews, (r) => r.verdict)` → `{ flag: [...], accept: [...] }`.
+
+The same function can also group by risk or by section number: generics + a function parameter, written once and used everywhere.
+--- starter
+function groupBy<T>(xs: T[], key: (x: T) => string): Record<string, T[]> {
+  const groups: Record<string, T[]> = {};
+  return groups;
+}
+--- solution
+function groupBy<T>(xs: T[], key: (x: T) => string): Record<string, T[]> {
+  const groups: Record<string, T[]> = {};
+  for (const x of xs) {
+    const k = key(x);
+    if (groups[k] === undefined) {
+      groups[k] = [];
+    }
+    groups[k].push(x);
+  }
+  return groups;
+}
+--- tests
+const REVIEWS = [
+  { id: "3.1", verdict: "accept" },
+  { id: "8.1", verdict: "flag" },
+  { id: "8.2", verdict: "accept" },
+  { id: "10.1", verdict: "flag" },
+];
+const ids = (g: Record<string, { id: string }[]>) => Object.fromEntries(Object.entries(g).map(([k, v]) => [k, v.map((r) => r.id)]));
+expect("by verdict", () => ids(groupBy(REVIEWS, (r) => r.verdict)), { accept: ["3.1", "8.2"], flag: ["8.1", "10.1"] });
+expect("by section number", () => ids(groupBy(REVIEWS, (r) => r.id.split(".")[0])), { "3": ["3.1"], "8": ["8.1", "8.2"], "10": ["10.1"] });
+expect("strings work too", () => groupBy(["low", "high", "low"], (s) => s), { low: ["low", "low"], high: ["high"] });
+expect("empty", () => groupBy([], (x: string) => x), {});
+--- hints
+- For each element, first work out the group name: `const k = key(x);`.
+- If the group doesn't exist yet, put an empty array there first, then `push`. It's the same as Day 5's `groupByTopic`, except the group name now comes from calling `key(x)`.
+
+@@ item d15-10
+type: order
+title: Put the code in order: generic indexBy
+level: 2
+cards: Generics: parameters for types
+--- context
+During a review you often need to find a clause by its number, or a playbook rule by its id. Searching the array from the start every time is slow; building a lookup table first is more convenient.
+--- prompt
+Put `indexBy` in order: it turns an array into a "name → element" lookup table, where the name comes from `key(x)`; when two elements have the same name, the later one overwrites the earlier one. Two lines are distractors.
+--- lines
+function indexBy<T>(xs: T[], key: (x: T) => string): Record<string, T> {
+  const out: Record<string, T> = {};
+  for (const x of xs) {
+    out[key(x)] = x;
+  }
+  return out;
+}
+--- distractors
+function indexBy(xs: T[], key: (x: T) => string): Record<string, T> {
+  for (const x in xs) {
+--- tests
+const CLAUSES = [
+  { id: "3.1", heading: "Invoicing" },
+  { id: "8.1", heading: "Cap on Liability" },
+];
+expect("look up by id", () => indexBy(CLAUSES, (c) => c.id)["8.1"].heading, "Cap on Liability");
+expect("same name: the later one overwrites the earlier one", () => indexBy(["flag", "fine", "accept"], (s) => s[0]), { f: "fine", a: "accept" });
+expect("empty", () => indexBy([], (x: string) => x), {});
+--- hints
+- In the line without `<T>`, where does T come from? TypeScript says `Cannot find name 'T'`.
+- To loop over the **values** of an array, use `of`; `in` gives you the indexes, as strings.
+
+@@ item d15-11
+type: code
+title: A Partial patch
+level: 2
+cards: Utility types: derive one type from another
+--- context
+When lawyers read the report in the app and think a verdict is wrong, they can change it on the spot, for example from flag to redline. The original result must be kept too, so you can compare it with how the model judged the clause at first.
+--- prompt
+The lawyer changed only one or two fields in the app. Write the generic `applyPatch(obj, patch)`: return a **new object** where the fields present in `patch` override the original values and everything else stays the same; **don't change** `obj`. The type of `patch` must be `Partial<T>` (the starter has it wrong). Example: `applyPatch(review, { verdict: "redline" })`.
+--- starter
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  note?: string;
+}
+
+function applyPatch<T>(obj: T, patch: T): T {
+  return obj;
+}
+--- solution
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  note?: string;
+}
+
+function applyPatch<T>(obj: T, patch: Partial<T>): T {
+  return { ...obj, ...patch };
+}
+--- tests
+const R: Review = { id: "8.1", verdict: "flag", risk: "high" };
+expect("change one field", () => applyPatch(R, { verdict: "redline" }), { id: "8.1", verdict: "redline", risk: "high" });
+expect("add an optional field", () => applyPatch(R, { note: "cap too low" }).note, "cap too low");
+expect("the original object is unchanged", () => { applyPatch(R, { risk: "low" }); return R.risk; }, "high");
+expect("an empty patch also returns a new object", () => { const out = applyPatch(R, {}); return [out === R, out.verdict]; }, [false, "flag"]);
+expect("works with other types too", () => applyPatch({ a: 1, b: 2 }, { b: 3 }), { a: 1, b: 3 });
+--- hints
+- First change the parameter type to `patch: Partial<T>`; the type errors in the tests go away.
+- The spread operator `{ ...obj, ...patch }` builds a new object; later fields override earlier ones.
+
+@@ item d15-12
+type: predict
+title: Omit at run time
+level: 2
+cards: Utility types: derive one type from another
+--- context
+Some fields in a review result are for internal eyes only, for example how much this review cost. The team used a TypeScript utility type to define a "public version" type for people outside.
+--- prompt
+Write the output. Think: does `Omit` still exist at run time?
+--- code
+interface Review {
+  id: string;
+  verdict: string;
+  cost_usd: number;
+}
+type PublicReview = Omit<Review, "cost_usd">;
+
+const full: Review = { id: "8.1", verdict: "flag", cost_usd: 0.002 };
+const shown: PublicReview = full;
+console.log(Object.keys(shown).join(", "));
+console.log(JSON.stringify(shown));
+const { cost_usd, ...rest } = full;
+console.log(Object.keys(rest).join(", "), cost_usd);
+--- explain
+Types are completely erased after compiling: `shown` and `full` are the same object, so `cost_usd` is still in the JSON. If this were an API response, the internal cost would have been sent to the customer. To really remove a field, your code has to build a new object (for example with destructuring and a rest element).
+
+@@ item d15-13
+type: code
+title: The public review result
+level: 2
+cards: Utility types: derive one type from another
+--- context
+The review results customers see in the front end must not carry the internal cost or the model's raw reply: the first is business information, and the second is long and messy. The list page shows only the simplest few fields.
+--- prompt
+Review results that the API returns to the front end must not include internal fields. Write two functions; both return a **new object** and don't change the original:
+
+- `toPublic(r)`: remove `cost_usd` and `raw_response`, and keep every other field (the type `PublicReview` is already defined with `Omit`)
+- `toSummary(r)`: keep only `id` and `verdict` (the type is already defined with `Pick`)
+
+The starter passes the type check, but the tests fail: think about the previous exercise.
+--- starter
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  cost_usd: number;
+  raw_response: string;
+}
+type PublicReview = Omit<Review, "cost_usd" | "raw_response">;
+type ReviewSummary = Pick<Review, "id" | "verdict">;
+
+function toPublic(r: Review): PublicReview {
+  return r;
+}
+
+function toSummary(r: Review): ReviewSummary {
+  return r;
+}
+--- solution
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  cost_usd: number;
+  raw_response: string;
+}
+type PublicReview = Omit<Review, "cost_usd" | "raw_response">;
+type ReviewSummary = Pick<Review, "id" | "verdict">;
+
+function toPublic(r: Review): PublicReview {
+  const { cost_usd, raw_response, ...rest } = r;
+  return rest;
+}
+
+function toSummary(r: Review): ReviewSummary {
+  return { id: r.id, verdict: r.verdict };
+}
+--- tests
+const FULL: Review = { id: "8.1", verdict: "flag", risk: "high", cost_usd: 0.0021, raw_response: '{"verdict": "flag"}' };
+expect("toPublic removes the internal fields", () => toPublic(FULL), { id: "8.1", verdict: "flag", risk: "high" });
+expect("toSummary keeps only two fields", () => toSummary(FULL), { id: "8.1", verdict: "flag" });
+expect("no cost in the JSON", () => JSON.stringify(toPublic(FULL)).includes("cost_usd"), false);
+expect("the original object is unchanged", () => FULL.cost_usd, 0.0021);
+--- hints
+- `return r` still returns the original object with all its fields; the type just can't "see" the extra ones.
+- `toPublic`: `const { cost_usd, raw_response, ...rest } = r;` then return `rest`. `toSummary`: just write a new object `{ id: r.id, verdict: r.verdict }`.
+
+@@ item d15-14
+type: choice
+title: any and unknown
+level: 2
+cards: unknown and type guards
+--- context
+Every review result the front end receives is a piece of JSON text, which has to be parsed into an object before it can be used. Misspelling a field name by one letter while writing code happens all the time.
+--- prompt
+After `const data = JSON.parse(raw);` you wrote `data.verdcit.toUpperCase()` (verdict is misspelled). Which statement is correct?
+--- options
+- TypeScript reports an error because `verdcit` is misspelled
+- No type error: `JSON.parse` returns `any`, and TypeScript doesn't check any; the error `Cannot read properties of undefined` only comes at run time
+- Neither the type check nor running it gives an error
+- Marking `data` as `unknown` wouldn't give a type error either
+answer: 2
+--- explain
+`any` is the same as switching checking off. `unknown` is the opposite: until you check it with `typeof`, `in` or a type guard, it won't let you do anything (`data.verdict` is an error straight away). So always treat external data (model output, HTTP responses) as `unknown` first, and use it only after checking. That's also why the parameter of Zod's `safeParse` has the type unknown.
+
+@@ item d15-15
+type: code
+title: Guard + filter out bad data
+level: 3
+cards: unknown and type guards; Union types and narrowing
+--- context
+To send fewer requests, you sometimes have the model review several clauses at once, and it hands back a JSON array. The array is bound to contain elements with missing fields or wrongly written verdicts; this outside data has to be checked element by element before you use it.
+--- prompt
+The model returned a JSON array in one go, but some of its elements are invalid. Without Zod, write by hand:
+
+- `isVerdict(x: unknown): x is Verdict`: x is an object (not null), `clause_id` is a string, and `verdict` is one of `accept` / `flag` / `redline`
+- `parseVerdicts(raw: string): Verdict[]`: parse `raw` and keep only the valid elements; if `raw` isn't valid JSON, or what it parses to isn't an array, return `[]`
+--- starter
+const VERDICTS = ["accept", "flag", "redline"];
+interface Verdict {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+}
+
+function isVerdict(x: unknown): x is Verdict {
+  return false;
+}
+
+function parseVerdicts(raw: string): Verdict[] {
+  return [];
+}
+--- solution
+const VERDICTS = ["accept", "flag", "redline"];
+interface Verdict {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+}
+
+function isVerdict(x: unknown): x is Verdict {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "clause_id" in x &&
+    typeof x.clause_id === "string" &&
+    "verdict" in x &&
+    typeof x.verdict === "string" &&
+    VERDICTS.includes(x.verdict)
+  );
+}
+
+function parseVerdicts(raw: string): Verdict[] {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(data)) {
+    return [];
+  }
+  return data.filter(isVerdict);
+}
+--- tests
+expect("valid", () => isVerdict({ clause_id: "8.1", verdict: "flag" }), true);
+expect("null and a string", () => [isVerdict(null), isVerdict("flag")], [false, false]);
+expect("verdict is not one of the three values", () => isVerdict({ clause_id: "8.1", verdict: "maybe" }), false);
+expect("clause_id is not a string", () => isVerdict({ clause_id: 8.1, verdict: "flag" }), false);
+const RAW = '[{"clause_id": "3.1", "verdict": "accept"}, {"clause_id": "8.1", "verdict": "HIGH"}, null, {"clause_id": "10.1", "verdict": "redline"}]';
+expect("keeps only the valid ones", () => parseVerdicts(RAW).map((v) => v.clause_id), ["3.1", "10.1"]);
+expect("bad JSON and not an array", () => [parseVerdicts("Sure! ["), parseVerdicts('{"clause_id": "8.1", "verdict": "flag"}')], [[], []]);
+--- hints
+- Write the guard the way the knowledge card does: `typeof x === "object" && x !== null && "clause_id" in x && typeof x.clause_id === "string" && ...`.
+- Put `JSON.parse` in a try/catch; then use `Array.isArray(data)` to check that it's an array.
+- A guard function can be passed straight to filter: `data.filter(isVerdict)`, and the result's type is `Verdict[]`.
+
+@@ item d15-16
+type: code
+title: as const: the highest risk
+level: 2
+cards: as const: one list, two uses; unknown and type guards
+--- context
+The report cover shows the highest risk level in the whole contract. The list of risk levels is needed at run time to check the values the model gives, and it's needed in the types too; write it twice and sooner or later the two won't match.
+--- prompt
+`RISKS` is given. First change `type Risk` into a union type **derived from RISKS**, then write:
+
+- `isRisk(x: string): x is Risk`
+- `maxRisk(values: string[]): Risk`: ignore values that aren't risk levels and return the highest level among them (low < medium < high); if there isn't a single valid value, return `"low"`
+
+Example: `maxRisk(["low", "HIGH", "medium", "urgent"])` → `"medium"` (`"HIGH"` has the wrong case, so it doesn't count).
+--- starter
+const RISKS = ["low", "medium", "high"] as const;
+type Risk = string; // change this to a union type derived from RISKS
+
+function isRisk(x: string): x is Risk {
+  return false;
+}
+
+function maxRisk(values: string[]): Risk {
+  return "low";
+}
+--- solution
+const RISKS = ["low", "medium", "high"] as const;
+type Risk = (typeof RISKS)[number];
+
+function isRisk(x: string): x is Risk {
+  return (RISKS as readonly string[]).includes(x);
+}
+
+function maxRisk(values: string[]): Risk {
+  let best: Risk = "low";
+  for (const v of values) {
+    if (isRisk(v) && RISKS.indexOf(v) > RISKS.indexOf(best)) {
+      best = v;
+    }
+  }
+  return best;
+}
+--- tests
+expect("the example", () => maxRisk(["low", "HIGH", "medium", "urgent"]), "medium");
+expect("has high", () => maxRisk(["high", "low"]), "high");
+expect("not a single valid value", () => maxRisk(["urgent", ""]), "low");
+expect("isRisk", () => [isRisk("medium"), isRisk("urgent")], [true, false]);
+expect("Risk is a union of three literals", () => { const r: "low" | "medium" | "high" = maxRisk(["high"]); return r; }, "high");
+--- hints
+- `type Risk = (typeof RISKS)[number];`
+- To check any string: `(RISKS as readonly string[]).includes(x)`.
+- A level's rank is just its index in RISKS: update best when `RISKS.indexOf(v) > RISKS.indexOf(best)`.
+
+@@ item d15-17
+type: fill
+title: Fill in: one list, two uses
+level: 1
+cards: as const: one list, two uses; unknown and type guards
+--- context
+The three verdict words are used twice in the program: at run time to check the model's answer, and at compile time to limit a variable to just these three values. The model's answer may also contain spaces or capital letters.
+--- prompt
+Complete the code: `VERDICTS` is an array at run time and is also where the `Verdict` type is derived from; `isVerdict` is a type guard.
+--- template
+const VERDICTS = ["accept", "flag", "redline"] [[as const]];
+type Verdict = ([[typeof]] VERDICTS)[number];
+
+function isVerdict(x: string): x [[is]] Verdict {
+  return (VERDICTS as readonly string[]).includes(x);
+}
+
+function toVerdict(x: string): Verdict {
+  const v = x.trim().toLowerCase();
+  return isVerdict(v) ? v : "flag";
+}
+--- tests
+expect("valid after cleaning", () => toVerdict(" REDLINE "), "redline");
+expect("an unknown word becomes flag", () => toVerdict("maybe"), "flag");
+expect("the type is a union", () => { const v: "accept" | "flag" | "redline" = toVerdict("accept"); return v; }, "accept");
+--- hints
+- Which two words keep the array elements' literal types?
+- Which keyword "takes the type of a value"? The guard function's return type is written `x ___ Verdict`.
+
+@@ item d15-18
+type: translate
+title: Translate: dataclass→TS
+level: 2
+cards: Optional, read-only, and optional chaining; interface and type; d5:From Python to TypeScript
+--- context
+Clause Check's back end is written in Python. Suppose you build a TypeScript front end for it: both sides must describe the same data, so the Python data class has to be translated into a TypeScript type.
+--- prompt
+Translate the Python dataclass and function into a TypeScript `interface Review` and `headline(r)`.
+
+An interface can't contain default values: fields that have a default value in Python (including those that default to `None`) become **optional** fields (`?`) in TypeScript, and the function fills in the defaults with `??`. Example: `headline({ clause_id: "8.1", verdict: "flag" })` → `"8.1 flag/low: no note"`.
+--- source
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class Review:
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk: Literal["low", "medium", "high"] = "low"
+    note: str | None = None
+
+def headline(r: Review) -> str:
+    note = r.note if r.note is not None else "no note"
+    return f"{r.clause_id} {r.verdict}/{r.risk}: {note}"
+--- starter
+interface Review {
+  clause_id: string;
+}
+
+function headline(r: Review): string {
+  return "";
+}
+--- solution
+interface Review {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk?: "low" | "medium" | "high";
+  note?: string;
+}
+
+function headline(r: Review): string {
+  return `${r.clause_id} ${r.verdict}/${r.risk ?? "low"}: ${r.note ?? "no note"}`;
+}
+--- tests
+const minimal: Review = { clause_id: "8.1", verdict: "flag" };
+expect("only the required fields", () => headline(minimal), "8.1 flag/low: no note");
+expect("all fields", () => headline({ clause_id: "10.1", verdict: "redline", risk: "high", note: "data leaves the EU" }), "10.1 redline/high: data leaves the EU");
+--- hints
+- `Literal[...]` corresponds to the TypeScript literal union `"accept" | "flag" | "redline"`.
+- `risk: ... = "low"` → `risk?: "low" | "medium" | "high"`, and when you use it, write `r.risk ?? "low"`.
+
+@@ item d15-19
+type: local
+title: Local task: type checking with tsc
+level: 2
+cards: Discriminated unions and exhaustiveness checks; d5:From Python to TypeScript
+--- context
+When you write TypeScript on your own computer, "it runs" and "it passes the type check" are two different things. See the difference with your own eyes once, so that in a real project you won't mistakenly think your code is fine.
+--- prompt
+This page type-checks your code every time you run it. On your own computer, you have to run `tsc` (the TypeScript compiler) yourself for this step.
+
+1. In `G:\Contract Clause Reviewer\work`, create `decision.ts` and write it by hand **without looking at the page**: the `Decision` discriminated union (three kinds: accept / flag / redline), `describe(d)` with a `never` exhaustiveness check, and as the last line `console.log(describe({ kind: "flag", reason: "unclear fee" }));`
+2. Run it once from the project root and check that it prints:
+
+```
+cd "G:\Contract Clause Reviewer"
+npx tsx work/decision.ts
+```
+
+3. **Delete** the `case "redline"` branch and run `npx tsx work/decision.ts` again: it still prints normally! That's because tsx only runs the code and **does not type-check it**
+4. Run the type check (the first time, it asks whether to download TypeScript; type y):
+
+```
+npx -p typescript tsc --noEmit --strict work/decision.ts
+```
+
+5. Paste the output of step 4 below; you should see `TS2322` and `not assignable to type 'never'`. Finally, add the case back and run tsc again: no output at all means it passed.
+placeholder: Paste the tsc output
+verify: not assignable to type 'never'
+--- hints
+- tsc printed nothing: that means the type check passed. Make sure you really deleted a case, and that default contains `const unreachable: never = d;`.
+- Real projects usually set up a `"typecheck": "tsc --noEmit"` script in `package.json` and run it before committing code.
+
+@@ item d15-e1
+type: scratch
+title: Closed book: event summary
+exam: yes
+level: 3
+cards: Discriminated unions and exhaustiveness checks
+--- context
+While the agent reviews a contract, it leaves a record of each step: which tool it called, what verdict it gave, where something went wrong. At the end these records are combined into a short summary shown on the report page.
+--- prompt
+An agent produces a series of events while it runs. Define the discriminated union `ReviewEvent` (the field `type` tells the cases apart):
+
+- `{ type: "tool_call"; tool: string }`
+- `{ type: "verdict"; clause_id: string; verdict: "accept" | "flag" | "redline" }`
+- `{ type: "error"; message: string }`
+
+Write `summarize(events: ReviewEvent[])`, returning `{ toolCalls: <number of tool calls>, verdicts: { <verdict>: <count> }, errors: [<every message, in order>] }`. Use switch, and add a `never` exhaustiveness check.
+--- solution
+type ReviewEvent =
+  | { type: "tool_call"; tool: string }
+  | { type: "verdict"; clause_id: string; verdict: "accept" | "flag" | "redline" }
+  | { type: "error"; message: string };
+
+interface Summary {
+  toolCalls: number;
+  verdicts: Record<string, number>;
+  errors: string[];
+}
+
+function summarize(events: ReviewEvent[]): Summary {
+  const out: Summary = { toolCalls: 0, verdicts: {}, errors: [] };
+  for (const e of events) {
+    switch (e.type) {
+      case "tool_call":
+        out.toolCalls += 1;
+        break;
+      case "verdict":
+        out.verdicts[e.verdict] = (out.verdicts[e.verdict] ?? 0) + 1;
+        break;
+      case "error":
+        out.errors.push(e.message);
+        break;
+      default: {
+        const unreachable: never = e;
+        throw new Error(`unknown event: ${JSON.stringify(unreachable)}`);
+      }
+    }
+  }
+  return out;
+}
+--- tests
+const EVENTS: ReviewEvent[] = [
+  { type: "tool_call", tool: "lookup_playbook" },
+  { type: "verdict", clause_id: "8.1", verdict: "redline" },
+  { type: "error", message: "http 429" },
+  { type: "tool_call", tool: "get_clause" },
+  { type: "verdict", clause_id: "3.1", verdict: "accept" },
+  { type: "verdict", clause_id: "10.1", verdict: "redline" },
+  { type: "error", message: "bad json" },
+];
+expect("mixed events", () => summarize(EVENTS), { toolCalls: 2, verdicts: { redline: 2, accept: 1 }, errors: ["http 429", "bad json"] });
+expect("empty", () => summarize([]), { toolCalls: 0, verdicts: {}, errors: [] });
+
+@@ item d15-e2
+type: scratch
+title: Closed book: generic topBy
+exam: yes
+level: 3
+cards: Generics: parameters for types
+--- context
+The report page lists "the clauses to look at first". The score might be the risk or a retrieval score, and the function will be used on other data too, so it has to be a general function.
+--- prompt
+Write the generic function `topBy<T>(xs: T[], score: (x: T) => number, k: number): T[]`: return the top `k` elements by `score`, from highest to lowest.
+
+- equal scores keep their original order
+- **don't change** `xs`
+- if `k` is larger than the length, return all of them; if `k <= 0`, return `[]`
+--- solution
+function topBy<T>(xs: T[], score: (x: T) => number, k: number): T[] {
+  if (k <= 0) {
+    return [];
+  }
+  return [...xs].sort((a, b) => score(b) - score(a)).slice(0, k);
+}
+--- tests
+const RISK_SCORE: Record<string, number> = { low: 1, medium: 2, high: 3 };
+const CLAUSES = [
+  { id: "3.1", risk: "low" },
+  { id: "8.1", risk: "high" },
+  { id: "4.2", risk: "medium" },
+  { id: "10.1", risk: "high" },
+];
+expect("top 3, ties keep the original order", () => topBy(CLAUSES, (c) => RISK_SCORE[c.risk], 3).map((c) => c.id), ["8.1", "10.1", "4.2"]);
+expect("the original array is unchanged", () => { topBy(CLAUSES, (c) => RISK_SCORE[c.risk], 2); return CLAUSES.map((c) => c.id); }, ["3.1", "8.1", "4.2", "10.1"]);
+expect("strings by length", () => topBy(["a", "abc", "ab"], (s) => s.length, 10), ["abc", "ab", "a"]);
+expect("k is 0 or negative", () => [topBy([1, 2, 3], (n) => n, 0), topBy([1, 2, 3], (n) => n, -1)], [[], []]);
+
+@@ item d15-e3
+type: scratch
+title: Closed book: load rules with a guard
+exam: yes
+level: 3
+cards: unknown and type guards; Union types and narrowing
+--- context
+The playbook is the customer's review rules, stored in a JSON file that people write and edit by hand, so some rules are bound to be wrong. When loading, the bad rules have to be picked out; they must not slip quietly into the review.
+--- prompt
+Load playbook rules from JSON text, checking them by hand without Zod:
+
+- `interface Rule { id: string; topic: string; severity: "low" | "medium" | "high"; keywords?: string[] }`
+- `isRule(x: unknown): x is Rule`: `id` and `topic` are strings, and `severity` is one of the three levels; `keywords` may be missing, but if it's there it must be an array of strings
+- `loadRules(raw: string): { rules: Rule[]; rejected: number }`: `raw` should be JSON like `{"rules": [...]}`. Valid rules go into `rules` (in order), and the number of invalid ones goes into `rejected`. If `raw` isn't valid JSON, or has no `rules` array, return `{ rules: [], rejected: 0 }`
+--- solution
+const SEVERITIES = ["low", "medium", "high"];
+
+interface Rule {
+  id: string;
+  topic: string;
+  severity: "low" | "medium" | "high";
+  keywords?: string[];
+}
+
+function isRule(x: unknown): x is Rule {
+  if (typeof x !== "object" || x === null) {
+    return false;
+  }
+  if (!("id" in x) || typeof x.id !== "string") {
+    return false;
+  }
+  if (!("topic" in x) || typeof x.topic !== "string") {
+    return false;
+  }
+  if (!("severity" in x) || typeof x.severity !== "string" || !SEVERITIES.includes(x.severity)) {
+    return false;
+  }
+  if ("keywords" in x) {
+    const kw = x.keywords;
+    if (!Array.isArray(kw) || !kw.every((k) => typeof k === "string")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function loadRules(raw: string): { rules: Rule[]; rejected: number } {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { rules: [], rejected: 0 };
+  }
+  if (typeof data !== "object" || data === null || !("rules" in data) || !Array.isArray(data.rules)) {
+    return { rules: [], rejected: 0 };
+  }
+  const items: unknown[] = data.rules;
+  const rules = items.filter(isRule);
+  return { rules, rejected: items.length - rules.length };
+}
+--- tests
+const RAW = JSON.stringify({
+  rules: [
+    { id: "PB-01", topic: "liability_cap", severity: "high", keywords: ["liability", "cap"] },
+    { id: "PB-02", topic: "auto_renewal", severity: "urgent" },
+    { id: "PB-03", topic: "payment", severity: "medium", keywords: "fee" },
+    { id: "PB-04", topic: "data_processing", severity: "high" },
+    null,
+  ],
+});
+expect("valid rules are kept", () => loadRules(RAW).rules.map((r) => r.id), ["PB-01", "PB-04"]);
+expect("count of invalid rules", () => loadRules(RAW).rejected, 3);
+expect("isRule on its own", () => [isRule({ id: "PB-05", topic: "x", severity: "low" }), isRule({ id: "PB-05", topic: "x", severity: "low", keywords: [1] })], [true, false]);
+expect("bad JSON and no rules", () => [loadRules("{oops"), loadRules('{"items": []}')], [{ rules: [], rejected: 0 }, { rules: [], rejected: 0 }]);

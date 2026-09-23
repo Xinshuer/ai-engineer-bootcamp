@@ -595,7 +595,7 @@ cards: 私有状态和 getter; 自定义错误和 instanceof
 --- context
 审一份很长的合同可能要调几十次模型。给每份合同设一个 token 上限，免得一份奇怪的合同把一个月的预算烧光；已经用了多少，也不能被别处的代码偷偷改掉。
 --- prompt
-写 `class TokenBudget`（错误类 `BudgetExceededError` 已经写好，后面「自定义错误」那张卡片会细讲）：
+写 `class TokenBudget`（错误类 `BudgetExceededError` 已经写好，「自定义错误」那张卡片会细讲）：
 
 - 构造函数接收 `limit`
 - 已用量存在私有字段 `#used` 里；外面只能通过 getter `used` 和 `remaining` 读

@@ -1,0 +1,801 @@
+@@ day 23
+title: Intermediate SQL: JOIN, subqueries, CTEs, window functions
+lang: sql
+dataset: clausecheck
+hours: 5 hours
+--- goal
+Connect several tables (JOIN), and know the traps of LEFT JOIN and of JOIN fan-out; use subqueries and CTEs to split a long query into a few named steps; use window functions for "the latest row per group", ranking within a group, comparing with the previous row, and running totals. The eval dashboard and the cost dashboard are built on exactly these, and interview SQL questions love them too.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change every example before you run it
+- Pass every practice exercise
+- The 3 closed-book challenges
+- Explain in your own words: with a LEFT JOIN, why conditions on the right-hand table belong in ON; how to write "the latest row per group"
+
+@@ concept
+title: JOIN: connect tables
+--- body
+Tables are connected by "keys": `reviews.contract_id` points to `contracts.id`, and `contracts.customer_id` points to `customers.id`. `JOIN ... ON ...` puts the rows of two tables whose keys match together into one row, just like looking up an id in a dictionary in Python: `contracts_by_id[review["contract_id"]]`.
+
+- Give tables short aliases: `FROM reviews r JOIN contracts c`, then write `r.clause_id`, `c.title`
+- Both tables have an `id` column, so writing just `id` gives the error `ambiguous column name`: put the alias in front
+- `ON` says **how the two tables match up**, `WHERE` says **which rows you want**. For JOIN the result is the same wherever you put a condition, but keeping them apart is clearer (with LEFT JOIN it is different; see the next card)
+- `JOIN` is `INNER JOIN`: only rows that match on both sides stay
+- To connect three tables, write two JOINs, each with its own ON
+--- code
+SELECT r.id, c.title, r.clause_id, r.verdict, r.model
+FROM reviews r
+JOIN contracts c ON c.id = r.contract_id
+WHERE r.clause_id = '8.1';
+
+@@ concept
+title: LEFT JOIN: keep rows without a match
+--- body
+Customer 6 (Amsterdam Data BV, which only signed up on August 30) has no contracts yet. After `customers JOIN contracts`, it disappears. **LEFT JOIN** keeps every row of the left table, and fills the right table's columns with NULL where nothing matches.
+
+- To count "how many contracts each customer has", write `COUNT(c.id)`: a customer without contracts still has one row (all NULL on the right), and `COUNT(*)` would count it as 1
+- The classic bug: putting a condition on the right-hand table in WHERE, for example `WHERE c.status = 'reviewed'`. In the row without a contract, `c.status` is NULL, so WHERE drops it, and the LEFT JOIN quietly turns into a JOIN
+- The right way: **put conditions on the right-hand table in ON**: `LEFT JOIN contracts c ON c.customer_id = cu.id AND c.status = 'reviewed'`
+
+Run the example below and look at the last row: the customer is still there, and the contract columns are all NULL.
+--- code
+SELECT cu.name, c.id AS contract_id, c.title, c.status
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+ORDER BY cu.id, c.id;
+
+@@ concept
+title: JOIN fan-out: why the total doubled
+--- body
+One contract has many reviews. After `contracts JOIN reviews`, every column of a contract is **copied** onto each of its reviews (this is called fan-out): contract 101 has 12 reviews, so its `pages` (12 pages) shows up 12 times, and `SUM(c.pages)` comes out as 144 instead of 12.
+
+The fix: **aggregate first, then JOIN**. First summarize reviews into "one row per contract", written in parentheses as a temporary table (give it an alias, so you can refer to it later as `rs.contract_id`), then JOIN it with contracts. Both sides have one row per contract, so nothing fans out:
+
+```sql
+JOIN (SELECT contract_id, COUNT(*) AS n
+      FROM reviews
+      GROUP BY contract_id) rs ON rs.contract_id = c.id
+```
+
+When an interviewer asks "why did this total double?", your first thought should be: the JOIN multiplied the rows.
+--- code
+SELECT c.id,
+       c.pages,
+       COUNT(*) AS rows_after_join,
+       SUM(c.pages) AS wrong_pages
+FROM contracts c
+JOIN reviews r ON r.contract_id = c.id
+GROUP BY c.id, c.pages
+ORDER BY c.id;
+
+@@ concept
+title: Subqueries: IN, EXISTS, and a single value
+--- body
+You can put a query inside a query (in parentheses). This is called a **subquery**:
+
+- `WHERE id IN (SELECT contract_id FROM reviews WHERE model = 'deepseek-v4-pro')`: first compute a set of values, then check whether the value is among them
+- `WHERE EXISTS (SELECT 1 FROM ... WHERE ... = a column of the outer query)`: only asks "is there any?", and one row found is enough; `NOT EXISTS` finds "none at all"
+- **Scalar subquery**: a subquery that returns a single value can be used like a number, for example to compute a percentage of the total: `SUM(cost_usd) / (SELECT SUM(cost_usd) FROM reviews)`
+- Trap: if `NOT IN (subquery)` meets even one NULL, it returns no rows at all (yesterday's NULL rules). To find "none", `NOT EXISTS` is safer
+--- code
+SELECT topic,
+       ROUND(SUM(cost_usd), 6) AS cost,
+       ROUND(100.0 * SUM(cost_usd) / (SELECT SUM(cost_usd) FROM reviews), 1) AS pct_of_total
+FROM reviews
+GROUP BY topic
+ORDER BY cost DESC;
+
+@@ concept
+title: CTE: name each step with WITH
+--- body
+Once a query gets long, parentheses inside parentheses become unreadable. `WITH` gives each step a name (a **CTE**, short for common table expression), and you read it from top to bottom, like computing a few intermediate variables first in Python:
+
+```sql
+WITH per_contract AS (
+  SELECT contract_id, COUNT(*) AS reviews
+  FROM reviews
+  GROUP BY contract_id
+)
+SELECT ... FROM per_contract p JOIN contracts c ON c.id = p.contract_id
+```
+
+- You can write several, separated by commas: `WITH a AS (...), b AS (...)`; later ones can use earlier ones
+- A column computed in a CTE (for example `reviews`) is a normal column in the outer query, so you can put it straight into WHERE
+- It is the same thing as the subquery in the "JOIN fan-out" card (in parentheses after FROM / JOIN, with an alias), except that it has a name and comes first. Postgres, BigQuery and SQLite all support it, and it is the first choice for long queries in interviews
+
+The example below is the most typical use of a CTE: two different statistics, each first aggregated into "one row per contract", then JOINed together (connecting all three tables directly and then counting would fan out again).
+--- code
+WITH review_stats AS (
+  SELECT contract_id, COUNT(*) AS reviews
+  FROM reviews
+  GROUP BY contract_id
+),
+tool_stats AS (
+  SELECT r.contract_id, COUNT(*) AS tool_calls
+  FROM tool_calls t
+  JOIN reviews r ON r.id = t.review_id
+  GROUP BY r.contract_id
+)
+SELECT rs.contract_id, rs.reviews, COALESCE(ts.tool_calls, 0) AS tool_calls
+FROM review_stats rs
+LEFT JOIN tool_stats ts ON ts.contract_id = rs.contract_id
+ORDER BY rs.contract_id;
+
+@@ concept
+title: Window functions: every row stays
+--- body
+GROUP BY **squeezes a group of rows into one row**; a window function **keeps every row**, and just adds a column next to each row that says "how this row stands within its group":
+
+```sql
+ROW_NUMBER() OVER (PARTITION BY contract_id ORDER BY cost_usd DESC)
+```
+
+- `PARTITION BY`: what to group by (leave it out and the whole table is one group); `ORDER BY`: how to sort within the group
+- `ROW_NUMBER()`: 1, 2, 3, 4; ties still get different numbers
+- `RANK()`: ties get the same rank, and the numbers after them are skipped: 1, 2, 2, 4
+- `DENSE_RANK()`: ties get the same rank, and nothing is skipped: 1, 2, 2, 3
+- Aggregate functions can take OVER too: `SUM(cost_usd) OVER (PARTITION BY contract_id)` is the total cost of the whole contract, placed next to each row
+
+Window functions are computed only at the SELECT step, so they **can't go in WHERE** (WHERE runs earlier). To filter on one, put it in a CTE first.
+--- code
+SELECT contract_id, clause_id, cost_usd,
+       ROW_NUMBER() OVER (PARTITION BY contract_id ORDER BY cost_usd DESC) AS rn,
+       ROUND(cost_usd / SUM(cost_usd) OVER (PARTITION BY contract_id), 2) AS share_of_contract
+FROM reviews
+WHERE contract_id IN (104, 108)
+ORDER BY contract_id, rn;
+
+@@ concept
+title: The latest row per group
+--- body
+Clause 8.1 of contract 103 was reviewed twice: on August 12 the v1 prompt gave it redline, and on September 18 it was run again with v2 and got flag. Clause 8.1 of contract 109 failed with a 429 the first time, and succeeded when it was run again later. In a report, each clause should count only its **latest** review.
+
+"Take the latest / largest row of each group" is a very common interview question. The recipe has two steps:
+
+1. In a CTE, number each group from newest to oldest: `ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id ORDER BY created_at DESC) AS rn`
+2. In the outer query: `WHERE rn = 1`
+
+`GROUP BY` + `MAX(created_at)` alone only gets you the latest time; to get that row's verdict you would have to JOIN back to the original table. ROW_NUMBER does it in one step. Note: SQLite has a special rule. In `SELECT clause_id, verdict, MAX(created_at) ... GROUP BY clause_id`, the ungrouped `verdict` comes from the row with the largest time, so it gives the right result on this page; but in Postgres and BigQuery this is invalid and fails with an error. Don't write it.
+
+BigQuery has a shorter `QUALIFY`. It can't run on this page (SQLite doesn't support it), so just learn to recognize it (for illustration only):
+
+```sql
+SELECT clause_id, verdict
+FROM `clausecheck.reviews`
+WHERE contract_id = 103
+QUALIFY ROW_NUMBER() OVER (PARTITION BY clause_id ORDER BY created_at DESC) = 1
+```
+--- code
+WITH ranked AS (
+  SELECT id, contract_id, clause_id, verdict, prompt_version, created_at,
+         ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id
+                            ORDER BY created_at DESC) AS rn
+  FROM reviews
+  WHERE clause_id = '8.1'
+)
+SELECT *
+FROM ranked
+ORDER BY contract_id, rn;
+-- add WHERE rn = 1 before the ORDER BY line, then run it again
+
+@@ concept
+title: LAG and running totals
+--- body
+- `LAG(latency_ms) OVER (ORDER BY created_at)`: the value from the **previous row** (the first row has no previous row, so it is NULL); `LEAD` takes the next row. Use it to compute "how much did it change since last time"
+- `SUM(cost_usd) OVER (ORDER BY created_at)`: adds everything from the first row up to the current row, which is a **running total**. A small detail: rows with the same sort value (for example two in the same second) are added in together and get the same running total
+- Add `PARTITION BY contract_id`, and each contract gets its own separate calculation
+
+To summarize by day or by month, first turn the time into a date: in SQLite, `date(created_at)` gives `'2026-09-05'`, and `strftime('%Y-%m', created_at)` gives `'2026-09'`. Postgres writes `created_at::date` and `date_trunc('month', created_at)`; BigQuery writes `DATE(created_at)` and `DATE_TRUNC(DATE(created_at), MONTH)` (Day 25).
+--- code
+SELECT id, clause_id, model, latency_ms,
+       LAG(latency_ms) OVER (ORDER BY created_at) AS prev_ms,
+       latency_ms - LAG(latency_ms) OVER (ORDER BY created_at) AS change_ms,
+       ROUND(SUM(cost_usd) OVER (ORDER BY created_at), 6) AS running_cost
+FROM reviews
+WHERE contract_id = 103
+ORDER BY created_at;
+
+@@ item d23-01
+type: sql
+title: Recap: flaky eval test cases
+level: 1
+ordered: yes
+cards: d22:GROUP BY and HAVING; d22:Aggregates: turn many rows into one number
+--- context
+The evals from Day 13 run the same test case several times, because the model's answer can be different each time. The results are stored in the `evals` table. The test cases that pass some times and fail other times deserve a look first: they show that the prompt isn't stable enough there yet.
+--- prompt
+Review yesterday's GROUP BY and HAVING, and meet the `evals` table on the way: each row is one run of one eval test case (`case_id`) with one prompt version (`prompt_version`); `run` is the run number, and `passed` is 1 (passed) or 0.
+
+Find the "flaky" (unstable) combinations: the same test case with the same version, where the runs did **not all pass**. Three columns: `case_id`, `prompt_version`, `passes` (how many runs passed), sorted by `case_id`, `prompt_version`.
+--- solution
+SELECT case_id, prompt_version, SUM(passed) AS passes
+FROM evals
+GROUP BY case_id, prompt_version
+HAVING SUM(passed) < COUNT(*)
+ORDER BY case_id, prompt_version;
+--- hints
+- Group by two columns: `GROUP BY case_id, prompt_version`.
+- "Not all passed": the number of passes is less than the number of runs, `HAVING SUM(passed) < COUNT(*)` (every group ran 3 times, so `< 3` works too).
+
+@@ item d23-02
+type: sql
+title: Contracts and customers
+level: 1
+cards: JOIN: connect tables
+--- context
+The `contracts` table only stores the customer's number, `customer_id`; the customer's name and country are in the `customers` table. A report that people read has to show the customer's name, not just a number.
+--- prompt
+One row per contract, three columns: `title`, `customer` (the customer's name, `customers.name`), `country` (the customer's country). The rows can be in any order.
+--- starter
+SELECT title
+FROM contracts;
+--- solution
+SELECT c.title, cu.name AS customer, cu.country
+FROM contracts c
+JOIN customers cu ON cu.id = c.customer_id;
+--- hints
+- A contract's `customer_id` equals the customer's `id`: `JOIN customers cu ON cu.id = c.customer_id`.
+- Give both tables an alias, and put the alias in front of column names: `cu.name AS customer`.
+
+@@ item d23-03
+type: sql
+title: Redlines with the customer's name
+level: 2
+ordered: yes
+cards: JOIN: connect tables
+--- context
+Each customer's legal team gets a reminder listing which of their clauses we suggest rewriting. Customers don't know our internal numbers, so the reminder has to use names they recognize: their company name and the contract title.
+--- prompt
+You're sending a reminder to each customer's legal team: list every review whose `verdict` is `redline`, four columns: `customer` (the customer's name), `title` (the contract title), `clause_id`, `heading`. Sort by `customer`, `title`, `clause_id` (sorting `clause_id` as text is fine here).
+--- solution
+SELECT cu.name AS customer, c.title, r.clause_id, r.heading
+FROM reviews r
+JOIN contracts c ON c.id = r.contract_id
+JOIN customers cu ON cu.id = c.customer_id
+WHERE r.verdict = 'redline'
+ORDER BY customer, c.title, r.clause_id;
+--- hints
+- Three tables: start from `reviews r`, first JOIN `contracts c` (`c.id = r.contract_id`), then JOIN `customers cu` (`cu.id = c.customer_id`).
+- Each JOIN needs its own ON; finish with `WHERE r.verdict = 'redline'` and ORDER BY.
+
+@@ item d23-04
+type: sql
+title: Which clause did the tool read?
+level: 2
+ordered: yes
+cards: JOIN: connect tables; d22:WHERE: pick the rows you need
+--- context
+During a review the model calls tools, for example `get_clause` to read another clause of the same contract that this clause refers to. Every call is recorded in the `tool_calls` table. When you investigate how the model behaved, you look at each call together with the review it belongs to.
+--- prompt
+`tool_calls` records the tools called during each review. The argument `args` is a piece of JSON text, for example `'{"clause_id": "12"}'`. SQLite gets the value out with `json_extract(args, '$.clause_id')` (BigQuery writes `JSON_VALUE(args, '$.clause_id')`; Day 24 covers JSON columns in more detail).
+
+List all `get_clause` calls, four columns: `review_id`, `clause_id` (the clause being reviewed, from `reviews`), `requested` (the clause the model wanted to read, from `args`), `ok`. Sort by `review_id`.
+
+When you're done, take a look: in the call that failed, which clause did the model want to read? Does this contract have that clause?
+--- solution
+SELECT t.review_id,
+       r.clause_id,
+       json_extract(t.args, '$.clause_id') AS requested,
+       t.ok
+FROM tool_calls t
+JOIN reviews r ON r.id = t.review_id
+WHERE t.tool = 'get_clause'
+ORDER BY t.review_id;
+--- hints
+- Every tool call belongs to one review: `JOIN reviews r ON r.id = t.review_id`.
+- `json_extract(t.args, '$.clause_id') AS requested`, then add `WHERE t.tool = 'get_clause'`.
+- The failed call (`ok` is 0) wanted clause 99. The tool couldn't find it: the highest clause reviewed in contract 103 is 15.4, so the model most likely made up this cross-reference. In that case `get_clause` in the project's `tools.py` returns `NOT_FOUND` plus the clause numbers that do exist, instead of making up some text for the model. This is exactly what Day 17 meant by "errors are messages for the model".
+
+@@ item d23-05
+type: choice
+title: Counting after a LEFT JOIN
+level: 2
+cards: LEFT JOIN: keep rows without a match; d22:Aggregates: turn many rows into one number
+--- context
+The monthly report lists how many contracts each customer has, and a customer who just signed up and hasn't uploaded a contract yet (Amsterdam Data BV) is in the customers table too. Before you write this kind of statistic, get clear on what the query gives for such a customer.
+--- prompt
+Customer 6, Amsterdam Data BV, has no contracts yet. In the query below, what is `n` in its row? And what if you replace `LEFT JOIN` with `JOIN`?
+--- code
+SELECT cu.name, COUNT(*) AS n
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+GROUP BY cu.id, cu.name;
+--- options
+- With LEFT JOIN, `n` is 1; with JOIN, the row doesn't appear
+- With LEFT JOIN, `n` is 0; with JOIN, `n` is still 0
+- With LEFT JOIN, `n` is NULL; with JOIN, the row doesn't appear
+- `n` is 1 both ways
+answer: 1
+--- explain
+LEFT JOIN keeps this customer, and the right-hand columns are all NULL, but it is still **one row**. `COUNT(*)` counts rows, so it is 1. Only `COUNT(c.id)` (which counts only values that are not NULL) gives 0. JOIN keeps only rows that match on both sides, so a customer without contracts disappears completely. Yet in a report, "customers with 0 contracts" are often the ones most worth attention: they just signed up and haven't really started using it.
+
+@@ item d23-06
+type: sql
+title: How many contracts per customer
+level: 2
+ordered: yes
+cards: LEFT JOIN: keep rows without a match
+--- context
+This is a customer list for the sales team: who uses it a lot, and who signed up but hasn't uploaded a single contract yet. The second kind is the one that most needs someone to follow up.
+--- prompt
+One row per customer, **including customers with no contracts yet**: two columns `name`, `contracts` (the number of contracts). Sort by `contracts` from most to fewest, ties by `name`.
+--- solution
+SELECT cu.name, COUNT(c.id) AS contracts
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+GROUP BY cu.id, cu.name
+ORDER BY contracts DESC, cu.name;
+--- hints
+- Start from `customers cu` and `LEFT JOIN contracts c`; customers without contracts still keep one row.
+- Count with `COUNT(c.id)`, not `COUNT(*)` (see the previous exercise).
+- `GROUP BY cu.id, cu.name`: with the id in the grouping, two customers with the same name are never merged into one group.
+
+@@ item d23-07
+type: sql
+title: Fix the bug: customers missing in September
+level: 2
+ordered: yes
+cards: LEFT JOIN: keep rows without a match
+--- context
+The monthly customer report goes to the sales team: who was very active this month, and who didn't upload a single contract. With two customers missing from the report, it leaves out exactly the people who most need a follow-up.
+--- prompt
+The monthly report lists how many contracts **every** customer uploaded in September (`uploaded_at` on or after `'2026-09-01'`), with 0 for those who uploaded none. The query below returns only 4 customers: Fjord Health AS and Amsterdam Data BV are gone.
+
+Run it and fix it. Two columns `name`, `september`, sorted by `name`.
+--- starter
+SELECT cu.name, COUNT(c.id) AS september
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+WHERE c.uploaded_at >= '2026-09-01'
+GROUP BY cu.id, cu.name
+ORDER BY cu.name;
+--- solution
+SELECT cu.name, COUNT(c.id) AS september
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+                     AND c.uploaded_at >= '2026-09-01'
+GROUP BY cu.id, cu.name
+ORDER BY cu.name;
+--- hints
+- For a customer with no September contracts, `c.uploaded_at` after the LEFT JOIN is NULL (or an August date), and WHERE drops that row.
+- Put the condition on the right-hand table (contracts) in ON: `LEFT JOIN contracts c ON c.customer_id = cu.id AND c.uploaded_at >= '2026-09-01'`.
+
+@@ item d23-08
+type: sql
+title: Fix the bug: the page count is several times too high
+level: 3
+ordered: yes
+cards: JOIN fan-out: why the total doubled; JOIN: connect tables
+--- context
+The customer summary table shows both the total pages of each customer's contracts (to estimate the lawyers' workload) and the number of reviews. This kind of mistake raises no error; the numbers are simply wrong, which is why it slips into reports so easily.
+--- prompt
+One row per customer: the total contract pages `pages` and the number of reviews `reviews`. In the query below the review count is right, but the pages are absurdly high: Nordlys AB's three contracts have 20 pages in total (12 + 6 + 2), but the query says 178.
+
+Run it, find the cause, and fix it. Three columns `name`, `pages`, `reviews`, sorted by `name` (only customers that have contracts).
+
+Note: the database for this exercise has one extra contract, 111 (CloudNotes Inc's `Mutual NDA (Renewal)`, 3 pages, 1 review), so 108 and 111 both have 3 pages.
+--- schema
+INSERT INTO contracts VALUES (111, 4, 'Mutual NDA (Renewal)', '2026-09-20 10:00:00', 3, 'reviewed');
+INSERT INTO reviews VALUES (1066, 111, '6.2', 'Duration of Confidentiality', 'confidentiality', 'redline', 'medium', '["PB-06"]', 'deepseek-v4-flash', 'v2', 2702, 201, 0, 1804, 0.001052, NULL, '2026-09-20 10:02:05');
+--- starter
+SELECT cu.name,
+       SUM(c.pages) AS pages,
+       COUNT(r.id) AS reviews
+FROM customers cu
+JOIN contracts c ON c.customer_id = cu.id
+JOIN reviews r ON r.contract_id = c.id
+GROUP BY cu.id, cu.name
+ORDER BY cu.name;
+--- solution
+SELECT cu.name,
+       SUM(c.pages) AS pages,
+       SUM(rs.n) AS reviews
+FROM customers cu
+JOIN contracts c ON c.customer_id = cu.id
+JOIN (SELECT contract_id, COUNT(*) AS n
+      FROM reviews
+      GROUP BY contract_id) rs ON rs.contract_id = c.id
+GROUP BY cu.id, cu.name
+ORDER BY cu.name;
+--- hints
+- After JOIN reviews, every column of a contract is copied onto each of its reviews: contract 101 has 12 reviews, so its 12 pages are added 12 times (12 × 12 + 6 × 5 + 2 × 2 = 178).
+- Aggregate first, then JOIN: first summarize reviews into one row per contract, `(SELECT contract_id, COUNT(*) AS n FROM reviews GROUP BY contract_id) rs`, then `JOIN ... ON rs.contract_id = c.id`.
+- The review count then has to be `SUM(rs.n)`. Don't try to get away with `SUM(DISTINCT c.pages)`: 108 and 111 both have 3 pages, and DISTINCT would treat them as one.
+
+@@ item d23-09
+type: sql
+title: Contracts that used v4-pro
+level: 2
+cards: Subqueries: IN, EXISTS, and a single value
+--- context
+The `model` column of the `reviews` table records which model each review used. The person in charge wants to know which contracts that rarely used model went to, to check whether switching models was really necessary.
+--- prompt
+Clause Check normally uses the flash model (recorded in the table as `deepseek-v4-flash`), and switches to the larger `deepseek-v4-pro` only for a few high-risk clauses: it is slower, its price per token is much higher, and it also outputs more tokens. Which contracts had reviews that used it? Two columns `id`, `title`; write it with `WHERE id IN (subquery)`, and each contract appears only once. The rows can be in any order.
+--- solution
+SELECT id, title
+FROM contracts
+WHERE id IN (SELECT contract_id
+             FROM reviews
+             WHERE model = 'deepseek-v4-pro');
+--- hints
+- The subquery first computes a set of contract ids: `SELECT contract_id FROM reviews WHERE model = 'deepseek-v4-pro'`.
+- The outer query: `SELECT id, title FROM contracts WHERE id IN (...)`.
+- With a JOIN, contract 103 would appear twice (it has two v4-pro reviews); IN only asks "is it in there?", so nothing is repeated.
+
+@@ item d23-10
+type: sql
+title: Customers who never got a redline
+level: 2
+cards: Subqueries: IN, EXISTS, and a single value
+--- context
+The customer team wants to find customers whose contracts have always been "clean": no clause has ever been suggested for rewriting. Maybe their contracts are just well written, or maybe they haven't used the product much yet. Either way, it's worth finding out.
+--- prompt
+Which customers have **never** received a redline? Customers with no contracts yet count too. Return one column, `name`, and write it with `NOT EXISTS`. The rows can be in any order.
+--- solution
+SELECT cu.name
+FROM customers cu
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM contracts c
+  JOIN reviews r ON r.contract_id = c.id
+  WHERE c.customer_id = cu.id
+    AND r.verdict = 'redline'
+);
+--- hints
+- `NOT EXISTS (subquery)` is true only when the subquery finds no rows at all.
+- In the subquery, JOIN contracts and reviews, connect them to this customer of the outer query with `c.customer_id = cu.id`, then add `r.verdict = 'redline'`.
+- EXISTS only cares whether there are rows, so by habit the subquery says `SELECT 1`.
+
+@@ item d23-11
+type: sql
+title: CTE: contracts that need a person
+level: 2
+ordered: yes
+cards: CTE: name each step with WITH; d22:CASE WHEN: labels and conditional counts
+--- context
+Lawyers look first at the contracts with the most problems: clauses the model didn't accept and reviews that failed all end up needing a person to handle them.
+--- prompt
+Write it in two steps with `WITH`:
+
+1. `per_contract`: one row per contract, `contract_id`, `reviews` (the number of reviews), `attention` (the number that need a person: the verdict is not accept, **failed ones count too**)
+2. The outer query: JOIN `contracts` to get `title`, and keep only contracts where `attention` is at least 2
+
+Return three columns `title`, `reviews`, `attention`, sorted by `attention` from most to fewest, ties by `title`.
+--- solution
+WITH per_contract AS (
+  SELECT contract_id,
+         COUNT(*) AS reviews,
+         SUM(CASE WHEN verdict = 'accept' THEN 0 ELSE 1 END) AS attention
+  FROM reviews
+  GROUP BY contract_id
+)
+SELECT c.title, p.reviews, p.attention
+FROM per_contract p
+JOIN contracts c ON c.id = p.contract_id
+WHERE p.attention >= 2
+ORDER BY p.attention DESC, c.title;
+--- hints
+- "Not accept, and failed ones count too": `SUM(CASE WHEN verdict = 'accept' THEN 0 ELSE 1 END)`. Writing it the other way round, `CASE WHEN verdict <> 'accept' THEN 1 ELSE 0 END`, misses NULL (yesterday's trap).
+- The outer query treats the CTE like a normal table: `FROM per_contract p JOIN contracts c ON c.id = p.contract_id`.
+- `attention`, computed in the CTE, is a normal column in the outer query, so just write `WHERE p.attention >= 2`.
+
+@@ item d23-12
+type: order
+title: Put the code in order: CTE
+level: 2
+cards: CTE: name each step with WITH
+--- context
+Long contracts are cut into many clauses, and lawyers need more time for them. This small table picks out the contracts with many clauses, along with their titles, to help plan who works on what.
+--- prompt
+Put this query in order: first use a CTE to compute the number of reviews of each contract, then get the contract title, keep only contracts with at least 5, most reviews first (ties by title). Two lines are distractors.
+--- lines
+WITH per_contract AS (
+  SELECT contract_id, COUNT(*) AS reviews
+  FROM reviews
+  GROUP BY contract_id
+)
+SELECT c.title, p.reviews
+FROM per_contract p
+JOIN contracts c ON c.id = p.contract_id
+WHERE p.reviews >= 5
+ORDER BY p.reviews DESC, c.title;
+--- distractors
+) AS per_contract
+HAVING p.reviews >= 5
+--- hints
+- How a CTE is written: `WITH name AS (`, then a complete query inside the parentheses, and finally a `)` on its own line. `(...) AS name` is how you write a subquery in FROM; it is not a CTE.
+- The outer query treats `per_contract` as a table: SELECT → FROM → JOIN → WHERE → ORDER BY. The outer query has no GROUP BY, so it uses WHERE, not HAVING.
+
+@@ item d23-13
+type: choice
+title: Three ways to number ties
+level: 2
+cards: Window functions: every row stays
+--- context
+The dashboard ranks topics by how many problems they have, so everyone improves the kind of clause that goes wrong most often first. A few topics have the same number of problems, so first get clear on how their ranks are written.
+--- prompt
+The CTE `topic_problems` is the result of yesterday's fill-in exercise (how many flag + redline each topic has in total). It has 5 rows: liability_cap 7, auto_renewal 4, data_processing 4, payment 4, confidentiality 3. In the query below, what are `rn`, `rnk` and `drnk` for the confidentiality row?
+--- code
+WITH topic_problems AS (
+  SELECT topic, COUNT(*) AS problems
+  FROM reviews
+  WHERE verdict IN ('flag', 'redline')
+  GROUP BY topic
+  HAVING COUNT(*) >= 3
+)
+SELECT topic, problems,
+       ROW_NUMBER() OVER (ORDER BY problems DESC, topic) AS rn,
+       RANK() OVER (ORDER BY problems DESC) AS rnk,
+       DENSE_RANK() OVER (ORDER BY problems DESC) AS drnk
+FROM topic_problems;
+--- options
+- `5, 5, 3`
+- `5, 3, 3`
+- `3, 3, 3`
+- `5, 5, 5`
+answer: 1
+--- explain
+Three topics tie at 4. `ROW_NUMBER` ignores ties and numbers the rows 1 to 5 no matter what, so it is 5; `RANK` puts all three tied topics at rank 2 and skips the numbers after them, so the next one is rank 5; `DENSE_RANK` skips nothing, so the next one is rank 3. How to choose: for "only one row per group" (for example the latest row per group), use `ROW_NUMBER`, which guarantees exactly one 1; for "the top three, ties included", use `RANK` or `DENSE_RANK`.
+
+@@ item d23-14
+type: sql
+title: Rank contracts within each customer
+level: 3
+ordered: yes
+cards: Window functions: every row stays; CTE: name each step with WITH
+--- context
+The account manager wants to know which of a customer's contracts costs the most in model calls, to judge whether the price of the plan the customer bought covers these costs.
+--- prompt
+Rank each customer's contracts by total review cost. Four columns:
+
+- `customer`: the customer's name
+- `contract_id`
+- `cost`: the sum of `cost_usd` over all reviews of this contract, rounded to 6 decimal places
+- `rank_in_customer`: the rank by `cost`, from high to low, among the contracts of **the same customer** (use `RANK()`)
+
+Sort by `customer`, `rank_in_customer`.
+--- solution
+WITH contract_cost AS (
+  SELECT contract_id, ROUND(SUM(cost_usd), 6) AS cost
+  FROM reviews
+  GROUP BY contract_id
+)
+SELECT cu.name AS customer,
+       cc.contract_id,
+       cc.cost,
+       RANK() OVER (PARTITION BY cu.id ORDER BY cc.cost DESC) AS rank_in_customer
+FROM contract_cost cc
+JOIN contracts c ON c.id = cc.contract_id
+JOIN customers cu ON cu.id = c.customer_id
+ORDER BY customer, rank_in_customer;
+--- hints
+- First use a CTE to compute each contract's cost (one row per contract), then JOIN `contracts` and `customers` to get the customer's name.
+- The rank: `RANK() OVER (PARTITION BY cu.id ORDER BY cc.cost DESC)`. PARTITION BY makes each customer's contracts ranked separately.
+- Finally, `ORDER BY customer, rank_in_customer`.
+
+@@ item d23-15
+type: sql
+title: Fix the bug: where the window function goes
+level: 2
+ordered: yes
+cards: The latest row per group; Window functions: every row stays
+--- context
+The same clause may be reviewed several times: run again after a failure, or reviewed again with a new prompt. In the report each clause should appear only once, with the result of its most recent review; otherwise lawyers see verdicts that contradict each other.
+--- prompt
+Clause 8.1 of contract 109 failed on its first review (429) and later succeeded when it was run again; clause 10.1 of contract 106 failed and hasn't been run again yet. The report wants only the **latest** review of each "contract + clause": if it was run again, show the result of the rerun; if not yet, show that failure. A colleague's query fails with the error `misuse of aliased window function rn`.
+
+Run it to see the error, then fix it: return the latest review of each clause of contracts 106 and 109, four columns `contract_id`, `clause_id`, `verdict`, `created_at`, sorted by `contract_id`, `clause_id` (sorting `clause_id` as text is fine).
+--- starter
+SELECT contract_id, clause_id, verdict, created_at,
+       ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id ORDER BY created_at DESC) AS rn
+FROM reviews
+WHERE contract_id IN (106, 109) AND rn = 1
+ORDER BY contract_id, clause_id;
+--- solution
+WITH ranked AS (
+  SELECT contract_id, clause_id, verdict, created_at,
+         ROW_NUMBER() OVER (PARTITION BY contract_id, clause_id ORDER BY created_at DESC) AS rn
+  FROM reviews
+  WHERE contract_id IN (106, 109)
+)
+SELECT contract_id, clause_id, verdict, created_at
+FROM ranked
+WHERE rn = 1
+ORDER BY contract_id, clause_id;
+--- hints
+- Order of execution: WHERE runs before SELECT, and window functions are computed only at the SELECT step, so `rn` doesn't exist yet in WHERE.
+- Put the query with ROW_NUMBER into a CTE, `WITH ranked AS (...)`, and write `WHERE rn = 1` in the outer query.
+- The outer query SELECTs only the four columns; don't bring `rn` along. Simply removing the failed rows with `verdict IS NOT NULL` is wrong: the latest review of 106's 10.1 is the failure, and the report must show it.
+
+@@ item d23-16
+type: fill
+title: Fill in: count only the latest review
+level: 2
+ordered: yes
+cards: The latest row per group
+--- context
+In the report for a customer, each clause should have only one final conclusion. For a clause that was reviewed again, the last review counts; only then do the summary numbers in the report match the clauses the lawyers see.
+--- prompt
+Count only the latest review of each "contract + clause", then count how many there are of each verdict. Once it's filled in, compare it with yesterday's result (accept 37, flag 14, redline 12, NULL 2): which numbers changed? Why?
+--- template
+WITH latest AS (
+  SELECT verdict,
+         ROW_NUMBER() OVER (PARTITION BY [[contract_id, clause_id]]
+                            ORDER BY created_at [[DESC]]) AS rn
+  FROM reviews
+)
+SELECT verdict, COUNT(*) AS n
+FROM latest
+WHERE [[rn = 1]]
+GROUP BY verdict
+ORDER BY n DESC;
+--- hints
+- One group per "contract + clause": PARTITION BY two columns, separated by a comma.
+- The latest has to be number 1: sort by time **from newest to oldest**; keep only the first row of each group: `rn = 1`.
+- The comparison: redline has 1 fewer (the old redline for 103's 8.1 was replaced by the new flag, and that flag was already counted in the 14), and NULL has 1 fewer (109's 8.1 failed, then succeeded when it was run again).
+
+@@ item d23-17
+type: sql
+title: Running cost per day
+level: 3
+ordered: yes
+cards: LAG and running totals; CTE: name each step with WITH
+--- context
+This chart is for keeping an eye on the model-cost budget: you see at a glance which days cost a lot, and whether the running total has gone over the plan.
+--- prompt
+To draw a chart of "cost accumulating over time", you need data like this: one row per day that has reviews, three columns:
+
+- `day`: `date(created_at)`, like `'2026-09-05'`
+- `cost`: the sum of `cost_usd` over all reviews of that day, rounded to 6 decimal places
+- `running_cost`: the cost accumulated from the first day up to that day, rounded to 6 decimal places
+
+Sort by `day`.
+--- solution
+WITH daily AS (
+  SELECT date(created_at) AS day, SUM(cost_usd) AS cost
+  FROM reviews
+  GROUP BY date(created_at)
+)
+SELECT day,
+       ROUND(cost, 6) AS cost,
+       ROUND(SUM(cost) OVER (ORDER BY day), 6) AS running_cost
+FROM daily
+ORDER BY day;
+--- hints
+- Step one (the CTE): `GROUP BY date(created_at)`, one row per day, with that day's total cost.
+- Step two: `SUM(cost) OVER (ORDER BY day)` adds everything from the first day up to the current day.
+- You can also write it without a CTE: `SUM(SUM(cost_usd)) OVER (ORDER BY date(created_at))`, where the inner SUM is each day's total and the outer SUM is the running total. The CTE version is easier to read.
+
+@@ item d23-18
+type: sql
+title: Sudden latency jumps
+level: 3
+ordered: yes
+cards: LAG and running totals
+--- context
+Lawyers wait for review results on the web page, so when a review suddenly takes several seconds longer, they are the first to feel it. Find those reviews first; then you can look for the cause.
+--- prompt
+Find the reviews where the latency suddenly jumped: within **the same contract**, sorted by `created_at`, compare each review with the one before it, and keep those whose `latency_ms` went up by more than 4000 (`> 4000`). Four columns: `id`, `model`, `latency_ms`, `jump_ms` (this review's `latency_ms` minus the previous one's), sorted by `id`.
+
+When you're done, look at the `model` column: can you explain these jumps?
+--- solution
+WITH with_prev AS (
+  SELECT id, model, latency_ms,
+         latency_ms - LAG(latency_ms) OVER (PARTITION BY contract_id ORDER BY created_at) AS jump_ms
+  FROM reviews
+)
+SELECT id, model, latency_ms, jump_ms
+FROM with_prev
+WHERE jump_ms > 4000
+ORDER BY id;
+--- hints
+- The previous review within the same contract: `LAG(latency_ms) OVER (PARTITION BY contract_id ORDER BY created_at)`. The first review of each contract has no previous one, so the result is NULL; `NULL > 4000` is not true, so it is left out automatically.
+- Window functions can't go in WHERE: first compute `jump_ms` in a CTE, then write `WHERE jump_ms > 4000` in the outer query.
+- Don't forget `PARTITION BY contract_id`: without it, the first review of each contract is compared with the last review of **the previous contract**. In this data it happens not to change the result, but the logic is wrong.
+
+@@ item d23-19
+type: sql
+title: v1 and v2 side by side
+level: 3
+ordered: yes
+cards: d22:CASE WHEN: labels and conditional counts
+--- context
+On Day 13 you used evals to compare the v1 and v2 prompts. With both versions in the same row, you can see at a glance whether each test case got better, got worse, or stayed the same.
+--- prompt
+Put v1 and v2 of each test case in `evals` side by side in one row: three columns `case_id`, `v1_passes` (how many of v1's runs passed), `v2_passes`, sorted by `case_id`.
+--- solution
+SELECT case_id,
+       SUM(CASE WHEN prompt_version = 'v1' THEN passed ELSE 0 END) AS v1_passes,
+       SUM(CASE WHEN prompt_version = 'v2' THEN passed ELSE 0 END) AS v2_passes
+FROM evals
+GROUP BY case_id
+ORDER BY case_id;
+--- hints
+- One row per test case: `GROUP BY case_id`. One column per version, using yesterday's "conditional sum": `SUM(CASE WHEN prompt_version = 'v1' THEN passed ELSE 0 END)`.
+- Another way: two CTEs (one for v1, one for v2, each with GROUP BY case_id), then JOIN them on `case_id`. Both are worth knowing for interviews.
+
+@@ item d23-e1
+type: sql
+title: Closed book: the final verdicts for contract 103
+exam: yes
+level: 3
+ordered: yes
+cards: The latest row per group; d22:ORDER BY: sorting and top N
+--- context
+Contract 103 was first reviewed in full with the v1 prompt; later some of its clauses were reviewed again with v2. In the final report for the customer, each clause can have only one conclusion.
+--- prompt
+In the `reviews` table, some clauses of contract 103 were reviewed more than once. For each clause (`clause_id`), keep only the **latest** review (the largest `created_at`), and return three columns `clause_id`, `verdict`, `prompt_version`.
+
+Sort in the **numeric** order of the clause numbers: the numbers are text like `'8.1'` and `'10.3'`, and all of them have only one digit after the dot.
+--- solution
+WITH ranked AS (
+  SELECT clause_id, verdict, prompt_version,
+         ROW_NUMBER() OVER (PARTITION BY clause_id ORDER BY created_at DESC) AS rn
+  FROM reviews
+  WHERE contract_id = 103
+)
+SELECT clause_id, verdict, prompt_version
+FROM ranked
+WHERE rn = 1
+ORDER BY CAST(clause_id AS REAL);
+
+@@ item d23-e2
+type: sql
+title: Closed book: spending per customer
+exam: yes
+level: 3
+ordered: yes
+cards: LEFT JOIN: keep rows without a match; d22:NULL: unknown
+--- context
+At the end of the month, finance wants to see how much model cost each customer generated, and compare it with the plan the customer bought (`plan`), to see which customers' costs are on the high side.
+--- prompt
+Use `customers`, `contracts` (`customer_id` points to the customer) and `reviews` (`contract_id` points to the contract). One row per customer, **including customers with no contracts at all yet**, three columns:
+
+- `name`
+- `reviews`: the number of reviews across all of this customer's contracts, 0 if there are none
+- `total_cost`: the sum of `cost_usd` over these reviews, rounded to 6 decimal places, 0 if there are none
+
+Sort by `total_cost` from high to low, ties by `name`.
+--- solution
+SELECT cu.name,
+       COUNT(r.id) AS reviews,
+       COALESCE(ROUND(SUM(r.cost_usd), 6), 0) AS total_cost
+FROM customers cu
+LEFT JOIN contracts c ON c.customer_id = cu.id
+LEFT JOIN reviews r ON r.contract_id = c.id
+GROUP BY cu.id, cu.name
+ORDER BY total_cost DESC, cu.name;
+
+@@ item d23-e3
+type: sql
+title: Closed book: pass rates of v1 and v2
+exam: yes
+level: 3
+ordered: yes
+cards: CTE: name each step with WITH; d22:CASE WHEN: labels and conditional counts
+--- context
+Deciding whether to switch the live prompt from v1 to v2 depends on how the pass rate of each eval test case changes. Looking only at the totals hides the details: maybe a few test cases got fixed while another one broke.
+--- prompt
+Each row of the `evals` table is one run of one test case (`case_id`) with one prompt version (`prompt_version`, `'v1'` or `'v2'`); `passed` is 1 or 0. One row per test case, four columns:
+
+- `case_id`
+- `v1_rate`: v1's pass rate (passes ÷ runs), rounded to 2 decimal places
+- `v2_rate`: v2's pass rate, rounded to 2 decimal places
+- `diff`: v2's pass rate minus v1's pass rate, **subtracting the rates from before rounding**, then rounded to 2 decimal places
+
+Keep only the test cases whose two versions have **different** pass rates, sorted by `case_id`.
+--- solution
+WITH rates AS (
+  SELECT case_id,
+         AVG(CASE WHEN prompt_version = 'v1' THEN passed END) AS v1,
+         AVG(CASE WHEN prompt_version = 'v2' THEN passed END) AS v2
+  FROM evals
+  GROUP BY case_id
+)
+SELECT case_id,
+       ROUND(v1, 2) AS v1_rate,
+       ROUND(v2, 2) AS v2_rate,
+       ROUND(v2 - v1, 2) AS diff
+FROM rates
+WHERE v1 <> v2
+ORDER BY case_id;

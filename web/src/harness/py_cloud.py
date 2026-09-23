@@ -37,6 +37,13 @@ REGION = "eu-north-1"
 _STATE = {"cloud": None}
 
 
+
+def _tr(zh, en):
+    """The page's language: __main__._CC_LANG is "en" when the page is in English."""
+    import __main__
+    return en if getattr(__main__, "_CC_LANG", "zh") == "en" else zh
+
+
 def _module(name, **attrs):
     mod = _types.ModuleType(name)
     mod.__dict__.update(attrs)
@@ -220,7 +227,7 @@ class _AwsClient:
                 raise AttributeError(f"'{type(mv).__name__}' object has no attribute 'encode'")
         missing = sorted(k for k in kwargs if k not in op.implemented)
         if missing:
-            raise NotImplementedError(f"本页的模拟没有实现 {op.name} 的参数 {', '.join(missing)}（真 SDK 支持）")
+            raise NotImplementedError(_tr(f"本页的模拟没有实现 {op.name} 的参数 {', '.join(missing)}（真 SDK 支持）", f"this page's simulation does not implement the {op.name} parameter(s) {', '.join(missing)} (the real SDK does)"))
 
     def _validate_nested(self, op_name, kwargs):
         return []
@@ -354,7 +361,7 @@ class S3(_AwsClient):
         objects = self._bucket(Bucket, "PutObject")
         if IfNoneMatch is not None:
             if IfNoneMatch != "*":
-                raise NotImplementedError("本页的模拟只支持 IfNoneMatch='*'（对象不存在时才写入）")
+                raise NotImplementedError(_tr("本页的模拟只支持 IfNoneMatch='*'（对象不存在时才写入）", "this page's simulation only supports IfNoneMatch='*' (write only if the object does not exist)"))
             if Key in objects:
                 raise self._error("PreconditionFailed", "At least one of the pre-conditions you specified did not hold", "PutObject", 412, {"Condition": "If-None-Match"})
         data = _as_bytes(Body)
@@ -438,7 +445,7 @@ class S3(_AwsClient):
 
     def get_paginator(self, operation_name):
         if operation_name != "list_objects_v2":
-            raise NotImplementedError(f"本页的模拟只有 list_objects_v2 的分页器，没有 {operation_name}")
+            raise NotImplementedError(_tr(f"本页的模拟只有 list_objects_v2 的分页器，没有 {operation_name}", f"this page's simulation only has a paginator for list_objects_v2, not for {operation_name}"))
         client = self
 
         class _Paginator:
@@ -468,7 +475,7 @@ class S3(_AwsClient):
 
     def generate_presigned_url(self, ClientMethod, Params=None, ExpiresIn=3600, HttpMethod=None):
         if ClientMethod not in ("get_object", "put_object"):
-            raise NotImplementedError("本页的模拟只能为 get_object / put_object 生成预签名 URL")
+            raise NotImplementedError(_tr("本页的模拟只能为 get_object / put_object 生成预签名 URL", "this page's simulation can only presign get_object / put_object"))
         if not 1 <= ExpiresIn <= 604800:
             raise ParamValidationError(report=f"Invalid value for parameter ExpiresIn, value: {ExpiresIn}, valid range: 1-604800")
         self._c.sign()  # presigning signs locally, so it also needs credentials
@@ -665,7 +672,7 @@ class BedrockRuntime(_AwsClient):
         return report
 
     def _invoke_model(self, **kw):
-        raise NotImplementedError("本页的模拟只实现了 converse（统一的对话接口）；invoke_model 的请求体格式随模型而变")
+        raise NotImplementedError(_tr("本页的模拟只实现了 converse（统一的对话接口）；invoke_model 的请求体格式随模型而变", "this page's simulation only implements converse (the unified chat API); invoke_model's body format differs per model"))
 
     def _converse(self, modelId, messages=None, system=None, inferenceConfig=None):
         if not _BEDROCK_MODEL.match(modelId):
@@ -674,7 +681,7 @@ class BedrockRuntime(_AwsClient):
         for i, m in enumerate(messages):
             for b in m["content"]:
                 if "text" not in b:
-                    raise NotImplementedError("本页的模拟 converse 只支持 text 内容块（真 Bedrock 还支持图片、文档、工具调用等）")
+                    raise NotImplementedError(_tr("本页的模拟 converse 只支持 text 内容块（真 Bedrock 还支持图片、文档、工具调用等）", "this page's simulated converse only supports text content blocks (real Bedrock also takes images, documents, tool calls and more)"))
         if not messages or messages[0]["role"] != "user":
             raise self._error("ValidationException", "A conversation must start with a user message. Try again with a conversation that starts with a user message.", "Converse")
         cfg = inferenceConfig or {}
@@ -701,7 +708,7 @@ def _client(service_name, region_name=None, config=None, **kwargs):
     cloud = _cloud()
     cls = _AWS_CLIENTS.get(service_name)
     if cls is None:
-        raise NotImplementedError(f"本页的模拟 boto3 只有 s3、sqs、secretsmanager、bedrock-runtime，没有 {service_name}")
+        raise NotImplementedError(_tr(f"本页的模拟 boto3 只有 s3、sqs、secretsmanager、bedrock-runtime，没有 {service_name}", f"this page's simulated boto3 only has s3, sqs, secretsmanager and bedrock-runtime, not {service_name}"))
     region = region_name or (config.region_name if config else None) or cloud.aws_region
     if region is None:
         if service_name != "s3":
@@ -719,7 +726,7 @@ class Session:
 
 
 def _resource(*a, **kw):
-    raise NotImplementedError("本页的模拟只有 boto3.client(...)，没有 boto3.resource(...)（AWS 已经不再给 resource 接口加新功能）")
+    raise NotImplementedError(_tr("本页的模拟只有 boto3.client(...)，没有 boto3.resource(...)（AWS 已经不再给 resource 接口加新功能）", "this page's simulation only has boto3.client(...), not boto3.resource(...) (AWS no longer adds features to the resource interface)"))
 
 
 # ======================================================================== Google: api_core exceptions
@@ -1018,7 +1025,7 @@ class _StorageClient:
         bucket = bucket_or_name if isinstance(bucket_or_name, Bucket) else Bucket(self, bucket_or_name)
         unsupported = {k: v for k, v in kwargs.items() if v is not None and k in ("start_offset", "end_offset", "include_trailing_delimiter", "versions", "projection", "fields", "match_glob")}
         if unsupported or page_token is not None:
-            raise NotImplementedError(f"本页的模拟 list_blobs 不支持 {sorted(list(unsupported) + (['page_token'] if page_token else []))}")
+            raise NotImplementedError(_tr(f"本页的模拟 list_blobs 不支持 {sorted(list(unsupported) + (['page_token'] if page_token else []))}", f"this page's simulated list_blobs does not support {sorted(list(unsupported) + (['page_token'] if page_token else []))}"))
         return _BlobIterator(self, bucket, prefix, delimiter, max_results)
 
 
@@ -1053,9 +1060,9 @@ class QueryJobConfig:
             if name not in self._KNOWN:
                 raise AttributeError(f"Property {name} is unknown for {type(self)}.")
             if name not in self._IMPLEMENTED and value is not None:
-                raise NotImplementedError(f"本页的模拟不支持 QueryJobConfig 的 {name}（真 SDK 支持）")
+                raise NotImplementedError(_tr(f"本页的模拟不支持 QueryJobConfig 的 {name}（真 SDK 支持）", f"this page's simulation does not support QueryJobConfig.{name} (the real SDK does)"))
             if name == "use_legacy_sql" and value:
-                raise NotImplementedError("本页只有 GoogleSQL（标准 SQL），不支持 legacy SQL")
+                raise NotImplementedError(_tr("本页只有 GoogleSQL（标准 SQL），不支持 legacy SQL", "this page only has GoogleSQL (standard SQL), not legacy SQL"))
         object.__setattr__(self, name, value)
 
 
@@ -1134,7 +1141,7 @@ class RowIterator:
         return iter(self._rows)
 
     def to_dataframe(self, *a, **kw):
-        raise NotImplementedError("to_dataframe() 需要 pandas，本页没有；在本机 pip install 'google-cloud-bigquery[pandas]' 后可以用")
+        raise NotImplementedError(_tr("to_dataframe() 需要 pandas，本页没有；在本机 pip install 'google-cloud-bigquery[pandas]' 后可以用", "to_dataframe() needs pandas, which this page does not have; on your own computer, pip install 'google-cloud-bigquery[pandas]'"))
 
 
 _TS = _re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
@@ -1518,7 +1525,7 @@ class GenerateContentConfig:
             if field not in _GEN_FIELDS:
                 raise ValidationError(f"1 validation error for GenerateContentConfig\n{k}\n  Extra inputs are not permitted [type=extra_forbidden, input_value={v!r}, input_type={type(v).__name__}]")
             if field not in _GEN_IMPLEMENTED and v is not None:
-                raise NotImplementedError(f"本页的模拟不支持 GenerateContentConfig 的 {field}（真 SDK 支持）")
+                raise NotImplementedError(_tr(f"本页的模拟不支持 GenerateContentConfig 的 {field}（真 SDK 支持）", f"this page's simulation does not support GenerateContentConfig.{field} (the real SDK does)"))
             values[field] = v
         for f in _GEN_FIELDS:
             object.__setattr__(self, f, values.get(f))
@@ -1541,7 +1548,7 @@ class _Models:
         elif isinstance(contents, list) and all(isinstance(x, str) for x in contents):
             text = " ".join(contents)
         else:
-            raise NotImplementedError("本页的模拟 generate_content 只接受字符串（或字符串列表）作为 contents")
+            raise NotImplementedError(_tr("本页的模拟 generate_content 只接受字符串（或字符串列表）作为 contents", "this page's simulated generate_content only takes a string (or a list of strings) as contents"))
         system = config.system_instruction if isinstance(config.system_instruction, str) else ""
         reply = _json.dumps(_judge(text)) if config.response_mime_type == "application/json" else "Mock Gemini reply: " + text[:60]
         out, finish = len(reply) // 4 + 2, "STOP"
@@ -1677,7 +1684,7 @@ class _Cloud:
                 raise BadRequest(f"Query parameter '{name}' not found at [1:1]")
         for p in config.query_parameters:
             if not isinstance(p, ScalarQueryParameter):
-                raise NotImplementedError("本页的模拟只支持 ScalarQueryParameter")
+                raise NotImplementedError(_tr("本页的模拟只支持 ScalarQueryParameter", "this page's simulation only supports ScalarQueryParameter"))
             if str(p.type_).upper() not in ScalarQueryParameter._TYPES:
                 raise BadRequest(f"Invalid query parameter type: {p.type_}")
         tables = self._sql.table_names(self.db)

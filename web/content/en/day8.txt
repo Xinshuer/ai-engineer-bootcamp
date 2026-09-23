@@ -1,0 +1,1015 @@
+@@ day 8
+title: Functions and data modeling: tuples, sets, dataclass
+lang: py
+hours: 4–5 hours
+--- goal
+Use tuples, sets and dataclasses to keep clause data tidy; use `enumerate`, `zip`, comprehensions, `Counter` and multi-key sorting to write data code that is short and correct; read `*args` / `**kwargs` in other people's code. These patterns are all over Clause Check: in `pipeline.py` (`summarise`), `split.py` (sorting by clause number) and `config.py` (`Settings` is a dataclass).
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change something in each one before you run it
+- Pass every practice exercise
+- The 3 closed-book challenges
+- Open `summarise` in `clausecheck/pipeline.py`: how many items are in the tuple its sort key returns? The last item is the clause number as a string: could it run into today's "10.1 sorts before 8.1" problem? Compare it with `_sort_key` in `split.py` and think it through
+
+@@ concept
+title: Tuples and unpacking
+--- body
+A tuple `("8.1", "flag")` is like a **small list you can't change**. Use it for "a fixed few things that always go together": a clause number and its verdict, a result and its reason.
+
+- **Unpacking**: `cid, verdict = pair`; the number of variables on the left must match the length of the tuple
+- A function that "returns two values" really returns one tuple: `return ok, reason`, and the caller writes `ok, reason = check(...)`
+- `a, b = b, a` swaps two variables in one line
+- You have been unpacking for a while already: in `for k, v in d.items():` each step gives you a `(key, value)` tuple
+
+A common mistake is trying to change an element of a tuple: `pair[1] = "accept"` raises `TypeError`. To change it, build a new tuple.
+--- code
+pair = ("8.1", "flag")
+cid, verdict = pair
+print(cid, verdict, len(pair))
+
+def check(verdict):
+    if verdict in ("accept", "flag", "redline"):
+        return True, ""
+    return False, f"unknown verdict: {verdict}"
+
+ok, reason = check("maybe")
+print(ok, reason)
+print(check("flag"))
+
+first, second = "8.1", "3.1"
+first, second = second, first
+print(first, second)
+
+try:
+    pair[1] = "accept"
+except TypeError as e:
+    print("TypeError:", e)
+
+@@ concept
+title: enumerate and zip
+--- body
+- `enumerate(xs)` gives you an `(index, element)` pair each time; `enumerate(xs, 1)` starts counting at 1. Clause Check's `pipeline.py` has exactly `for i, clause in enumerate(clauses, 1):`, used to show "clause i of n". From now on you don't need `for i in range(len(xs))` any more
+- `zip(a, b)` **pairs up two lists by position**: `zip(["8.1", "3.1"], ["flag", "accept"])` gives `("8.1", "flag")`, then `("3.1", "accept")`
+- `dict(zip(ids, verdicts))` pairs them into a dictionary in one step
+
+Trap: when the two lists have different lengths, `zip` **stops as soon as the shorter one runs out**. The extra items are silently dropped, with no error.
+--- code
+ids = ["8.1", "3.1", "10.1"]
+verdicts = ["flag", "accept", "redline"]
+
+for i, cid in enumerate(ids, 1):
+    print(f"{i}/{len(ids)} reviewing {cid}")
+
+for cid, v in zip(ids, verdicts):
+    print(cid, "->", v)
+
+print(dict(zip(ids, verdicts)))
+print(list(zip(ids, ["flag"])))
+
+@@ concept
+title: The set type
+--- body
+A set `{"PB-01", "PB-03"}` is a collection of elements with **no duplicates and no order**. It is best at two things:
+
+- **Removing duplicates**: `set(["PB-01", "PB-01", "PB-03"])` leaves just two; `s.add(x)` adds one element
+- **Checking membership**: `"PB-03" in rules` is fast, however big the set is
+
+Operations between sets match "rule checks" exactly:
+
+- `required - cited`: required but not cited (which ones are missing)
+- `required & cited`: in both
+- `required | cited`: everything from both together
+
+Two traps: an empty set is written `set()`, because `{}` is an empty **dictionary**; and a set has no order, so when you need stable output, turn it into a sorted list with `sorted(the_set)`.
+--- code
+required = {"PB-01", "PB-03", "PB-07"}
+cited = set(["PB-03", "PB-03", "PB-09"])
+print(len(cited))
+print(sorted(required - cited))
+print(sorted(required & cited))
+print(sorted(required | cited))
+print("PB-07" in required)
+
+seen = set()
+for rid in ["PB-02", "PB-01", "PB-02"]:
+    seen.add(rid)
+print(sorted(seen))
+print(type(set()).__name__, type({}).__name__)
+
+@@ concept
+title: More on dictionaries: comprehensions, Counter, defaultdict
+--- body
+- **Dictionary comprehension**: `{r["id"]: r["verdict"] for r in reviews}`. It works like a list comprehension, only written as `key: value`
+- **Counter**: a dictionary made for counting. `Counter(a_list)` does Day 2's counting loop in one line; `.most_common(2)` returns the two most common `(value, count)` pairs; looking up a missing key returns 0 instead of raising an error
+- **defaultdict(list)**: when you look up a key that isn't there, it first puts an empty list there for you, so grouping no longer needs `if key not in groups`. `evals/run_evals.py` uses `defaultdict(list)` to collect the results of each test case
+
+Both need an import first: `from collections import Counter, defaultdict`.
+
+Trap: a defaultdict adds a missing key even when you only **read** it. Before you hand it to other code, turn it into a plain dictionary with `dict(groups)`.
+--- code
+from collections import Counter, defaultdict
+
+reviews = [
+    {"id": "3.1", "topic": "payment", "verdict": "accept"},
+    {"id": "8.1", "topic": "liability_cap", "verdict": "flag"},
+    {"id": "3.2", "topic": "payment", "verdict": "flag"},
+]
+print({r["id"]: r["verdict"] for r in reviews})
+
+counts = Counter([r["verdict"] for r in reviews])
+print(counts)
+print(counts.most_common(1), counts["redline"])
+
+groups = defaultdict(list)
+for r in reviews:
+    groups[r["topic"]].append(r["id"])
+print(dict(groups))
+print(groups["termination"], len(groups))
+
+@@ concept
+title: any and all
+--- body
+- `any(...)`: True if **at least one** is true. "Did any clause get a redline?"
+- `all(...)`: True only if **all of them** are true. "Are all the verdicts valid?"
+
+Inside the parentheses you usually write a **comprehension without the square brackets** (called a generator expression):
+
+```python
+any(r["verdict"] == "redline" for r in reviews)
+```
+
+It doesn't build a whole list first: it checks as it goes and stops as soon as it knows the answer. You can write the same thing inside `sum(...)`, `max(...)` and `Counter(...)`. `evals/harness.py` has the line `any(t.startswith(prefix) for t in ...)`.
+
+Remember the edge cases: `any([])` is False, and `all([])` is **True** (there is no counterexample, so "all valid" holds). If an empty list means something went wrong in your program, check for it separately.
+--- code
+reviews = [{"id": "3.1", "verdict": "accept"}, {"id": "8.1", "verdict": "redline"}]
+print(any(r["verdict"] == "redline" for r in reviews))
+print(all(r["verdict"] in ("accept", "flag", "redline") for r in reviews))
+print(sum(1 for r in reviews if r["verdict"] != "accept"))
+print(any([]), all([]))
+
+@@ concept
+title: Sorting by several keys
+--- body
+The order a lawyer wants often has more than one condition: "by risk from high to low first, and by clause number when the risk is the same". The trick is to make `key` return a **tuple**. Python compares tuples item by item: the first items first, and only when those are equal, the second:
+
+```python
+RISK = {"high": 0, "medium": 1, "low": 2}
+sorted(reviews, key=lambda r: (RISK[r["risk"]], r["id"]))
+```
+
+- `reverse=True` flips the whole order; to sort one item descending and another ascending, negate the number: `key=lambda r: (-r["tokens"], r["id"])`
+- `max(xs, key=...)` finds the "largest" element, and `min` works the same way; add `default=None` when the list may be empty
+
+The clause-number trap: strings are compared one character at a time, so `"10.1" < "8.1"` (because `"1" < "8"`). To sort by clause number, first turn it into a tuple of numbers: `"10.1"` → `(10, 1)`. That is exactly what `_sort_key` in Clause Check's `split.py` does.
+--- code
+RISK = {"high": 0, "medium": 1, "low": 2}
+reviews = [
+    {"id": "10.1", "risk": "high", "tokens": 900},
+    {"id": "3.1", "risk": "low", "tokens": 300},
+    {"id": "8.1", "risk": "high", "tokens": 1200},
+]
+print(sorted(["10.1", "8.1", "3.1"]))
+
+def id_key(cid):
+    return tuple(int(x) for x in cid.split("."))
+
+print(id_key("10.1"), sorted(["10.1", "8.1", "3.1"], key=id_key))
+for r in sorted(reviews, key=lambda r: (RISK[r["risk"]], id_key(r["id"]))):
+    print(r["risk"], r["id"])
+print(max(reviews, key=lambda r: r["tokens"])["id"])
+print(max([], key=len, default=None))
+
+@@ concept
+title: dataclass: classes that only hold data
+--- body
+On Day 3, writing a class meant writing `__init__` by hand, one `self.x = x` line after another. When a class mostly holds data, `@dataclass` has Python write that for you:
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Clause:
+    id: str
+    text: str
+    risk: str = "low"
+    tags: list[str] = field(default_factory=list)
+```
+
+You get these for free: `__init__` (`Clause("8.1", "...")`), readable printing `Clause(id='8.1', ...)`, and an `==` that compares field by field. You write methods as usual. `asdict(c)` turns it into a dictionary (handy for writing JSON).
+
+- **Mutable** defaults such as lists and dictionaries must be written `field(default_factory=list)`, so every object gets its own new one; writing `= []` raises an error straight away. Plain functions have the same trap with `def f(tags=[])`; you'll meet it in the exercises
+- A dataclass **does no validation**: `Clause(8.1, None)` is created without complaint
+--- code
+from dataclasses import dataclass, field, asdict
+
+@dataclass
+class Clause:
+    id: str
+    text: str
+    risk: str = "low"
+    tags: list[str] = field(default_factory=list)
+
+    def is_high(self) -> bool:
+        return self.risk == "high"
+
+a = Clause("8.1", "Liability is unlimited.", "high")
+b = Clause("3.1", "Fees are due in 30 days.")
+print(a)
+print(a.is_high(), b.is_high())
+b.tags.append("payment")
+print(b.tags, a.tags)
+print(a == Clause("8.1", "Liability is unlimited.", "high"))
+print(asdict(b))
+
+@@ concept
+title: *args, **kwargs, and keyword-only parameters
+--- body
+When you read other people's code (Clause Check included), you often see stars in front of parameters:
+
+- In a definition, `def log(event, *args, **kwargs):` collects extra **positional arguments** into the tuple `args`, and extra **keyword arguments** into the dictionary `kwargs`
+- In a call, `f(**d)` unpacks a dictionary into keyword arguments. Day 4's `tools[name](**args)` is exactly this; so is `Settings(**kw)` in `run_evals.py`; and `_create(self, **kwargs)` in `review.py` passes the arguments it receives on, unchanged, to `client.messages.create(**kwargs)`
+- `def review(clause_id, *, strict=False):` has a lone `*` in the middle, which means the parameters after it **can only be passed by name**: `review("8.1", strict=True)` works, `review("8.1", True)` raises `TypeError`. That way, anyone reading the call sees at once what that `True` means
+
+When you write your own functions and can list the parameters, don't use `**kwargs`: it lets misspelled parameter names slip through silently.
+--- code
+def log(event, *args, **kwargs):
+    print(event, args, kwargs)
+
+log("review")
+log("review", "8.1", "flag", risk="high", ms=120)
+
+def review(clause_id, *, strict=False):
+    return f"{clause_id} strict={strict}"
+
+options = {"strict": True}
+print(review("8.1"), "|", review("8.1", **options))
+try:
+    review("8.1", True)
+except TypeError as e:
+    print("TypeError:", e)
+
+@@ item d8-01
+type: code
+title: Recap: count by risk
+level: 1
+cards: d2:The standard way to count; More on dictionaries: comprehensions, Counter, defaultdict
+--- context
+The report summary has a line like "2 high risk, 1 low risk". Lawyers use these numbers to estimate how long the contract will take them to read.
+--- prompt
+A warm-up first, going over Day 2's counting pattern. Write `count_by_risk(reviews)`: `reviews` is a list of dictionaries, each with a `"risk"` key. Return how many times each risk level appears.
+
+```python
+count_by_risk([{"id": "8.1", "risk": "high"}, {"id": "3.1", "risk": "low"}, {"id": "10.1", "risk": "high"}])
+# → {"high": 2, "low": 1}
+```
+
+Later today you'll learn a way to do this in one line.
+--- starter
+def count_by_risk(reviews):
+    pass
+--- solution
+def count_by_risk(reviews):
+    counts = {}
+    for r in reviews:
+        counts[r["risk"]] = counts.get(r["risk"], 0) + 1
+    return counts
+--- tests
+DATA = [{"id": "8.1", "risk": "high"}, {"id": "3.1", "risk": "low"}, {"id": "10.1", "risk": "high"}]
+expect("two risk levels", lambda: count_by_risk(DATA), {"high": 2, "low": 1})
+expect("just one clause", lambda: count_by_risk([{"id": "4.2", "risk": "medium"}]), {"medium": 1})
+expect("empty list", lambda: count_by_risk([]), {})
+--- hints
+- `counts = {}` before the loop, update it inside the loop, `return counts` after the loop.
+- The update line: `counts[r["risk"]] = counts.get(r["risk"], 0) + 1`.
+
+@@ item d8-02
+type: predict
+title: Recap: sorted and key
+level: 1
+cards: d2:Sorting and while; Sorting by several keys
+--- context
+The report puts high-risk clauses first, but other parts of the program still use the original list, in contract order.
+--- prompt
+Write the output. Look at the last line: did `sorted` change the original list?
+--- code
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+reviews = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "4.2", "risk": "medium"},
+    {"id": "9.1", "risk": "high"},
+]
+ordered = sorted(reviews, key=lambda r: RISK_ORDER[r["risk"]])
+print([r["id"] for r in ordered])
+print(sorted(["b", "a", "c"], reverse=True))
+print(reviews[0]["id"])
+--- explain
+`sorted` returns a **new** list and leaves the original `reviews` unchanged, so its first element is still `3.1`. It is a stable sort: `8.1` and `9.1` are both high, so they keep their original order.
+
+@@ item d8-03
+type: predict
+title: Unpacking, enumerate and zip
+level: 1
+cards: Tuples and unpacking; enumerate and zip
+--- context
+Clause numbers and the model's verdicts often sit in two separate lists and have to be matched up by position; the report also shows where each clause is in the list ("clause 1", "clause 2", …).
+--- prompt
+Write the output. Pay special attention to what `zip` does when the two lists have different lengths.
+--- code
+pair = ("8.1", "flag")
+cid, verdict = pair
+print(verdict, cid)
+
+ids = ["3.1", "8.1", "10.1"]
+verdicts = ["accept", "flag"]
+for i, cid in enumerate(ids, 1):
+    print(i, cid)
+print(list(zip(ids, verdicts)))
+print(dict(zip(ids, verdicts)))
+--- explain
+`enumerate(ids, 1)` starts counting at 1. `zip` stops when the shorter list runs out, so `10.1` is **silently dropped**, with no error at all. In Clause Check, if the model returned one verdict too few, pairing them like this would make a clause vanish without a trace, so in an exercise coming up you check the lengths yourself.
+
+@@ item d8-04
+type: code
+title: Return two values
+level: 1
+cards: Tuples and unpacking
+--- context
+The model's verdict has to be checked first: is it a valid one? Knowing that it is invalid isn't enough; you also need to say why. The reason can go into the report, or back to the model so it can correct itself.
+--- prompt
+Write `check_verdict(verdict)`:
+
+- valid (one of `accept` / `flag` / `redline`): return `(True, "")`
+- otherwise: return `(False, "unknown verdict: " + verdict)`
+
+```python
+ok, reason = check_verdict("maybe")
+# ok → False, reason → "unknown verdict: maybe"
+```
+
+With this "result + reason" pattern, the caller gets both things out in one line by unpacking.
+--- starter
+VALID = ("accept", "flag", "redline")
+
+def check_verdict(verdict):
+    pass
+--- solution
+VALID = ("accept", "flag", "redline")
+
+def check_verdict(verdict):
+    if verdict in VALID:
+        return True, ""
+    return False, f"unknown verdict: {verdict}"
+--- tests
+expect("valid", lambda: check_verdict("flag"), (True, ""))
+expect("invalid", lambda: check_verdict("maybe"), (False, "unknown verdict: maybe"))
+expect("uppercase is invalid too", lambda: check_verdict("FLAG"), (False, "unknown verdict: FLAG"))
+def _unpack():
+    ok, reason = check_verdict("redline")
+    return ok
+expect("can be unpacked", _unpack, True)
+--- hints
+- Put a comma between the two values: `return True, ""`, and Python packs them into a tuple.
+- First check `verdict in VALID`: if it is, return `(True, "")`; if not, return `False` and the reason built with an f-string.
+
+@@ item d8-05
+type: code
+title: A numbered list
+level: 1
+cards: enumerate and zip
+--- context
+Lawyers print the to-do list for meetings, and people say "look at number 3", so every line needs a number in front. The real project's `pipeline.py` shows review progress as "clause i of n" the same way.
+--- prompt
+The lawyer wants a numbered list. Write `numbered(ids)`: return a list of strings, each one `"position. clause number"`, with positions starting at 1.
+
+`numbered(["8.1", "10.1"])` → `["1. 8.1", "2. 10.1"]`
+
+Use `enumerate`; don't keep a counter variable yourself.
+--- starter
+def numbered(ids):
+    result = []
+    return result
+--- solution
+def numbered(ids):
+    return [f"{i}. {cid}" for i, cid in enumerate(ids, 1)]
+--- tests
+expect("two clauses", lambda: numbered(["8.1", "10.1"]), ["1. 8.1", "2. 10.1"])
+expect("one clause", lambda: numbered(["12"]), ["1. 12"])
+expect("empty", lambda: numbered([]), [])
+--- hints
+- `for i, cid in enumerate(ids, 1):`; the second argument, 1, means start counting at 1.
+- Each item is `f"{i}. {cid}"`. You can also write it as a one-line comprehension.
+
+@@ item d8-06
+type: code
+title: Pair two lists into a dictionary
+level: 2
+cards: enumerate and zip; d3:raise: report an error on purpose
+--- context
+Suppose the model reviews a batch of clauses at once and returns a list of verdicts in order. If a single one is missing, every clause number after it is paired with the wrong verdict: the report pins a flag on the wrong clause, and nobody notices.
+--- prompt
+The model returned a list of verdicts in order, and they must be paired one to one with the clause numbers. Write `verdict_map(ids, verdicts)` that returns `{clause number: verdict}`.
+
+`verdict_map(["8.1", "3.1"], ["flag", "accept"])` → `{"8.1": "flag", "3.1": "accept"}`
+
+If the two lists have different lengths, something went wrong (a clause was skipped?). Then you must not silently drop data the way `zip` does; instead, `raise ValueError(f"length mismatch: {len(ids)} ids, {len(verdicts)} verdicts")`.
+
+(Since Python 3.10, `zip(..., strict=True)` also raises an error when the lengths differ, but here you have to write the clear error message above yourself.)
+--- starter
+def verdict_map(ids, verdicts):
+    return dict(zip(ids, verdicts))
+--- solution
+def verdict_map(ids, verdicts):
+    if len(ids) != len(verdicts):
+        raise ValueError(f"length mismatch: {len(ids)} ids, {len(verdicts)} verdicts")
+    return dict(zip(ids, verdicts))
+--- tests
+expect("two clauses", lambda: verdict_map(["8.1", "3.1"], ["flag", "accept"]), {"8.1": "flag", "3.1": "accept"})
+expect("empty", lambda: verdict_map([], []), {})
+expect_raises("one verdict missing", lambda: verdict_map(["8.1", "3.1"], ["flag"]), ValueError)
+def _message():
+    try:
+        verdict_map(["8.1"], ["flag", "accept"])
+    except ValueError as e:
+        return str(e)
+expect("error message", _message, "length mismatch: 1 ids, 2 verdicts")
+--- hints
+- The starter code is already right when the lengths match. What's missing: raise an error when they differ.
+- Before the `return`, add `if len(ids) != len(verdicts):` with `raise ValueError(...)` inside it.
+
+@@ item d8-07
+type: predict
+title: Set operations
+level: 2
+cards: The set type
+--- context
+The model's answer lists the IDs of the playbook rules it relied on (`rule_ids` in the real project), sometimes repeating the same one. The review compares them with the rules this kind of clause should rely on.
+--- prompt
+Write the output. Every set is turned into a sorted list with `sorted`, so the output order is fixed.
+--- code
+required = {"PB-01", "PB-03", "PB-07"}
+cited = ["PB-03", "PB-09", "PB-03"]
+cited_set = set(cited)
+print(len(cited), len(cited_set))
+print(sorted(required - cited_set))
+print(sorted(cited_set - required))
+print(sorted(required & cited_set))
+print("PB-01" in required, "PB-01" in cited_set)
+print(type({}).__name__)
+--- explain
+`-` has a direction: `required - cited_set` is "required but not cited", and `cited_set - required` is "cited but not required" (the model may have made a rule up). `{}` is an empty dictionary; an empty set is written `set()`.
+
+@@ item d8-08
+type: code
+title: Which rules were missed
+level: 2
+cards: The set type
+--- context
+If the model judges a liability clause without citing the playbook rule on liability caps, it may have reached its conclusion without checking the rules. Once the missed rules are found, the report can remind the lawyer to double-check that clause.
+--- prompt
+The playbook says this kind of clause must rely on certain rules (`required`), and the model's answer cites some rules (`cited`). Both are lists and may contain duplicates.
+
+Write `missing_rules(required, cited)`: return the rule IDs that are "required but not cited", as a list **with no duplicates, sorted**.
+
+`missing_rules(["PB-01", "PB-03"], ["PB-03", "PB-03"])` → `["PB-01"]`
+--- starter
+def missing_rules(required, cited):
+    pass
+--- solution
+def missing_rules(required, cited):
+    return sorted(set(required) - set(cited))
+--- tests
+expect("one missed", lambda: missing_rules(["PB-01", "PB-03"], ["PB-03", "PB-03"]), ["PB-01"])
+expect("all cited", lambda: missing_rules(["PB-01", "PB-03"], ["PB-03", "PB-01", "PB-09"]), [])
+expect("none cited, result sorted", lambda: missing_rules(["PB-07", "PB-01"], []), ["PB-01", "PB-07"])
+expect("duplicates in required", lambda: missing_rules(["PB-02", "PB-02"], []), ["PB-02"])
+--- hints
+- First turn both lists into sets: `set(required)`, `set(cited)`.
+- Subtracting one set from another gives the elements "in the first, not in the second"; finally `sorted(...)` turns them into a list.
+
+@@ item d8-09
+type: choice
+title: Tuple, list, set or dictionary
+level: 1
+cards: The set type; Tuples and unpacking; d2:Dictionaries: look up values by name
+--- context
+Picking the right container before you write the code makes everything after it much simpler. The four situations below all involve data you meet when reviewing contracts.
+--- prompt
+Which of these four situations is the best fit for a **set**?
+--- options
+- Keep all the clauses of a contract in their original order, and later get clause 3 by its index
+- A function returns two values at once: "is it valid" and "the reason"
+- Record the rule IDs already checked in one review: you often ask "has this one been checked?", and a duplicate counts only once
+- Store each clause's verdict so you can look it up by clause number
+answer: 3
+--- explain
+A set's two strengths are removing duplicates and a very fast `in`. For order and indexes, use a list; for a fixed few things that go together, a tuple; for looking up values by key, a dictionary. A set has no order, so you can't write `s[0]`.
+
+@@ item d8-10
+type: fill
+title: Fill in: dictionary comprehension
+level: 1
+cards: More on dictionaries: comprehensions, Counter, defaultdict; enumerate and zip
+--- context
+The "to do" part of the report lists only the clauses that need a person to look at them, and the lawyer looks up each one's verdict by clause number.
+--- prompt
+Complete `attention_map(ids, verdicts)`: pair the clause numbers with the verdicts using `zip`, keep only the ones that are not `accept`, and return `{clause number: verdict}`.
+
+`attention_map(["3.1", "8.1"], ["accept", "flag"])` → `{"8.1": "flag"}`
+--- template
+def attention_map(ids, verdicts):
+    return {[[cid]]: v for cid, v in [[zip]](ids, verdicts) if v [[!=]] "accept"}
+--- tests
+expect("keeps only the ones to look at", lambda: attention_map(["3.1", "8.1", "10.1"], ["accept", "flag", "redline"]), {"8.1": "flag", "10.1": "redline"})
+expect("all accept", lambda: attention_map(["3.1"], ["accept"]), {})
+--- hints
+- The shape of a dictionary comprehension: `{key: value for ... in ... if condition}`. The key is the clause number.
+- Which function pairs up two lists by position?
+
+@@ item d8-11
+type: code
+title: Grouping with defaultdict
+level: 2
+cards: More on dictionaries: comprehensions, Counter, defaultdict
+--- context
+Lawyers like to read a contract by topic: the payment clauses together, the liability clauses together. The topic comes from the `topic` the model gives with its verdict (`Topic` in the real project's `models.py`).
+--- prompt
+Rewrite Day 2's grouping with `defaultdict(list)`. Write `group_by_topic(reviews)`: return `{topic: [clause number, ...]}`, keeping the clause numbers in their original order.
+
+```python
+group_by_topic([
+    {"id": "3.1", "topic": "payment"},
+    {"id": "8.1", "topic": "liability_cap"},
+    {"id": "3.2", "topic": "payment"},
+])
+# → {"payment": ["3.1", "3.2"], "liability_cap": ["8.1"]}
+```
+
+Turn it into a **plain `dict`** before you return it (the tests check the type): if you hand out the defaultdict, a caller who looks up a topic that doesn't exist gets no error but silently gains an empty list, and the bug stays hidden.
+--- starter
+from collections import defaultdict
+
+def group_by_topic(reviews):
+    groups = defaultdict(list)
+    return groups
+--- solution
+from collections import defaultdict
+
+def group_by_topic(reviews):
+    groups = defaultdict(list)
+    for r in reviews:
+        groups[r["topic"]].append(r["id"])
+    return dict(groups)
+--- tests
+DATA = [
+    {"id": "3.1", "topic": "payment"},
+    {"id": "8.1", "topic": "liability_cap"},
+    {"id": "3.2", "topic": "payment"},
+]
+expect("two groups", lambda: group_by_topic(DATA), {"payment": ["3.1", "3.2"], "liability_cap": ["8.1"]})
+expect("returns a plain dict", lambda: type(group_by_topic(DATA)).__name__, "dict")
+expect("empty", lambda: group_by_topic([]), {})
+--- hints
+- With a defaultdict, the loop needs only one line: `groups[r["topic"]].append(r["id"])`, with no need to check first whether the key is there.
+- End with `return dict(groups)`.
+
+@@ item d8-12
+type: code
+title: The topics with the most problems
+level: 2
+cards: More on dictionaries: comprehensions, Counter, defaultdict
+--- context
+Once a contract is reviewed, the lawyer first wants to know which kinds of problem come up most, for example "2 liability cap clauses need work", and starts the negotiation with those.
+--- prompt
+Write `top_topics(reviews, n)`: look only at the clauses whose verdict is **not** `accept`, count how many times each topic appears, and return a list of the `n` `(topic, count)` pairs with the highest counts. When counts are equal, the topic that appeared first comes first (`Counter.most_common` already works this way).
+
+```python
+top_topics(reviews, 1)   # → [("liability_cap", 2)]
+```
+--- starter
+from collections import Counter
+
+def top_topics(reviews, n):
+    pass
+--- solution
+from collections import Counter
+
+def top_topics(reviews, n):
+    topics = [r["topic"] for r in reviews if r["verdict"] != "accept"]
+    return Counter(topics).most_common(n)
+--- tests
+DATA = [
+    {"id": "3.1", "topic": "payment", "verdict": "accept"},
+    {"id": "8.1", "topic": "liability_cap", "verdict": "flag"},
+    {"id": "8.2", "topic": "liability_cap", "verdict": "redline"},
+    {"id": "3.2", "topic": "payment", "verdict": "flag"},
+    {"id": "6.2", "topic": "confidentiality", "verdict": "flag"},
+    {"id": "3.3", "topic": "payment", "verdict": "accept"},
+]
+expect("top two (accept doesn't count)", lambda: top_topics(DATA, 2), [("liability_cap", 2), ("payment", 1)])
+expect("top one", lambda: top_topics(DATA, 1), [("liability_cap", 2)])
+expect("n larger than the number of topics", lambda: top_topics(DATA, 10), [("liability_cap", 2), ("payment", 1), ("confidentiality", 1)])
+expect("all accept", lambda: top_topics([DATA[0]], 3), [])
+--- hints
+- First use a comprehension to get the list of topics of the clauses that are not accept.
+- `Counter(that_list).most_common(n)` returns exactly a list of `(topic, count)` tuples.
+
+@@ item d8-13
+type: code
+title: Any of them, all of them
+level: 2
+cards: any and all
+--- context
+Suppose the top of the report answers two yes/no questions: does this contract have any clause that must be rewritten? Are all of the model's verdicts valid? If even one verdict is invalid, the report can't go straight to the lawyer.
+--- prompt
+Write two functions, each using one `any` or `all`:
+
+- `any_redline(reviews)`: return True if any verdict is `redline`
+- `all_valid(reviews)`: return True only if every verdict is one of `accept` / `flag` / `redline`. **An empty list returns False**: if nothing was reviewed, you can't say "all valid"
+
+Note that `all([])` on its own is True, so the second function has to handle the empty list separately.
+--- starter
+VALID = {"accept", "flag", "redline"}
+
+def any_redline(reviews):
+    pass
+
+def all_valid(reviews):
+    pass
+--- solution
+VALID = {"accept", "flag", "redline"}
+
+def any_redline(reviews):
+    return any(r["verdict"] == "redline" for r in reviews)
+
+def all_valid(reviews):
+    if not reviews:
+        return False
+    return all(r["verdict"] in VALID for r in reviews)
+--- tests
+expect("has a redline", lambda: any_redline([{"verdict": "accept"}, {"verdict": "redline"}]), True)
+expect("no redline", lambda: any_redline([{"verdict": "flag"}]), False)
+expect("an empty list has no redline", lambda: any_redline([]), False)
+expect("all valid", lambda: all_valid([{"verdict": "accept"}, {"verdict": "flag"}]), True)
+expect("one is invalid", lambda: all_valid([{"verdict": "accept"}, {"verdict": "HIGH"}]), False)
+expect("an empty list is not valid", lambda: all_valid([]), False)
+--- hints
+- `any(r["verdict"] == "redline" for r in reviews)`; `all` is written the same way, with the condition `r["verdict"] in VALID`.
+- Empty list: before `all(...)`, write `if not reviews: return False`.
+
+@@ item d8-14
+type: code
+title: Risk first, then clause number
+level: 3
+cards: Sorting by several keys; Tuples and unpacking
+--- context
+In this exercise the "needs attention" list is ordered like this: the lawyer starts with the most dangerous clauses and reads equally dangerous ones in contract order, so there's no jumping back and forth through the contract.
+--- prompt
+Write two functions:
+
+1. `id_key(clause_id)`: turn the clause number into a tuple of numbers: `"10.1"` → `(10, 1)`, `"12"` → `(12,)`
+2. `sort_reviews(reviews)`: return the sorted **list of clause numbers**. Sort by risk from high to low first (`high` → `medium` → `low`); for the same risk, by the **numeric value** of the clause number, smallest first: `8.1` before `10.1`, `8.2` before `8.10`
+
+Each item in `reviews` is `{"id": ..., "risk": ...}`.
+--- starter
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    pass
+
+def sort_reviews(reviews):
+    pass
+--- solution
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def sort_reviews(reviews):
+    ordered = sorted(reviews, key=lambda r: (RISK[r["risk"]], id_key(r["id"])))
+    return [r["id"] for r in ordered]
+--- tests
+expect("id_key with two levels", lambda: id_key("10.1"), (10, 1))
+expect("id_key with no dot", lambda: id_key("12"), (12,))
+DATA = [
+    {"id": "10.1", "risk": "high"},
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.10", "risk": "medium"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "8.2", "risk": "medium"},
+]
+expect("risk first, clause numbers by value", lambda: sort_reviews(DATA), ["8.1", "10.1", "8.2", "8.10", "3.1"])
+expect("empty", lambda: sort_reviews([]), [])
+--- hints
+- `id_key`: `clause_id.split(".")` gives a list of strings; turn each one into an `int`, then wrap them in `tuple(...)`.
+- The sort key returns a tuple: `(RISK[r["risk"]], id_key(r["id"]))`; at the end, take the clause numbers out.
+
+@@ item d8-15
+type: code
+title: The Clause dataclass
+level: 2
+cards: dataclass: classes that only hold data
+--- context
+Each clause carries its number, text, risk and tags through the whole pipeline. Keeping them together in one class makes misspelled keys less likely than passing dictionaries around. The real project's configuration, `Settings` (`config.py`), is written the same way.
+--- prompt
+Define `Clause` with `@dataclass`, with these fields, in this order:
+
+- `id`: a string
+- `text`: a string
+- `risk`: a string, default `"low"`
+- `tags`: a list of strings, default an empty list (each object gets its own)
+
+Then add a method `is_high()`: return True when `risk` is `"high"`, otherwise False.
+--- starter
+from dataclasses import dataclass, field
+
+@dataclass
+class Clause:
+    id: str
+--- solution
+from dataclasses import dataclass, field
+
+@dataclass
+class Clause:
+    id: str
+    text: str
+    risk: str = "low"
+    tags: list[str] = field(default_factory=list)
+
+    def is_high(self):
+        return self.risk == "high"
+--- tests
+expect("defaults", lambda: (Clause("3.1", "Fees are due.").risk, Clause("3.1", "Fees are due.").tags), ("low", []))
+expect("is_high", lambda: [Clause("8.1", "x", "high").is_high(), Clause("3.1", "y").is_high()], [True, False])
+expect("equal when the fields are equal", lambda: Clause("8.1", "x", "high") == Clause("8.1", "x", "high"), True)
+def _independent():
+    a = Clause("1", "a")
+    b = Clause("2", "b")
+    a.tags.append("payment")
+    return b.tags
+expect("two objects' tags don't affect each other", _independent, [])
+expect("the generated print format", lambda: repr(Clause("8.1", "x")), "Clause(id='8.1', text='x', risk='low', tags=[])")
+--- hints
+- One line per field, `name: type`; fields with a default come after the others: `risk: str = "low"`.
+- The list default: `tags: list[str] = field(default_factory=list)`. Methods work as in any class: the first parameter is `self`.
+
+@@ item d8-16
+type: fix
+title: Fix the bug: mutable default argument
+level: 2
+cards: dataclass: classes that only hold data; d2:Functions: default arguments and early return
+--- context
+During the review, each clause gets topic tags (payment, liability_cap, …), and the report groups clauses by tag. Once a tag leaks onto another clause, the groups the lawyer sees are wrong.
+--- prompt
+`add_tag(tag, tags)` adds a tag to the list and returns it. One call shows no problem, but **several calls in a row** go wrong. Run it first and look at the second line of the output, then at what the "call again" test gets, and then fix it.
+--- starter
+def add_tag(tag, tags=[]):
+    tags.append(tag)
+    return tags
+
+print(add_tag("payment"))
+print(add_tag("liability_cap"))
+--- solution
+def add_tag(tag, tags=None):
+    if tags is None:
+        tags = []
+    tags.append(tag)
+    return tags
+
+print(add_tag("payment"))
+print(add_tag("liability_cap"))
+--- tests
+expect("a single call", lambda: add_tag("payment"), ["payment"])
+expect("call again: no tags left over from the last call", lambda: add_tag("termination"), ["termination"])
+expect("adds to a list you pass in", lambda: add_tag("b", ["a"]), ["a", "b"])
+--- hints
+- The default `[]` is created **once**, when the `def` line runs; after that, every call that doesn't pass `tags` uses that same list.
+- The usual pattern: make the default `None`, and inside the function write `if tags is None: tags = []` (check for None with `is`).
+
+@@ item d8-17
+type: fix
+title: Fix the bug: a list default
+level: 2
+cards: dataclass: classes that only hold data; d1:Reading errors: start from the last line
+--- context
+`Review` records the review result for one clause and which rules it cited. This class fails as soon as it loads, so the whole program can't run.
+--- prompt
+This code raises an error as soon as it runs, before the tests even start. Read the last line of the error message: Python is actually telling you how to fix it.
+--- starter
+from dataclasses import dataclass
+
+@dataclass
+class Review:
+    clause_id: str
+    verdict: str = "accept"
+    rule_ids: list[str] = []
+
+    def cite(self, rule_id):
+        self.rule_ids.append(rule_id)
+--- solution
+from dataclasses import dataclass, field
+
+@dataclass
+class Review:
+    clause_id: str
+    verdict: str = "accept"
+    rule_ids: list[str] = field(default_factory=list)
+
+    def cite(self, rule_id):
+        self.rule_ids.append(rule_id)
+--- tests
+expect("an empty list by default", lambda: Review("8.1").rule_ids, [])
+expect("the default verdict", lambda: Review("8.1").verdict, "accept")
+def _two():
+    a = Review("8.1")
+    b = Review("3.1")
+    a.cite("PB-03")
+    return [a.rule_ids, b.rule_ids]
+expect("each object has its own list", _two, [["PB-03"], []])
+--- hints
+- The end of the error message says `use default_factory`.
+- Change it to `field(default_factory=list)`, and don't forget to import `field` from `dataclasses`.
+
+@@ item d8-18
+type: choice
+title: dataclass or Pydantic
+level: 2
+cards: dataclass: classes that only hold data; d4:Pydantic: rules for your data
+--- context
+Reading the real project, you'll find two ways of writing data classes side by side. Being able to explain why each is used where it is makes good material for "tell me about your design" in an interview.
+--- prompt
+In Clause Check, the program's internal configuration `Settings` is a `@dataclass` (`config.py`), while the model's verdict `ClauseVerdict` uses Pydantic (`models.py`). Why isn't a dataclass used for the model's output?
+--- options
+- A dataclass can't have default values
+- A dataclass doesn't check types or values: even if the model returns `"verdict": "HIGH"`, the object is created without complaint, and the error quietly flows on to later steps
+- Pydantic runs faster than a dataclass
+- A dataclass can't be turned into a dictionary
+answer: 2
+--- explain
+A dataclass only writes `__init__` for you; type hints are not checked when the code runs (as Day 3 said). Model output is **external data**: it must be validated the moment it comes in, and when that fails, the error goes back to the model (Day 4). For internal data the program makes itself (configuration, intermediate results), a dataclass is lighter. Dataclasses do have default values, and `asdict` turns them into dictionaries. Interviews often ask about this difference.
+
+@@ item d8-19
+type: order
+title: Put the code in order: dataclass
+level: 2
+cards: dataclass: classes that only hold data; Sorting by several keys
+--- context
+In this exercise, each review result carries a risk score: the higher the score, the more dangerous the clause. The list for the lawyer puts the most dangerous first.
+--- prompt
+Put the program in order: define the `Review` dataclass (`clause_id` a string, `risk_score` an integer), then write `riskiest_first(reviews)`: sort by `risk_score` **from high to low**, and for equal scores by `clause_id` **from low to high**, and return the list of clause numbers. Two lines are distractors.
+--- lines
+from dataclasses import dataclass
+@dataclass
+class Review:
+    clause_id: str
+    risk_score: int
+def riskiest_first(reviews):
+    ordered = sorted(reviews, key=lambda r: (-r.risk_score, r.clause_id))
+    return [r.clause_id for r in ordered]
+--- distractors
+    ordered = sorted(reviews, key=lambda r: (r.risk_score, r.clause_id), reverse=True)
+    return [r["clause_id"] for r in ordered]
+--- tests
+REVIEWS = [Review("3.1", 1), Review("8.2", 3), Review("8.1", 3), Review("4.2", 2)]
+expect("higher scores first, ties by clause number", lambda: riskiest_first(REVIEWS), ["8.1", "8.2", "4.2", "3.1"])
+expect("empty", lambda: riskiest_first([]), [])
+--- hints
+- `reverse=True` flips **both items**, so for equal scores the clause numbers would go from high to low too. To make only the score descending, negate it.
+- Get a field of a dataclass object with a dot: `r.clause_id`, not `r["clause_id"]`.
+
+@@ item d8-20
+type: choice
+title: Reading star parameters
+level: 2
+cards: *args, **kwargs, and keyword-only parameters
+--- context
+In the real project you'll run into parameters with stars, like `Settings(**kw)` in `run_evals.py`. First get clear on which ways of calling a function it accepts.
+--- prompt
+Read the code below. Which call raises `TypeError`?
+--- code
+def review(clause_id, *, strict=False, **extra):
+    return clause_id, strict, extra
+
+opts = {"strict": True, "model": "deepseek-flash"}
+--- options
+- `review("8.1")`
+- `review("8.1", strict=True)`
+- `review("8.1", True)`
+- `review("8.1", **opts)`
+answer: 3
+--- explain
+Parameters after a lone `*` can only be passed by name, so the second positional argument, `True`, has nowhere to go, and you get `takes 1 positional argument but 2 were given`. `**opts` unpacks into `strict=True, model="deepseek-flash"`: `strict` matches a parameter, and `model` is collected by `**extra`. The same idea explains `client.messages.create(**kwargs)` in `review.py`: it unpacks a dictionary, as it is, into the SDK call.
+
+@@ item d8-e1
+type: scratch
+title: Closed book: review summary
+exam: yes
+level: 3
+cards: More on dictionaries: comprehensions, Counter, defaultdict; Sorting by several keys
+--- context
+A simplified version of `summarise` in the real project's `pipeline.py`: once every clause has been reviewed, it builds the summary at the top of the report for the lawyer.
+--- prompt
+Write `summarise(reviews)`. `reviews` is a list of dictionaries, each with `"id"` (like `"8.1"`), `"verdict"` (`accept` / `flag` / `redline`) and `"risk"` (`high` / `medium` / `low`). Return:
+
+```python
+{
+    "total": number of clauses,
+    "counts": {verdict: count},       # only the verdicts that appear
+    "needs_attention": [clause number, ...],
+}
+```
+
+`needs_attention` holds the clause numbers whose verdict is not `accept`: higher risk first (high → medium → low); for the same risk, by the numeric value of the clause number, smallest first (`8.1` before `10.1`).
+--- solution
+from collections import Counter
+
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = Counter(r["verdict"] for r in reviews)
+    flagged = [r for r in reviews if r["verdict"] != "accept"]
+    ordered = sorted(flagged, key=lambda r: (RISK[r["risk"]], id_key(r["id"])))
+    return {
+        "total": len(reviews),
+        "counts": dict(counts),
+        "needs_attention": [r["id"] for r in ordered],
+    }
+--- tests
+DATA = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "10.1", "verdict": "redline", "risk": "high"},
+    {"id": "4.2", "verdict": "flag", "risk": "medium"},
+    {"id": "8.1", "verdict": "flag", "risk": "high"},
+    {"id": "9.1", "verdict": "flag", "risk": "low"},
+]
+expect("full summary", lambda: summarise(DATA), {"total": 5, "counts": {"accept": 1, "redline": 1, "flag": 3}, "needs_attention": ["8.1", "10.1", "4.2", "9.1"]})
+expect("empty", lambda: summarise([]), {"total": 0, "counts": {}, "needs_attention": []})
+
+@@ item d8-e2
+type: scratch
+title: Closed book: Rule dataclass
+exam: yes
+level: 2
+cards: dataclass: classes that only hold data; any and all
+--- context
+Every rule in the playbook comes with a set of keywords. The real project's rule-based review that doesn't call the model (mock mode) guesses a clause's topic from which keywords appear in it.
+--- prompt
+Write `Rule` with `@dataclass`, with these fields, in this order: `id` (a string), `topic` (a string), `keywords` (a list of strings, default an empty list, each object gets its own).
+
+Then add the method `matches(text)`: return True if at least one keyword appears in `text` (**case-insensitive**); otherwise return False (also False when there are no keywords).
+
+`Rule("PB-01", "liability_cap", ["unlimited"]).matches("Liability is UNLIMITED.")` → `True`
+--- solution
+from dataclasses import dataclass, field
+
+@dataclass
+class Rule:
+    id: str
+    topic: str
+    keywords: list[str] = field(default_factory=list)
+
+    def matches(self, text):
+        lowered = text.lower()
+        return any(k.lower() in lowered for k in self.keywords)
+--- tests
+R = Rule("PB-01", "liability_cap", ["unlimited", "Uncapped"])
+expect("matches, case-insensitive", lambda: [R.matches("Liability is UNLIMITED."), R.matches("an uncapped indemnity")], [True, True])
+expect("no match", lambda: R.matches("Fees are due in 30 days."), False)
+expect("no keywords", lambda: Rule("PB-00", "other").matches("anything"), False)
+def _independent():
+    a = Rule("A", "x")
+    b = Rule("B", "y")
+    a.keywords.append("k")
+    return b.keywords
+expect("each object has its own default list", _independent, [])
+
+@@ item d8-e3
+type: scratch
+title: Closed book: rule changes
+exam: yes
+level: 2
+cards: The set type
+--- context
+A customer's review rules get new versions, and the real `playbook.json` records the version date. After a new version, the changes to the rules are listed, and the lawyer uses that list to decide which contracts already reviewed need another look.
+--- prompt
+The playbook has a new version. Write `diff_rules(before, after)`: both arguments are lists of rule IDs (possibly with duplicates). Return:
+
+`{"added": in the new version but not the old one, "removed": in the old version but not the new one}`
+
+Both lists must have no duplicates and be sorted.
+
+`diff_rules(["PB-01", "PB-02"], ["PB-02", "PB-03"])` → `{"added": ["PB-03"], "removed": ["PB-01"]}`
+--- solution
+def diff_rules(before, after):
+    old = set(before)
+    new = set(after)
+    return {"added": sorted(new - old), "removed": sorted(old - new)}
+--- tests
+expect("one added, one removed", lambda: diff_rules(["PB-01", "PB-02"], ["PB-02", "PB-03"]), {"added": ["PB-03"], "removed": ["PB-01"]})
+expect("duplicates, sorted result", lambda: diff_rules(["PB-05", "PB-05"], ["PB-09", "PB-04", "PB-09"]), {"added": ["PB-04", "PB-09"], "removed": ["PB-05"]})
+expect("no change", lambda: diff_rules(["PB-01"], ["PB-01", "PB-01"]), {"added": [], "removed": []})
+expect("both empty", lambda: diff_rules([], []), {"added": [], "removed": []})

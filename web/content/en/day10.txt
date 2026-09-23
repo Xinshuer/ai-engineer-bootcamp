@@ -1,0 +1,1250 @@
+@@ day 10
+title: Files and the command line: pathlib, JSON/CSV, argparse, environment variables
+lang: py
+hours: 4–5 hours
+--- goal
+Read and write text, JSON and CSV files with pathlib; write a small command-line program with arguments and an exit code (argparse + `main(argv)`); read configuration from environment variables and combine it by the rule "command-line argument > environment variable > default". This matches the project's `clausecheck/cli.py`, `__main__.py`, `split.load_contract` and `config.py`.
+
+On this page, files are written to a **virtual disk** in your browser: they stay as long as the page is open and are gone when you refresh. The local task at the end uses the real disk on your computer.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change and run each example
+- Pass every practice exercise (including the local task: run the command line in the real project and look at the exit codes)
+- The 3 closed-book challenges
+- Open `clausecheck/cli.py`, find `main`, and say which arguments the `review` subcommand has, which one has `choices` and which one is `store_true`
+
+@@ concept
+title: Reading and writing files: open, with, encoding
+--- body
+When a program ends, its variables are gone. To keep results (reports, logs), write them to a **file**:
+
+```python
+with open("notes.txt", "w", encoding="utf-8") as f:
+    f.write("8.1 flag\n")
+```
+
+- When the `with` block ends, the file is closed for you, even if an error happens halfway. So always use `with`
+- Modes: `"r"` read (the default), `"w"` write (**empties the file first**), `"a"` append to the end
+- `f.read()` reads the whole file; `for line in f:` reads it line by line, and each line ends with `"\n"`
+- **Always write `encoding="utf-8"`**. On Windows, if you leave it out, the default encoding is often not UTF-8, so text with Chinese, `§` or `ö` comes out garbled or raises `UnicodeDecodeError`. The project's `parse.py` writes it when it reads a contract
+--- code
+with open("d10_log.txt", "w", encoding="utf-8") as f:
+    f.write("8.1 flag\n")
+    f.write("3.1 accept\n")
+
+with open("d10_log.txt", "a", encoding="utf-8") as f:
+    f.write("4.2 redline\n")
+
+with open("d10_log.txt", encoding="utf-8") as f:
+    print(repr(f.read()))
+
+with open("d10_log.txt", encoding="utf-8") as f:
+    for n, line in enumerate(f, start=1):
+        print(n, line.rstrip("\n"))
+
+@@ concept
+title: pathlib: paths are objects
+--- body
+Building paths from strings (`"data" + "/" + name`) is easy to get wrong. `pathlib.Path` turns a path into an object:
+
+- `Path("data") / "sample_contract.txt"`: join paths with `/`. Write it this way on Windows too; printed, it becomes `data\sample_contract.txt`
+- Take it apart: `.name` is the file name, `.stem` the name without the suffix, `.suffix` the suffix (the file extension), `.parent` the folder it is in
+- `.with_suffix(".report.json")` swaps the suffix. When no `--out` is given, `cli.py` uses it to work out the report path
+- `.exists()` tells you whether it exists; `.read_text(encoding="utf-8")` and `.write_text(text, encoding="utf-8")` read or write the whole file in one line, no `open` needed
+
+This page runs on a Linux-style virtual disk in the browser, so paths print with `/`.
+--- code
+from pathlib import Path
+
+p = Path("data") / "sample_contract.txt"
+print(p, "|", p.name, "|", p.stem, "|", p.suffix, "|", p.parent)
+print(p.with_suffix(".report.json"))
+print(p.exists())
+
+note = Path("d10_note.txt")
+note.write_text("Clause 8.1 needs a lawyer.\n", encoding="utf-8")
+print(note.exists(), repr(note.read_text(encoding="utf-8")))
+
+@@ concept
+title: Folders: mkdir, glob, and the current directory
+--- body
+- `folder.mkdir(parents=True, exist_ok=True)` creates a folder: `parents=True` also creates any missing folders above it, `exist_ok=True` means no error if it already exists. Before writing a file, create the folder it goes in: `path.parent.mkdir(...)`
+- `folder.glob("*.json")` finds the matching files. The order is not guaranteed, so you almost always write `sorted(folder.glob("*.json"))`
+- **Relative paths start from the current directory**: the folder you are in when you run the command, not the folder the .py file is in. `Path.cwd()` shows the current directory
+
+That is why the project must be run from `G:\Contract Clause Reviewer` to find `data/sample_contract.txt`. In `config.py`, `ROOT = Path(__file__).resolve().parent.parent` works out the project's root folder from where the code file is, so paths are found correctly no matter where you run it from.
+--- code
+from pathlib import Path
+
+folder = Path("work/d10/demo")
+folder.mkdir(parents=True, exist_ok=True)
+for name in ["b.json", "a.json", "notes.txt"]:
+    (folder / name).write_text("{}", encoding="utf-8")
+
+print(Path.cwd())
+print([p.name for p in sorted(folder.glob("*.json"))])
+print([p.name for p in sorted(folder.glob("*"))])
+
+@@ concept
+title: JSON files: load and dump
+--- body
+Day 3's `json.loads` / `json.dumps` work with **strings** (the s stands for string). For **files** there are two ways:
+
+```python
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(report, f, indent=2, ensure_ascii=False)   # write
+with open(path, encoding="utf-8") as f:
+    report = json.load(f)                                # read
+
+report = json.loads(Path(path).read_text(encoding="utf-8"))  # how playbook.py does it
+```
+
+- `indent=2` makes it readable for people; `ensure_ascii=False` writes characters like `ö` and `§` as they are, instead of escapes like `\u00f6`
+- The classic mistake: `json.dump(report, "out.json")`. The second argument must be an **open file**; passing a string raises `AttributeError: 'str' object has no attribute 'write'`
+--- code
+import json
+from pathlib import Path
+
+report = {"contract": "sample_contract", "counts": {"accept": 17, "redline": 11}, "note": "§ 8.2 Försäkring: a lawyer must check"}
+path = Path("work/d10/demo/report.json")
+path.parent.mkdir(parents=True, exist_ok=True)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(report, f, indent=2, ensure_ascii=False)
+
+print(path.read_text(encoding="utf-8"))
+with open(path, encoding="utf-8") as f:
+    back = json.load(f)
+print(back == report, back["counts"]["redline"])
+print(json.dumps({"note": "Försäkring"}))
+
+@@ concept
+title: CSV: so lawyers can open it in Excel
+--- body
+Lawyers don't read JSON; they use Excel. CSV is "table text with commas between the values". The `csv` module handles the quotes, and the commas inside the text, for you:
+
+- Write: `writer = csv.DictWriter(f, fieldnames=[column names...])`, first `writer.writeheader()` for the header row, then `writer.writerows(list_of_dicts)`
+- Open the file with `newline=""`, or on Windows an extra blank line appears between rows
+- Read: `csv.DictReader(f)`, where each row is a dictionary. **Every value you read back is a string**: you have to `int(...)` a `"340"` yourself
+- For Excel to show characters like `ö` or Chinese correctly, use the encoding `"utf-8-sig"` (it adds a BOM mark at the start of the file); read with it too, or the first column name gets an invisible extra character in front
+--- code
+import csv
+from pathlib import Path
+
+rows = [
+    {"clause_id": "8.1", "verdict": "redline", "tokens": 340, "rationale": "cap is not mutual, see 12"},
+    {"clause_id": "3.1", "verdict": "accept", "tokens": 120, "rationale": "standard"},
+]
+path = Path("work/d10/demo/reviews.csv")
+path.parent.mkdir(parents=True, exist_ok=True)
+with open(path, "w", encoding="utf-8", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["clause_id", "verdict", "tokens", "rationale"])
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(path.read_text(encoding="utf-8"))
+with open(path, encoding="utf-8", newline="") as f:
+    back = list(csv.DictReader(f))
+print(back[0])
+print(back[0]["tokens"] + back[1]["tokens"], int(back[0]["tokens"]) + int(back[1]["tokens"]))
+
+@@ concept
+title: Command-line arguments: argparse
+--- body
+When you run `python -m clausecheck review data/sample_contract.txt --mode mock` in the terminal, all the program gets is a list of words: `["review", "data/sample_contract.txt", "--mode", "mock"]` (that is `sys.argv[1:]`). `argparse` turns them into arguments with names, types and checks:
+
+```python
+parser = argparse.ArgumentParser(prog="clausecheck")
+parser.add_argument("path")                                  # positional argument: required
+parser.add_argument("--out")                                 # optional; None if not given
+parser.add_argument("--mode", choices=["mock", "deepseek"], default="mock")
+parser.add_argument("--limit", type=int)                     # converted to int for you
+parser.add_argument("--verbose", action="store_true")        # True if it is there
+args = parser.parse_args(["data/c.txt", "--limit", "5"])
+```
+
+- Get the values with a dot: `args.path`, `args.limit`. A `-` in the name becomes `_`: `--only-risk` → `args.only_risk`
+- When a value is invalid (not in `choices`, or `--limit abc`), argparse prints the usage and the reason, then exits with exit code 2
+- The `-h` help text is generated for you
+--- code
+import argparse
+
+parser = argparse.ArgumentParser(prog="clausecheck", description="Review a contract")
+parser.add_argument("path", help="contract file (.txt or .pdf)")
+parser.add_argument("--out", help="where to write the JSON report")
+parser.add_argument("--mode", choices=["mock", "deepseek", "local"], default="mock")
+parser.add_argument("--limit", type=int, help="review only the first N clauses")
+parser.add_argument("--verbose", action="store_true")
+
+args = parser.parse_args(["data/sample_contract.txt", "--limit", "5", "--verbose"])
+print(args)
+print(args.path, args.mode, args.limit + 1, args.verbose)
+
+try:
+    parser.parse_args(["-h"])
+except SystemExit as e:
+    print("exit code:", e.code)
+
+@@ concept
+title: main(argv), exit codes, and __name__
+--- body
+How the project does it (`clausecheck/cli.py` and `__main__.py`):
+
+```python
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    ...
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- `parse_args(argv)`: when `argv` is `None`, it reads the real command line; in tests you pass a list, `main(["c.txt", "--limit", "2"])`, with no terminal needed
+- **Exit code**: `0` means success, `1` an error (for example, the file doesn't exist), and an argparse argument error is `2`. Scripts and CI use it to tell success from failure; in PowerShell you see it with `$LASTEXITCODE`. `raise SystemExit(main())` hands `main`'s return value to the system as the exit code
+- `__name__`: it is `"__main__"` when you run this file directly, and the module name when another file `import`s it. That's why `from clausecheck.cli import main` in a test does not also run the program
+- `python -m clausecheck` runs the package's `__main__.py`, which has just two lines: `from .cli import main` and `raise SystemExit(main())`
+
+On this page `__name__` is also `"__main__"`, but there is no real command line, so the code below calls `main([...])` directly. If you write `raise SystemExit(main())` on this page, you'll see a usage error about a missing argument: there are no command-line arguments to read here, and that's expected.
+--- code
+import argparse
+from pathlib import Path
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="clausecheck")
+    p.add_argument("path")
+    return p
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    path = Path(args.path)
+    if not path.exists():
+        print(f"error: {path} not found")
+        return 1
+    print(f"{path.name}: {len(path.read_text(encoding='utf-8'))} chars")
+    return 0
+
+demo = Path("work/d10/demo/c.txt")
+demo.parent.mkdir(parents=True, exist_ok=True)
+demo.write_text("8.1 Cap on Liability\nLiability is unlimited.\n", encoding="utf-8")
+print("exit code:", main(["work/d10/demo/c.txt"]))
+print("exit code:", main(["work/d10/demo/missing.txt"]))
+try:
+    main([])
+except SystemExit as e:
+    print("exit code:", e.code)
+print(__name__)
+
+@@ concept
+title: Environment variables and configuration
+--- body
+Some settings shouldn't be hard-coded: API keys, the run mode, the maximum number of steps. They go in **environment variables**:
+
+- Read: `os.getenv("CLAUSECHECK_MODE", "mock")` gives the default when the variable isn't set. **What you read is always a string**, so convert numbers yourself: `config.py` says `int(os.getenv("CLAUSECHECK_MAX_STEPS", "6"))`
+- Set one temporarily in PowerShell: `$env:CLAUSECHECK_MODE="mock"`
+- API keys go in the `.env` file in the project's root folder, and `load_dotenv()` from `python-dotenv` loads it into environment variables. `.env` is listed in `.gitignore`, so **keys never go into the code or into git**
+- Priority: **command-line argument > environment variable > default**. `cmd_review` in `cli.py` first creates `Settings()` (which reads the environment variables), then overrides the mode if `--mode` was given on the command line
+- When you write a function, pass the environment in as a parameter (an `env` dictionary), so tests don't have to change the global `os.environ`
+--- code
+import os
+
+def resolve_steps(cli_value, env):
+    if cli_value is not None:
+        return cli_value
+    return int(env.get("CLAUSECHECK_MAX_STEPS", "6"))
+
+print(resolve_steps(None, {}))
+print(resolve_steps(None, {"CLAUSECHECK_MAX_STEPS": "3"}))
+print(resolve_steps(10, {"CLAUSECHECK_MAX_STEPS": "3"}))
+
+os.environ["CLAUSECHECK_MODE"] = "deepseek"
+print(os.getenv("CLAUSECHECK_MODE", "mock"), type(os.getenv("CLAUSECHECK_MODE")).__name__)
+del os.environ["CLAUSECHECK_MODE"]
+print(os.getenv("CLAUSECHECK_MODE", "mock"))
+
+@@ item d10-01
+type: predict
+title: Recap: splitting lines and Counter
+level: 1
+cards: Reading and writing files: open, with, encoding; d8:More on dictionaries: comprehensions, Counter, defaultdict
+--- context
+Say the review log is stored in a text file, one "number verdict" pair per line. After reading it in, you first split it into lines, then count.
+--- prompt
+Write the output. This reviews Day 8's `Counter`. Also notice: file contents usually end with `"\n"`. What is the difference between the results of `split("\n")` and `splitlines()`?
+--- code
+from collections import Counter
+
+text = "8.1 flag\n3.1 accept\n4.2 flag\n"
+print(text.split("\n"))
+print(text.splitlines())
+verdicts = [line.split()[1] for line in text.splitlines()]
+print(Counter(verdicts).most_common(1))
+--- explain
+`split("\n")` also cuts out an empty string `''` after the last line break; `splitlines()` doesn't. When you read a file, that empty string makes a line count one too high, or makes `line.split()[1]` raise `IndexError`. `most_common(1)` returns the item that appears most often, in the form `[(value, count)]`.
+
+@@ item d10-02
+type: code
+title: Count non-empty lines
+level: 1
+cards: Reading and writing files: open, with, encoding
+--- context
+Contract text extracted from a PDF has lots of blank lines in it. Counting the lines that have content quickly shows whether the file was read correctly, or came out as a pile of whitespace.
+--- prompt
+Write `count_lines(path)`: return the number of **non-empty lines** in the file (a line with only spaces counts as empty too). Open it with `with open(path, encoding="utf-8") as f:`.
+
+Example: when the file contains `"8.1 Cap\n\n   \nLiability is capped.\n"`, return `2`. The tests prepare their own files in `work/d10/lines/`.
+--- starter
+def count_lines(path):
+    pass
+--- solution
+def count_lines(path):
+    count = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+--- tests
+from pathlib import Path
+_dir = Path("work/d10/lines")
+_dir.mkdir(parents=True, exist_ok=True)
+(_dir / "a.txt").write_text("8.1 Cap on Liability\n\n   \nLiability is capped.\n", encoding="utf-8")
+(_dir / "b.txt").write_text("", encoding="utf-8")
+(_dir / "c.txt").write_text("one line, no newline at the end", encoding="utf-8")
+(_dir / "d.txt").write_text("§ 8.1 Ansvar\n§ 8.2 Försäkring\n", encoding="utf-8")
+expect("skips empty lines and lines with only spaces", lambda: count_lines("work/d10/lines/a.txt"), 2)
+expect("empty file", lambda: count_lines("work/d10/lines/b.txt"), 0)
+expect("last line has no line break", lambda: count_lines("work/d10/lines/c.txt"), 1)
+expect("has characters like § and ö", lambda: count_lines("work/d10/lines/d.txt"), 2)
+--- hints
+- `with open(path, encoding="utf-8") as f:`, then look at one line at a time with `for line in f:`.
+- If `line.strip()` gives an empty string once the whitespace is removed, the line is empty; only when it isn't do you `count += 1`.
+
+@@ item d10-03
+type: fix
+title: Fix the bug: only one line left in the log
+level: 2
+cards: Reading and writing files: open, with, encoding
+--- context
+During a review, each time a clause gets its verdict, a line goes into the log file. If something goes wrong, you can look back: which clause, and what verdict it got.
+--- prompt
+`log_verdict` should **append** each verdict to the end of the log file, one per line, like `8.1,flag`. But after three calls in a row, only the last line is left in the file.
+
+Run it, compare Expected with Got in the test results, find the cause, then fix it.
+--- starter
+def log_verdict(path, clause_id, verdict):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{clause_id},{verdict}\n")
+--- solution
+def log_verdict(path, clause_id, verdict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{clause_id},{verdict}\n")
+--- tests
+from pathlib import Path
+Path("work/d10/log").mkdir(parents=True, exist_ok=True)
+def _three():
+    p = Path("work/d10/log/verdicts.log")
+    p.unlink(missing_ok=True)
+    log_verdict(str(p), "8.1", "flag")
+    log_verdict(str(p), "3.1", "accept")
+    log_verdict(str(p), "4.2", "redline")
+    return p.read_text(encoding="utf-8")
+expect("three calls, all three lines are there", _three, "8.1,flag\n3.1,accept\n4.2,redline\n")
+def _fresh():
+    p = Path("work/d10/log/new.log")
+    p.unlink(missing_ok=True)
+    log_verdict(str(p), "12", "accept")
+    return p.read_text(encoding="utf-8")
+expect("creates the file if it doesn't exist", _fresh, "12,accept\n")
+--- hints
+- Mode `"w"` empties the file every time it opens it.
+- To append, use `"a"`: it writes at the end, and it also creates the file if it doesn't exist.
+
+@@ item d10-04
+type: predict
+title: Take a path apart
+level: 1
+cards: pathlib: paths are objects
+--- context
+Once the command-line tool has the path of the contract file, it still has to work out where to save the report. When the user gives no `--out`, the real project's `cli.py` takes the contract's path, swaps the suffix, and uses that as the report's path.
+--- prompt
+Write the output. Paths on this page are Linux-style and print with `/`. Notice what `.stem` and `.suffix` are when the file name has two dots.
+--- code
+from pathlib import Path
+
+p = Path("data") / "contracts" / "cloudnotes.v2.pdf"
+print(p)
+print(p.name, p.stem, p.suffix)
+print(p.parent, p.parent.name)
+print(p.with_suffix(".report.json"))
+print(Path("data/sample_contract.txt").stem)
+--- explain
+`.suffix` takes only the part after the **last** dot, so `.stem` is `cloudnotes.v2`. When no `--out` is given, `cli.py` works out the report path with `Path(args.path).with_suffix(".report.json")`, so the report for `data/sample_contract.txt` is `data/sample_contract.report.json`. You can find it in the project's `data/` folder.
+
+@@ item d10-05
+type: code
+title: Read the contract, report a clear error
+level: 2
+cards: pathlib: paths are objects; d3:raise: report an error on purpose
+--- context
+This is where the command-line tool starts: `python -m clausecheck review <contract file>` first has to read the contract in. The real project's `split.load_contract` also raises an error that names the file when it finds no clauses in the contract.
+--- prompt
+Following the project's `split.load_contract`, write `load_contract(path)`:
+
+- the file doesn't exist: `raise FileNotFoundError(f"contract not found: {path}")`
+- the file exists, but is empty once whitespace is removed: `raise ValueError(f"contract is empty: {file_name}")`, where the file name is `.name` (without the folder)
+- otherwise, return the file's contents (`encoding="utf-8"`)
+
+Python itself raises `FileNotFoundError` when a file doesn't exist, but its message is `[Errno 2] No such file or directory: ...`. **Check first, then raise an error a person understands at a glance**: that's a good habit when you write command-line tools.
+--- starter
+from pathlib import Path
+
+def load_contract(path):
+    path = Path(path)
+    pass
+--- solution
+from pathlib import Path
+
+def load_contract(path):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"contract not found: {path}")
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"contract is empty: {path.name}")
+    return text
+--- tests
+from pathlib import Path
+_dir = Path("work/d10/load")
+_dir.mkdir(parents=True, exist_ok=True)
+(_dir / "ok.txt").write_text("8.1 Cap on Liability\nLiability is capped.\n", encoding="utf-8")
+(_dir / "blank.txt").write_text("  \n\n", encoding="utf-8")
+(_dir / "gone.txt").unlink(missing_ok=True)
+expect("reads the contents", lambda: load_contract("work/d10/load/ok.txt"), "8.1 Cap on Liability\nLiability is capped.\n")
+expect_raises("file doesn't exist → FileNotFoundError", lambda: load_contract("work/d10/load/gone.txt"), FileNotFoundError)
+def _msg(name, err):
+    try:
+        load_contract(f"work/d10/load/{name}")
+    except err as e:
+        return str(e)
+expect("message when it doesn't exist", lambda: _msg("gone.txt", FileNotFoundError), "contract not found: work/d10/load/gone.txt")
+expect_raises("only whitespace → ValueError", lambda: load_contract("work/d10/load/blank.txt"), ValueError)
+expect("message for an empty file has only the file name", lambda: _msg("blank.txt", ValueError), "contract is empty: blank.txt")
+--- hints
+- First, `if not path.exists():` raise; then read the file.
+- After reading it, `if not text.strip():` means "only whitespace". The file name is `path.name`.
+
+@@ item d10-06
+type: choice
+title: But the file is right there
+level: 2
+cards: Folders: mkdir, glob, and the current directory
+--- context
+You create a small script in the project to read the playbook, and it says "file not found". This is one of the most common problems beginners run into.
+--- prompt
+You created `stats.py` in `G:\Contract Clause Reviewer\tools\`, containing `Path("data/playbook.json").read_text(encoding="utf-8")`. Then you ran the two lines below in the terminal and got `FileNotFoundError: ... 'data\\playbook.json'`. But `G:\Contract Clause Reviewer\data\playbook.json` is definitely there. Why?
+--- code
+cd "G:\Contract Clause Reviewer\tools"
+python stats.py
+--- options
+- On Windows, paths must use backslashes: `data\playbook.json`
+- Relative paths start from the **current directory** (where you ran the command), so the program looks for `tools\data\playbook.json`
+- `read_text` can't read JSON files; you need `json.load`
+- The file is open in VS Code, so it is locked
+answer: 2
+--- explain
+Relative paths are always relative to the current directory. Run it from the project's root folder (`cd "G:\Contract Clause Reviewer"`, then `python tools\stats.py`) and it works. The sturdier way is what `config.py` does: work out the project's root folder with `Path(__file__).resolve().parent.parent` and build paths from it, so it's right no matter where you run it from. Writing `/` in code on Windows is perfectly fine.
+
+@@ item d10-07
+type: code
+title: Save the report
+level: 2
+cards: JSON files: load and dump; Folders: mkdir, glob, and the current directory
+--- context
+When a contract has been reviewed, the report is saved as a JSON file, so the web page, the evals or a lawyer can open it again later. The real project's `cli.py` also writes the report to a `.report.json` file after a review.
+--- prompt
+Write `save_report(report, path)`: write the dictionary `report` to a JSON file, **indented by 2 spaces, with non-ASCII characters (like `ö`) written as they are**; create the parent folders if they don't exist. Return the file's `Path` object.
+
+Example: `save_report({"counts": {"flag": 1}}, "work/d10/save/runs/r1.json")` first creates `work/d10/save/runs/`, then writes the file.
+--- starter
+import json
+from pathlib import Path
+
+def save_report(report, path):
+    path = Path(path)
+    pass
+--- solution
+import json
+from pathlib import Path
+
+def save_report(report, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    return path
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/save", ignore_errors=True)
+REPORT = {"contract": "sample_contract", "counts": {"accept": 2, "redline": 1}, "note": "8.1 Försäkring: a lawyer must check"}
+TARGET = "work/d10/save/runs/2026-09/report.json"
+def _text():
+    save_report(REPORT, TARGET)
+    return Path(TARGET).read_text(encoding="utf-8")
+expect("returns a Path object", lambda: isinstance(save_report(REPORT, TARGET), Path), True)
+expect("creates the parent folders; reads back the same content", lambda: json.loads(_text()), REPORT)
+expect("indented by 2 spaces", lambda: _text().splitlines()[1], '  "contract": "sample_contract",')
+expect("non-ASCII characters written as they are", lambda: "Försäkring" in _text(), True)
+--- hints
+- Before writing, `path.parent.mkdir(parents=True, exist_ok=True)`.
+- Inside `with open(path, "w", encoding="utf-8") as f:`, write `json.dump(report, f, indent=2, ensure_ascii=False)`, and finally `return path`.
+
+@@ item d10-08
+type: fix
+title: Fix the bug: json.dump
+level: 2
+cards: JSON files: load and dump
+--- context
+Writing a dictionary to a JSON file is the most common way to save reports and settings. Almost everyone makes this mistake once.
+--- prompt
+`write_json` should write a dictionary to a file, but it fails as soon as you call it. Run it, read the last line of the error in the test results, think about what the second argument of `json.dump` should be, then fix it.
+--- starter
+import json
+from pathlib import Path
+
+def write_json(obj, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    json.dump(obj, path, indent=2)
+--- solution
+import json
+from pathlib import Path
+
+def write_json(obj, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/fixjson", ignore_errors=True)
+def _roundtrip():
+    write_json({"clause_id": "8.1", "verdict": "flag"}, "work/d10/fixjson/v.json")
+    return json.loads(Path("work/d10/fixjson/v.json").read_text(encoding="utf-8"))
+expect("write it, then read it back", _roundtrip, {"clause_id": "8.1", "verdict": "flag"})
+def _indent():
+    write_json({"a": 1}, "work/d10/fixjson/sub/a.json")
+    return Path("work/d10/fixjson/sub/a.json").read_text(encoding="utf-8")
+expect("indented by 2 spaces", _indent, '{\n  "a": 1\n}')
+--- hints
+- The error is `'str' object has no attribute 'write'`: `json.dump` calls `.write(...)` on its second argument, but you gave it a string.
+- First `with open(path, "w", encoding="utf-8") as f:`, then `json.dump(obj, f, indent=2)`. Another way: `Path(path).write_text(json.dumps(obj, indent=2), encoding="utf-8")`.
+
+@@ item d10-09
+type: code
+title: Read every report in a folder
+level: 3
+cards: Folders: mkdir, glob, and the current directory; JSON files: load and dump
+--- context
+Each reviewed contract gets its own report file, so over time one folder fills up with many of them. For weekly stats, you first have to read them all in.
+--- prompt
+A folder holds the reports of many reviews, `*.json`. Write `load_reports(folder)`:
+
+- in **file name** order, read each `.json` file and return a list of the dictionaries; add one more key `"file"` to each dictionary, whose value is the file name (like `"a.json"`)
+- ignore any other files in the folder (like `.txt`)
+- the folder doesn't exist: return `[]`
+- a file is not valid JSON: `raise ValueError(f"bad JSON in {file_name}")`, so people know **which file** is broken
+--- starter
+import json
+from pathlib import Path
+
+def load_reports(folder):
+    folder = Path(folder)
+    reports = []
+    return reports
+--- solution
+import json
+from pathlib import Path
+
+def load_reports(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    reports = []
+    for path in sorted(folder.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            raise ValueError(f"bad JSON in {path.name}")
+        data["file"] = path.name
+        reports.append(data)
+    return reports
+--- tests
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/reports", ignore_errors=True)
+_ok = Path("work/d10/reports/ok")
+_ok.mkdir(parents=True)
+(_ok / "b.json").write_text('{"contract": "beta", "counts": {"flag": 1}}', encoding="utf-8")
+(_ok / "a.json").write_text('{"contract": "alpha", "counts": {"accept": 3}}', encoding="utf-8")
+(_ok / "notes.txt").write_text("not a report", encoding="utf-8")
+_bad = Path("work/d10/reports/bad")
+_bad.mkdir(parents=True)
+(_bad / "a.json").write_text('{"contract": "alpha"}', encoding="utf-8")
+(_bad / "b.json").write_text('{"contract": ', encoding="utf-8")
+expect("sorted by file name, with file added", lambda: load_reports("work/d10/reports/ok"), [
+    {"contract": "alpha", "counts": {"accept": 3}, "file": "a.json"},
+    {"contract": "beta", "counts": {"flag": 1}, "file": "b.json"},
+])
+expect("folder doesn't exist", lambda: load_reports("work/d10/reports/nope"), [])
+def _msg():
+    try:
+        load_reports("work/d10/reports/bad")
+    except ValueError as e:
+        return str(e)
+    return "no error raised"
+expect("bad JSON: the error message has the file name", _msg, "bad JSON in b.json")
+--- hints
+- First check `folder.exists()`; then `for path in sorted(folder.glob("*.json")):`, and `json.loads(path.read_text(encoding="utf-8"))` for each one.
+- Put `json.loads` inside a `try`, and in `except json.JSONDecodeError:` do `raise ValueError(f"bad JSON in {path.name}")`.
+- Good to know: `json.JSONDecodeError` is itself a kind of `ValueError`, so even if you don't catch it, you still "raise a ValueError". But then the message has no file name, and when you track the problem down you won't know which file is broken.
+
+@@ item d10-10
+type: fill
+title: Fill in: export a CSV
+level: 2
+cards: CSV: so lawyers can open it in Excel
+--- context
+Lawyers don't read JSON; they use Excel. Here you export the review results to a table file, so lawyers can filter, sort and add comments in a tool they already know.
+--- prompt
+Complete `export_csv(reviews, path)`: export the review results to CSV with only the four columns in `FIELDS` (ignore any other keys in the dictionaries, like `tokens`), and return how many data rows were written (not counting the header).
+
+`newline=""` is already there: without it, Windows puts an extra blank line between rows.
+--- template
+import csv
+from pathlib import Path
+
+FIELDS = ["clause_id", "verdict", "risk_level", "rationale"]
+
+def export_csv(reviews, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.[[DictWriter]](f, fieldnames=FIELDS, extrasaction=[["ignore"]])
+        writer.[[writeheader()]]
+        writer.writerows(reviews)
+    return [[len(reviews)]]
+--- tests
+import csv
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/csv", ignore_errors=True)
+REVIEWS = [
+    {"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "rationale": "cap is not mutual, see 12", "tokens": 340},
+    {"clause_id": "3.1", "verdict": "accept", "risk_level": "low", "rationale": "standard", "tokens": 120},
+]
+OUT = "work/d10/csv/out/reviews.csv"
+expect("returns the number of data rows", lambda: export_csv(REVIEWS, OUT), 2)
+def _back():
+    export_csv(REVIEWS, OUT)
+    with open(OUT, encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+expect("read back: only four columns, and the comma in the text didn't mess up the columns", lambda: _back()[0], {"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "rationale": "cap is not mutual, see 12"})
+expect("the first line is the header", lambda: (export_csv(REVIEWS, OUT), Path(OUT).read_text(encoding="utf-8").splitlines()[0])[1], "clause_id,verdict,risk_level,rationale")
+--- hints
+- To write dictionaries, use `csv.DictWriter`, and write the header first: `writer.writeheader()`.
+- When a dictionary has keys that aren't in `fieldnames`, it raises `ValueError: dict contains fields not in fieldnames` by default; `extrasaction="ignore"` makes it ignore the extra keys.
+
+@@ item d10-11
+type: code
+title: Read back the CSV the lawyer edited
+level: 2
+cards: CSV: so lawyers can open it in Excel
+--- context
+Continuing from the last exercise: the lawyer changed some verdicts in Excel and saved the table back. The program has to read back what a person changed, because in the end the lawyer's judgment is what counts.
+--- prompt
+The lawyer changed verdicts in Excel and saved it back as CSV (columns: `clause_id,verdict,tokens`). Write `csv_summary(path)`, which returns:
+
+`{"rows": number of data rows, "flagged": [clause_id of every row whose verdict is not accept, in file order], "tokens": sum of the tokens column (an integer)}`
+
+Note: the values `csv.DictReader` reads are **all strings**. Open the file with `encoding="utf-8", newline=""`.
+--- starter
+import csv
+
+def csv_summary(path):
+    pass
+--- solution
+import csv
+
+def csv_summary(path):
+    rows = 0
+    flagged = []
+    tokens = 0
+    with open(path, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            rows += 1
+            if row["verdict"] != "accept":
+                flagged.append(row["clause_id"])
+            tokens += int(row["tokens"])
+    return {"rows": rows, "flagged": flagged, "tokens": tokens}
+--- tests
+from pathlib import Path
+Path("work/d10/csv_in").mkdir(parents=True, exist_ok=True)
+Path("work/d10/csv_in/r.csv").write_text("clause_id,verdict,tokens\n8.1,redline,340\n3.1,accept,120\n4.2,flag,95\n", encoding="utf-8")
+Path("work/d10/csv_in/empty.csv").write_text("clause_id,verdict,tokens\n", encoding="utf-8")
+expect("summary", lambda: csv_summary("work/d10/csv_in/r.csv"), {"rows": 3, "flagged": ["8.1", "4.2"], "tokens": 555})
+expect("tokens are added as numbers, not joined as strings", lambda: csv_summary("work/d10/csv_in/r.csv")["tokens"], 555)
+expect("header only", lambda: csv_summary("work/d10/csv_in/empty.csv"), {"rows": 0, "flagged": [], "tokens": 0})
+--- hints
+- `for row in csv.DictReader(f):`, where each `row` is a dictionary, like `{"clause_id": "8.1", "verdict": "redline", "tokens": "340"}`.
+- `"340"` is a string, so `int(row["tokens"])` before adding it.
+
+@@ item d10-12
+type: predict
+title: What argparse parses
+level: 2
+cards: Command-line arguments: argparse
+--- context
+The real project is used like this in the terminal: `python -m clausecheck review data/sample_contract.txt --mode mock`. All the program gets is a list of words, which first have to become arguments with names and types.
+--- prompt
+Write the output. Notice what value an argument has when it isn't given, what `type=int` does, and what `--only-risk` is called in `args`.
+--- code
+import argparse
+
+p = argparse.ArgumentParser(prog="clausecheck")
+p.add_argument("path")
+p.add_argument("--mode", choices=["mock", "deepseek"], default="mock")
+p.add_argument("--limit", type=int)
+p.add_argument("--only-risk")
+p.add_argument("--verbose", action="store_true")
+
+a = p.parse_args(["data/c.txt", "--limit", "5"])
+print(a.path, a.mode, a.limit * 2, a.verbose)
+b = p.parse_args(["--verbose", "--only-risk", "high", "x.txt"])
+print(b.path, b.limit, b.only_risk, b.verbose)
+--- explain
+`type=int` turns `--limit 5` into the integer 5, so it can be multiplied by 2. An optional argument that isn't given takes its default, and with no `default` that is `None`. `store_true` gives `True` when the flag is there. The positional argument can come before or after the others. `--only-risk` becomes the attribute `only_risk` (`-` is replaced by `_`).
+
+@@ item d10-13
+type: code
+title: Write the argument parser
+level: 2
+cards: Command-line arguments: argparse
+--- context
+This is the command-line tool's "manual": which arguments the user can give, what type each one is, and which values it allows. The `review` command in the real project's `cli.py` also has `--out` and `--mode`. When an argument is wrong, the program should stop it before it starts any work.
+--- prompt
+Write `build_parser()`, which returns an `argparse.ArgumentParser(prog="clausecheck")` that supports:
+
+- the positional argument `path`
+- `--out`: a string, default `None`
+- `--mode`: only `mock` / `deepseek` / `local`, default `"mock"`
+- `--limit`: an integer, default `None`
+- `--verbose`: a switch, `True` when it is there
+
+The tests call `build_parser().parse_args([...])`, then turn the result into a dictionary with `vars(args)` to compare it. When an argument is invalid, argparse prints the usage and does `raise SystemExit`, which is exactly what we want.
+--- starter
+import argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="clausecheck")
+    parser.add_argument("path")
+    return parser
+--- solution
+import argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="clausecheck")
+    parser.add_argument("path")
+    parser.add_argument("--out")
+    parser.add_argument("--mode", choices=["mock", "deepseek", "local"], default="mock")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+--- tests
+P = lambda *argv: vars(build_parser().parse_args(list(argv)))
+expect("defaults", lambda: P("c.txt"), {"path": "c.txt", "out": None, "mode": "mock", "limit": None, "verbose": False})
+expect("everything given", lambda: P("c.txt", "--out", "r.json", "--mode", "deepseek", "--limit", "3", "--verbose"), {"path": "c.txt", "out": "r.json", "mode": "deepseek", "limit": 3, "verbose": True})
+expect_raises("--mode not in choices", lambda: P("c.txt", "--mode", "fast"), SystemExit)
+expect_raises("--limit is not a number", lambda: P("c.txt", "--limit", "abc"), SystemExit)
+--- hints
+- Optional argument names start with `--`: `parser.add_argument("--out")`.
+- `--mode` uses `choices=[...]` plus `default="mock"`; an integer uses `type=int`; a switch uses `action="store_true"`.
+
+@@ item d10-14
+type: order
+title: Put the code in order: main(argv)
+level: 2
+cards: main(argv), exit codes, and __name__; Command-line arguments: argparse
+--- context
+The skeleton of a complete small command-line tool. Written as `main(argv)`, a test can run it by passing a list, with no terminal; its return value tells the system whether this run succeeded or failed.
+--- prompt
+Put together a small command-line tool: `main(argv=None)` parses the arguments; if the file doesn't exist, it prints `error: <path> not found` and returns `1`; otherwise it prints `<file name>: <line count> lines` and returns `0`. Two lines are distractors.
+--- lines
+import argparse
+from pathlib import Path
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="count-lines")
+    parser.add_argument("path")
+    args = parser.parse_args(argv)
+    path = Path(args.path)
+    if not path.exists():
+        print(f"error: {path} not found")
+        return 1
+    lines = path.read_text(encoding="utf-8").splitlines()
+    print(f"{path.name}: {len(lines)} lines")
+    return 0
+--- distractors
+    args = parser.parse_args()
+    lines = path.read_text(encoding="utf-8").split("\n")
+--- tests
+from pathlib import Path
+Path("work/d10/order").mkdir(parents=True, exist_ok=True)
+Path("work/d10/order/c.txt").write_text("8.1 Cap on Liability\nLiability is capped.\n", encoding="utf-8")
+expect_output("prints the line count", lambda: main(["work/d10/order/c.txt"]), "c.txt: 2 lines")
+expect("returns 0 on success", lambda: main(["work/d10/order/c.txt"]), 0)
+expect_output("message when the file doesn't exist", lambda: main(["work/d10/order/nope.txt"]), "error: work/d10/order/nope.txt not found")
+expect("returns 1 when the file doesn't exist", lambda: main(["work/d10/order/nope.txt"]), 1)
+--- hints
+- Order: imports → def → create the parser → parse → check the file → read → print → return.
+- `parse_args()` with no argument reads the real command line, so the tests would have no way to pass their arguments in.
+- When the file ends with `"\n"`, `split("\n")` gives an extra empty string (today's exercise 1).
+
+@@ item d10-15
+type: code
+title: A real small command-line tool
+level: 3
+cards: main(argv), exit codes, and __name__; Command-line arguments: argparse; pathlib: paths are objects
+--- context
+Put today's pieces together: a small tool that shows in the terminal how many clauses a contract has, like the real project's `python -m clausecheck clauses`. While debugging, looking at only the first few clauses saves a lot of time.
+--- prompt
+Write `main(argv=None)`. The parser `build_parser()` is already written (arguments: `path`, `--mode`, `--limit`, `--verbose`), and so is `load_clause_ids(text)`, which returns all the clause numbers in the contract. Requirements:
+
+1. the file doesn't exist: print `error: file not found: <path>` and return `1`
+2. read the file and get the clause numbers; if `--limit N` is given, keep only the first N
+3. print one line: `<file name>: <number of clauses> clauses, mode=<mode>`
+4. with `--verbose`, also print each number on its own line, with two spaces in front
+5. return `0`
+
+Example: `main(["work/d10/cli/c.txt", "--limit", "2", "--verbose"])` prints:
+
+```
+c.txt: 2 clauses, mode=mock
+  1.1
+  3.1
+```
+--- starter
+import argparse
+import re
+from pathlib import Path
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+[A-Z]", re.M)
+
+def load_clause_ids(text):
+    return HEAD.findall(text)
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="clausecheck")
+    parser.add_argument("path")
+    parser.add_argument("--mode", choices=["mock", "deepseek", "local"], default="mock")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return 0
+--- solution
+import argparse
+import re
+from pathlib import Path
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+[A-Z]", re.M)
+
+def load_clause_ids(text):
+    return HEAD.findall(text)
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="clausecheck")
+    parser.add_argument("path")
+    parser.add_argument("--mode", choices=["mock", "deepseek", "local"], default="mock")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    path = Path(args.path)
+    if not path.exists():
+        print(f"error: file not found: {path}")
+        return 1
+    ids = load_clause_ids(path.read_text(encoding="utf-8"))
+    if args.limit is not None:
+        ids = ids[:args.limit]
+    print(f"{path.name}: {len(ids)} clauses, mode={args.mode}")
+    if args.verbose:
+        for cid in ids:
+            print(f"  {cid}")
+    return 0
+--- tests
+from pathlib import Path
+Path("work/d10/cli").mkdir(parents=True, exist_ok=True)
+Path("work/d10/cli/c.txt").write_text('CLOUDNOTES AGREEMENT\n1.1 Defined Terms\n"Service" means the platform.\n3.1 Invoicing\nFees are payable within thirty (30) days.\n8.1 Cap on Liability\nLiability is capped at 12 months of fees.\n', encoding="utf-8")
+expect_output("the simplest call", lambda: main(["work/d10/cli/c.txt"]), "c.txt: 3 clauses, mode=mock")
+expect_output("--limit, --verbose and --mode", lambda: main(["work/d10/cli/c.txt", "--limit", "2", "--verbose", "--mode", "deepseek"]), "c.txt: 2 clauses, mode=deepseek\n  1.1\n  3.1")
+expect_output("--limit 0 means none at all", lambda: main(["work/d10/cli/c.txt", "--limit", "0"]), "c.txt: 0 clauses, mode=mock")
+expect("returns 0 on success", lambda: main(["work/d10/cli/c.txt"]), 0)
+expect_output("message when the file doesn't exist", lambda: main(["work/d10/cli/missing.txt"]), "error: file not found: work/d10/cli/missing.txt")
+expect("returns 1 when the file doesn't exist", lambda: main(["work/d10/cli/missing.txt"]), 1)
+--- hints
+- The structure is the same as in the ordering exercise before it: parse → check the file → read → print → return.
+- When `--limit` isn't given, it is `None`. Write `if args.limit is not None:`; if you write `if args.limit:`, then `--limit 0` is treated as "not given".
+- Take the first N with a slice: `ids = ids[:args.limit]`.
+
+@@ item d10-16
+type: choice
+title: Does importing run main?
+level: 2
+cards: main(argv), exit codes, and __name__
+--- context
+When you write tests for a command-line tool (Day 9's pytest), the test file first imports `main` from `cli.py`.
+--- prompt
+The last two lines of `clausecheck/cli.py` are below. A test file says `from clausecheck.cli import main`. What happens?
+--- code
+if __name__ == "__main__":
+    raise SystemExit(main())
+--- options
+- `main()` runs once automatically and prints a report before the tests start
+- `main()` does not run: on import, `__name__` is `"clausecheck.cli"`, not `"__main__"`; a test that wants it calls `main([...])` itself
+- Error: a file can't have both `main` and `__name__`
+- The program exits right away with exit code 0, and none of the tests after it run
+answer: 2
+--- explain
+`__name__` is `"__main__"` when the file is run directly, and the module name when it is imported. These two lines let the same file work as a command-line program and also be imported safely by tests. `raise SystemExit(main())` turns the 0 or 1 that `main` returns into the process's exit code, which is how CI and scripts tell success from failure.
+
+@@ item d10-17
+type: code
+title: Configuration priority
+level: 2
+cards: Environment variables and configuration
+--- context
+A user may have set the run mode in `.env`, and to switch it just this once, add `--mode` on the command line. When several places set it, the program needs one fixed rule for which one wins.
+--- prompt
+Write `resolve_mode(cli_value, env)` to pick the run mode by "command line > environment variable > default":
+
+- `cli_value` is not `None`: use it
+- otherwise, look at `CLAUSECHECK_MODE` in the `env` dictionary; **a missing key or an empty string** both count as not set
+- neither is set: use `"mock"`
+- finally, strip the whitespace from both ends of the value and make it lowercase; if it is not in `MODES`, `raise ValueError(f"unknown mode: {value}")` (`value` is the cleaned-up one)
+
+Example: `resolve_mode(None, {"CLAUSECHECK_MODE": " DeepSeek "})` → `"deepseek"`
+--- starter
+MODES = ("mock", "deepseek", "local")
+
+def resolve_mode(cli_value, env):
+    pass
+--- solution
+MODES = ("mock", "deepseek", "local")
+
+def resolve_mode(cli_value, env):
+    if cli_value is not None:
+        value = cli_value
+    elif env.get("CLAUSECHECK_MODE"):
+        value = env["CLAUSECHECK_MODE"]
+    else:
+        value = "mock"
+    value = value.strip().lower()
+    if value not in MODES:
+        raise ValueError(f"unknown mode: {value}")
+    return value
+--- tests
+expect("the command line wins", lambda: resolve_mode("local", {"CLAUSECHECK_MODE": "deepseek"}), "local")
+expect("no command line, so the environment variable", lambda: resolve_mode(None, {"CLAUSECHECK_MODE": " DeepSeek "}), "deepseek")
+expect("neither, so the default", lambda: resolve_mode(None, {}), "mock")
+expect("an empty environment variable counts as not set", lambda: resolve_mode(None, {"CLAUSECHECK_MODE": ""}), "mock")
+def _msg():
+    try:
+        resolve_mode(None, {"CLAUSECHECK_MODE": "FAST"})
+    except ValueError as e:
+        return str(e)
+    return "no error raised"
+expect("unknown mode → ValueError", _msg, "unknown mode: fast")
+--- hints
+- Check the three sources in order: `if cli_value is not None:` / `elif env.get("CLAUSECHECK_MODE"):` / `else:`, and put the value into the same variable in each.
+- An empty string counts as false, so `elif env.get(...)` rules out "missing" and "empty" together.
+- At the end, do `value.strip().lower()` once for all of them, then check `in MODES`.
+
+@@ item d10-18
+type: testwrite
+title: Write tests for env_int
+level: 3
+cards: Environment variables and configuration; d9:How to come up with test cases
+--- context
+The real project's `config.py` reads number settings such as "maximum steps" from environment variables. What you read from an environment variable is always text, and one wrong value changes how the whole review behaves, so small functions that read configuration are the ones most worth testing.
+--- prompt
+`env_int(env, name, default)` below reads an integer setting from a dictionary of environment variables, like `int(os.getenv("CLAUSECHECK_MAX_STEPS", "6"))` in `config.py`, but stricter:
+
+- the key is missing, or the value is empty once whitespace is removed: return `default`
+- it can be converted to an integer: return the integer (including `"0"`)
+- it can't: `raise ValueError`, with the setting's name in the message
+
+Write tests for it the Day 9 way: each `test_` function tests one case. Your tests must all pass on the correct version and catch every version with a planted bug.
+--- impl
+def env_int(env, name, default):
+    raw = env.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+--- mutants
+===== Type: does it return an integer or a string?
+def env_int(env, name, default):
+    raw = env.get(name, "").strip()
+    if raw == "":
+        return default
+    if not raw.lstrip("-").isdigit():
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+    return raw
+===== Edge case: when the value is "0"
+def env_int(env, name, default):
+    raw = env.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw) or default
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+===== On error: an invalid value is quietly replaced by the default
+def env_int(env, name, default):
+    raw = env.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+===== Whitespace: when the value is only spaces
+def env_int(env, name, default):
+    raw = env.get(name, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+--- starter
+import pytest
+
+def test_reads_a_number():
+    assert env_int({"CLAUSECHECK_MAX_STEPS": "8"}, "CLAUSECHECK_MAX_STEPS", 6) == 8
+--- solution
+import pytest
+
+def test_reads_a_number():
+    assert env_int({"CLAUSECHECK_MAX_STEPS": "8"}, "CLAUSECHECK_MAX_STEPS", 6) == 8
+
+def test_missing_key_uses_default():
+    assert env_int({}, "CLAUSECHECK_MAX_STEPS", 6) == 6
+
+def test_zero_is_a_real_value():
+    assert env_int({"CLAUSECHECK_MAX_STEPS": "0"}, "CLAUSECHECK_MAX_STEPS", 6) == 0
+
+def test_blank_value_uses_default():
+    assert env_int({"CLAUSECHECK_MAX_STEPS": "   "}, "CLAUSECHECK_MAX_STEPS", 6) == 6
+
+def test_bad_value_raises_with_name():
+    with pytest.raises(ValueError, match="CLAUSECHECK_MAX_STEPS"):
+        env_int({"CLAUSECHECK_MAX_STEPS": "six"}, "CLAUSECHECK_MAX_STEPS", 6)
+--- hints
+- One `test_` function per case: a normal number, a missing key, `"0"`, only spaces, an invalid value.
+- "Exactly 0" is a classic edge case: `int(raw) or default` treats 0 as "not set".
+- To test an error: `with pytest.raises(ValueError, match="CLAUSECHECK_MAX_STEPS"):`, with the function call on the line below it.
+
+@@ item d10-19
+type: local
+title: Local task: run the real command line
+level: 2
+cards: Command-line arguments: argparse; main(argv), exit codes, and __name__
+--- context
+Take today's lessons back to the real project: see how its command line parses arguments, where it writes the report, and how it exits when an argument is invalid. When you demo the project live in an interview, these are the commands you use.
+--- prompt
+Run through today's material in the real project on your computer. Open the terminal in VS Code (PowerShell) and run these lines one at a time:
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck -h
+python -m clausecheck clauses data/sample_contract.txt
+New-Item -ItemType Directory -Force work | Out-Null
+python -m clausecheck review data/sample_contract.txt --mode mock --out work/sample.report.json
+echo "exit code: $LASTEXITCODE"
+python -m clausecheck review data/sample_contract.txt --mode fast
+echo "exit code: $LASTEXITCODE"
+```
+
+Then:
+
+1. Open `work/sample.report.json` in VS Code, find `counts` inside `summary`, and compare it with the `counts=` the terminal printed
+2. Open `clausecheck/cli.py` and find the `--mode` line: why is `fast` rejected? Why is the exit code 2?
+3. Paste the terminal output (from the `review` command to the end) below
+
+`--mode mock` doesn't call any model; it reviews by rules and costs nothing. The report's file name ends with `.report.json`, which the project's `.gitignore` ignores, so it won't get committed by mistake.
+placeholder: Paste the terminal output: you should see counts=…, exit code: 0, invalid choice and exit code: 2
+verify: ^(?=[\s\S]*counts=)(?=[\s\S]*invalid choice)(?=[\s\S]*exit code: ?2)
+--- hints
+- If you see `No module named clausecheck`: you're not in the project's root folder. First `cd "G:\Contract Clause Reviewer"`; this is the "current directory" from today's cards.
+- If you see something like `No module named 'dotenv'`: run `python -m pip install -r requirements.txt`.
+- Why create the `work` folder first? `cli.py` doesn't `mkdir` when it writes the report, so if the folder doesn't exist you get `FileNotFoundError`. To see it for yourself, change `--out` to `nowhere/x.report.json` and run it again (the exit code will be 1).
+
+@@ item d10-e1
+type: scratch
+title: Closed book: merge several reports
+exam: yes
+level: 3
+cards: JSON files: load and dump; Folders: mkdir, glob, and the current directory
+--- context
+Every week the team gets a summary: which contracts were reviewed this week, and how many clauses were flagged in total. Each contract's report is in its own file, and they have to be merged into one.
+--- prompt
+Write `merge_reports(folder, out_path)`:
+
+- `folder` holds some `*.json` reports, each like `{"contract": "alpha", "counts": {"accept": 3, "flag": 1}}`; ignore any other files in the folder
+- add up the `counts` of all the reports per verdict, and write the result as a JSON file to `out_path` (indented by 2 spaces; create the parent folders if they don't exist), with this content:
+  `{"files": number of reports, "contracts": [each report's contract, in file name order], "counts": {verdict: total}}`
+- return the dictionary you wrote
+- `folder` doesn't exist, or has no JSON in it: `files` is `0`, `contracts` and `counts` are empty, and the file is still written
+--- solution
+import json
+from pathlib import Path
+
+def merge_reports(folder, out_path):
+    folder = Path(folder)
+    paths = sorted(folder.glob("*.json")) if folder.exists() else []
+    contracts = []
+    counts = {}
+    for p in paths:
+        report = json.loads(p.read_text(encoding="utf-8"))
+        contracts.append(report["contract"])
+        for verdict, n in report["counts"].items():
+            counts[verdict] = counts.get(verdict, 0) + n
+    merged = {"files": len(paths), "contracts": contracts, "counts": counts}
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2)
+    return merged
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/e1", ignore_errors=True)
+_in = Path("work/d10/e1/in")
+_in.mkdir(parents=True)
+(_in / "b.json").write_text('{"contract": "beta", "counts": {"flag": 2, "redline": 1}}', encoding="utf-8")
+(_in / "a.json").write_text('{"contract": "alpha", "counts": {"accept": 3, "flag": 1}}', encoding="utf-8")
+(_in / "readme.txt").write_text("ignore me", encoding="utf-8")
+EXPECTED = {"files": 2, "contracts": ["alpha", "beta"], "counts": {"accept": 3, "flag": 3, "redline": 1}}
+expect("returns the merged result", lambda: merge_reports("work/d10/e1/in", "work/d10/e1/out/merged.json"), EXPECTED)
+def _written():
+    merge_reports("work/d10/e1/in", "work/d10/e1/out2/deep/m.json")
+    return json.loads(Path("work/d10/e1/out2/deep/m.json").read_text(encoding="utf-8"))
+expect("the written file (folders created for you)", _written, EXPECTED)
+expect("folder doesn't exist", lambda: merge_reports("work/d10/e1/nothing", "work/d10/e1/out3/m.json"), {"files": 0, "contracts": [], "counts": {}})
+
+@@ item d10-e2
+type: scratch
+title: Closed book: a command line that counts verdicts
+exam: yes
+level: 3
+cards: Command-line arguments: argparse; CSV: so lawyers can open it in Excel; main(argv), exit codes, and __name__
+--- context
+With a review table (CSV) a lawyer exported, sometimes you just want a quick look in the terminal at how many clauses got each verdict. Here you build that as a separate small command-line tool.
+--- prompt
+Using argparse, write `main(argv=None)` for the command-line tool `count-verdicts` (`prog="count-verdicts"`):
+
+- positional argument `path`: a CSV file with at least the two columns `clause_id` and `verdict`
+- optional argument `--only`: must be `accept` / `flag` / `redline`; when it is invalid, argparse reports the error and exits (`SystemExit`)
+- no `--only`: print one line `verdict: count` for each verdict, in alphabetical order of the verdicts, for example `accept: 2`
+- `--only flag` given: print just one line, `flag: count` (if the file has no such verdict, print `flag: 0`)
+- return `0` on success; when the file doesn't exist, print `error: file not found: <path>` and return `1`
+--- solution
+import argparse
+import csv
+from collections import Counter
+from pathlib import Path
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="count-verdicts")
+    parser.add_argument("path")
+    parser.add_argument("--only", choices=["accept", "flag", "redline"])
+    args = parser.parse_args(argv)
+    path = Path(args.path)
+    if not path.exists():
+        print(f"error: file not found: {path}")
+        return 1
+    with open(path, encoding="utf-8", newline="") as f:
+        counts = Counter(row["verdict"] for row in csv.DictReader(f))
+    if args.only:
+        print(f"{args.only}: {counts[args.only]}")
+    else:
+        for verdict in sorted(counts):
+            print(f"{verdict}: {counts[verdict]}")
+    return 0
+--- tests
+from pathlib import Path
+Path("work/d10/e2").mkdir(parents=True, exist_ok=True)
+Path("work/d10/e2/r.csv").write_text("clause_id,verdict\n8.1,redline\n3.1,accept\n4.2,redline\n2.1,accept\n", encoding="utf-8")
+expect_output("all verdicts, in alphabetical order", lambda: main(["work/d10/e2/r.csv"]), "accept: 2\nredline: 2")
+expect_output("--only prints 0 even when there are none", lambda: main(["work/d10/e2/r.csv", "--only", "flag"]), "flag: 0")
+expect("returns 1 when the file doesn't exist", lambda: main(["work/d10/e2/none.csv"]), 1)
+expect_raises("invalid --only", lambda: main(["work/d10/e2/r.csv", "--only", "maybe"]), SystemExit)
+
+@@ item d10-e3
+type: scratch
+title: Closed book: validate the playbook
+exam: yes
+level: 3
+cards: JSON files: load and dump; d3:raise: report an error on purpose
+--- context
+The review rules are all stored in `data/playbook.json`, and the model looks up rules by topic (the real project's `playbook.py` groups the rules by topic). When someone edits this file by hand, it's easy to leave out a field, and the program should notice as soon as it starts.
+--- prompt
+Write `load_playbook(path)` to read and validate a playbook JSON file:
+
+- the file doesn't exist: just let `FileNotFoundError` be raised on its own
+- the top level must be a dictionary, and `"rules"` must be a list; otherwise `raise ValueError("playbook needs a 'rules' list")`
+- every rule must have the three keys `id`, `topic` and `severity`, checked **in this order**; if one is missing, `raise ValueError(f"rule {i} is missing '{key}'")`, where `i` is the rule's index in the list (starting at 0)
+- all valid: return `{topic: [ids of the rules with this topic, in file order]}`
+--- solution
+import json
+from pathlib import Path
+
+REQUIRED = ("id", "topic", "severity")
+
+def load_playbook(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+        raise ValueError("playbook needs a 'rules' list")
+    by_topic = {}
+    for i, rule in enumerate(data["rules"]):
+        for key in REQUIRED:
+            if key not in rule:
+                raise ValueError(f"rule {i} is missing '{key}'")
+        by_topic.setdefault(rule["topic"], []).append(rule["id"])
+    return by_topic
+--- tests
+from pathlib import Path
+_d = Path("work/d10/e3")
+_d.mkdir(parents=True, exist_ok=True)
+(_d / "ok.json").write_text('{"rules": [{"id": "PB-01", "topic": "liability_cap", "severity": "high"}, {"id": "PB-02", "topic": "payment", "severity": "medium"}, {"id": "PB-03", "topic": "liability_cap", "severity": "high"}]}', encoding="utf-8")
+(_d / "norules.json").write_text('{"customer": "studio"}', encoding="utf-8")
+(_d / "missing.json").write_text('{"rules": [{"id": "PB-01", "topic": "payment", "severity": "low"}, {"id": "PB-02", "severity": "high"}]}', encoding="utf-8")
+(_d / "nope.json").unlink(missing_ok=True)
+expect("grouped by topic", lambda: load_playbook("work/d10/e3/ok.json"), {"liability_cap": ["PB-01", "PB-03"], "payment": ["PB-02"]})
+def _err(name):
+    try:
+        load_playbook(f"work/d10/e3/{name}")
+    except ValueError as e:
+        return str(e)
+    return "no ValueError raised"
+expect("no rules", lambda: _err("norules.json"), "playbook needs a 'rules' list")
+expect("missing field", lambda: _err("missing.json"), "rule 1 is missing 'topic'")
+expect_raises("file doesn't exist", lambda: load_playbook("work/d10/e3/nope.json"), FileNotFoundError)

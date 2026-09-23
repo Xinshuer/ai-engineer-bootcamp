@@ -1,0 +1,763 @@
+@@ day 2
+title: Python core: loops, dictionaries, functions, comprehensions
+lang: py
+hours: 4–5 hours
+--- goal
+Loop over real data shaped like a "list of dictionaries" to count, filter, group and sort it; use default arguments and early return in functions. Today's material is everything behind `summarise()` in Clause Check.
+--- checklist
+- Clear your Review list first: redo from blank every exercise where you looked at the answer yesterday
+- Read all 8 knowledge cards, change the examples and run them
+- Pass every practice exercise
+- The 3 closed-book challenges
+- In VS Code, write `count_verdicts` and `group_by_topic` from a blank file, without looking at anything
+
+@@ concept
+title: for loops
+--- body
+`for variable in list:` takes the elements out of the list one at a time and runs the indented code below once for each.
+
+`range(n)` produces the numbers 0 to n-1; `range(1, 4)` is 1, 2, 3 (the end is not included).
+
+You can give the loop variable any name, but make it meaningful: when you loop over clauses, call it `clause` or `c`, not `x`.
+--- code
+ids = ["3.1", "4.2", "8.1"]
+for cid in ids:
+    print("reviewing", cid)
+
+for i in range(3):
+    print("attempt", i + 1)
+
+@@ concept
+title: Accumulating: set up before the loop, update inside it
+--- body
+Almost every count or total has the same shape:
+
+1. **Before** the loop, set up a starting value (`0`, an empty list `[]`, an empty dictionary `{}`)
+2. **Inside** the loop, update it
+3. **After** the loop, return it
+
+The most common bug: putting the starting value inside the loop, so it is reset on every pass.
+--- code
+lengths = [120, 45, 300]
+total = 0
+for n in lengths:
+    total = total + n
+print("total", total)
+
+long_ones = []
+for n in lengths:
+    if n > 100:
+        long_ones.append(n)
+print(long_ones)
+
+@@ concept
+title: Dictionaries: look up values by name
+--- body
+A dictionary `{key: value, ...}` finds a value by its key, like looking something up in a table.
+
+- `d["8.1"]` gets the value; a missing key raises `KeyError`
+- `d.get("4.2")` returns `None` when the key is missing; `d.get("4.2", "unknown")` returns the default you give it
+- `d["4.2"] = "low"` adds or changes a value
+- `"3.1" in d` checks whether the key is there
+- `for k, v in d.items():` loops over keys and values together
+
+The JSON the model returns, the playbook rules, the counts: in Python they are all dictionaries.
+--- code
+risk = {"8.1": "high", "3.1": "low"}
+print(risk["8.1"])
+print(risk.get("4.2"), risk.get("4.2", "unknown"))
+risk["4.2"] = "medium"
+for cid, level in risk.items():
+    print(cid, "->", level)
+
+@@ concept
+title: The standard way to count
+--- body
+Counting how many times each verdict appears is the most common operation in this project. The standard way:
+
+```python
+counts = {}
+for v in verdicts:
+    counts[v] = counts.get(v, 0) + 1
+```
+
+`counts.get(v, 0)` means "how many we have counted so far, or 0 if we haven't seen it yet". Writing `counts[v] += 1` directly raises `KeyError` the first time a value shows up.
+--- code
+verdicts = ["accept", "flag", "accept", "redline", "accept"]
+counts = {}
+for v in verdicts:
+    counts[v] = counts.get(v, 0) + 1
+print(counts)
+
+@@ concept
+title: Lists of dictionaries: what real data looks like
+--- body
+When a contract has been reviewed, the result is a list, and each element is the dictionary for one clause:
+
+```python
+clauses = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "8.1", "verdict": "flag", "risk": "high"},
+]
+```
+
+In the loop, `c` is a dictionary, and `c["risk"]` gets one field. When you read code like this, ask yourself: "Is this variable a list, a dictionary or a string right now?"
+--- code
+clauses = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "8.1", "verdict": "flag", "risk": "high"},
+    {"id": "10.1", "verdict": "redline", "risk": "high"},
+]
+for c in clauses:
+    if c["risk"] == "high":
+        print(c["id"], c["verdict"])
+
+@@ concept
+title: Functions: default arguments and early return
+--- body
+- **Default argument**: `def label(cid, prefix="Clause"):`; if the call leaves out `prefix`, the default is used
+- **Early return**: as soon as you find the answer, `return` it and the function ends right there; if the loop finishes without finding it, `return None` at the end
+
+The standard shape of "find one thing":
+
+```python
+def find(items, target):
+    for x in items:
+        if x == target:
+            return x
+    return None
+```
+
+Note that the last line, `return None`, lines up with `for`: it is not inside the loop.
+--- code
+def label(cid, prefix="Clause"):
+    return f"{prefix} {cid}"
+
+def first_high(clauses):
+    for c in clauses:
+        if c["risk"] == "high":
+            return c["id"]
+    return None
+
+print(label("8.1"), label("8.1", "Section"))
+print(first_high([{"id": "3.1", "risk": "low"}, {"id": "8.1", "risk": "high"}]))
+print(first_high([]))
+
+@@ concept
+title: List comprehensions: filter and transform in one line
+--- body
+`[expression for variable in list if condition]` does the same as "set up an empty list → loop → append when the condition holds".
+
+```python
+ids = [c["id"] for c in clauses if c["risk"] == "high"]
+```
+
+Get comfortable with plain for loops first, then use comprehensions. The tests accept both; being able to read comprehensions is enough, and in an interview you can write either.
+--- code
+clauses = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "10.1", "risk": "high"},
+]
+print([c["id"] for c in clauses])
+print([c["id"] for c in clauses if c["risk"] == "high"])
+print([len(c["id"]) for c in clauses])
+
+@@ concept
+title: Sorting and while
+--- body
+**Sorting**: `sorted(list)` returns a new, sorted list. To sort by a field, use `key=`:
+
+```python
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+sorted(clauses, key=lambda c: RISK_ORDER[c["risk"]])
+```
+
+`lambda c: ...` is a small function without a name: give it a clause and it returns the value to compare. `sorted` is stable: elements with the same comparison value keep their original order.
+
+**while**: keeps looping as long as the condition is true. Use it when you don't know how many times you will loop, for example retrying when an API call fails. Always make sure something changes inside the loop, or it will loop forever (an infinite loop).
+--- code
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+clauses = [{"id": "3.1", "risk": "low"}, {"id": "8.1", "risk": "high"}, {"id": "4.2", "risk": "medium"}]
+for c in sorted(clauses, key=lambda c: RISK_ORDER[c["risk"]]):
+    print(c["id"], c["risk"])
+
+attempt = 1
+while attempt <= 3:
+    print("try", attempt)
+    attempt = attempt + 1
+
+@@ item d2-01
+type: predict
+title: for and range
+level: 1
+cards: for loops
+--- context
+Reviewing a contract means handing the clauses to the model one at a time. In a program, "one at a time" is a loop, so first see clearly what it gets on each pass.
+--- prompt
+Write the output.
+--- code
+for i in range(3):
+    print(i)
+for cid in ["3.1", "8.1"]:
+    print("clause", cid)
+
+@@ item d2-02
+type: predict
+title: Three ways to get a value from a dictionary
+level: 1
+cards: Dictionaries: look up values by name
+--- context
+The program often stores "clause number → risk level" as a table; to find a clause's risk, it looks the number up. Before you look anything up, you need to know what happens when the number is not in the table.
+--- prompt
+Write the output. Notice what `get` returns when the key is missing.
+--- code
+risk = {"8.1": "high", "3.1": "low"}
+print(risk["8.1"])
+print(risk.get("4.2"))
+print(risk.get("4.2", "unknown"))
+print("3.1" in risk)
+print(len(risk))
+
+@@ item d2-03
+type: code
+title: Total number of characters
+level: 1
+cards: Accumulating: set up before the loop, update inside it; for loops
+--- context
+The longer the text sent to the model, the slower it runs and the more it costs. Add up the lengths of all the clauses in a contract and you have a first estimate of how big the contract is.
+--- prompt
+Write `total_length(texts)`: `texts` is a list of strings; return the sum of their lengths. An empty list returns `0`.
+
+Write it with a for loop (accumulating is exactly what you're practicing today).
+--- starter
+def total_length(texts):
+    total = 0
+    # loop over texts and add each one's length to total
+    return total
+--- solution
+def total_length(texts):
+    total = 0
+    for t in texts:
+        total = total + len(t)
+    return total
+--- tests
+expect("two strings", lambda: total_length(["abc", "de"]), 5)
+expect("empty list", lambda: total_length([]), 0)
+expect("three strings", lambda: total_length(["Cap", " on ", "Liability"]), 16)
+--- hints
+- `for t in texts:`, then `total = total + len(t)`.
+- `return total` lines up with `for`, outside the loop.
+
+@@ item d2-04
+type: code
+title: Count each verdict
+level: 2
+cards: The standard way to count; Dictionaries: look up values by name
+--- context
+The top of the report tells the person reviewing the contract how many clauses were accepted, how many were flagged, and how many need a redline. The input is the model's verdict for each clause, in clause order.
+--- prompt
+Write `count_verdicts(verdicts)`: given a list of verdicts, return how many times each verdict appears.
+
+```python
+count_verdicts(["accept", "flag", "accept"])
+# → {"accept": 2, "flag": 1}
+```
+--- starter
+def count_verdicts(verdicts):
+    pass
+--- solution
+def count_verdicts(verdicts):
+    counts = {}
+    for v in verdicts:
+        counts[v] = counts.get(v, 0) + 1
+    return counts
+--- tests
+expect("basic", lambda: count_verdicts(["accept", "flag", "accept"]), {"accept": 2, "flag": 1})
+expect("all three verdicts", lambda: count_verdicts(["redline", "accept", "flag", "redline"]), {"redline": 2, "accept": 1, "flag": 1})
+expect("empty list", lambda: count_verdicts([]), {})
+--- hints
+- `counts = {}` before the loop, update it inside the loop, `return counts` after it.
+- The update line: `counts[v] = counts.get(v, 0) + 1`.
+
+@@ item d2-05
+type: code
+title: Get all the clause numbers
+level: 1
+cards: Lists of dictionaries: what real data looks like; for loops
+--- context
+When a contract has been reviewed, the result is a list with one dictionary per clause, holding several fields: number, verdict, risk and so on. When the report lists which clauses the contract has, it needs only the number column.
+--- prompt
+Write `ids_of(clauses)`: `clauses` is a list of dictionaries (each has an `"id"` key); return a list of all the numbers, in the original order.
+--- starter
+def ids_of(clauses):
+    pass
+--- solution
+def ids_of(clauses):
+    result = []
+    for c in clauses:
+        result.append(c["id"])
+    return result
+--- tests
+expect("three clauses", lambda: ids_of([{"id": "3.1"}, {"id": "8.1"}, {"id": "12"}]), ["3.1", "8.1", "12"])
+expect("empty", lambda: ids_of([]), [])
+--- hints
+- Set up `result = []`, and inside the loop `result.append(c["id"])`.
+- Or a one-line comprehension: `[c["id"] for c in clauses]`.
+
+@@ item d2-06
+type: code
+title: High-risk clauses
+level: 2
+cards: List comprehensions: filter and transform in one line; Lists of dictionaries: what real data looks like
+--- context
+The person reviewing the contract has little time and most wants to know which clauses are high risk. The summary in the real project has exactly this: a list of high-risk clause numbers (`high_risk`).
+--- prompt
+Write `high_risk_ids(clauses)`: return the numbers of the clauses whose `risk` is `"high"`, in the original order.
+--- starter
+def high_risk_ids(clauses):
+    pass
+--- solution
+def high_risk_ids(clauses):
+    return [c["id"] for c in clauses if c["risk"] == "high"]
+--- tests
+CLAUSES = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "4.2", "risk": "medium"},
+    {"id": "10.1", "risk": "high"},
+]
+expect("two high-risk clauses", lambda: high_risk_ids(CLAUSES), ["8.1", "10.1"])
+expect("no high-risk clauses", lambda: high_risk_ids([{"id": "1", "risk": "low"}]), [])
+--- hints
+- Inside the loop add `if c["risk"] == "high":`, then append.
+- As a comprehension: `[c["id"] for c in clauses if ...]`.
+
+@@ item d2-07
+type: code
+title: Find a clause by number
+level: 2
+cards: Functions: default arguments and early return; Lists of dictionaries: what real data looks like
+--- context
+While reviewing one clause, the model may want to look at another clause it mentions, for example "see clause 8.1". The real project's `get_clause` tool first has to find that clause in the whole contract by its number, and the model may also get the number wrong.
+--- prompt
+Write `find_clause(clauses, clause_id)`: return the dictionary whose number equals `clause_id`; if there is none, return `None`.
+--- starter
+def find_clause(clauses, clause_id):
+    pass
+--- solution
+def find_clause(clauses, clause_id):
+    for c in clauses:
+        if c["id"] == clause_id:
+            return c
+    return None
+--- tests
+DATA = [{"id": "3.1", "risk": "low"}, {"id": "8.1", "risk": "high"}]
+expect("finds 8.1", lambda: find_clause(DATA, "8.1"), {"id": "8.1", "risk": "high"})
+expect("not found returns None", lambda: find_clause(DATA, "99"), None)
+expect("empty list", lambda: find_clause([], "1"), None)
+--- hints
+- As soon as you find it, `return c`.
+- The last line, `return None`, lines up with `for` (it runs only after the whole loop has finished).
+
+@@ item d2-08
+type: fix
+title: Fix the bug: prints but doesn't return
+level: 1
+cards: d1:Functions: def and return; Accumulating: set up before the loop, update inside it
+--- context
+The summary part of the report calls this function and puts the number of high-risk clauses it computes at the top of the report.
+--- prompt
+This function "looks" right (you can see the output when it runs), but every test fails. Why? Fix it.
+--- starter
+def count_high(clauses):
+    total = 0
+    for c in clauses:
+        if c["risk"] == "high":
+            total = total + 1
+    print(total)
+--- solution
+def count_high(clauses):
+    total = 0
+    for c in clauses:
+        if c["risk"] == "high":
+            total = total + 1
+    return total
+--- tests
+expect("two", lambda: count_high([{"risk": "high"}, {"risk": "low"}, {"risk": "high"}]), 2)
+expect("zero", lambda: count_high([{"risk": "low"}]), 0)
+--- hints
+- What does the test show under Got? `None` means the function doesn't return anything.
+- `print` only shows the value; replace it with `return`.
+
+@@ item d2-09
+type: fix
+title: Fix the bug: KeyError
+level: 2
+cards: The standard way to count; d1:Reading errors: start from the last line
+--- context
+In this exercise we count which topics a contract covers (payment, cap on liability, ...) and how many clauses each topic has. This function fails as soon as it runs, and then the whole report never gets made.
+--- prompt
+Running the tests raises `KeyError`. Read the error and fix this counting function.
+--- starter
+def count_topics(topics):
+    counts = {}
+    for t in topics:
+        counts[t] += 1
+    return counts
+--- solution
+def count_topics(topics):
+    counts = {}
+    for t in topics:
+        counts[t] = counts.get(t, 0) + 1
+    return counts
+--- tests
+expect("basic", lambda: count_topics(["payment", "payment", "liability_cap"]), {"payment": 2, "liability_cap": 1})
+expect("empty", lambda: count_topics([]), {})
+--- hints
+- The first time `"payment"` comes up, the dictionary doesn't have that key yet, so `counts[t] += 1` can't read an old value and fails.
+- Use `counts.get(t, 0) + 1`.
+
+@@ item d2-10
+type: choice
+title: print and return
+level: 1
+cards: d1:Functions: def and return; d1:How code runs: print and comments
+--- context
+The earlier exercise "Fix the bug: prints but doesn't return" went wrong because of exactly these two words. When beginners write counting functions, this is one of the most common misunderstandings.
+--- prompt
+Which statement about `print` and `return` is true?
+--- options
+- They are the same: both hand the result to the caller
+- `return` hands the value to the caller and ends the function; `print` only shows it on the screen
+- A function can use only one of them
+- The function ends after `print`
+answer: 2
+--- explain
+`return` is the function's way out: when you call `x = f()`, `x` gets the returned value, and the function ends as soon as it reaches return. `print` only affects the screen, not the value the program gets. Calling a function that has no return gives `None`.
+
+@@ item d2-11
+type: predict
+title: List comprehensions
+level: 2
+cards: List comprehensions: filter and transform in one line; Lists of dictionaries: what real data looks like
+--- context
+The summary code in the real project's `pipeline.py` is full of one-line filters like these. First learn to read them at a glance.
+--- prompt
+Write the output.
+--- code
+clauses = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "10.1", "risk": "high"},
+]
+print([c["id"] for c in clauses])
+print([c["id"] for c in clauses if c["risk"] == "high"])
+print(len([c for c in clauses if c["risk"] != "high"]))
+
+@@ item d2-12
+type: code
+title: Sort by risk
+level: 3
+cards: Sorting and while; Dictionaries: look up values by name
+--- context
+The "needs attention" part of the report is a to-do list for the person reviewing the contract: the higher up, the sooner it gets read. `high`, `medium` and `low` are text, and in alphabetical order they come out as high, low, medium, so the program has to define the order itself.
+--- prompt
+The lawyer wants to see high risk first. Write `attention_order(clauses)`: return a list of clause numbers sorted so that `"high"` comes first, then `"medium"`, and `"low"` last; clauses with the same risk keep their original order.
+
+The real project's `needs_attention` also puts high risk at the top (it also drops the accepted clauses, and sorts clauses with the same risk by verdict and then by number).
+--- starter
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def attention_order(clauses):
+    pass
+--- solution
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def attention_order(clauses):
+    ordered = sorted(clauses, key=lambda c: RISK_ORDER[c["risk"]])
+    return [c["id"] for c in ordered]
+--- tests
+DATA = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "4.2", "risk": "medium"},
+    {"id": "10.1", "risk": "high"},
+]
+expect("high → medium → low, same level keeps its original order", lambda: attention_order(DATA), ["8.1", "10.1", "4.2", "3.1"])
+expect("empty", lambda: attention_order([]), [])
+--- hints
+- `sorted(clauses, key=lambda c: RISK_ORDER[c["risk"]])` gives the sorted list of dictionaries.
+- Then take out the numbers. `sorted` is a stable sort, so clauses on the same level don't get shuffled.
+
+@@ item d2-13
+type: order
+title: Put the code in order: count high risk
+level: 2
+cards: Accumulating: set up before the loop, update inside it; for loops
+--- context
+The top of the report says how many high-risk clauses the contract has, and this function computes that number. Counting functions are the most common kind in summary code, and they almost always have the same shape, so it's worth knowing them so well you don't have to think.
+--- prompt
+Put the lines of `count_high(clauses)` in order: it returns the number of high-risk clauses. Note that there are two distractor lines.
+--- lines
+def count_high(clauses):
+    total = 0
+    for c in clauses:
+        if c["risk"] == "high":
+            total = total + 1
+    return total
+--- distractors
+        total = 0
+    for c in range(clauses):
+--- tests
+expect("two", lambda: count_high([{"risk": "high"}, {"risk": "low"}, {"risk": "high"}]), 2)
+expect("zero", lambda: count_high([]), 0)
+--- hints
+- The starting value `total = 0` goes outside the loop (the line indented 4 spaces).
+- `range(clauses)` is wrong: range needs a number, and here you loop over the list directly.
+
+@@ item d2-14
+type: code
+title: Group by topic
+level: 3
+cards: Dictionaries: look up values by name; Lists of dictionaries: what real data looks like; Accumulating: set up before the loop, update inside it
+--- context
+Besides a verdict, the model also labels each clause with a topic, such as `payment` or `liability_cap` (cap on liability). People reviewing contracts often read by topic: all the payment clauses together, read side by side.
+--- prompt
+Write `group_by_topic(clauses)`: return a dictionary whose keys are topics and whose values are the lists of clause numbers under each topic (in the original order).
+
+```python
+group_by_topic([
+    {"id": "3.1", "topic": "payment"},
+    {"id": "8.1", "topic": "liability_cap"},
+    {"id": "3.2", "topic": "payment"},
+])
+# → {"payment": ["3.1", "3.2"], "liability_cap": ["8.1"]}
+```
+--- starter
+def group_by_topic(clauses):
+    pass
+--- solution
+def group_by_topic(clauses):
+    groups = {}
+    for c in clauses:
+        if c["topic"] not in groups:
+            groups[c["topic"]] = []
+        groups[c["topic"]].append(c["id"])
+    return groups
+--- tests
+DATA = [
+    {"id": "3.1", "topic": "payment"},
+    {"id": "8.1", "topic": "liability_cap"},
+    {"id": "3.2", "topic": "payment"},
+]
+expect("two groups", lambda: group_by_topic(DATA), {"payment": ["3.1", "3.2"], "liability_cap": ["8.1"]})
+expect("empty", lambda: group_by_topic([]), {})
+--- hints
+- The values are lists: the first time a topic comes up, put an empty list there first, `groups[topic] = []`.
+- Then `groups[topic].append(c["id"])`.
+
+@@ item d2-15
+type: code
+title: Summary report
+level: 3
+cards: The standard way to count; List comprehensions: filter and transform in one line; Lists of dictionaries: what real data looks like
+--- context
+This is the last step of the whole pipeline: once every clause has been reviewed, the long list of results is boiled down to a few lines at the top of the report, so the person reviewing the contract sees the whole picture at a glance. The real `summarise()` also works out how much money and time the review took; here you practice only the core.
+--- prompt
+Write `summarise(clauses)` that returns a dictionary like this:
+
+```python
+{
+    "total": number of clauses,
+    "counts": {each verdict: count},
+    "needs_attention": [numbers whose verdict is not "accept", in the original order],
+}
+```
+
+This is the core of `summarise()` in Clause Check's `pipeline.py`. You can write a loop in the function or use a comprehension.
+--- starter
+def summarise(clauses):
+    pass
+--- solution
+def summarise(clauses):
+    counts = {}
+    for c in clauses:
+        counts[c["verdict"]] = counts.get(c["verdict"], 0) + 1
+    return {
+        "total": len(clauses),
+        "counts": counts,
+        "needs_attention": [c["id"] for c in clauses if c["verdict"] != "accept"],
+    }
+--- tests
+DATA = [
+    {"id": "3.1", "verdict": "accept"},
+    {"id": "8.1", "verdict": "flag"},
+    {"id": "4.2", "verdict": "redline"},
+    {"id": "14", "verdict": "accept"},
+]
+expect("full summary", lambda: summarise(DATA), {"total": 4, "counts": {"accept": 2, "flag": 1, "redline": 1}, "needs_attention": ["8.1", "4.2"]})
+expect("empty contract", lambda: summarise([]), {"total": 0, "counts": {}, "needs_attention": []})
+--- hints
+- Three steps: first compute counts (the standard counting pattern), then needs_attention, and finally put them into a dictionary and return it.
+- A dictionary can span several lines; put a comma after each key-value pair.
+
+@@ item d2-16
+type: code
+title: Which attempt succeeded
+level: 2
+skip_starter: yes
+cards: Sorting and while; Functions: default arguments and early return
+--- context
+Calls to the model's API sometimes fail, so the program waits a moment and tries again. On every call the server sends back a number called a status code, which says whether the call worked (200 means success). When you track down a problem, you often need to know which attempt finally worked.
+--- prompt
+The API can fail, and when retrying you want to know which attempt succeeded. Write `first_success(statuses)`: `statuses` holds the status code each call returned, in order. Return the attempt on which the first `200` appears (counting from 1); if there is never a 200, return `-1`.
+
+Try writing it with `while`.
+--- starter
+def first_success(statuses):
+    i = 0
+    while i < len(statuses):
+        # check statuses[i], and don't forget to change i
+        pass
+    return -1
+--- solution
+def first_success(statuses):
+    i = 0
+    while i < len(statuses):
+        if statuses[i] == 200:
+            return i + 1
+        i = i + 1
+    return -1
+--- tests
+expect("succeeds on the third attempt", lambda: first_success([429, 429, 200]), 3)
+expect("succeeds on the first attempt", lambda: first_success([200, 500]), 1)
+expect("always fails", lambda: first_success([500, 503]), -1)
+expect("empty list", lambda: first_success([]), -1)
+--- hints
+- The while loop in the starter code never ends: `i` never changes. Click Run to try it, and look at the message when it is forcibly stopped after 10 seconds.
+- When you find 200, `return i + 1` (indexes start at 0, attempts start at 1); otherwise `i = i + 1`.
+
+@@ item d2-17
+type: choice
+title: What range covers
+level: 1
+cards: for loops
+--- context
+When you retry an API call or number clauses in order, you often need a run of consecutive numbers. In Python you usually make them with `range`.
+--- prompt
+What is `list(range(1, 4))`?
+--- options
+- `[1, 2, 3, 4]`
+- `[1, 2, 3]`
+- `[0, 1, 2, 3]`
+- `[2, 3, 4]`
+answer: 2
+--- explain
+`range(start, end)` includes the start and does **not include** the end. It is the same rule as the slice `ids[1:4]`.
+
+@@ item d2-18
+type: fill
+title: Fill in: the counting template
+level: 1
+cards: The standard way to count
+--- context
+The report says how many clauses are high, medium and low risk. "Count by value" is the most common shape in summary code, and every counting exercise today uses it, so it's worth knowing so well you don't have to think.
+--- prompt
+Complete the counting template.
+--- template
+def count_risks(risks):
+    counts = {}
+    for r in risks:
+        counts[r] = counts.[[get]](r, [[0]]) + 1
+    return [[counts]]
+--- tests
+expect("basic", lambda: count_risks(["high", "low", "high"]), {"high": 2, "low": 1})
+expect("empty", lambda: count_risks([]), {})
+--- hints
+- What is the dictionary method that means "use a default value if the key isn't there"?
+
+@@ item d2-19
+type: code
+title: Default arguments
+level: 1
+cards: Functions: default arguments and early return
+--- context
+In the report a clause is usually called `Clause 8.1`, but some contracts use Section or Article instead (when the real project looks for clause references, it recognizes all three). Most places use the same word; only now and then does it need to change.
+--- prompt
+Write `label(clause_id, prefix="Clause")`: return `"Clause 8.1"`; if the call gives a `prefix`, use that one instead, for example `label("8.1", "Section")` returns `"Section 8.1"`.
+--- starter
+def label(clause_id, prefix="Clause"):
+    pass
+--- solution
+def label(clause_id, prefix="Clause"):
+    return f"{prefix} {clause_id}"
+--- tests
+expect("default prefix", lambda: label("8.1"), "Clause 8.1")
+expect("custom prefix", lambda: label("8.1", "Section"), "Section 8.1")
+expect("prefix passed by name", lambda: label("12", prefix="Art."), "Art. 12")
+--- hints
+- The default is already in the parameter list, so the function body only needs to build the string with `prefix`.
+
+@@ item d2-e1
+type: scratch
+title: Closed book: count words
+exam: yes
+level: 2
+cards: The standard way to count; d1:Strings
+--- context
+When you get a new contract, first skim its most frequent words: if fees and liability come up a lot, you already have a rough idea that the contract is mostly about money and liability.
+--- prompt
+Write `count_words(text)`: split the text on whitespace, convert everything to lowercase, count how many times each word appears, and return a dictionary.
+
+`count_words("Fees and fees")` → `{"fees": 2, "and": 1}`
+--- solution
+def count_words(text):
+    counts = {}
+    for w in text.lower().split():
+        counts[w] = counts.get(w, 0) + 1
+    return counts
+--- tests
+expect("upper and lower case count as one word", lambda: count_words("Fees and fees"), {"fees": 2, "and": 1})
+expect("several spaces", lambda: count_words("a  b a"), {"a": 2, "b": 1})
+expect("empty string", lambda: count_words(""), {})
+
+@@ item d2-e2
+type: scratch
+title: Closed book: clause numbers by verdict
+exam: yes
+level: 1
+cards: List comprehensions: filter and transform in one line; Lists of dictionaries: what real data looks like
+--- context
+People reviewing contracts often say "show me only the ones that need a redline first", or "list everything that was flagged".
+--- prompt
+Write `clauses_by_verdict(clauses, verdict)`: return the numbers of the clauses whose verdict equals `verdict` (each clause is a dictionary with `"id"` and `"verdict"`), in the original order.
+--- solution
+def clauses_by_verdict(clauses, verdict):
+    return [c["id"] for c in clauses if c["verdict"] == verdict]
+--- tests
+DATA = [{"id": "3.1", "verdict": "accept"}, {"id": "8.1", "verdict": "flag"}, {"id": "9.1", "verdict": "flag"}]
+expect("flag", lambda: clauses_by_verdict(DATA, "flag"), ["8.1", "9.1"])
+expect("no redline", lambda: clauses_by_verdict(DATA, "redline"), [])
+
+@@ item d2-e3
+type: scratch
+title: Closed book: counts for three risk levels
+exam: yes
+level: 2
+cards: The standard way to count; Dictionaries: look up values by name
+--- context
+In these exercises the report starts with a risk table that always has three cells: high, medium, low. The web page looks up the numbers by these three names, and if one cell is missing, the page breaks.
+--- prompt
+Write `risk_counts(clauses)`: return `{"high": count, "medium": count, "low": count}`. **All three keys must be there**; a level with no clauses gets 0; ignore any other risk values.
+--- solution
+def risk_counts(clauses):
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for c in clauses:
+        if c["risk"] in counts:
+            counts[c["risk"]] += 1
+    return counts
+--- tests
+expect("mixed", lambda: risk_counts([{"risk": "high"}, {"risk": "low"}, {"risk": "high"}]), {"high": 2, "medium": 0, "low": 1})
+expect("empty list: all three keys are 0", lambda: risk_counts([]), {"high": 0, "medium": 0, "low": 0})
+expect("ignores unknown values", lambda: risk_counts([{"risk": "urgent"}, {"risk": "medium"}]), {"high": 0, "medium": 1, "low": 0})

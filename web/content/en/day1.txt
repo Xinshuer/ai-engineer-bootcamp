@@ -1,0 +1,638 @@
+@@ day 1
+title: Getting started with Python: variables, strings, lists, decisions
+lang: py
+hours: 4–5 hours
+--- goal
+Write small functions that take parameters and return a value; work with strings and lists; make decisions with if; read the three most common errors.
+--- checklist
+- Read all 8 knowledge cards (card 1 introduces the project behind the exercises), and change at least one thing in every example before you run it
+- Pass every practice exercise (exercises where you looked at the answer go to Review, redo them tomorrow)
+- The 3 closed-book challenges: no hints, no pasting
+- Close the page, create day1.py in VS Code, and rewrite today's hardest exercise from a blank file, then run it
+
+@@ concept project
+title: Meet the project: Clause Check
+--- body
+Almost every exercise in this course comes from one real project: **Clause Check**, a small program that helps people review contracts. It works in this order:
+
+1. Read a contract and cut it into numbered **clauses**. Each clause has a number (`clause_id`, for example `"8.1"`) and a heading (`heading`, for example `"Cap on Liability"`)
+2. Send each clause to a **large language model** (this course uses DeepSeek) and have it check the clause against the company's review rules (the **playbook**). The model gives a **verdict**, one of three:
+   - `accept`: fine, accept it
+   - `flag`: risky, mark it for a person to look at
+   - `redline`: must be rewritten; the model suggests new wording
+3. Each clause also gets a **risk** level: `high` / `medium` / `low`
+4. Collect the results for all clauses into a report for the person reviewing the contract
+
+Every exercise is one small piece of this pipeline. The **Background** above each exercise says which step it belongs to and why it is needed; **Knowledge cards used** opens the matching card so you can review it.
+
+You don't need to remember these words now. Come back to this card whenever you forget one. (Local tasks on your own computer assume the project lives in `G:\Contract Clause Reviewer`; use your own folder instead.)
+
+@@ concept
+title: How code runs: print and comments
+--- body
+Code runs from top to bottom, one line at a time. `print(...)` shows what is inside the parentheses in the output area. It is your window into the program.
+
+- Text (a string) goes inside quotes: `"Hello"`
+- Anything after `#` is a comment: it is for people and does not run
+- Separate several values in `print` with commas; the output puts one space between them
+
+Change the code below and click Run. This is today's most important habit: **write two or three lines, then run**.
+--- code
+# This is a comment; it does not run
+print("Hello, Clause Check")
+print("8.1", "Cap on Liability")
+print(1 + 2)
+
+@@ concept
+title: Variables and types
+--- body
+`=` means "put the value on the right into the name on the left". It is not the equals sign from math. After that, the name gives you the value back.
+
+The most common types:
+
+- `str` string: `"8.1"`
+- `int` whole number: `3`
+- `float` decimal number: `0.82`
+- `bool` true or false: `True` / `False` (capital first letter)
+- `None`: nothing at all
+
+`type(x)` shows the type. A variable can be assigned again: `page = page + 1` computes a new value from the old one and puts it back.
+--- code
+clause_id = "8.1"
+page = 3
+ratio = 0.82
+is_risky = True
+print(clause_id, page, ratio, is_risky)
+print(type(clause_id), type(page))
+page = page + 1
+print(page)
+
+@@ concept
+title: Strings
+--- body
+- **f-string**: inside `f"..."`, `{variable}` is replaced by its value. This is the usual way to build text
+- Common methods: `.strip()` removes spaces at both ends, `.lower()` / `.upper()` change case, `.replace(a, b)` replaces text, `.split(".")` cuts at a separator, `.startswith(x)` checks the beginning
+- `"x" in s` checks whether s contains x, `len(s)` is the length
+- Indexes: `s[0]` is the first character, `s[-1]` the last; the slice `s[0:3]` takes characters 0, 1 and 2
+
+String methods **never change the original string**. They return a new one, so keep the result in a variable.
+--- code
+heading = "  Cap on Liability  "
+clean = heading.strip()
+print(f"[{clean}]")
+print(clean.lower(), clean.upper())
+print(clean.replace("Cap", "Limit"))
+print("8.1".split("."))
+print("Liability" in clean, len(clean))
+print(clean[0], clean[-1], clean[0:3])
+
+@@ concept
+title: Lists
+--- body
+`[...]` holds several values in order.
+
+- Indexes start at **0**: `ids[0]` is the first, `ids[-1]` the last
+- `len(ids)` is how many there are, `ids.append(x)` adds x at the end
+- The slice `ids[1:3]` takes indexes 1 and 2 (not 3)
+- `x in ids` checks whether x is in the list
+
+Unlike strings, `append` **changes the list itself**.
+--- code
+ids = ["3.1", "4.2", "8.1"]
+print(ids[0], ids[-1], len(ids))
+ids.append("12")
+print(ids)
+print(ids[1:3])
+print("8.1" in ids, "9.9" in ids)
+
+@@ concept
+title: if / elif / else
+--- body
+- Comparisons: `==` equal, `!=` not equal, `<` `>` `<=` `>=`
+- Combining: `and` both are true, `or` at least one is true, `not` flips it
+- Don't forget the colon `:` at the end
+- **Indentation (4 spaces)** says "these lines belong to the if above". Python uses indentation to know where a block starts and ends
+
+`elif` means "else if", and you can have many; `else` catches everything left, and is optional.
+--- code
+risk = "high"
+verdict = "accept"
+if risk == "high":
+    print("Look at this one first")
+elif risk == "medium":
+    print("Look when you have time")
+else:
+    print("Can skip")
+if risk == "high" and verdict == "accept":
+    print("High risk but accepted? Worth a second look")
+
+@@ concept
+title: Functions: def and return
+--- body
+Almost every exercise is "write a function". Remember the shape:
+
+```python
+def function_name(param1, param2):
+    ...compute...
+    return result
+```
+
+Call it as `function_name(value1, value2)` and you get back what it `return`s.
+
+**return is not print**: `print` only shows something on the screen; `return` hands the result to the code that called the function. The tests check the `return` value, so a function that only prints will never pass. A function stops at `return`; lines after it do not run.
+--- code
+def describe(clause_id, heading):
+    return f"{clause_id} {heading}"
+
+text = describe("8.1", "Cap on Liability")
+print(text)
+print(describe("4.2", "Automatic Renewal"))
+
+@@ concept
+title: Reading errors: start from the last line
+error_demo: yes
+--- body
+Errors are not scary: they tell you what went wrong. How to read one:
+
+1. **Read the last line first**: the error type and the reason
+2. Then the `File "main.py", line N` above it: which line
+3. Go to that line and compare
+
+The three most common:
+
+- `NameError: name 'x' is not defined`: the name was never defined, usually a **typo**
+- `TypeError`: the wrong type, for example a string `+` a number
+- `SyntaxError` / `IndentationError`: the code is written wrongly or indented wrongly, for example a missing colon
+
+Run the code below, read the error, then fix it.
+--- code
+clause_id = "8.1"
+print("Clause " + clause_id)
+print(clause_idd)
+
+@@ item d1-01
+type: choice
+title: What one equals sign means
+level: 1
+cards: Variables and types
+--- context
+When Clause Check gets a verdict from the model, the first thing it does is store it under a name, so it can compare and print it later. This line is how you store it.
+--- prompt
+What does this line of code do?
+--- code
+verdict = "flag"
+--- options
+- Checks whether verdict equals "flag"
+- Puts the string "flag" into the name verdict
+- Shows flag on the screen
+- Creates a variable called flag
+answer: 2
+--- explain
+A single `=` is **assignment**: it stores the value on the right in the name on the left. To check whether two values are equal, use two equals signs: `==`.
+
+@@ item d1-02
+type: predict
+title: print with several values
+level: 1
+cards: How code runs: print and comments; Strings
+--- context
+The report shows each clause as one line: number plus heading. First see exactly how `print` and an f-string each put several values together into one line.
+--- prompt
+Don't run it. Run it in your head first and write the output (one line per print).
+--- code
+clause_id = "8.1"
+heading = "Cap on Liability"
+print(clause_id, heading)
+print(f"{clause_id}: {heading}")
+print("Clause", clause_id + "!")
+
+@@ item d1-03
+type: predict
+title: String methods
+level: 1
+cards: Strings
+--- context
+Clause text cut out of a contract file often has extra spaces at both ends. The program removes them first, so later checks and counts are correct.
+--- prompt
+Write the output. Notice which characters `strip()` removes, and that `len` counts the length after removing them.
+--- code
+text = "  Subject to Section 12  "
+clean = text.strip()
+print(clean)
+print(clean.lower())
+print(len(clean))
+print(clean.startswith("Subject"))
+
+@@ item d1-04
+type: code
+title: Build a one-line description
+level: 1
+cards: Strings; Functions: def and return
+--- context
+The report is read by the person reviewing the contract, one line per clause: number, heading, and the model's verdict. This function builds that line.
+--- prompt
+Write the function `describe(clause_id, heading, verdict)` that returns a string like this:
+
+`"8.1 Cap on Liability: flag"`
+
+The format is: number, space, heading, colon, space, verdict.
+--- starter
+def describe(clause_id, heading, verdict):
+    # build the result with an f-string, then return it
+    pass
+--- solution
+def describe(clause_id, heading, verdict):
+    return f"{clause_id} {heading}: {verdict}"
+--- tests
+expect("description of 8.1", lambda: describe("8.1", "Cap on Liability", "flag"), "8.1 Cap on Liability: flag")
+expect("description of 4.2", lambda: describe("4.2", "Automatic Renewal", "redline"), "4.2 Automatic Renewal: redline")
+expect("returns a string", lambda: type(describe("1", "A", "accept")).__name__, "str")
+--- hints
+- An f-string looks like `f"{a} {b}"`: variable names go inside the braces.
+- Don't forget `return`: printing alone won't pass. `pass` is a placeholder; delete it once you've written your code.
+
+@@ item d1-05
+type: code
+title: Is it high risk?
+level: 1
+cards: if / elif / else; Functions: def and return
+--- context
+Clauses with risk `high` go to the top of the report so people see them first. To do that, the program must first be able to tell whether a clause is high risk.
+--- prompt
+Write `is_high(risk)`: return `True` when `risk` is `"high"`, otherwise `False`.
+--- starter
+def is_high(risk):
+    pass
+--- solution
+def is_high(risk):
+    return risk == "high"
+--- tests
+expect("high", lambda: is_high("high"), True)
+expect("low", lambda: is_high("low"), False)
+expect("uppercase HIGH does not count (different case means a different string)", lambda: is_high("HIGH"), False)
+--- hints
+- You can write an if/else that returns True in one branch and False in the other.
+- Shorter: `risk == "high"` is already True or False, so you can return it directly.
+
+@@ item d1-06
+type: code
+title: Clean up the model's output
+level: 1
+cards: Strings; Functions: def and return
+--- context
+The program asks the model to answer with a single verdict word (accept / flag / redline), but the model often adds spaces or a line break, or uses capital letters. Compared as it is with `"redline"`, it won't match, so the answer is cleaned up first.
+--- prompt
+The model sometimes returns text like `"  REDLINE\n"`, with extra spaces, a line break and mixed case.
+
+Write `normalize(text)`: remove the whitespace at both ends (spaces and line breaks), convert to lowercase, and return it.
+--- starter
+def normalize(text):
+    pass
+--- solution
+def normalize(text):
+    return text.strip().lower()
+--- tests
+expect("spaces and a line break", lambda: normalize("  REDLINE\n"), "redline")
+expect("capital first letter", lambda: normalize("Accept"), "accept")
+expect("already clean", lambda: normalize("flag"), "flag")
+--- hints
+- `.strip()` removes both spaces and line breaks.
+- Methods can be chained: `text.strip().lower()`.
+
+@@ item d1-07
+type: fix
+title: Fix the bug: string plus number
+level: 1
+cards: Strings; Reading errors: start from the last line
+--- context
+Clause headings in the report read like `Clause 12`. Sometimes the clause number is the number `12` rather than the text `"12"`, and then joining them directly fails. This is one of the most common beginner errors.
+--- prompt
+This function should return `"Clause 12"`, but the test fails with an error. Click Run, read the last line of the error, then fix it.
+--- starter
+def label(number):
+    return "Clause " + number
+--- solution
+def label(number):
+    return "Clause " + str(number)
+--- tests
+expect("label(12)", lambda: label(12), "Clause 12")
+expect("label(3)", lambda: label(3), "Clause 3")
+--- hints
+- The last line of the error is `TypeError`: a string `str` can't be joined to a whole number `int` with `+`.
+- Turn the number into a string with `str(number)`, or use an f-string: `f"Clause {number}"`.
+
+@@ item d1-08
+type: choice
+title: Reading an error: NameError
+level: 1
+cards: Reading errors: start from the last line
+--- context
+Misspelling a variable name happens every day. Recognizing this error at a glance saves a lot of searching.
+--- prompt
+Line 1 of the code is `heading = "Cap on Liability"`. Running it shows this error. What is the most likely cause?
+--- code
+Traceback (most recent call last):
+  File "main.py", line 3, in <module>
+    print(headng)
+NameError: name 'headng' is not defined
+--- options
+- The variable name is misspelled on line 3
+- Line 1 should use print
+- Python is not installed correctly on the computer
+- headng is a reserved word in Python and can't be used
+answer: 1
+--- explain
+`NameError` means "this name was never defined". The most common reason is a typo: it was defined as `heading`, but line 3 says `headng`, missing an i. Read the last line first, then use `line 3` to find the place.
+
+@@ item d1-09
+type: predict
+title: List indexes and slices
+level: 1
+cards: Lists
+--- context
+Once a contract is cut up, all the clause numbers sit in a list, in order. Taking the first, the last or a few in the middle all use indexes and slices.
+--- prompt
+Write the output. Remember: indexes start at 0, and a slice does not include its end index.
+--- code
+ids = ["3.1", "4.2", "8.1", "12"]
+print(ids[0])
+print(ids[-1])
+print(ids[1:3])
+print(len(ids))
+
+@@ item d1-10
+type: code
+title: Get the section number
+level: 2
+cards: Strings; Lists
+--- context
+A contract's clauses are grouped into sections: `8.1` and `8.2` both belong to section 8. The report groups clauses by section, so first the section number has to come out of the clause number.
+--- prompt
+The section of clause `"8.1"` is `"8"`, the section of `"12"` is `"12"`, and the section of `"10.2.1"` is `"10"`.
+
+Write `section_of(clause_id)` that returns the section number (a string).
+--- starter
+def section_of(clause_id):
+    pass
+--- solution
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+--- tests
+expect("8.1", lambda: section_of("8.1"), "8")
+expect("12 has no dot", lambda: section_of("12"), "12")
+expect("10.2.1 has several levels", lambda: section_of("10.2.1"), "10")
+--- hints
+- `"8.1".split(".")` gives the list `["8", "1"]`.
+- Take the first element of a list with `[0]`. Both steps fit on one line: `clause_id.split(".")[0]`.
+
+@@ item d1-11
+type: code
+title: Risk label
+level: 2
+cards: if / elif / else
+--- context
+The report shows each risk level as an eye-catching label. Now and then the model gives an unexpected value, so there must be a fallback label at the end rather than a crash.
+--- prompt
+Write `risk_label(risk)`:
+
+- `"high"` → `"HIGH RISK"`
+- `"medium"` → `"MEDIUM"`
+- `"low"` → `"LOW"`
+- anything else → `"UNKNOWN"`
+--- starter
+def risk_label(risk):
+    if risk == "high":
+        return "HIGH RISK"
+    # go on with elif and else
+--- solution
+def risk_label(risk):
+    if risk == "high":
+        return "HIGH RISK"
+    elif risk == "medium":
+        return "MEDIUM"
+    elif risk == "low":
+        return "LOW"
+    else:
+        return "UNKNOWN"
+--- tests
+expect("high", lambda: risk_label("high"), "HIGH RISK")
+expect("medium", lambda: risk_label("medium"), "MEDIUM")
+expect("low", lambda: risk_label("low"), "LOW")
+expect("fallback for anything else", lambda: risk_label("urgent"), "UNKNOWN")
+--- hints
+- `elif condition:` means "else if"; line it up with the `if`.
+- End with `else:` to catch every other case.
+
+@@ item d1-12
+type: fill
+title: Fill in: does a person need to look?
+level: 1
+cards: if / elif / else; Functions: def and return
+--- context
+Only clauses with the verdict accept can be passed without a look; flag and redline both go to a person. The program uses this check to decide which clauses go on the to-do list.
+--- prompt
+Every clause whose verdict is not `"accept"` needs a person to look at it. Fill in the blanks so that `needs_attention("accept")` returns `False` and every other verdict returns `True`.
+--- template
+def needs_attention(verdict):
+    if verdict [[==]] "accept":
+        return [[False]]
+    return [[True]]
+--- tests
+expect("accept needs no look", lambda: needs_attention("accept"), False)
+expect("flag needs a look", lambda: needs_attention("flag"), True)
+expect("redline needs a look", lambda: needs_attention("redline"), True)
+--- hints
+- Checking whether two values are equal uses two equals signs.
+- `True` and `False` start with a capital letter and have no quotes.
+
+@@ item d1-13
+type: order
+title: Put the code in order: does it mention a Section?
+level: 1
+cards: Strings; if / elif / else
+--- context
+A clause that says `Section 12` refers to section 12, so the reviewer has to read that section too. First the program has to spot such a reference.
+--- prompt
+Click the lines to put them in the right order and build `mentions_section(text)`: return `True` if the text contains `"Section"`, otherwise `False`.
+
+One line is a distractor and is not used.
+--- lines
+def mentions_section(text):
+    if "Section" in text:
+        return True
+    return False
+--- distractors
+    if "Section" = text:
+--- tests
+expect("contains Section", lambda: mentions_section("Subject to Section 12"), True)
+expect("no Section", lambda: mentions_section("Fees are payable in 30 days"), False)
+--- hints
+- The first line of a function is always `def ...:`.
+- `=` is assignment and can't compare, so that line is the distractor.
+
+@@ item d1-14
+type: code
+title: Add a clause number, no duplicates
+level: 2
+cards: Lists; if / elif / else
+--- context
+During the review the program keeps a list of the clause numbers it has already looked at. The same clause must not be recorded twice, or the report would show it twice.
+--- prompt
+Write `add_clause(ids, new_id)`: add `new_id` to the end of the list `ids`; if it is already in the list, don't add it again. Return the list.
+--- starter
+def add_clause(ids, new_id):
+    pass
+--- solution
+def add_clause(ids, new_id):
+    if new_id not in ids:
+        ids.append(new_id)
+    return ids
+--- tests
+expect("adds a new one", lambda: add_clause(["3.1", "4.2"], "8.1"), ["3.1", "4.2", "8.1"])
+expect("already there, not added", lambda: add_clause(["3.1", "4.2"], "3.1"), ["3.1", "4.2"])
+expect("empty list", lambda: add_clause([], "1.1"), ["1.1"])
+--- hints
+- "Not in the list" is written `new_id not in ids`.
+- `ids.append(new_id)` changes the list itself; don't forget `return ids` at the end.
+
+@@ item d1-15
+type: code
+title: Singular or plural
+level: 2
+cards: if / elif / else; Strings
+--- context
+The report's summary line says how many clauses got a given verdict. One clause is singular, any other number is plural ("clauses"); getting it wrong looks unprofessional.
+--- prompt
+Write `count_text(count, verdict)`:
+
+- when `count` is 1, return `"1 clause: flag"`
+- any other number (including 0) gives the plural, like `"3 clauses: flag"`
+--- starter
+def count_text(count, verdict):
+    pass
+--- solution
+def count_text(count, verdict):
+    if count == 1:
+        return f"1 clause: {verdict}"
+    return f"{count} clauses: {verdict}"
+--- tests
+expect("1 clause", lambda: count_text(1, "flag"), "1 clause: flag")
+expect("3 clauses", lambda: count_text(3, "redline"), "3 clauses: redline")
+expect("0 is plural too", lambda: count_text(0, "accept"), "0 clauses: accept")
+--- hints
+- Handle the singular first with `if count == 1:`; every other case goes to the return below it.
+- Numbers in an f-string don't need `str()`: `f"{count} clauses"`.
+
+@@ item d1-16
+type: choice
+title: and vs. or
+level: 2
+cards: if / elif / else
+--- context
+Programs often combine two conditions, for example "high risk, and the verdict is flag". First get clear on the difference between `and` and `or`.
+--- prompt
+With `risk = "medium"` and `verdict = "flag"`, which expression is `True`?
+--- options
+- `risk == "high" and verdict == "flag"`
+- `risk == "high" or verdict == "flag"`
+- `not verdict == "flag"`
+- `risk == "low" or verdict == "accept"`
+answer: 2
+--- explain
+`and` needs both sides to be True; `or` needs only one. Here `verdict == "flag"` is True, so the second expression, with `or`, is True. The first one uses `and`, and `risk == "high"` is False, so the whole thing is False.
+
+@@ item d1-17
+type: code
+title: Shorten long text
+level: 2
+cards: Strings; if / elif / else
+--- context
+The clause list on the web page has no room for the full text of each clause. It shows only the beginning and adds `...` to say there is more.
+--- prompt
+The screen shows only the first `n` characters. Write `shorten(text, n)`:
+
+- length at most `n`: return it unchanged
+- longer than `n`: return the first `n` characters followed by `"..."`
+--- starter
+def shorten(text, n):
+    pass
+--- solution
+def shorten(text, n):
+    if len(text) <= n:
+        return text
+    return text[:n] + "..."
+--- tests
+expect("short text unchanged", lambda: shorten("Fees", 10), "Fees")
+expect("long text shortened", lambda: shorten("Cap on Liability", 6), "Cap on...")
+expect("exactly n is not shortened", lambda: shorten("abcdef", 6), "abcdef")
+--- hints
+- `len(text)` gives the length; compare it with `n`.
+- The slice `text[:n]` takes the first n characters (`[:n]` is the same as `[0:n]`).
+
+@@ item d1-e1
+type: scratch
+title: Closed book: clause title
+exam: yes
+level: 1
+cards: Strings; Functions: def and return
+--- context
+In the report, every clause starts with a title line that gives its number and name.
+--- prompt
+Write the function `clause_title(clause_id, heading)` that returns text like `"Clause 8.1 - Cap on Liability"` (in the middle: space, dash, space).
+--- solution
+def clause_title(clause_id, heading):
+    return f"Clause {clause_id} - {heading}"
+--- tests
+expect("8.1", lambda: clause_title("8.1", "Cap on Liability"), "Clause 8.1 - Cap on Liability")
+expect("12", lambda: clause_title("12", "Exclusions"), "Clause 12 - Exclusions")
+
+@@ item d1-e2
+type: scratch
+title: Closed book: verdict color
+exam: yes
+level: 2
+cards: Strings; if / elif / else
+--- context
+The web page shows verdicts in color: green to pass, orange for a person to look at, red to rewrite. The verdict comes from the model's answer, so it may have spaces or capital letters.
+--- prompt
+Write `verdict_color(verdict)`: `"accept"` → `"green"`, `"flag"` → `"orange"`, `"redline"` → `"red"`, anything else → `"grey"`.
+
+The input may have spaces at either end or capital letters (for example `" Flag "`); recognize it correctly anyway.
+--- solution
+def verdict_color(verdict):
+    v = verdict.strip().lower()
+    if v == "accept":
+        return "green"
+    elif v == "flag":
+        return "orange"
+    elif v == "redline":
+        return "red"
+    return "grey"
+--- tests
+expect("accept", lambda: verdict_color("accept"), "green")
+expect("flag with spaces and a capital", lambda: verdict_color(" Flag "), "orange")
+expect("REDLINE", lambda: verdict_color("REDLINE"), "red")
+expect("anything else", lambda: verdict_color("maybe"), "grey")
+
+@@ item d1-e3
+type: scratch
+title: Closed book: first and last
+exam: yes
+level: 2
+cards: Lists; if / elif / else
+--- context
+The top of the report says which clause the contract starts with and which it ends with, so it needs the first and the last number in the clause list.
+--- prompt
+Write `ends(ids)`: return a new list with the first and the last element of `ids`.
+
+- if `ids` is empty, return `[]`
+- if it has one element, return `[that element, that element]`
+--- solution
+def ends(ids):
+    if len(ids) == 0:
+        return []
+    return [ids[0], ids[-1]]
+--- tests
+expect("normal list", lambda: ends(["3.1", "4.2", "8.1"]), ["3.1", "8.1"])
+expect("one element", lambda: ends(["12"]), ["12", "12"])
+expect("empty list", lambda: ends([]), [])

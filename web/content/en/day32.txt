@@ -1,0 +1,1719 @@
+@@ day 32
+title: State graph basics: StateGraph, nodes, edges, reducers, parallelism, streaming
+lang: py
+langchain: yes
+hours: 4–5 hours
+--- goal
+Rewrite your Day 19 graph runner with LangGraph: `StateGraph`, nodes, fixed edges and conditional edges, `START` / `END`, `compile`, `invoke`. Understand how it runs (supersteps: the nodes in the same step run together), reducers (how updates are merged when several nodes write the same key), parallel branches and joins, and tell the errors that are raised apart from the ones that happen **silently**; finally, build a chat node with `MessagesState`. This matches `clausecheck/graph.py` in the project.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change one thing in each before you run it
+- Pass every practice exercise
+- The 3 closed-book challenges
+- Open `clausecheck/graph.py` and say which node writes each key of `State`, and why this graph needs no reducer
+
+@@ concept
+title: From your runner to StateGraph
+--- body
+Every piece of the runner you wrote on Day 19 has a counterpart in LangGraph:
+
+- `nodes["review"] = review` → `g.add_node("review", review)`
+- `start = "load"` → `g.add_edge(START, "load")`
+- `edges["load"] = "review"` → `g.add_edge("load", "review")`
+- `edges["summarise"] = route` → `g.add_conditional_edges("summarise", route)` (two cards from now)
+- `"END"` → `END`
+- `run_graph(...)` → `app = g.compile()`, then `app.invoke(input)` returns the **final state** (a dict)
+- `max_steps=20` → pass `{"recursion_limit": 20}` when you call it (Day 31: if you don't, the limit is 10007)
+
+The rules are the same too: a node gets the whole state and returns only **the keys it changed** (a small dictionary); the framework does the merging. `compile()` checks the structure first (an edge pointing to a node that doesn't exist, no starting point, …). The `app` it returns is a Runnable, so it also has `stream` and `batch` (Day 29).
+
+The State is a `TypedDict` (you learned it on Day 19); `total=False` means every key may be missing at the start.
+
+Is it worth it? For a straight-line flow like the one below, plain functions called one after another are enough (that's exactly what `pipeline.py` does). What LangGraph is really worth is checkpoints, interrupts that wait for a person, parallelism and streaming; the docstring at the top of `graph.py` gives exactly this reason.
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    clauses: list[str]
+    redlines: list[str]
+    summary: str
+
+def load(state: State) -> dict:
+    return {"clauses": state["text"].split("\n")}
+
+def review(state: State) -> dict:
+    return {"redlines": [c.split()[0] for c in state["clauses"] if "unlimited" in c]}
+
+def summarise(state: State) -> dict:
+    return {"summary": f"{len(state['clauses'])} clauses, {len(state['redlines'])} redline(s)"}
+
+g = StateGraph(State)
+g.add_node("load", load)
+g.add_node("review", review)
+g.add_node("summarise", summarise)
+g.add_edge(START, "load")
+g.add_edge("load", "review")
+g.add_edge("review", "summarise")
+g.add_edge("summarise", END)
+app = g.compile()
+
+final = app.invoke({"text": "3.1 Fees are payable in 30 days.\n8.3 Liability shall be unlimited."})
+print(final["summary"], final["redlines"])
+print(sorted(final))
+print(type(app).__name__)
+
+@@ concept
+title: State and reducers
+--- body
+By default every key is **overwritten**: when two nodes write `verdict` one after the other, the later one wins, just like `{**state, **update}`.
+
+To "add up" instead, give the key a **reducer**:
+
+```python
+class State(TypedDict):
+    verdict: str                                  # overwrite
+    notes: Annotated[list[str], operator.add]     # append
+```
+
+When merging, LangGraph calls `operator.add(old value, new value)`, which for lists means joining them. A reducer can be any function that "takes two arguments and returns the merged result", for example one that keeps the higher risk level (you'll write it in the practice). The input to `invoke` goes through the reducer too.
+
+Why it matters: nodes can run in parallel (a later card), and when several nodes in the same step write the same key, only a reducer knows how to combine them.
+
+Classic mistake: a key has a reducer, but the node returns the **whole** list, `{"notes": state["notes"] + ["x"]}`. The old contents get joined on a second time. A node returns only the **new** part.
+--- code
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict):
+    verdict: str
+    notes: Annotated[list[str], operator.add]
+
+def legal(state):
+    return {"verdict": "flag", "notes": ["legal: cap is 12 months"]}
+
+def cost(state):
+    return {"verdict": "accept", "notes": ["cost: within budget"]}
+
+def wrong(state):
+    return {"notes": state["notes"] + ["wrong: returned the whole list"]}
+
+g = StateGraph(State)
+g.add_node("legal", legal)
+g.add_node("cost", cost)
+g.add_node("wrong", wrong)
+g.add_edge(START, "legal")
+g.add_edge("legal", "cost")
+g.add_edge("cost", "wrong")
+g.add_edge("wrong", END)
+out = g.compile().invoke({"verdict": "", "notes": ["input"]})
+print("verdict:", out["verdict"])
+for note in out["notes"]:
+    print(" -", note)
+
+@@ concept
+title: Conditional edges
+--- body
+`g.add_conditional_edges("summarise", route)`: after `summarise` finishes, LangGraph calls `route(state)`, which returns the name of the next node, or `END` (finish right away). Exactly like the routing function from Day 19.
+
+Give the routing function a return type, `-> Literal["approve", "export"]` (that's how `route` in `graph.py` is written):
+
+- From this annotation LangGraph knows which nodes the conditional edge can go to, so it draws the graph correctly
+- When the returned name is not in it (for example misspelled as `"Approve"`), it raises `KeyError: 'Approve'` right away, so you find out immediately
+- It runs without the annotation too, but a misspelled name **raises no error**: the graph logs a warning and just stops (a later card is all about this)
+
+You can also give the destinations as a third argument: a list, `["approve", "export"]`, or a mapping, `{"yes": "approve", "no": "export"}` (the router then returns yes / no). The effect is the same: the drawing knows the destinations, and a typo raises `KeyError`.
+--- code
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] > 0 else "export"
+
+g = StateGraph(State)
+g.add_node("summarise", summarise)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "summarise")
+g.add_conditional_edges("summarise", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+app = g.compile()
+
+print(app.invoke({"redlines": 2})["path"])
+print(app.invoke({"redlines": 0})["path"])
+
+@@ concept
+title: Parallel branches and supersteps
+--- body
+LangGraph runs in **steps (supersteps)**: each step runs all the nodes that are due, together; when they have all finished, it merges their updates at once, then decides the next step. When a node has two outgoing edges, both targets run in parallel in the same step (on a normal computer with threads; in this page's browser one after the other, with the same result).
+
+- **Join**: `g.add_edge(["legal_check", "cost_estimate"], "summarise")` (the start written as a list) means `summarise` runs only after **both** have finished, and only once. With just two separate edges, when one branch is longer than the other, `summarise` is triggered **twice**, in different steps (the example below)
+- Two nodes in the same step write the same key, and that key has **no reducer**: `InvalidUpdateError: At key 'verdict': Can receive only one value per step. Use an Annotated key to handle multiple values.` The fix is to give it a reducer
+- The merge order is fixed (in this version it goes by node name), but it's not the order you added the edges, and not who finished first. Don't rely on it: if you need a stable order, sort it yourself
+- Don't `print` inside parallel nodes: on a real machine the threads run in no fixed order, so the output order can differ every time
+--- code
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    findings: Annotated[list[str], operator.add]
+    runs: Annotated[list[str], operator.add]
+
+def legal_check(state):
+    return {"findings": ["legal: liability is unlimited"]}
+
+def cost_check(state):
+    return {"findings": ["cost: fees can rise any time"]}
+
+def cost_estimate(state):
+    return {"findings": ["cost: +12% per year"]}
+
+def summarise(state):
+    return {"runs": [f"summarise saw {len(state['findings'])} finding(s)"]}
+
+def build(join):
+    g = StateGraph(State)
+    for name, fn in [("legal_check", legal_check), ("cost_check", cost_check), ("cost_estimate", cost_estimate), ("summarise", summarise)]:
+        g.add_node(name, fn)
+    g.add_edge(START, "legal_check")
+    g.add_edge(START, "cost_check")
+    g.add_edge("cost_check", "cost_estimate")
+    if join:
+        g.add_edge(["legal_check", "cost_estimate"], "summarise")
+    else:
+        g.add_edge("legal_check", "summarise")
+        g.add_edge("cost_estimate", "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+
+print("two edges:", build(join=False).invoke({})["runs"])
+out = build(join=True).invoke({})
+print("joined:   ", out["runs"])
+print(sorted(out["findings"]))
+
+@@ concept
+title: Loud errors and silent errors
+--- body
+What LangGraph **reports** (good news: you know right away):
+
+- An edge pointing to a node that doesn't exist: at `compile()`, `ValueError: Found edge ending at unknown node ...`
+- No edge leaving `START`: `ValueError: Graph must have an entrypoint ...`
+- The same node name added twice: `ValueError: Node ... already present.`
+- A node returns something that isn't a dictionary: `InvalidUpdateError: Expected dict, got ...`
+- A node reads a key nobody has written: an ordinary `KeyError`
+
+What happens **silently** (the most dangerous kind; tests have to catch it on purpose):
+
+- A node returns a key that isn't in the State (`verdikt`): it's simply dropped
+- A routing function (without a `Literal` annotation) returns a node name that doesn't exist: only a warning is logged (the `Task ... wrote to unknown channel ...` line in the output below), and the graph stops
+- A node has no outgoing edge: the graph ends there
+- A node forgets `return` (returns `None`): treated as "changed nothing"
+
+How to catch them: tests assert the **final state** and the **nodes visited**; routing functions get a `Literal`; when debugging, look at stream (next card).
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class S(TypedDict, total=False):
+    verdict: str
+
+def run(label, node, route=None):
+    try:
+        g = StateGraph(S)
+        g.add_node("review", node)
+        g.add_node("export", lambda s: {})
+        g.add_edge(START, "review")
+        if route:
+            g.add_conditional_edges("review", route)
+        else:
+            g.add_edge("review", "export")
+        g.add_edge("export", END)
+        print(f"{label:<16} ->", g.compile().invoke({"verdict": "pending"}))
+    except Exception as e:
+        print(f"{label:<16} -> {type(e).__name__}: {str(e).splitlines()[0]}")
+
+run("returns a str", lambda s: "flag")
+run("reads missing", lambda s: {"verdict": s["risk"]})
+run("typo in key", lambda s: {"verdikt": "flag"})
+run("forgot return", lambda s: None)
+run("route typo", lambda s: {"verdict": "flag"}, route=lambda s: "exprot")
+
+@@ concept
+title: stream: see what each step did
+--- body
+`invoke` gives only the final state. To see "which node changed what in each step", use `stream`:
+
+- `stream_mode="updates"`: each time a node finishes, you get one `{node name: its update}`. When a node wrote nothing into the state (it returned `None`, or the key name was misspelled and dropped), the update here is `None`
+- `stream_mode="values"`: after each step you get the **full state** once, and the first one is the input itself (a step that wrote nothing into the state gives nothing)
+- Both: `stream_mode=["updates", "values"]`, and each item is a `(mode, data)` tuple
+
+When you debug "silent errors", one look at the updates tells you: a node that should appear doesn't (a misspelled route), or some node's update is `None` (a misspelled key). On Day 34 you'll use it to push progress to the front end. On a real machine, the order of the updates from parallel branches can differ from run to run; don't rely on it.
+--- code
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    exported: bool
+
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["verdict"] == "redline" else "export"
+
+def approve(state):
+    return {"verdikt": "approved"}   # misspelled on purpose: see what this step turns into in the updates
+
+def export(state):
+    return {"exported": True}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+app = g.compile()
+
+for update in app.stream({"text": "Liability shall be unlimited."}, stream_mode="updates"):
+    print(update)
+print("--- values")
+for state in app.stream({"text": "Fees are due in 30 days."}, stream_mode="values"):
+    print(state)
+
+@@ concept
+title: MessagesState and add_messages
+--- body
+Chat history is the most common kind of state. `MessagesState` is a ready-made State with a single key, `messages`, whose reducer is `add_messages`:
+
+- A node returns `{"messages": [new message]}`, and it is **appended** to the history
+- `("user", "hi")` and `{"role": "user", "content": "hi"}` automatically become a `HumanMessage` and get an id
+- A new message with the same id **replaces** the old one; `RemoveMessage(id=...)` **deletes** that message (used to trim the history)
+- Need more keys? Inherit from it: `class State(MessagesState): clause_id: str`
+
+Classic mistake: writing `messages: list` yourself (no reducer). The one new message a node returns **overwrites** the whole history, and on the next turn the model "has forgotten everything".
+
+The system prompt usually isn't stored in the state; the node puts it at the front only for the model call (`create_agent` does the same). `ChatDeepSeek` inside a node still has thinking turned off: there are no tools here, so leaving it on wouldn't cause a 400, but simple Q&A doesn't need long thinking, and thinking tokens are billed as output; once a node binds tools to the model, it must be off (Day 31).
+--- code
+from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, RemoveMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.graph.message import add_messages
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def chat(state: MessagesState):
+    reply = model.invoke([SystemMessage("You answer questions about a SaaS contract.")] + state["messages"])
+    return {"messages": [reply]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+app = g.compile()
+
+out = app.invoke({"messages": [("user", "Is clause 8.1 standard?")]})
+out = app.invoke({"messages": out["messages"] + [("user", "And clause 9.2?")]})
+print([type(m).__name__ for m in out["messages"]])
+print([m["role"] for m in MOCK.calls[-1]["body"]["messages"]])
+
+history = [HumanMessage("Review clause 8.1", id="m1"), AIMessage("accept", id="m2")]
+history = add_messages(history, [AIMessage("flag: see Section 12", id="m2")])
+print([m.content for m in history])
+print([m.content for m in add_messages(history, [RemoveMessage(id="m1")])])
+
+@@ concept
+title: Viewing the graph: draw_mermaid
+--- body
+`app.get_graph().draw_mermaid()` outputs Mermaid text; paste it into GitHub, Notion or mermaid.live to see it as a diagram. How to read it:
+
+- `a --> b;` is a fixed edge; `a -.-> b;` is a conditional edge (a dotted line)
+- `__start__` and `__end__` are `START` and `END`
+
+Where a conditional edge can go is read from the routing function's `Literal` annotation (or the third argument). **Without an annotation it doesn't know**: in the second line below, summarise connects straight to `__end__`, and even edges like `approve --> export` are gone (the two nodes are still there, cut off like islands). The drawn graph is wrong (the graph itself still runs). One more reason to write `Literal`.
+
+Compare it with the hand-drawn graph in the docstring at the top of `graph.py`: `load -> review -> summarise -> (redlines?) -> approve -> export`, and the other path goes from summarise straight to export. When you explain the architecture in a PR or an interview, pasting the Mermaid is much clearer than describing it in words.
+--- code
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+
+def build(route):
+    g = StateGraph(State)
+    for name in ["load", "review", "summarise", "approve", "export"]:
+        g.add_node(name, lambda s: {})
+    g.add_edge(START, "load")
+    g.add_edge("load", "review")
+    g.add_edge("review", "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+
+def with_literal(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] else "export"
+
+def without(state):
+    return "approve" if state["redlines"] else "export"
+
+for route in [with_literal, without]:
+    edges = [line.strip() for line in build(route).get_graph().draw_mermaid().splitlines() if "->" in line]
+    print(route.__name__, edges)
+
+@@ item d32-01
+type: predict
+title: Recap: create_agent is a graph
+level: 1
+cards: d31:create_agent: a ready-made tool loop; From your runner to StateGraph
+--- context
+The review assistant you built with `create_agent` on Day 31 is really a LangGraph graph inside. Today you build graphs yourself, so first look back at what this ready-made graph looks like inside.
+--- prompt
+Review Day 31. Write the output. The mock server first has the model call the tool; once it has the tool result, it answers `"Based on the playbook: "` plus the first 80 characters of the tool result.
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langchain.agents import create_agent
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Return the customer's playbook rule for a contract topic."""
+    return "PB-07: at least 60 days' notice."
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+agent = create_agent(model, tools=[lookup_playbook])
+print(list(agent.get_graph().nodes))
+result = agent.invoke({"messages": [("user", "Can the provider terminate on ten days' notice?")]})
+print([type(m).__name__ for m in result["messages"]])
+print(result["messages"][-1].content)
+print(len(MOCK.calls), "model calls")
+--- explain
+What `create_agent` returns is a compiled LangGraph graph: the `model` node calls the model, the `tools` node runs the tools, and a conditional edge checks whether the last AIMessage has `tool_calls` to decide between going to `tools` and finishing. What you learn today is how to build a graph like that yourself.
+
+@@ item d32-02
+type: choice
+title: Recap: an agent with no limit
+level: 1
+cards: d31:create_agent: a ready-made tool loop; From your runner to StateGraph
+--- context
+In a real service, the model now and then gets stuck in a "look up the rule one more time" loop it can't get out of, and every round calls the model once and costs money once. Before going live, you have to know how such a loop ends when no limit is set.
+--- prompt
+Review Day 31. An agent made with `create_agent` is called **without** passing `recursion_limit`. One time the model gets stuck and asks for another tool call in every round. What happens on LangGraph 1.2, the version this course uses?
+--- options
+- It raises `GraphRecursionError` after 25 steps
+- It keeps running until the default limit of 10007 steps and only then raises `GraphRecursionError`, calling the model about 5000 times along the way
+- LangGraph stops automatically the second time the same tool is called
+- `create_agent` allows only 6 steps by default
+answer: 2
+--- explain
+In this version the default limit is 10007; older versions and many tutorials say 25. Every two steps (model + tools) make one paid model call, so setting no limit is almost the same as having no limit at all. In production code, always pass `{"recursion_limit": N}` explicitly, and catch `GraphRecursionError` outside (Day 31's `ask_safely`).
+
+@@ item d32-03
+type: code
+title: Your first graph
+level: 1
+cards: From your runner to StateGraph
+--- context
+The real project's `clausecheck/graph.py` writes the review flow as a graph: read the contract, review it clause by clause, summarize. The exercise builds the same skeleton from three simplified nodes: the input is two lines of clause text, and at the end you get a one-sentence summary.
+--- prompt
+The three node functions are already written. Write `build_app()`: use `StateGraph(State)` to connect them as `START → load → review → summarise → END`, and return the app after `compile()`.
+
+Example: `build_app().invoke({"text": "3.1 Fees are payable in 30 days.\n8.3 Liability shall be unlimited."})["summary"]` → `"2 clauses, 1 redline(s)"`
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    clauses: list[str]
+    redlines: list[str]
+    summary: str
+
+def load(state: State) -> dict:
+    return {"clauses": [line for line in state["text"].split("\n") if line.strip()]}
+
+def review(state: State) -> dict:
+    return {"redlines": [c.split()[0] for c in state["clauses"] if "unlimited" in c or "any country" in c]}
+
+def summarise(state: State) -> dict:
+    return {"summary": f"{len(state['clauses'])} clauses, {len(state['redlines'])} redline(s)"}
+
+def build_app():
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    clauses: list[str]
+    redlines: list[str]
+    summary: str
+
+def load(state: State) -> dict:
+    return {"clauses": [line for line in state["text"].split("\n") if line.strip()]}
+
+def review(state: State) -> dict:
+    return {"redlines": [c.split()[0] for c in state["clauses"] if "unlimited" in c or "any country" in c]}
+
+def summarise(state: State) -> dict:
+    return {"summary": f"{len(state['clauses'])} clauses, {len(state['redlines'])} redline(s)"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("load", load)
+    g.add_node("review", review)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "load")
+    g.add_edge("load", "review")
+    g.add_edge("review", "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- tests
+TEXT = "3.1 Fees are payable in 30 days.\n8.3 Liability shall be unlimited.\n\n10.1 Data may be processed in any country."
+expect("final state", lambda: build_app().invoke({"text": TEXT}), {"text": TEXT, "clauses": ["3.1 Fees are payable in 30 days.", "8.3 Liability shall be unlimited.", "10.1 Data may be processed in any country."], "redlines": ["8.3", "10.1"], "summary": "3 clauses, 2 redline(s)"})
+expect("no redlines", lambda: build_app().invoke({"text": "3.1 Fees are payable in 30 days."})["summary"], "1 clauses, 0 redline(s)")
+expect("nodes", lambda: list(build_app().get_graph().nodes), ["__start__", "load", "review", "summarise", "__end__"])
+--- hints
+- `g = StateGraph(State)`, then `g.add_node("name", function)` three times.
+- The start and the end are edges too: `g.add_edge(START, "load")`, `g.add_edge("summarise", END)`.
+- Finally `return g.compile()`; don't forget compile.
+
+@@ item d32-04
+type: predict
+title: Overwrite or append
+level: 2
+cards: State and reducers
+--- context
+In the review graph, some keys should keep only the latest value (the verdict, for example), and some should collect the records from every node (notes, for example). This code has three nodes write both kinds of keys in turn; see what is left at the end.
+--- prompt
+Write the output. `verdict` has no reducer; `notes` has `operator.add`. Notice what `third` returns, and that the input to `invoke(...)` itself also goes through the reducer.
+--- code
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict):
+    verdict: str
+    notes: Annotated[list[str], operator.add]
+
+def first(state):
+    return {"verdict": "flag", "notes": ["first"]}
+
+def second(state):
+    return {"verdict": "redline", "notes": ["second"]}
+
+def third(state):
+    return {"notes": state["notes"] + ["third"]}
+
+g = StateGraph(State)
+g.add_node("first", first)
+g.add_node("second", second)
+g.add_node("third", third)
+g.add_edge(START, "first")
+g.add_edge("first", "second")
+g.add_edge("second", "third")
+g.add_edge("third", END)
+out = g.compile().invoke({"verdict": "accept", "notes": ["input"]})
+print(out["verdict"])
+print(out["notes"])
+print(len(out["notes"]))
+--- explain
+`verdict` is overwritten every time, so it ends as the redline that `second` wrote (`third` didn't write it). `notes` is "old list + new list" every time. `third` returned the whole list plus one item, and the reducer joined that onto the old list once more, so input, first and second appear twice. For a key with a reducer, a node returns only the new part: `{"notes": ["third"]}`.
+
+@@ item d32-05
+type: choice
+title: Two branches write the same key
+level: 2
+cards: Parallel branches and supersteps; State and reducers
+--- context
+The legal check and the cost check don't depend on each other, so running them together in the same step saves time. But in the end, both results have to go into the same `reviews` key.
+--- prompt
+The State has `reviews: list[dict]` (**no** reducer). `legal_check` and `cost_check` both start from `START` (in parallel), and each returns `{"reviews": [...]}`. What happens on `invoke`?
+--- options
+- The two lists are joined automatically
+- The one that finishes later overwrites the one that finished first
+- It raises `InvalidUpdateError: At key 'reviews': Can receive only one value per step. ...`; you need to change it to `Annotated[list[dict], operator.add]`
+- Only the result of the branch whose edge was added first is kept
+answer: 3
+--- explain
+When two values have to go into the same plain key in the same step, LangGraph doesn't guess for you: it raises an error, and the error message even tells you the fix: give the key a reducer with Annotated. The rule that the later write overwrites the earlier one only holds across **different steps** (the `verdict` in the previous exercise). This is exactly Day 18's question of "how do you merge results when things run in parallel", and the framework turns it into a type declaration.
+
+@@ item d32-06
+type: code
+title: Custom reducer: keep the highest risk
+level: 2
+cards: State and reducers; Parallel branches and supersteps
+--- context
+One clause goes through several checks at once (liability, data, payment), and each gives a risk level. The report cares only about the most serious one: if any check says high, this clause goes to the top so people look at it first.
+--- prompt
+Three check nodes start in parallel from `START`, and each returns a `risk` (`"low"` / `"medium"` / `"high"`). The `risk` in the final state should be the **highest** one.
+
+1. Write the reducer `max_risk(old, new)`: return whichever of the two is the higher risk. The order is low < medium < high. In this version of LangGraph, the first time it's called, `old` is the empty string `""` (the key's type is `str`, so it uses `str()` as the starting value); treat it as lower than low
+2. Change `risk: str` in `State` to `risk: Annotated[str, max_risk]`
+
+Example: `max_risk("medium", "low")` → `"medium"`; `max_risk("", "low")` → `"low"`
+--- starter
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+ORDER = {"low": 0, "medium": 1, "high": 2}
+
+def max_risk(old, new):
+    return new
+
+class State(TypedDict, total=False):
+    text: str
+    risk: str
+
+def liability_check(state):
+    return {"risk": "high" if "unlimited" in state["text"] else "low"}
+
+def data_check(state):
+    return {"risk": "medium" if "any country" in state["text"] else "low"}
+
+def payment_check(state):
+    return {"risk": "medium" if "without notice" in state["text"] else "low"}
+
+def build_app():
+    g = StateGraph(State)
+    for name, fn in [("liability_check", liability_check), ("data_check", data_check), ("payment_check", payment_check)]:
+        g.add_node(name, fn)
+        g.add_edge(START, name)
+        g.add_edge(name, END)
+    return g.compile()
+--- solution
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+ORDER = {"low": 0, "medium": 1, "high": 2}
+
+def max_risk(old, new):
+    if ORDER.get(new, -1) > ORDER.get(old, -1):
+        return new
+    return old
+
+class State(TypedDict, total=False):
+    text: str
+    risk: Annotated[str, max_risk]
+
+def liability_check(state):
+    return {"risk": "high" if "unlimited" in state["text"] else "low"}
+
+def data_check(state):
+    return {"risk": "medium" if "any country" in state["text"] else "low"}
+
+def payment_check(state):
+    return {"risk": "medium" if "without notice" in state["text"] else "low"}
+
+def build_app():
+    g = StateGraph(State)
+    for name, fn in [("liability_check", liability_check), ("data_check", data_check), ("payment_check", payment_check)]:
+        g.add_node(name, fn)
+        g.add_edge(START, name)
+        g.add_edge(name, END)
+    return g.compile()
+--- tests
+expect("reducer: keeps the higher one", lambda: [max_risk("medium", "low"), max_risk("low", "high"), max_risk("high", "medium")], ["medium", "high", "high"])
+expect("reducer: on the first call old is the empty string", lambda: max_risk("", "low"), "low")
+expect("three parallel checks: take the highest", lambda: build_app().invoke({"text": "Customer Data may be processed in any country; liability is unlimited."})["risk"], "high")
+expect("only medium", lambda: build_app().invoke({"text": "Provider may suspend the Service without notice."})["risk"], "medium")
+expect("all low", lambda: build_app().invoke({"text": "Fees are payable in 30 days."})["risk"], "low")
+--- hints
+- Get the level with `ORDER.get(x, -1)`: the empty string (or any value it doesn't know) gets -1, which is naturally lower than low.
+- `max_risk` compares the two levels and returns the bigger one; if they are equal, return old.
+- Without a reducer, the three parallel nodes writing `risk` in the same step raise `InvalidUpdateError`: `risk: Annotated[str, max_risk]`.
+
+@@ item d32-07
+type: code
+title: Conditional edge: approve or export
+level: 2
+cards: Conditional edges; Viewing the graph: draw_mermaid
+--- context
+The real `graph.py` branches after the summary: if there are clauses to rewrite (redlines), it first stops and waits for a person to approve, then exports; if there are none, it exports the report right away. In the exercise, `path` records the nodes visited, and the tests use it to check which way the graph went.
+--- prompt
+Write the routing function and the graph:
+
+- `route(state)`: return `"approve"` when `state["redlines"] > 0`, otherwise `"export"`. Give it the return type `-> Literal["approve", "export"]`
+- `build_app()`: `START → summarise`, after `summarise` follow `route`, `approve → export → END`. The node functions are already written; each node records its own name in `path`
+
+Example: `build_app().invoke({"redlines": 2})["path"]` → `["summarise", "approve", "export"]`
+--- starter
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state):
+    pass
+
+def build_app():
+    pass
+--- solution
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] > 0 else "export"
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("summarise", summarise)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+expect("redlines: approve first", lambda: build_app().invoke({"redlines": 2})["path"], ["summarise", "approve", "export"])
+expect("no redlines: export right away", lambda: build_app().invoke({"redlines": 0})["path"], ["summarise", "export"])
+expect("the routing function itself", lambda: [route({"redlines": 1}), route({"redlines": 0})], ["approve", "export"])
+expect("the graph shows two conditional edges (needs the Literal annotation)", lambda: sorted(line.strip() for line in build_app().get_graph().draw_mermaid().splitlines() if "-.->" in line), ["summarise -.-> approve;", "summarise -.-> export;"])
+--- hints
+- A routing function only returns a name; it doesn't change the state: `return "approve" if state["redlines"] > 0 else "export"`.
+- Conditional edge: `g.add_conditional_edges("summarise", route)`. Note that you pass the function itself, `route`, not `route(state)`.
+- Write the return type as `-> Literal["approve", "export"]`, so the graph knows where the conditional edge can go.
+
+@@ item d32-08
+type: fix
+title: Fix the bug: the graph quietly stops
+level: 2
+cards: Loud errors and silent errors; Conditional edges
+--- context
+When a graph goes wrong, it doesn't necessarily raise an error; it may just stop early. In production, that means the clauses to rewrite never get approved and the report is never exported, and nobody notices. Learning to catch these "silent errors" matters even more than fixing bugs that raise errors.
+--- prompt
+When there are redlines, this graph should go `summarise → approve → export`. But the tests show that it ends right after `summarise`, with no exception at all, only an easy-to-miss warning (in a real service's logs it's easily buried).
+
+Run the tests, find the cause and fix it. Once it's fixed, do one more thing, so that this kind of typo **raises an error right away** in the future instead of quietly stopping (the tests check this).
+--- starter
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state):
+    return "Approve" if state["redlines"] > 0 else "export"
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("summarise", summarise)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- solution
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], operator.add]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def export(state):
+    return {"path": ["export"]}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] > 0 else "export"
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("summarise", summarise)
+    g.add_node("approve", approve)
+    g.add_node("export", export)
+    g.add_edge(START, "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+expect("redlines: all three steps run", lambda: build_app().invoke({"redlines": 1})["path"], ["summarise", "approve", "export"])
+expect("no redlines", lambda: build_app().invoke({"redlines": 0})["path"], ["summarise", "export"])
+def _typo_now_raises():
+    global route
+    original = route
+    def typo(state):
+        return "Approve"
+    typo.__annotations__ = dict(original.__annotations__)
+    route = typo
+    try:
+        build_app().invoke({"redlines": 1})
+        return "silent stop"
+    except KeyError:
+        return "KeyError"
+    finally:
+        route = original
+expect("a future typo raises KeyError right away", _typo_now_raises, "KeyError")
+--- hints
+- Run it once with `stream_mode="updates"`, or read the warning: does the name the router returns match the node name? Case counts too.
+- The node is called `"approve"`, but the router returns `"Approve"`.
+- To make a typo raise an error: give `route` the return type `-> Literal["approve", "export"]` (the card "Conditional edges"), or pass `add_conditional_edges` a third argument, `["approve", "export"]`.
+
+@@ item d32-09
+type: testwrite
+title: Write tests: routing after the review
+level: 2
+cards: Conditional edges; Loud errors and silent errors
+--- context
+The exercise assumes the review may not have finished (for example, the model's answer was unusable), and then the program has to decide: review again, hand it to a person, or move on. If this router is wrong, a contract that wasn't fully reviewed could be handed over as if it were done.
+--- prompt
+The function under test, `route_after_review(state)`, decides where to go after the review. It checks in this order:
+
+1. `state["failed"]` is True (some clauses weren't reviewed) and `state["retries"] < 2` → `"review"` (review again)
+2. still failed, but it has already retried 2 times → `"human"`
+3. `state["redlines"] > 0` → `"approve"`
+4. otherwise → `END` (import it from `langgraph.graph`; its value is `"__end__"`)
+
+Write test functions (use `assert` inside `def test_...():`) that all pass on the correct function and catch the hidden buggy versions. A routing function is a pure function, so you can test it without building a graph; this is the cheapest layer for testing a graph.
+--- impl
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["failed"] and state["retries"] < 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    if state["redlines"] > 0:
+        return "approve"
+    return END
+--- mutants
+===== Edge case: when it has already retried 2 times
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["failed"] and state["retries"] <= 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    if state["redlines"] > 0:
+        return "approve"
+    return END
+===== When there are no redlines
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["failed"] and state["retries"] < 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    if state["redlines"] >= 0:
+        return "approve"
+    return END
+===== Finishing must return END, not "export"
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["failed"] and state["retries"] < 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    if state["redlines"] > 0:
+        return "approve"
+    return "export"
+===== Failed but there are also redlines: handle the failure first
+from langgraph.graph import END
+
+def route_after_review(state):
+    if state["redlines"] > 0:
+        return "approve"
+    if state["failed"] and state["retries"] < 2:
+        return "review"
+    if state["failed"]:
+        return "human"
+    return END
+--- starter
+def test_redlines_go_to_approve():
+    assert route_after_review({"failed": False, "retries": 0, "redlines": 2}) == "approve"
+--- solution
+from langgraph.graph import END
+
+def test_redlines_go_to_approve():
+    assert route_after_review({"failed": False, "retries": 0, "redlines": 2}) == "approve"
+
+def test_failed_retries_first():
+    assert route_after_review({"failed": True, "retries": 1, "redlines": 0}) == "review"
+
+def test_two_retries_go_to_human():
+    assert route_after_review({"failed": True, "retries": 2, "redlines": 0}) == "human"
+
+def test_nothing_to_do_ends():
+    assert route_after_review({"failed": False, "retries": 0, "redlines": 0}) == END
+
+def test_failure_beats_redlines():
+    assert route_after_review({"failed": True, "retries": 0, "redlines": 3}) == "review"
+--- hints
+- At least one test per branch, plus the edge case: `retries` exactly 2.
+- With no redlines and no failure, the expected value is `END` (`from langgraph.graph import END`).
+- When it failed and also has redlines, it should review again first: the redline count may be incomplete.
+
+@@ item d32-10
+type: code
+title: Parallel checks, then a join
+level: 3
+cards: Parallel branches and supersteps; State and reducers
+--- context
+In the exercise, the review runs down two paths at the same time: legal on one, cost on the other (cost has one extra estimate step). The final summary needs to see all the findings from both paths; if it runs too early or runs twice, the report ends up with an incomplete summary.
+--- prompt
+Write `build_app()` so that the graph goes like this:
+
+- `START` goes to both `legal_check` and `cost_check` (in parallel)
+- `cost_check → cost_estimate` (the cost side has one more step)
+- `summarise` runs after **both** sides have finished, and runs **only once**
+- `summarise → END`
+
+The node functions are already written: the check nodes add findings to `findings`, and `summarise` writes `summary` and records one entry in `runs`. Both `findings` and `runs` are `Annotated[list[str], operator.add]`.
+--- starter
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    findings: Annotated[list[str], operator.add]
+    runs: Annotated[list[str], operator.add]
+    summary: str
+
+def legal_check(state):
+    return {"findings": ["legal: unlimited liability"] if "unlimited" in state["text"] else []}
+
+def cost_check(state):
+    return {"findings": ["cost: price can change any time"] if "at any time" in state["text"] else []}
+
+def cost_estimate(state):
+    return {"findings": ["cost: budget impact unknown"] if "at any time" in state["text"] else []}
+
+def summarise(state):
+    found = sorted(state["findings"])
+    return {"summary": f"{len(found)} finding(s): " + "; ".join(found), "runs": ["summarise"]}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("legal_check", legal_check)
+    g.add_node("cost_check", cost_check)
+    g.add_node("cost_estimate", cost_estimate)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "legal_check")
+    g.add_edge("legal_check", "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- solution
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    findings: Annotated[list[str], operator.add]
+    runs: Annotated[list[str], operator.add]
+    summary: str
+
+def legal_check(state):
+    return {"findings": ["legal: unlimited liability"] if "unlimited" in state["text"] else []}
+
+def cost_check(state):
+    return {"findings": ["cost: price can change any time"] if "at any time" in state["text"] else []}
+
+def cost_estimate(state):
+    return {"findings": ["cost: budget impact unknown"] if "at any time" in state["text"] else []}
+
+def summarise(state):
+    found = sorted(state["findings"])
+    return {"summary": f"{len(found)} finding(s): " + "; ".join(found), "runs": ["summarise"]}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("legal_check", legal_check)
+    g.add_node("cost_check", cost_check)
+    g.add_node("cost_estimate", cost_estimate)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "legal_check")
+    g.add_edge(START, "cost_check")
+    g.add_edge("cost_check", "cost_estimate")
+    g.add_edge(["legal_check", "cost_estimate"], "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- tests
+TEXT = "Liability is unlimited. Provider may raise prices at any time."
+expect("all three findings are in the summary", lambda: build_app().invoke({"text": TEXT})["summary"], "3 finding(s): cost: budget impact unknown; cost: price can change any time; legal: unlimited liability")
+expect("summarise runs only once", lambda: build_app().invoke({"text": TEXT})["runs"], ["summarise"])
+expect("no findings", lambda: build_app().invoke({"text": "Fees are payable in 30 days."})["summary"], "0 finding(s): ")
+expect("all four nodes ran, once each", lambda: sorted(name for update in build_app().stream({"text": TEXT}, stream_mode="updates") for name in update), ["cost_check", "cost_estimate", "legal_check", "summarise"])
+--- hints
+- Two edges leaving `START` mean parallel: `g.add_edge(START, "legal_check")`, `g.add_edge(START, "cost_check")`.
+- A join has to wait for both sides: write the start as a list, `g.add_edge(["legal_check", "cost_estimate"], "summarise")`.
+- If you write two separate edges instead, the `legal_check` side gets there in one step, so `summarise` runs once first, then again after `cost_estimate` finishes.
+
+@@ item d32-11
+type: fix
+title: Fix the bug: InvalidUpdateError
+level: 2
+cards: Parallel branches and supersteps; State and reducers; Loud errors and silent errors
+--- context
+Two checks run in parallel, and each brings back some findings for the summary node to count together. This time the graph doesn't go wrong silently; it raises an error, and that's actually good news: the error message tells you where the problem is.
+--- prompt
+Two check nodes run in parallel, then join at `summarise`. Run the tests, read the error message (it even spells out the fix), and change just one line in the State.
+--- starter
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    findings: list[str]
+    summary: str
+
+def legal_check(state):
+    return {"findings": ["legal: unlimited liability"] if "unlimited" in state["text"] else []}
+
+def data_check(state):
+    return {"findings": ["data: stored in any country"] if "any country" in state["text"] else []}
+
+def summarise(state):
+    return {"summary": f"{len(state['findings'])} finding(s)"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("legal_check", legal_check)
+    g.add_node("data_check", data_check)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "legal_check")
+    g.add_edge(START, "data_check")
+    g.add_edge(["legal_check", "data_check"], "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- solution
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    findings: Annotated[list[str], operator.add]
+    summary: str
+
+def legal_check(state):
+    return {"findings": ["legal: unlimited liability"] if "unlimited" in state["text"] else []}
+
+def data_check(state):
+    return {"findings": ["data: stored in any country"] if "any country" in state["text"] else []}
+
+def summarise(state):
+    return {"summary": f"{len(state['findings'])} finding(s)"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("legal_check", legal_check)
+    g.add_node("data_check", data_check)
+    g.add_node("summarise", summarise)
+    g.add_edge(START, "legal_check")
+    g.add_edge(START, "data_check")
+    g.add_edge(["legal_check", "data_check"], "summarise")
+    g.add_edge("summarise", END)
+    return g.compile()
+--- tests
+TEXT = "Liability is unlimited and Customer Data may be stored in any country."
+expect("two findings", lambda: sorted(build_app().invoke({"text": TEXT})["findings"]), ["data: stored in any country", "legal: unlimited liability"])
+expect("summary", lambda: build_app().invoke({"text": TEXT})["summary"], "2 finding(s)")
+expect("only one", lambda: build_app().invoke({"text": "Liability is unlimited."})["findings"], ["legal: unlimited liability"])
+--- hints
+- The error message: `At key 'findings': Can receive only one value per step. Use an Annotated key to handle multiple values.`
+- Two parallel nodes write `findings` in the same step; you have to tell LangGraph how to merge two lists.
+- `findings: Annotated[list[str], operator.add]` (`operator` and `Annotated` are already imported).
+
+@@ item d32-12
+type: predict
+title: stream updates
+level: 2
+cards: stream: see what each step did; Conditional edges
+--- context
+When a graph gives only the final result after it runs, you can't see which path it took along the way. When you debug, or when a web page has to show "which step is running now", you look at the output of each step on its own.
+--- prompt
+Write the output. Each time a node finishes, `stream_mode="updates"` gives one `{node name: the update it returned}`; `stream_mode="values"` gives the full state once after each step (the first one is the input).
+--- code
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    exported: bool
+
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["verdict"] == "redline" else "export"
+
+def approve(state):
+    return {"verdict": "redline (approved)"}
+
+def export(state):
+    return {"exported": True}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+app = g.compile()
+
+for update in app.stream({"text": "Liability shall be unlimited."}, stream_mode="updates"):
+    print(update)
+print("---")
+for update in app.stream({"text": "Fees are due in 30 days."}, stream_mode="updates"):
+    print(update)
+print(len(list(app.stream({"text": "Fees are due in 30 days."}, stream_mode="values"))))
+--- explain
+updates lists what each node returned, in the order they ran, so the path is clear at a glance: the second input has no redline, and `approve` doesn't appear at all. values mode gave the full state 3 times: once for the input, once after `review`, once after `export`. When debugging, look at updates first: it's easier than adding a print to every node, and it doesn't get out of order when nodes run in parallel.
+
+@@ item d32-13
+type: fix
+title: Fix the bug: the review result isn't written
+level: 2
+cards: Loud errors and silent errors; stream: see what each step did
+--- context
+Clause 8.3 says liability is unlimited, so it should be a redline, but the exported result is always the starting value, pending. The program raises no error, so the only clues are in each step's updates.
+--- prompt
+The exported result is always `8.3: pending`, as if the review node never ran. Yet there is no error at all.
+
+First take a look yourself this way (add it at the end of the code for now, and delete it when you're done):
+
+```python
+for update in build_app().stream({"clause_id": "8.3", "text": "Liability shall be unlimited.", "verdict": "pending"}, stream_mode="updates"):
+    print(update)
+```
+
+What is the update of the `review` step? Find the cause and fix it.
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clause_id: str
+    text: str
+    verdict: str
+    exported: str
+
+def review(state):
+    verdict = "redline" if "unlimited" in state["text"] else "accept"
+    return {"verdikt": verdict}
+
+def export(state):
+    return {"exported": f"{state['clause_id']}: {state['verdict']}"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clause_id: str
+    text: str
+    verdict: str
+    exported: str
+
+def review(state):
+    verdict = "redline" if "unlimited" in state["text"] else "accept"
+    return {"verdict": verdict}
+
+def export(state):
+    return {"exported": f"{state['clause_id']}: {state['verdict']}"}
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+START_STATE = {"clause_id": "8.3", "text": "Liability shall be unlimited.", "verdict": "pending"}
+expect("the redline is written", lambda: build_app().invoke(START_STATE)["exported"], "8.3: redline")
+expect("accept is written too", lambda: build_app().invoke({"clause_id": "3.1", "text": "Fees are due in 30 days.", "verdict": "pending"})["exported"], "3.1: accept")
+expect("the review node itself (testable without building the graph)", lambda: review({"text": "Liability shall be unlimited."}), {"verdict": "redline"})
+--- hints
+- In the stream, the `review` step shows `None`: the key it returns isn't in the State, so it was dropped.
+- Compare with the key names in `State`, letter by letter.
+- The last test shows the cheapest way to guard against this kind of bug: test the node function's return value directly.
+
+@@ item d32-14
+type: code
+title: A debugging helper: the path taken
+level: 2
+cards: stream: see what each step did; Loud errors and silent errors
+--- context
+This is a debugging tool for yourself, not a review feature. Later, when you change the graph's structure (add nodes, change the routing), one run tells you whether the path taken and the keys changed are still the same as before.
+--- prompt
+Write `trace(app, inputs)`: run the graph once with `app.stream(inputs, stream_mode="updates")` and return a list with one entry for each node that finishes: `(node name, the keys it updated as a sorted list)`. When a node wrote nothing into the state (the update is `None`), the key list is `[]`.
+
+Example: `trace(APP, {"text": "Liability shall be unlimited."})` → `[("review", ["verdict"]), ("approve", ["approved"]), ("export", ["exported"])]`
+
+With it, tests can assert "which path the graph took", and silent bugs like a misspelled route or a misspelled key have nowhere to hide.
+--- starter
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    approved: bool
+    exported: bool
+
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["verdict"] == "redline" else "export"
+
+def approve(state):
+    return {"approved": True}
+
+def export(state):
+    return {"exported": True}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+APP = g.compile()
+
+def trace(app, inputs):
+    return []
+--- solution
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    approved: bool
+    exported: bool
+
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["verdict"] == "redline" else "export"
+
+def approve(state):
+    return {"approved": True}
+
+def export(state):
+    return {"exported": True}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", "export")
+g.add_edge("export", END)
+APP = g.compile()
+
+def trace(app, inputs):
+    steps = []
+    for update in app.stream(inputs, stream_mode="updates"):
+        for node, changes in update.items():
+            steps.append((node, sorted(changes or {})))
+    return steps
+--- tests
+expect("the path with a redline", lambda: trace(APP, {"text": "Liability shall be unlimited."}), [("review", ["verdict"]), ("approve", ["approved"]), ("export", ["exported"])])
+expect("the path without a redline", lambda: trace(APP, {"text": "Fees are due in 30 days."}), [("review", ["verdict"]), ("export", ["exported"])])
+class _S(TypedDict, total=False):
+    verdict: str
+    n: int
+_g = StateGraph(_S)
+_g.add_node("review", lambda s: {"verdikt": "flag", "n": 1})
+_g.add_node("noop", lambda s: None)
+_g.add_node("both", lambda s: {"verdict": "flag", "n": 2})
+_g.add_edge(START, "review")
+_g.add_edge("review", "noop")
+_g.add_edge("noop", "both")
+_g.add_edge("both", END)
+expect("the misspelled key is gone, None becomes [], keys are sorted", lambda: trace(_g.compile(), {"verdict": "pending"}), [("review", ["n"]), ("noop", []), ("both", ["n", "verdict"])])
+--- hints
+- `for update in app.stream(inputs, stream_mode="updates"):`; each update is `{node name: update}`.
+- Take it apart with `for node, changes in update.items():`.
+- `changes` may be `None`: `sorted(changes or {})` on a dictionary gives the list of its keys.
+
+@@ item d32-15
+type: order
+title: Put the code in order: a graph with routing
+level: 2
+cards: From your runner to StateGraph; Conditional edges
+--- context
+This is a minimal review graph: review one clause; if it needs rewriting, go to the approve node, otherwise end right away. The exercise runs it on a clause that says liability is unlimited.
+--- prompt
+Put the whole program in order: define the State and the nodes, build the graph (`START → review`, after `review` follow the router to `approve` or `END`, `approve → END`), compile it and run it once, storing the result in `OUT`. Two lines are distractors.
+--- lines
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+class State(TypedDict, total=False):
+    text: str
+    verdict: str
+    approved: bool
+def review(state):
+    return {"verdict": "redline" if "unlimited" in state["text"] else "accept"}
+def route(state) -> Literal["approve", "__end__"]:
+    return "approve" if state["verdict"] == "redline" else END
+def approve(state):
+    return {"approved": True}
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_edge(START, "review")
+g.add_conditional_edges("review", route)
+g.add_edge("approve", END)
+app = g.compile()
+OUT = app.invoke({"text": "Customer's liability shall be unlimited."})
+--- distractors
+g.add_conditional_edges("review", route(State))
+OUT = g.invoke({"text": "Customer's liability shall be unlimited."})
+--- tests
+expect("final state", lambda: OUT, {"text": "Customer's liability shall be unlimited.", "verdict": "redline", "approved": True})
+expect("no redline: ends right away", lambda: app.invoke({"text": "Fees are due in 30 days."}), {"text": "Fees are due in 30 days.", "verdict": "accept"})
+--- hints
+- Imports first, then define the State and the three functions; only then can you build the graph (`add_node` needs the functions).
+- `add_conditional_edges` takes the routing function itself; only the compiled `app` has `invoke`.
+- The value of `END` is `"__end__"`, so the `Literal` says `"__end__"`.
+
+@@ item d32-16
+type: fill
+title: Fill in: a reducer and a conditional edge
+level: 1
+cards: State and reducers; Conditional edges
+--- context
+This is a scaled-down version of the "summarize → approve if needed" part of `graph.py`. `path` is there for the tests: it records the nodes the graph actually visited.
+--- prompt
+Complete the code: `path` should **append** each node's name; after `summarise`, use `route` to decide between going to `approve` and ending right away; finally, compile.
+--- template
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    redlines: int
+    path: Annotated[list[str], [[operator.add]]]
+
+def summarise(state):
+    return {"path": ["summarise"]}
+
+def approve(state):
+    return {"path": ["approve"]}
+
+def route(state) -> Literal["approve", "__end__"]:
+    return "approve" if state["redlines"] > 0 else [[END]]
+
+g = StateGraph(State)
+g.add_node("summarise", summarise)
+g.add_node("approve", approve)
+g.add_edge(START, "summarise")
+g.[[add_conditional_edges]]("summarise", route)
+g.add_edge("approve", END)
+app = g.[[compile]]()
+--- tests
+expect("with a redline", lambda: app.invoke({"redlines": 1})["path"], ["summarise", "approve"])
+expect("no redline: ends right away", lambda: app.invoke({"redlines": 0})["path"], ["summarise"])
+--- hints
+- The function that appends lists is in the `operator` module; it's the function version of `+`.
+- "End right away" returns the constant you imported from `langgraph.graph`.
+- An edge that depends on a condition is `add_conditional_edges`; finally `compile()`.
+
+@@ item d32-17
+type: code
+title: A chat node: MessagesState
+level: 2
+cards: MessagesState and add_messages; d29:Messages
+--- context
+People reviewing a contract often ask one follow-up after another: "Is clause 8.1 standard?" "And 9.2?" The second question can only be answered correctly with the previous turn in mind, so the chat history has to be kept as the conversation goes on. The system prompt is the model's "identity and rules".
+--- prompt
+Build a chat graph with one node:
+
+- `chat(state)`: answer with `MODEL`. Send the model `[SystemMessage(SYSTEM)] + state["messages"]`, and return `{"messages": [reply]}`. Do **not** store the system prompt in the state
+- `APP`: `StateGraph(MessagesState)`, `START → chat → END`, compiled
+- `ask(history, question)`: add `("user", question)` to the end of `history` (a list of messages), call `APP`, and return the new, complete list of messages
+
+Example:
+```python
+h = ask([], "Is clause 8.1 standard?")
+h = ask(h, "And clause 9.2?")
+[type(m).__name__ for m in h]   # ["HumanMessage", "AIMessage", "HumanMessage", "AIMessage"]
+```
+--- starter
+from langchain_core.messages import SystemMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You answer questions about a SaaS contract."
+
+def chat(state: MessagesState):
+    pass
+
+APP = None
+
+def ask(history, question):
+    pass
+--- solution
+from langchain_core.messages import SystemMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You answer questions about a SaaS contract."
+
+def chat(state: MessagesState):
+    reply = MODEL.invoke([SystemMessage(SYSTEM)] + state["messages"])
+    return {"messages": [reply]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+APP = g.compile()
+
+def ask(history, question):
+    out = APP.invoke({"messages": history + [("user", question)]})
+    return out["messages"]
+--- tests
+def _two_turns():
+    h = ask([], "Is clause 8.1 standard?")
+    h = ask(h, "And clause 9.2?")
+    return [(type(m).__name__, m.content) for m in h]
+expect("two turns of conversation", _two_turns, [("HumanMessage", "Is clause 8.1 standard?"), ("AIMessage", "Mock reply: Is clause 8.1 standard?"), ("HumanMessage", "And clause 9.2?"), ("AIMessage", "Mock reply: And clause 9.2?")])
+def _sent():
+    h = ask([], "Is clause 8.1 standard?")
+    ask(h, "And clause 9.2?")
+    body = MOCK.calls[-1]["body"]
+    return [[m["role"] for m in body["messages"]], body["messages"][0]["content"], body["thinking"]]
+expect("second turn: system + the full history, thinking off", _sent, [["system", "user", "assistant", "user"], SYSTEM, {"type": "disabled"}])
+expect("the system prompt is not stored in the state", lambda: [type(m).__name__ for m in ask([], "Hi")], ["HumanMessage", "AIMessage"])
+--- hints
+- `chat`: `reply = MODEL.invoke([SystemMessage(SYSTEM)] + state["messages"])`, then `return {"messages": [reply]}`; the reducer adds it to the end.
+- Build the graph outside the functions, in place of `APP = None`.
+- `ask`: `APP.invoke({"messages": history + [("user", question)]})["messages"]`.
+
+@@ item d32-18
+type: code
+title: Trim the history: RemoveMessage
+level: 3
+cards: MessagesState and add_messages
+--- context
+The longer the conversation, the more history is sent to the model each time, and the more tokens (what the model bills by); it may even go past the length the model can read at once. The model in this exercise is the mock server, and the tests check how many messages it actually received.
+--- prompt
+The longer the chat, the more tokens are sent to the model each time. Add a `trim` node in front of `chat`:
+
+- `trim(state)`: keep only the last `KEEP` messages; for each earlier message, return a `RemoveMessage(id=that message's id)`: `{"messages": [RemoveMessage(...), ...]}`. When there are no more than `KEEP` messages, return `{"messages": []}`
+- `APP`: `START → trim → chat → END`
+
+The `chat` node is already written. `add_messages` gives every message an id, so `m.id` always has a value.
+--- starter
+from langchain_core.messages import RemoveMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+KEEP = 3
+
+def chat(state: MessagesState):
+    return {"messages": [MODEL.invoke(state["messages"])]}
+
+def trim(state: MessagesState):
+    return {"messages": []}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+APP = g.compile()
+--- solution
+from langchain_core.messages import RemoveMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+KEEP = 3
+
+def chat(state: MessagesState):
+    return {"messages": [MODEL.invoke(state["messages"])]}
+
+def trim(state: MessagesState):
+    old = state["messages"][:-KEEP]
+    return {"messages": [RemoveMessage(id=m.id) for m in old]}
+
+g = StateGraph(MessagesState)
+g.add_node("trim", trim)
+g.add_node("chat", chat)
+g.add_edge(START, "trim")
+g.add_edge("trim", "chat")
+g.add_edge("chat", END)
+APP = g.compile()
+--- tests
+from langchain_core.messages import HumanMessage, AIMessage
+LONG = [HumanMessage("q1"), AIMessage("a1"), HumanMessage("q2"), AIMessage("a2"), HumanMessage("q3")]
+expect("the model receives only the last 3", lambda: (APP.invoke({"messages": LONG}), [m["content"] for m in MOCK.calls[-1]["body"]["messages"]])[1], ["q2", "a2", "q3"])
+expect("final state: 3 messages + the reply", lambda: [m.content for m in APP.invoke({"messages": LONG})["messages"]], ["q2", "a2", "q3", "Mock reply: q3"])
+expect("exactly 3: nothing is deleted", lambda: [m.content for m in APP.invoke({"messages": LONG[2:]})["messages"]], ["q2", "a2", "q3", "Mock reply: q3"])
+expect("the trim node itself: fewer than KEEP", lambda: trim({"messages": [HumanMessage("only", id="x")]}), {"messages": []})
+--- hints
+- Delete everything except the last `KEEP`: `state["messages"][:-KEEP]`. With fewer than KEEP messages, this slice is an empty list, which deletes nothing, exactly as it should.
+- For each message to delete: `RemoveMessage(id=m.id)`.
+- The graph: `g.add_node("trim", trim)`, and change the edges to `START → trim → chat`.
+
+@@ item d32-e1
+type: scratch
+title: Closed book: the review flow graph
+exam: yes
+level: 3
+cards: From your runner to StateGraph; Conditional edges
+--- context
+Closed book, write the skeleton of `clausecheck/graph.py` from scratch: read the contract, review, summarize, then branch on whether there are clauses to rewrite. When an interviewer asks "how does your project use LangGraph?", this graph is the core of the answer.
+--- prompt
+Using LangGraph (`from langgraph.graph import StateGraph, START, END`), write `build_review_graph()` that returns the compiled graph. The State's keys: `text: str`, `clauses: list[str]`, `redlines: list[str]`, `summary: str`, `approved: bool`, `exported: str`.
+
+Nodes:
+
+- `load`: `clauses` = `text` split on `"\n"`, with empty lines removed
+- `review`: `redlines` = the first word (the clause number) of each clause that contains `"unlimited"` or `"any country"`, in order
+- `summarise`: `summary` = `f"{number of clauses} clauses, {number of redlines} redline(s)"`
+- `approve`: `approved` = True
+- `export`: `exported` = `"with redlines"` (when `approved` is True), otherwise `"report only"`
+
+Edges: `START → load → review → summarise`; after `summarise`, go to `approve` if there are redlines, to `export` if not (a conditional edge; give the routing function a `Literal` return type); `approve → export → END`.
+--- solution
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    text: str
+    clauses: list[str]
+    redlines: list[str]
+    summary: str
+    approved: bool
+    exported: str
+
+def load(state):
+    return {"clauses": [line for line in state["text"].split("\n") if line.strip()]}
+
+def review(state):
+    return {"redlines": [c.split()[0] for c in state["clauses"] if "unlimited" in c or "any country" in c]}
+
+def summarise(state):
+    return {"summary": f"{len(state['clauses'])} clauses, {len(state['redlines'])} redline(s)"}
+
+def route(state) -> Literal["approve", "export"]:
+    return "approve" if state["redlines"] else "export"
+
+def approve(state):
+    return {"approved": True}
+
+def export(state):
+    return {"exported": "with redlines" if state.get("approved") else "report only"}
+
+def build_review_graph():
+    g = StateGraph(State)
+    for name, fn in [("load", load), ("review", review), ("summarise", summarise), ("approve", approve), ("export", export)]:
+        g.add_node(name, fn)
+    g.add_edge(START, "load")
+    g.add_edge("load", "review")
+    g.add_edge("review", "summarise")
+    g.add_conditional_edges("summarise", route)
+    g.add_edge("approve", "export")
+    g.add_edge("export", END)
+    return g.compile()
+--- tests
+TEXT = "3.1 Fees are payable in 30 days.\n\n8.3 Liability shall be unlimited.\n10.1 Data may be processed in any country."
+expect("with redlines", lambda: build_review_graph().invoke({"text": TEXT}), {"text": TEXT, "clauses": ["3.1 Fees are payable in 30 days.", "8.3 Liability shall be unlimited.", "10.1 Data may be processed in any country."], "redlines": ["8.3", "10.1"], "summary": "3 clauses, 2 redline(s)", "approved": True, "exported": "with redlines"})
+expect("no redlines: skips approve", lambda: build_review_graph().invoke({"text": "3.1 Fees are payable in 30 days."}), {"text": "3.1 Fees are payable in 30 days.", "clauses": ["3.1 Fees are payable in 30 days."], "redlines": [], "summary": "1 clauses, 0 redline(s)", "exported": "report only"})
+expect("the graph has two conditional edges", lambda: sorted(l.strip() for l in build_review_graph().get_graph().draw_mermaid().splitlines() if "-.->" in l), ["summarise -.-> approve;", "summarise -.-> export;"])
+
+@@ item d32-e2
+type: scratch
+title: Closed book: parallel checks and a join
+exam: yes
+level: 3
+cards: Parallel branches and supersteps; State and reducers
+--- context
+One clause goes through three checks at once, each gives a risk level, and at the end one node gives the verdict. This is the most common use of parallelism and joins in a review.
+--- prompt
+Write `build_checks()` that returns a compiled LangGraph graph (`import operator`, `from typing import Annotated, TypedDict`, `from langgraph.graph import StateGraph, START, END`):
+
+The State's keys: `text: str`; `risk`: with a custom reducer that keeps the higher risk (low < medium < high; on the first call the old value is the empty string `""`, treat it as the lowest); `findings`: a list, appended with `operator.add`; `decision: str`.
+
+- Three check nodes start in parallel from `START`: `liability` (text contains `"unlimited"` → risk high, add `"liability"` to findings; otherwise risk low and add nothing), `data` (contains `"any country"` → medium, add `"data"`), `payment` (contains `"without notice"` → medium, add `"payment"`)
+- After all three have finished, run `decide`, **only once**: `decision` = `"redline"` (risk is high), `"flag"` (medium), `"accept"` (low)
+- `decide → END`
+--- solution
+import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+ORDER = {"low": 0, "medium": 1, "high": 2}
+
+def max_risk(old, new):
+    return new if ORDER.get(new, -1) > ORDER.get(old, -1) else old
+
+class State(TypedDict, total=False):
+    text: str
+    risk: Annotated[str, max_risk]
+    findings: Annotated[list[str], operator.add]
+    decision: str
+
+def check(keyword, level, name):
+    def node(state):
+        if keyword in state["text"]:
+            return {"risk": level, "findings": [name]}
+        return {"risk": "low", "findings": []}
+    return node
+
+def decide(state):
+    return {"decision": {"high": "redline", "medium": "flag"}.get(state["risk"], "accept")}
+
+def build_checks():
+    g = StateGraph(State)
+    names = []
+    for name, keyword, level in [("liability", "unlimited", "high"), ("data", "any country", "medium"), ("payment", "without notice", "medium")]:
+        g.add_node(name, check(keyword, level, name))
+        g.add_edge(START, name)
+        names.append(name)
+    g.add_node("decide", decide)
+    g.add_edge(names, "decide")
+    g.add_edge("decide", END)
+    return g.compile()
+--- tests
+expect("high wins", lambda: (lambda o: [o["risk"], sorted(o["findings"]), o["decision"]])(build_checks().invoke({"text": "Liability is unlimited; data may go to any country."})), ["high", ["data", "liability"], "redline"])
+expect("medium", lambda: build_checks().invoke({"text": "Provider may suspend the Service without notice."})["decision"], "flag")
+expect("all fine", lambda: (lambda o: [o["risk"], o["findings"], o["decision"]])(build_checks().invoke({"text": "Fees are payable in 30 days."})), ["low", [], "accept"])
+
+@@ item d32-e3
+type: scratch
+title: Closed book: a chat graph with trimming
+exam: yes
+level: 3
+cards: MessagesState and add_messages
+--- context
+A Q&A assistant for reviewers: it remembers what was said earlier, but when the history gets too long it keeps only the most recent messages, so that requests don't keep getting more expensive.
+--- prompt
+Write `build_chat(model, keep)` that returns a compiled LangGraph graph, with `MessagesState` as the State (`from langgraph.graph import StateGraph, START, END, MessagesState`):
+
+- `trim` node: keep only the last `keep` messages, and delete each earlier one with `RemoveMessage(id=m.id)` (`from langchain_core.messages import RemoveMessage`)
+- `chat` node: call `model.invoke(...)`, sending the model `[SystemMessage("You review SaaS contracts.")] + the current messages` (`from langchain_core.messages import SystemMessage`), and append the reply to messages. The system message is **not** stored in the state
+- Edges: `START → trim → chat → END`
+--- solution
+from langchain_core.messages import RemoveMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+def build_chat(model, keep):
+    def trim(state: MessagesState):
+        return {"messages": [RemoveMessage(id=m.id) for m in state["messages"][:-keep]]}
+
+    def chat(state: MessagesState):
+        reply = model.invoke([SystemMessage("You review SaaS contracts.")] + state["messages"])
+        return {"messages": [reply]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("trim", trim)
+    g.add_node("chat", chat)
+    g.add_edge(START, "trim")
+    g.add_edge("trim", "chat")
+    g.add_edge("chat", END)
+    return g.compile()
+--- tests
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_deepseek import ChatDeepSeek
+_m = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+_h = [HumanMessage("Review clause 3.1"), AIMessage("accept"), HumanMessage("Review clause 8.3"), AIMessage("redline"), HumanMessage("Why 8.3?")]
+def _sent():
+    build_chat(_m, 2).invoke({"messages": _h})
+    return [(m["role"], m["content"]) for m in MOCK.calls[-1]["body"]["messages"]]
+expect("the model receives system + the last 2", _sent, [("system", "You review SaaS contracts."), ("assistant", "redline"), ("user", "Why 8.3?")])
+expect("in the state: the last 2 + the reply, no system", lambda: [m.content for m in build_chat(_m, 2).invoke({"messages": _h})["messages"]], ["redline", "Why 8.3?", "Mock reply: Why 8.3?"])
+expect("nothing is deleted when there are few messages", lambda: len(build_chat(_m, 10).invoke({"messages": _h})["messages"]), 6)

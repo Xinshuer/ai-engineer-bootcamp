@@ -1,0 +1,802 @@
+@@ day 5
+title: TypeScript basics: types, arrays, objects, functions
+lang: ts
+hours: 5 hours
+--- goal
+"Translate" what you learned in Python over the first four days into TypeScript: variables and types, arrays and objects, functions, loops, counting and sorting. The focus is **reading type errors and fixing them**, the biggest difference between TypeScript and Python. The Mastra framework, which many AI teams use, is written in TypeScript.
+--- checklist
+- Clear your Review list first (the Python exercises too)
+- Read all 8 knowledge cards, change and run the examples, and make a type error on purpose to see what it reports
+- Pass every practice exercise (the type check must be clean too)
+- The 3 closed-book challenges
+- On your own computer: create `hello.ts` in the project's `work` folder, write 3 lines, and run `npx tsx work/hello.ts`
+
+@@ concept
+title: From Python to TypeScript
+--- body
+The ideas are almost the same; only the way you write them differs:
+
+- Variables: `const x = 1` (won't change) / `let x = 1` (will change), never a bare `x = 1`
+- Statements usually end with `;`, and blocks use `{ }` instead of indentation
+- `print(...)` → `console.log(...)`
+- f-string `f"{a}"` → template string `` `${a}` `` (backticks)
+- `True` / `False` / `None` → `true` / `false` / `null`, `undefined`
+- `and` / `or` / `not` → `&&` / `||` / `!`
+- Equal is `===`, not equal is `!==`
+- Comments: `#` → `//`
+
+Run on your own computer: `npx tsx file.ts`; type check only: `npx tsc --noEmit`. This page does both.
+--- code
+const clauseId = "8.1";
+let count = 3;
+count = count + 1;
+console.log(clauseId, count);
+console.log(`Clause ${clauseId} has ${count} refs`);
+console.log(count > 3 && clauseId.length > 0, !true);
+
+@@ concept
+title: Type annotations and type errors
+error_demo: yes
+--- body
+`variable: type` declares a type: `let page: number = 3;`. The basic types: `string`, `number` (whole numbers and decimals are both number), `boolean`.
+
+Often you don't need to write it, because TypeScript **infers** it: `let page = 3` is a number.
+
+The biggest difference from Python: **type errors are found before the code runs**. The code below has a type error. Run it, look at the Type check section, and read the English sentence there: `Type 'string' is not assignable to type 'number'` means "a string can't be put where a number is expected".
+
+In Practice, an exercise only passes when the type check **and** the tests both pass.
+--- code
+let page: number = 3;
+page = "four";
+console.log(page);
+
+@@ concept
+title: Arrays, objects, and type
+--- body
+- Arrays: `const ids: string[] = ["3.1", "8.1"]`, then `ids.length`, `ids[0]`, `ids.push("12")`
+- Objects (like Python dictionaries): `{ id: "8.1", risk: "high" }`; read a field with `c.id`
+- Use `type` to give an object's shape a name:
+
+```ts
+type Clause = { id: string; verdict: Verdict; risk: "low" | "medium" | "high" };
+```
+
+- `"low" | "medium" | "high"` is called a **union of literal types**. It is Python's `Literal["low", "medium", "high"]`: the value can only be one of these
+--- code
+type Verdict = "accept" | "flag" | "redline";
+type Clause = { id: string; verdict: Verdict; risk: "low" | "medium" | "high" };
+
+const clauses: Clause[] = [
+  { id: "3.1", verdict: "accept", risk: "low" },
+  { id: "8.1", verdict: "flag", risk: "high" },
+];
+clauses.push({ id: "4.2", verdict: "redline", risk: "medium" });
+console.log(clauses.length, clauses[1].id, clauses[1].risk);
+
+@@ concept
+title: Functions and arrow functions
+--- body
+Annotate the types of the parameters and of the return value:
+
+```ts
+function describe(id: string, heading: string): string {
+  return `${id} ${heading}`;
+}
+```
+
+An arrow function is another way to write a function, common for short functions and callbacks:
+
+```ts
+const isHigh = (risk: string): boolean => risk === "high";
+```
+
+Default argument: `function label(id: string, prefix = "Clause")`. Optional parameter: `note?: string` (it may be undefined).
+--- code
+function describe(id: string, heading: string): string {
+  return `${id} ${heading}`;
+}
+const isHigh = (risk: string): boolean => risk === "high";
+function label(id: string, prefix = "Clause"): string {
+  return `${prefix} ${id}`;
+}
+console.log(describe("8.1", "Cap on Liability"));
+console.log(isHigh("high"), isHigh("low"));
+console.log(label("8.1"), label("8.1", "Section"));
+
+@@ concept
+title: if and loops
+--- body
+```ts
+if (risk === "high") {
+  ...
+} else if (risk === "medium") {
+  ...
+} else {
+  ...
+}
+```
+
+- The condition goes inside parentheses
+- Loop over the values of an array: `for (const c of clauses) { }` (note: it is **of**; `in` loops over indexes/keys, a common trap)
+- Loop by index: `for (let i = 0; i < ids.length; i++) { }`
+- `while (condition) { }` works like in Python
+--- code
+const risks = ["low", "high", "medium"];
+for (const r of risks) {
+  if (r === "high") {
+    console.log(r, "-> look first");
+  } else {
+    console.log(r);
+  }
+}
+for (let i = 0; i < risks.length; i++) {
+  console.log(i, risks[i]);
+}
+
+@@ concept
+title: Array methods: map, filter, find
+--- body
+In TypeScript you rarely write "empty array → loop → push" by hand. You use array methods instead:
+
+- `filter(c => condition)` keeps the elements that match, like the `if` in a comprehension
+- `map(c => newValue)` turns each element into a new value, like the first part of a comprehension
+- `find(c => condition)` finds the first match; if there is none, you get `undefined`
+- `includes(x)`, `join(", ")`, `some(...)`, `every(...)`
+
+You can chain them: `clauses.filter(c => c.risk === "high").map(c => c.id)`
+--- code
+type Clause = { id: string; risk: string };
+const clauses: Clause[] = [
+  { id: "3.1", risk: "low" },
+  { id: "8.1", risk: "high" },
+  { id: "10.1", risk: "high" },
+];
+console.log(clauses.filter((c) => c.risk === "high").map((c) => c.id));
+console.log(clauses.find((c) => c.id === "8.1"));
+console.log(clauses.find((c) => c.id === "99"));
+console.log(clauses.map((c) => c.id).join(", "));
+
+@@ concept
+title: Record and counting
+--- body
+An object whose keys are strings and whose values are numbers is written `Record<string, number>`. It is Python's `dict[str, int]`.
+
+The standard way to count:
+
+```ts
+const counts: Record<string, number> = {};
+for (const v of verdicts) {
+  counts[v] = (counts[v] ?? 0) + 1;
+}
+```
+
+`a ?? b`: when a is `null` or `undefined`, use b. It plays the role of the default value in Python's `dict.get(key, 0)`.
+--- code
+const verdicts = ["accept", "flag", "accept", "redline"];
+const counts: Record<string, number> = {};
+for (const v of verdicts) {
+  counts[v] = (counts[v] ?? 0) + 1;
+}
+console.log(counts);
+console.log(Object.keys(counts), counts["flag"]);
+
+@@ concept
+title: Two sorting traps
+--- body
+1. **Without a compare function, `sort()` sorts as strings**: `[10, 9, 1].sort()` gives `[1, 10, 9]`
+2. **`sort()` changes the original array**. If you don't want that, copy it first: `[...arr].sort(...)`
+
+When the compare function returns a negative number, a goes first:
+
+```ts
+[...clauses].sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk])
+```
+
+Like Python's `sorted`, JavaScript's sort is stable too.
+--- code
+const nums = [10, 9, 1];
+console.log([...nums].sort());
+console.log([...nums].sort((a, b) => a - b));
+console.log(nums);
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+const risks = ["low", "high", "medium", "high"];
+console.log([...risks].sort((a, b) => RISK_ORDER[a] - RISK_ORDER[b]));
+
+@@ item d5-01
+type: choice
+title: let or const
+level: 1
+cards: From Python to TypeScript
+--- context
+Starting today, you write the pieces of Clause Check again, in TypeScript. The first thing that differs from Python: declaring a variable starts with `let` or `const`.
+--- prompt
+Which piece of code does TypeScript report an error for?
+--- options
+- `let count = 1; count = 2;`
+- `const count = 1; count = 2;`
+- `const ids = ["3.1"]; ids.push("8.1");`
+- `let name = "8.1"; name = "4.2";`
+answer: 2
+--- explain
+`const` means the name can't point to another value (TS2588: Cannot assign to 'count' because it is a constant). The third option is fine: `ids` is still the same array; it only got an element added. Rule of thumb: use `const` by default, and `let` only when you really need to assign again.
+
+@@ item d5-02
+type: predict
+title: Template strings and arrays
+level: 1
+cards: From Python to TypeScript; Arrays, objects, and type
+--- context
+Building the report's "number + heading" line and printing the list of clause numbers works a little differently in TypeScript than in Python.
+--- prompt
+Write the output. `console.log` prints arrays in a different format from Python: `[ '3.1', '4.2' ]` (single quotes, spaces inside the brackets).
+--- code
+const ids = ["3.1", "4.2", "8.1"];
+const heading = "Cap on Liability";
+console.log(ids.length, ids[0]);
+console.log(`8.1 ${heading}`);
+console.log(ids);
+console.log(heading.toUpperCase(), heading.includes("Cap"));
+
+@@ item d5-03
+type: code
+title: Build a one-line description (TS version)
+level: 1
+cards: Functions and arrow functions; Arrays, objects, and type
+--- context
+The report has one line per clause: number, heading, verdict. This time the verdict's type allows only three words, so passing a wrong one is caught before the code even runs. That is the extra protection TypeScript gives you over Python.
+--- prompt
+Write `describe(id, heading, verdict)` that returns `"8.1 Cap on Liability: flag"`. It's the same exercise as on Day 1, this time in TypeScript.
+--- starter
+type Verdict = "accept" | "flag" | "redline";
+
+function describe(id: string, heading: string, verdict: Verdict): string {
+  // build the result with a template string (backticks)
+  return "";
+}
+--- solution
+type Verdict = "accept" | "flag" | "redline";
+
+function describe(id: string, heading: string, verdict: Verdict): string {
+  return `${id} ${heading}: ${verdict}`;
+}
+--- tests
+expect("8.1", () => describe("8.1", "Cap on Liability", "flag"), "8.1 Cap on Liability: flag");
+expect("4.2", () => describe("4.2", "Automatic Renewal", "redline"), "4.2 Automatic Renewal: redline");
+--- hints
+- A template string uses backticks `` ` ``; write a variable as `${variable}`.
+
+@@ item d5-04
+type: code
+title: Is it high risk? (TS version)
+level: 1
+cards: Functions and arrow functions; From Python to TypeScript
+--- context
+High-risk clauses go to the top of the report, so first the program must tell whether a clause is high risk. The logic is the same as on Day 1; this time you practice writing it in TypeScript.
+--- prompt
+Write `isHigh(risk)`: return `true` when `risk` is `"high"`, otherwise `false`. Annotate the types of both the parameter and the return value.
+--- starter
+function isHigh(risk: string): boolean {
+  return false;
+}
+--- solution
+function isHigh(risk: string): boolean {
+  return risk === "high";
+}
+--- tests
+expect("high", () => isHigh("high"), true);
+expect("low", () => isHigh("low"), false);
+expect("HIGH does not count", () => isHigh("HIGH"), false);
+--- hints
+- Compare with three equals signs: `===`.
+
+@@ item d5-05
+type: code
+title: Get the section number (TS version)
+level: 1
+cards: Functions and arrow functions; d1:Strings
+--- context
+The report groups clauses by section: `8.1` and `8.2` both go under section 8. You did the same thing in Python on Day 1; now do it in TypeScript.
+--- prompt
+Write `sectionOf(id)`: `"8.1"` → `"8"`, `"12"` → `"12"`, `"10.2.1"` → `"10"`.
+--- starter
+function sectionOf(id: string): string {
+  return id;
+}
+--- solution
+function sectionOf(id: string): string {
+  return id.split(".")[0];
+}
+--- tests
+expect("8.1", () => sectionOf("8.1"), "8");
+expect("12", () => sectionOf("12"), "12");
+expect("10.2.1", () => sectionOf("10.2.1"), "10");
+--- hints
+- `split` exists just like in Python; take the first element with `[0]`.
+
+@@ item d5-06
+type: translate
+title: Translate: count each verdict
+level: 2
+cards: Record and counting; if and loops
+--- context
+The verdict counts at the top of the report (how many clauses accepted, flagged, redlined), now written in TypeScript. You already know the Python version; this time focus on how the two languages match up, line by line.
+--- prompt
+Translate the Python function above into the TypeScript function `countVerdicts`. The return type is `Record<string, number>`.
+--- source
+def count_verdicts(verdicts):
+    counts = {}
+    for v in verdicts:
+        counts[v] = counts.get(v, 0) + 1
+    return counts
+--- starter
+function countVerdicts(verdicts: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  return counts;
+}
+--- solution
+function countVerdicts(verdicts: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const v of verdicts) {
+    counts[v] = (counts[v] ?? 0) + 1;
+  }
+  return counts;
+}
+--- tests
+expect("basic", () => countVerdicts(["accept", "flag", "accept"]), { accept: 2, flag: 1 });
+expect("empty", () => countVerdicts([]), {});
+--- hints
+- `for (const v of verdicts) { ... }`
+- `counts.get(v, 0)` becomes `(counts[v] ?? 0)`.
+
+@@ item d5-07
+type: code
+title: High-risk clause numbers (filter + map)
+level: 2
+cards: Array methods: map, filter, find; Arrays, objects, and type
+--- context
+The person reviewing the contract wants to see the list of high-risk clause numbers first. This pattern, "pick some elements, then take one field from each", is everywhere in TypeScript code.
+--- prompt
+Write `highRiskIds(clauses)`: return an array with the numbers of the clauses whose `risk` is `"high"`, in their original order. Try to do it in one line with `filter` and `map`.
+--- starter
+type Clause = { id: string; risk: "low" | "medium" | "high" };
+
+function highRiskIds(clauses: Clause[]): string[] {
+  return [];
+}
+--- solution
+type Clause = { id: string; risk: "low" | "medium" | "high" };
+
+function highRiskIds(clauses: Clause[]): string[] {
+  return clauses.filter((c) => c.risk === "high").map((c) => c.id);
+}
+--- tests
+const DATA: Clause[] = [
+  { id: "3.1", risk: "low" },
+  { id: "8.1", risk: "high" },
+  { id: "4.2", risk: "medium" },
+  { id: "10.1", risk: "high" },
+];
+expect("two clauses", () => highRiskIds(DATA), ["8.1", "10.1"]);
+expect("none", () => highRiskIds([{ id: "1", risk: "low" }]), []);
+--- hints
+- `clauses.filter((c) => condition)` keeps the high-risk ones.
+- Then `.map((c) => c.id)` turns them into clause numbers.
+
+@@ item d5-08
+type: fix
+title: Fix the type errors
+level: 2
+cards: Type annotations and type errors; Arrays, objects, and type
+--- context
+When you write review results in TypeScript, the shape of a clause (which fields it has, which values the verdict can take) is written in its type. Unlike in Python, mistakes are marked before the code runs.
+--- prompt
+This code has two type errors (run it and look at the Type check section). Fix them, and make `needsAttention` return `true` when the verdict is not `accept`.
+--- starter
+type Verdict = "accept" | "flag" | "redline";
+type Clause = { id: string; verdict: Verdict; risk: "low" | "medium" | "high" };
+
+const example: Clause = { id: "8.1", verdict: "maybe", risk: "high" };
+
+function needsAttention(c: Clause): boolean {
+  return c.verdict;
+}
+--- solution
+type Verdict = "accept" | "flag" | "redline";
+type Clause = { id: string; verdict: Verdict; risk: "low" | "medium" | "high" };
+
+const example: Clause = { id: "8.1", verdict: "flag", risk: "high" };
+
+function needsAttention(c: Clause): boolean {
+  return c.verdict !== "accept";
+}
+--- tests
+expect("flag needs a look", () => needsAttention({ id: "1", verdict: "flag", risk: "low" }), true);
+expect("accept needs no look", () => needsAttention({ id: "2", verdict: "accept", risk: "low" }), false);
+expect("example is valid", () => example.verdict, "flag");
+--- hints
+- First error: `"maybe"` is not one of the values Verdict allows; change it to a valid one.
+- Second error: the function declares that it returns a boolean, but it returns a string. Return the result of a comparison instead.
+
+@@ item d5-09
+type: predict
+title: The two sort traps
+level: 2
+cards: Two sorting traps
+--- context
+The report is sorted by clause number or by risk. Sorting in TypeScript differs from Python in two ways; if you don't know them, the clauses quietly end up in the wrong order.
+--- prompt
+Write the output. Remember the two traps from the knowledge card.
+--- code
+const nums = [10, 9, 1];
+console.log([...nums].sort());
+console.log([...nums].sort((a, b) => a - b));
+console.log(nums);
+const ids = ["10.1", "3.1", "8.1"];
+console.log(ids.sort());
+
+@@ item d5-10
+type: code
+title: Sort by risk (TS version)
+level: 3
+cards: Two sorting traps; Array methods: map, filter, find
+--- context
+The report's "Needs attention" column puts high risk first. Other parts of the program still use the clause array you are given in its original order (for example to show each clause's full text), so sorting must not scramble it.
+--- prompt
+Write `attentionOrder(clauses)`: return an array of clause numbers with `high` first, then `medium`, then `low`; clauses with the same level keep their original order. **Don't change the array you are given.**
+--- starter
+type Clause = { id: string; risk: "low" | "medium" | "high" };
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+function attentionOrder(clauses: Clause[]): string[] {
+  return [];
+}
+--- solution
+type Clause = { id: string; risk: "low" | "medium" | "high" };
+const RISK_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+function attentionOrder(clauses: Clause[]): string[] {
+  return [...clauses].sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk]).map((c) => c.id);
+}
+--- tests
+const DATA: Clause[] = [
+  { id: "3.1", risk: "low" },
+  { id: "8.1", risk: "high" },
+  { id: "4.2", risk: "medium" },
+  { id: "10.1", risk: "high" },
+];
+expect("sorted", () => attentionOrder(DATA), ["8.1", "10.1", "4.2", "3.1"]);
+expect("original array unchanged", () => (attentionOrder(DATA), DATA.map((c) => c.id)), ["3.1", "8.1", "4.2", "10.1"]);
+--- hints
+- Copy first with `[...clauses]`, then `sort`; the compare function is `RISK_ORDER[a.risk] - RISK_ORDER[b.risk]`.
+- Finish with `.map((c) => c.id)`.
+
+@@ item d5-11
+type: order
+title: Put the code in order: count high risk (TS version)
+level: 2
+cards: if and loops; From Python to TypeScript
+--- context
+The top of the report says how many high-risk clauses the contract has. You wrote this function in Python on Day 2; in TypeScript the logic is the same, only the syntax differs.
+--- prompt
+Put `countHigh` in order. There are two distractor lines; think about what is wrong with them.
+--- lines
+type Clause = { id: string; risk: string };
+function countHigh(clauses: Clause[]): number {
+  let total = 0;
+  for (const c of clauses) {
+    if (c.risk === "high") {
+      total += 1;
+    }
+  }
+  return total;
+}
+--- distractors
+  const total = 0;
+  for (const c in clauses) {
+--- tests
+expect("two high", () => countHigh([{ id: "1", risk: "high" }, { id: "2", risk: "low" }, { id: "3", risk: "high" }]), 2);
+expect("none", () => countHigh([]), 0);
+--- hints
+- `total` is changed later by `+= 1`, so it can't be a const.
+- To loop over an array's values, use `of`; `in` gives you the indexes, as strings.
+
+@@ item d5-12
+type: code
+title: Singular or plural (TS version)
+level: 1
+cards: if and loops; From Python to TypeScript
+--- context
+The report's summary line has sentences like "3 clauses: flag"; getting singular and plural wrong looks unprofessional. You did the Python version on Day 1; now write it in TypeScript.
+--- prompt
+Write `countText(count, verdict)`: when `count` is 1, return `"1 clause: flag"`; otherwise return something like `"3 clauses: flag"` (0 is plural too).
+--- starter
+function countText(count: number, verdict: string): string {
+  return "";
+}
+--- solution
+function countText(count: number, verdict: string): string {
+  if (count === 1) {
+    return `1 clause: ${verdict}`;
+  }
+  return `${count} clauses: ${verdict}`;
+}
+--- tests
+expect("1", () => countText(1, "flag"), "1 clause: flag");
+expect("3", () => countText(3, "redline"), "3 clauses: redline");
+expect("0", () => countText(0, "accept"), "0 clauses: accept");
+--- hints
+- You can also use a ternary expression: `count === 1 ? "clause" : "clauses"`.
+
+@@ item d5-13
+type: code
+title: Find a clause (find)
+level: 2
+cards: Array methods: map, filter, find; Functions and arrow functions
+--- context
+During the review the model may want to look at another clause it mentions, so the program has to fetch that clause from the contract by its number. The number the model gives might not exist at all, and TypeScript makes you write that possibility into the type.
+--- prompt
+Write `findClause(clauses, id)`: return the clause whose number equals `id`; if there is none, return `undefined`. Pay attention to how the return type is written.
+--- starter
+type Clause = { id: string; risk: string };
+
+function findClause(clauses: Clause[], id: string): Clause | undefined {
+  return undefined;
+}
+--- solution
+type Clause = { id: string; risk: string };
+
+function findClause(clauses: Clause[], id: string): Clause | undefined {
+  return clauses.find((c) => c.id === id);
+}
+--- tests
+const DATA: Clause[] = [{ id: "3.1", risk: "low" }, { id: "8.1", risk: "high" }];
+expect("found", () => findClause(DATA, "8.1"), { id: "8.1", risk: "high" });
+expect("not found", () => findClause(DATA, "99"), undefined);
+--- hints
+- An array's `find` method already returns `undefined` when nothing matches.
+
+@@ item d5-14
+type: choice
+title: == and ===
+level: 1
+cards: From Python to TypeScript
+--- context
+Clause Check compares things everywhere: is the verdict `redline`, is the clause number `8.1`. JavaScript has two ways to write "equal", and in TypeScript you normally use only one of them.
+--- prompt
+Why is `===` recommended over `==` in TypeScript / JavaScript?
+--- options
+- `===` runs faster
+- `==` converts types before comparing, so `"1" == 1` is true, which easily leads to surprises; `===` doesn't convert
+- `==` has been removed
+- They are exactly the same; it's only a matter of style
+answer: 2
+--- explain
+`==` quietly converts types before comparing: `"1" == 1`, `0 == ""` and `null == undefined` are all true. `===` requires the same type and the same value, which behaves like Python's `==`. Always use `===` and `!==`.
+
+@@ item d5-15
+type: translate
+title: Translate: group by topic
+level: 3
+cards: Record and counting; if and loops; Arrays, objects, and type
+--- context
+Grouping clauses by topic (payment, cap on liability, ...) is the basis of the report's "by topic" view. You wrote the Python version on Day 2; now move it to TypeScript.
+--- prompt
+Translate the Python `group_by_topic` into the TypeScript `groupByTopic`.
+--- source
+def group_by_topic(clauses):
+    groups = {}
+    for c in clauses:
+        if c["topic"] not in groups:
+            groups[c["topic"]] = []
+        groups[c["topic"]].append(c["id"])
+    return groups
+--- starter
+type Clause = { id: string; topic: string };
+
+function groupByTopic(clauses: Clause[]): Record<string, string[]> {
+  const groups: Record<string, string[]> = {};
+  return groups;
+}
+--- solution
+type Clause = { id: string; topic: string };
+
+function groupByTopic(clauses: Clause[]): Record<string, string[]> {
+  const groups: Record<string, string[]> = {};
+  for (const c of clauses) {
+    if (!(c.topic in groups)) {
+      groups[c.topic] = [];
+    }
+    groups[c.topic].push(c.id);
+  }
+  return groups;
+}
+--- tests
+const DATA: Clause[] = [
+  { id: "3.1", topic: "payment" },
+  { id: "8.1", topic: "liability_cap" },
+  { id: "3.2", topic: "payment" },
+];
+expect("two groups", () => groupByTopic(DATA), { payment: ["3.1", "3.2"], liability_cap: ["8.1"] });
+expect("empty", () => groupByTopic([]), {});
+--- hints
+- "The key is not in the object": `!(c.topic in groups)`, or `groups[c.topic] === undefined`.
+- Python's `append` becomes `push`.
+
+@@ item d5-16
+type: fill
+title: Fill in: the TS counting pattern
+level: 1
+cards: Record and counting; if and loops
+--- context
+The report says how many clauses are high, medium and low risk. This counting shape comes up again and again in TypeScript too, so it's worth knowing it without thinking.
+--- prompt
+Complete the counting function.
+--- template
+function countRisks(risks: string[]): [[Record]]<string, number> {
+  const counts: Record<string, number> = {};
+  for (const r [[of]] risks) {
+    counts[r] = (counts[r] [[??]] 0) + 1;
+  }
+  return counts;
+}
+--- tests
+expect("basic", () => countRisks(["high", "low", "high"]), { high: 2, low: 1 });
+expect("empty", () => countRisks([]), {});
+--- hints
+- What is the type of an object whose keys are strings and whose values are numbers called?
+- Which keyword loops over an array's values? Which operator means "use a default when there is no value"?
+
+@@ item d5-17
+type: code
+title: Clean up the model's output (TS version)
+level: 1
+cards: From Python to TypeScript; d1:Strings
+--- context
+The verdict in the model's answer often has extra spaces, line breaks or capital letters, and compared as it is, it won't match. So the answer is cleaned up first; this time you write that step in TypeScript.
+--- prompt
+Write `normalize(text)`: remove the whitespace at both ends and convert to lowercase.
+--- starter
+function normalize(text: string): string {
+  return text;
+}
+--- solution
+function normalize(text: string): string {
+  return text.trim().toLowerCase();
+}
+--- tests
+expect("spaces and a line break", () => normalize("  REDLINE\n"), "redline");
+expect("mixed case", () => normalize("Accept"), "accept");
+--- hints
+- Python's `strip()` is called `trim()` in TS, and `lower()` is `toLowerCase()`.
+
+@@ item d5-18
+type: code
+title: Default arguments (TS version)
+level: 1
+cards: Functions and arrow functions
+--- context
+The report usually writes a clause as `Clause 8.1`, but a few contracts call it Section. You wrote the same function in Python on Day 2; this time see how it looks in TypeScript.
+--- prompt
+Write `label(id, prefix)`: when `prefix` is not passed, it defaults to `"Clause"`. `label("8.1")` → `"Clause 8.1"`, `label("8.1", "Section")` → `"Section 8.1"`.
+--- starter
+function label(id: string): string {
+  return "";
+}
+--- solution
+function label(id: string, prefix = "Clause"): string {
+  return `${prefix} ${id}`;
+}
+--- tests
+expect("default", () => label("8.1"), "Clause 8.1");
+expect("custom prefix", () => label("8.1", "Section"), "Section 8.1");
+--- hints
+- A default argument looks a lot like Python: `prefix = "Clause"`, and its type is inferred as string automatically.
+
+@@ item d5-19
+type: predict
+title: Truthy and falsy values, and ??
+level: 2
+cards: Record and counting; From Python to TypeScript
+--- context
+Handling review results, you often need a fallback for "no value", for example showing "no note" when there is no note. But `0` clauses or empty text are sometimes the correct value themselves, so tell them apart when you add a fallback.
+--- prompt
+Write the output. `||` takes the right side when the left side is "falsy" (`0`, `""`, `null`, `undefined`, `false`); `??` takes the right side only when the left side is `null` / `undefined`.
+--- code
+const note: string | undefined = undefined;
+const zero: number = 0;
+const empty: string = "";
+console.log(note ?? "no note");
+console.log(zero || 5, zero ?? 5);
+console.log(empty || "empty", JSON.stringify(empty ?? "empty"));
+
+@@ item d5-20
+type: code
+title: Join clause numbers
+level: 1
+cards: Array methods: map, filter, find; if and loops
+--- context
+The report needs a line like "Needs attention: 3.1, 4.2, 8.1". When there are none, leaving it blank looks as if the program broke; it's better to say so clearly.
+--- prompt
+Write `joinIds(ids)`: return a string like `"3.1, 4.2, 8.1"`, joined with a comma and a space; when the array is empty, return `"(none)"`.
+--- starter
+function joinIds(ids: string[]): string {
+  return "";
+}
+--- solution
+function joinIds(ids: string[]): string {
+  if (ids.length === 0) {
+    return "(none)";
+  }
+  return ids.join(", ");
+}
+--- tests
+expect("three", () => joinIds(["3.1", "4.2", "8.1"]), "3.1, 4.2, 8.1");
+expect("one", () => joinIds(["12"]), "12");
+expect("empty", () => joinIds([]), "(none)");
+--- hints
+- The array method `join(", ")`.
+
+@@ item d5-e1
+type: scratch
+title: Closed book: clause title (TS)
+exam: yes
+level: 1
+cards: Functions and arrow functions; From Python to TypeScript
+--- context
+In the report, every clause starts with a title line that gives its number and name.
+--- prompt
+Write `clauseTitle(id, heading)` that returns `"Clause 8.1 - Cap on Liability"`. Annotate the types of both the parameters and the return value.
+--- solution
+function clauseTitle(id: string, heading: string): string {
+  return `Clause ${id} - ${heading}`;
+}
+--- tests
+expect("8.1", () => clauseTitle("8.1", "Cap on Liability"), "Clause 8.1 - Cap on Liability");
+expect("12", () => clauseTitle("12", "Exclusions"), "Clause 12 - Exclusions");
+
+@@ item d5-e2
+type: scratch
+title: Closed book: counts for three risk levels (TS)
+exam: yes
+level: 2
+cards: Record and counting; if and loops
+--- context
+The report in these exercises starts with a risk table that always has three cells: high, medium, low. The web page reads the numbers by these three names; if a cell is missing, the page can't show it.
+--- prompt
+Write `riskCounts(clauses)`: each element of `clauses` has `risk: string`. Return `{ high: count, medium: count, low: count }`; all three keys must be there, and any other value is ignored.
+--- solution
+function riskCounts(clauses: { risk: string }[]): Record<string, number> {
+  const counts: Record<string, number> = { high: 0, medium: 0, low: 0 };
+  for (const c of clauses) {
+    if (c.risk in counts) {
+      counts[c.risk] += 1;
+    }
+  }
+  return counts;
+}
+--- tests
+expect("mixed", () => riskCounts([{ risk: "high" }, { risk: "low" }, { risk: "high" }]), { high: 2, medium: 0, low: 1 });
+expect("empty", () => riskCounts([]), { high: 0, medium: 0, low: 0 });
+expect("unknown values ignored", () => riskCounts([{ risk: "urgent" }]), { high: 0, medium: 0, low: 0 });
+
+@@ item d5-e3
+type: scratch
+title: Closed book: shorten text (TS)
+exam: yes
+level: 2
+cards: if and loops; Functions and arrow functions
+--- context
+Each row of the clause list on the web page has very little room. The full text doesn't fit, so only its beginning is shown.
+--- prompt
+Write `shorten(text, n)`: if the length is at most `n`, return the text unchanged; if it is longer, return the first `n` characters followed by `"..."`.
+--- solution
+function shorten(text: string, n: number): string {
+  if (text.length <= n) {
+    return text;
+  }
+  return text.slice(0, n) + "...";
+}
+--- tests
+expect("short", () => shorten("Fees", 10), "Fees");
+expect("long", () => shorten("Cap on Liability", 6), "Cap on...");
+expect("exactly n", () => shorten("abcdef", 6), "abcdef");

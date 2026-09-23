@@ -1,0 +1,1199 @@
+@@ day 9
+title: Testing and debugging: write your own tests, catch your own bugs
+lang: py
+hours: 4–5 hours
+--- goal
+Write tests for your own functions: `assert`, pytest-style `test_` functions, edge cases, `pytest.raises`, `pytest.approx`. When you hit a bug, track it down in this order: "reproduce → narrow down → print → hypothesize → fix → add a test". Learn to use `logging` to keep a record. In the project this is `tests/*.py` and `evals/test_review.py`, which you run on your own computer with `python -m pytest`.
+--- checklist
+- Clear your Review list first
+- Read all 7 knowledge cards, change each example and run it
+- Pass all 6 "Write tests" exercises: your tests catch every hidden buggy version
+- Pass every other practice exercise, including the local task (watch a test turn red and then green with your own eyes)
+- The 3 closed-book challenges
+- Open `tests/test_split.py` and, for each `test_` function, say in one sentence "what bug it guards against"
+
+@@ concept
+title: assert: the smallest test
+--- body
+`assert condition, "message"`: if the condition is true, nothing happens; if it is false, Python raises `AssertionError`, and the message becomes the error message.
+
+```python
+assert section_of("10.1") == "10", "two-digit section"
+```
+
+In the end, a test is just **code that calls your function and then asserts something about the result**. On Day 7 you already used `assert` to write examples for yourself.
+
+Two habits:
+
+- Write the message: when it fails, you see at a glance which assumption was wrong; without a message, the AssertionError is empty
+- Use `assert` for tests and for checking things that "can't happen"; to validate outside input (model output, a user's file), still use `if ... raise ValueError` (Day 3), because when you run Python with `python -O`, every assert is skipped
+--- code
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+
+assert section_of("8.1") == "8"
+assert section_of("12") == "12", "no dot"
+print("two checks passed")
+
+# get one expected value wrong on purpose, to see what a failure looks like
+try:
+    assert section_of("10.1") == "1", "two-digit section"
+except AssertionError as e:
+    print("AssertionError:", e)
+
+@@ concept
+title: Test functions and pytest
+--- body
+Put your asserts into functions whose names start with `test_`. **One function tests one thing**, and its name says clearly what it tests:
+
+```python
+def test_two_digit_section():
+    assert section_of("10.1") == "10"
+```
+
+On your own computer, pytest automatically finds every `test_` function in the `test_*.py` files and runs them one by one; one failing test doesn't affect the others: `python -m pytest`. Clause Check's `tests/test_split.py` is written this way.
+
+The "Write tests" exercises on this page: the exercise gives you a **correct function**, and also secretly hides a few versions with bugs planted on purpose. Your tests must **all pass on the correct version** and **make each buggy version fail at least one test**. This is called mutation testing: a test is only as good as its ability to catch bugs planted on purpose. The example below shows exactly that.
+--- code
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+
+def test_simple():
+    assert section_of("8.1") == "8"
+
+def test_two_digit_section():
+    assert section_of("10.1") == "10"
+
+def test_no_dot():
+    assert section_of("12") == "12"
+
+# what pytest does is roughly this loop: call each test_ function in turn; if it raises, it failed
+def run_tests():
+    for test in [test_simple, test_two_digit_section, test_no_dot]:
+        try:
+            test()
+            print("PASSED", test.__name__)
+        except AssertionError:
+            print("FAILED", test.__name__)
+
+run_tests()
+
+print("--- a buggy version: clause_id[0] ---")
+def section_of(clause_id):
+    return clause_id[0]
+
+run_tests()
+
+@@ concept
+title: How to come up with test cases
+--- body
+For each function, think of inputs in three groups, and write one test for each idea:
+
+1. **Normal**: the one or two most typical examples
+2. **Edge cases**: empty (`""`, `[]`), 0, just one element, **exactly equal** to the limit, a two-digit number like `10.1`, a three-level number like `10.2.1`
+3. **Invalid**: broken JSON, an unknown verdict, a negative number. Should the function raise an error or return a default? The test pins that decision down
+
+Bugs love to hide at the edges: `>` and `>=` only give different results when the values are "exactly equal". With examples far from the edge, both the right and the wrong implementation pass.
+
+Write the test name as a sentence, like `test_exactly_at_limit_is_not_split`. When it fails, the name itself tells you what broke.
+--- code
+def needs_split(text, limit=20):
+    return len(text) > limit
+
+def needs_split_buggy(text, limit=20):
+    return len(text) >= limit
+
+for text in ["", "short clause", "x" * 20, "x" * 21]:
+    print(len(text), needs_split(text), needs_split_buggy(text))
+
+@@ concept
+title: Testing errors and floats: raises, approx
+--- body
+**When it should raise an error, does it really?** Use `pytest.raises`:
+
+```python
+import pytest
+
+def test_bad_json_raises():
+    with pytest.raises(ValueError, match="not JSON"):
+        parse_verdict("Sure! {")
+```
+
+The code inside the `with` block must raise `ValueError`, or this test fails (with `DID NOT RAISE`). `match=` is a regular expression searched for in the error message, to make sure the error raised is **this** one.
+
+One of the most dangerous bugs is **swallowing an exception**: on an error, the function quietly returns None; the program doesn't crash, but the result is wrong. `pytest.raises` is made to catch exactly that.
+
+**Don't compare floats (decimal numbers) directly with `==`**: `0.1 + 0.2 == 0.3` is False (binary can't store these decimals exactly). Write `assert x == pytest.approx(0.3)`, which allows a tiny error.
+--- code
+import pytest
+
+print(0.1 + 0.2, 0.1 + 0.2 == 0.3)
+print(0.1 + 0.2 == pytest.approx(0.3))
+
+def parse_risk(text):
+    risk = text.strip().lower()
+    if risk not in ("low", "medium", "high"):
+        raise ValueError(f"unknown risk: {text}")
+    return risk
+
+def test_unknown_risk_raises():
+    with pytest.raises(ValueError, match="unknown risk"):
+        parse_risk("urgent")
+
+test_unknown_risk_raises()
+print("test passed")
+
+def parse_risk_swallowing(text):
+    try:
+        return parse_risk(text)
+    except ValueError:
+        return None
+
+print("swallowed:", parse_risk_swallowing("urgent"))
+
+@@ concept
+title: Debugging: reproduce, then guess, change one thing at a time
+--- body
+When you hit a bug, don't rush to change the code. Go in this order:
+
+1. **Reproduce**: find the **smallest** input that fails every time (one clause, not the whole contract)
+2. **Read the traceback**: start from the bottom line; first look at the error type and message, then at the line of code right above them
+3. **Look at the values in between**: print them with `repr(x)` or the f-string `{x=}`. `repr` shows invisible spaces and line breaks, and tells `'8.1'` apart from `8.1`
+4. **One hypothesis at a time**: "I guess the field name is wrong" → print to check → change it only if you were right; change one thing at a time
+5. **Add a test**: turn that smallest input into a test, and this bug can never come back
+--- code
+reply = "flag\n"
+print(reply == "flag")
+print(repr(reply))
+print(f"{reply=}")
+
+cid = 8.1
+print(f"{cid=}", type(cid).__name__)
+
+row = {"clause_id": "8.1", "risk_level": "high"}
+print(f"{row=}")
+print(sorted(row))
+
+@@ concept
+title: logging: keep a record of what the program does
+--- body
+`print` is fine for a quick look; a long-running program (for example Clause Check turned into a service like `api.py`) should use `logging`:
+
+- Every record has a **level**: DEBUG (details) < INFO (normal progress) < WARNING (a problem, but it can go on) < ERROR (something failed)
+- One line of configuration decides which levels are shown and in what format, so you never have to delete your debugging statements: set it to WARNING in production and it goes quiet; change it to DEBUG while you investigate and you see every detail
+
+```python
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+logger.info("clause %s -> %s", cid, verdict)
+```
+
+`getLogger(__name__)` gives each file a logger with its own name. Use `%s` placeholders and pass the values as arguments, instead of building the string yourself first: when the record is filtered out, even the work of building the string is saved.
+--- code
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("clausecheck.review")
+
+for cid, verdict in [("3.1", "accept"), ("8.1", "redline")]:
+    logger.debug("raw reply for %s", cid)
+    logger.info("clause %s -> %s", cid, verdict)
+logger.warning("clause %s: HTTP %d, retrying", "10.1", 429)
+
+@@ concept
+title: Common bug patterns
+--- body
+These bugs come up again and again, and interview "find the bug" questions love them too:
+
+- **Off-by-one**: `range(1, len(xs))` misses the first one; `text[:n]` and `text[:n - 1]` differ by one character
+- **`>` vs `>=`**: only shows up when the values are exactly equal
+- **Mutable default argument**: `def f(tags=[])` (Day 8)
+- **Removing while looping**: `for x in xs: xs.remove(x)` skips elements
+- **`is` vs `==`**: `is` checks "is it the same object". Always compare values with `==`; use `is` only in `is None`
+- **`//` vs `/`**: `2 // 3` is 0
+- **Forgetting return**: the function quietly returns None
+- **Shadowing a built-in name**: after you write `list = [...]`, you can no longer use `list(...)`
+--- code
+ids = ["3.1", "8.1", "10.1"]
+print([ids[i] for i in range(1, len(ids))])
+print(2 // 3, 2 / 3)
+
+verdicts = ["accept", "accept", "flag"]
+for v in verdicts:
+    if v == "accept":
+        verdicts.remove(v)
+print(verdicts)
+
+def label(risk):
+    if risk == "high":
+        return "HIGH RISK"
+    "normal"
+
+print(label("high"), label("low"))
+
+@@ item d9-01
+type: code
+title: Recap: the rules that were cited
+level: 1
+cards: d8:The set type
+--- context
+Suppose the end of the report lists which playbook rules were used to review this contract, so the lawyer can check them one by one. The `rule_ids` in each review result are the rules the model says it based its verdict on (a field in the real project's `models.py`).
+--- prompt
+Review Day 8's sets. Each review result has a `"rule_ids"` list. Write `cited_rules(reviews)`: return every rule ID that was cited, **without duplicates and sorted**.
+
+```python
+cited_rules([{"id": "8.1", "rule_ids": ["PB-03", "PB-01"]}, {"id": "3.1", "rule_ids": ["PB-03"]}])
+# → ["PB-01", "PB-03"]
+```
+--- starter
+def cited_rules(reviews):
+    seen = set()
+    return sorted(seen)
+--- solution
+def cited_rules(reviews):
+    seen = set()
+    for r in reviews:
+        for rid in r["rule_ids"]:
+            seen.add(rid)
+    return sorted(seen)
+--- tests
+DATA = [{"id": "8.1", "rule_ids": ["PB-03", "PB-01"]}, {"id": "3.1", "rule_ids": ["PB-03"]}]
+expect("no duplicates, sorted", lambda: cited_rules(DATA), ["PB-01", "PB-03"])
+expect("one review cites no rules", lambda: cited_rules([{"id": "14", "rule_ids": []}, {"id": "9.1", "rule_ids": ["PB-10"]}]), ["PB-10"])
+expect("empty", lambda: cited_rules([]), [])
+--- hints
+- Two loops: the outer loop goes over each review result, the inner loop over its `rule_ids`, and each one gets `seen.add(rid)`.
+
+@@ item d9-02
+type: predict
+title: What assert prints
+level: 1
+cards: assert: the smallest test
+--- context
+You can't write tests without `assert`: it checks a condition and raises an error if the condition doesn't hold. This code uses it to block invalid verdicts, for example when the model put the risk level where the verdict should be.
+--- prompt
+Write the output. Notice that the last assert has no message.
+--- code
+def check_verdict(v):
+    assert v in ("accept", "flag", "redline"), f"bad verdict: {v}"
+    return v
+
+print(check_verdict("flag"))
+try:
+    check_verdict("HIGH")
+except AssertionError as e:
+    print("AssertionError:", e)
+try:
+    assert len([]) > 0
+except AssertionError as e:
+    print("no message:", repr(str(e)))
+--- explain
+When an assert passes, it does nothing, and the function returns as usual. When it fails, the message after the comma becomes the error message; without a message, the error message is the empty string `''`, and to find the problem you have to dig through the code. So give the asserts in your tests a message, or at least make the test function's name say clearly what it tests.
+
+@@ item d9-03
+type: testwrite
+title: Write tests: does it fit the budget?
+level: 1
+cards: Test functions and pytest; How to come up with test cases
+--- context
+Suppose the program estimates usage before it sends a request: if the tokens (what the model charges by) go over the budget, it doesn't send. If this check is wrong, either money is wasted or clauses that should be reviewed are skipped, so tests pin its behavior down.
+--- prompt
+The first "Write tests" exercise. The function under test is `fits_budget(tokens, budget)`: it returns True when `tokens` is **not over** the budget (less than or equal to `budget`), otherwise False.
+
+We have also hidden a few versions with bugs planted on purpose. Your test file must:
+
+- **all pass** on the correct function
+- make each buggy version **fail at least one test**
+
+The starter code has only one test, and it is too weak. Run it first to see which bugs it misses (it tells you what kind of bug each one is), then add tests. Each `test_` function tests only one thing.
+--- impl
+def fits_budget(tokens, budget):
+    return tokens <= budget
+--- mutants
+===== Edge case: tokens exactly equal to the budget
+def fits_budget(tokens, budget):
+    return tokens < budget
+===== Parameter: a different budget
+def fits_budget(tokens, budget):
+    return tokens <= 4000
+--- starter
+def test_small_request_fits():
+    assert fits_budget(100, 4000) is True
+--- solution
+def test_small_request_fits():
+    assert fits_budget(100, 4000) is True
+
+def test_exactly_at_budget_fits():
+    assert fits_budget(4000, 4000) is True
+
+def test_over_budget_does_not_fit():
+    assert fits_budget(4001, 4000) is False
+
+def test_another_budget():
+    assert fits_budget(600, 500) is False
+--- hints
+- The starter test uses numbers far from the edge. Bugs love to hide at the edge: when `tokens` is exactly equal to `budget`.
+- Another buggy version doesn't use the `budget` parameter at all; it only knows 4000. Try a different budget, like 500, with a request over it.
+- Add a new function: `def test_exactly_at_budget_fits():`, and inside it `assert fits_budget(4000, 4000) is True`.
+
+@@ item d9-04
+type: testwrite
+title: Write tests: cleaning up the verdict
+level: 2
+cards: How to come up with test cases; Test functions and pytest
+--- context
+The verdict in the model's answer often comes with spaces, and its case varies. The cleanup function stands between the model and the report; the most dangerous thing it can do when it goes wrong is quietly let a problem clause through.
+--- prompt
+The function under test, `normalize_verdict(text)`, cleans up the verdict the model returns: first it removes whitespace at both ends and converts to lowercase; if the result is one of `accept` / `flag` / `redline`, it returns it, otherwise it returns `"flag"` (when unsure, hand it to a person; it must **never** default to accept).
+
+Write one test for each kind of input: a normal value, one with whitespace around it, one with different case, and an unknown value.
+--- impl
+VALID = ("accept", "flag", "redline")
+
+def normalize_verdict(text):
+    v = text.strip().lower()
+    if v in VALID:
+        return v
+    return "flag"
+--- mutants
+===== Whitespace: spaces or a line break around the verdict
+VALID = ("accept", "flag", "redline")
+
+def normalize_verdict(text):
+    v = text.lower()
+    if v in VALID:
+        return v
+    return "flag"
+===== Case: the model returns something like Accept
+VALID = ("accept", "flag", "redline")
+
+def normalize_verdict(text):
+    v = text.strip()
+    if v in VALID:
+        return v
+    return "flag"
+===== Unknown value: what comes back when it is unsure
+VALID = ("accept", "flag", "redline")
+
+def normalize_verdict(text):
+    v = text.strip().lower()
+    if v in VALID:
+        return v
+    return "accept"
+--- starter
+def test_plain_value():
+    assert normalize_verdict("flag") == "flag"
+--- solution
+def test_plain_value():
+    assert normalize_verdict("redline") == "redline"
+
+def test_whitespace_is_removed():
+    assert normalize_verdict("  accept\n") == "accept"
+
+def test_case_is_ignored():
+    assert normalize_verdict("Accept") == "accept"
+
+def test_unknown_goes_to_a_human():
+    assert normalize_verdict("maybe") == "flag"
+--- hints
+- One test function for each kind of input, with a name that says what it tests: `test_whitespace_is_removed`, `test_case_is_ignored`, …
+- The "unknown value" bug is the most dangerous one: when unsure, it turns into accept. What should `normalize_verdict("maybe")` give?
+
+@@ item d9-05
+type: choice
+title: Which test catches it?
+level: 2
+cards: How to come up with test cases; Common bug patterns
+--- context
+The web page shows the clause list in pages of 10, so first it has to work out how many pages there are. This time you don't write code; you pick a test to check code someone else wrote.
+--- prompt
+`pages(n_clauses)` should return how many pages it takes to fit all the clauses (10 per page; a last page that isn't full still counts as a page). The implementation below has a bug. Which test catches it?
+--- code
+def pages(n_clauses, per_page=10):
+    return n_clauses // per_page
+--- options
+- `assert pages(20) == 2`
+- `assert pages(0) == 0`
+- `assert pages(10) == 1`
+- `assert pages(25) == 3`
+answer: 4
+--- explain
+The first three inputs all divide exactly, so the buggy version gets them right too. **All tests passing doesn't mean there are no bugs**: pick inputs that go down the path where it goes wrong. Here that is the case "with a remainder": for 25 clauses it computes 2 pages. When you write tests, first ask yourself: for which kind of input is this function most likely to get it wrong? A correct version is `(n_clauses + per_page - 1) // per_page` or `math.ceil(n_clauses / per_page)`.
+
+@@ item d9-06
+type: testwrite
+title: Write tests: getting the section number
+level: 2
+cards: How to come up with test cases; Test functions and pytest
+--- context
+The report groups clauses by section, using the section number taken from the clause number (you wrote this function on Day 1). If the section number is wrong, the clause ends up under a different section.
+--- prompt
+The function under test, `section_of(clause_id)`, returns the section a clause belongs to: `"8.1"` → `"8"`, `"12"` → `"12"`, `"10.2.1"` → `"10"`.
+
+The starter test has only one example. The three buggy versions each go wrong on a different **shape** of clause number. Think it through first: what shapes can a clause number have?
+--- impl
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+--- mutants
+===== A two-digit section, like 10.1
+def section_of(clause_id):
+    return clause_id[0]
+===== A clause number with no dot
+def section_of(clause_id):
+    return clause_id[:clause_id.find(".")]
+===== A three-level number, like 10.2.1
+def section_of(clause_id):
+    return clause_id.rsplit(".", 1)[0]
+--- starter
+def test_simple():
+    assert section_of("8.1") == "8"
+--- solution
+def test_simple():
+    assert section_of("8.1") == "8"
+
+def test_two_digit_section():
+    assert section_of("10.1") == "10"
+
+def test_no_dot():
+    assert section_of("12") == "12"
+
+def test_three_levels():
+    assert section_of("10.2.1") == "10"
+--- hints
+- The shapes of a clause number: a one-digit section (8.1), a two-digit section (10.1), no dot (12), three levels (10.2.1).
+- Write one test for each shape.
+
+@@ item d9-07
+type: fill
+title: Fill in: pytest.raises
+level: 1
+cards: Testing errors and floats: raises, approx
+--- context
+When the model writes a risk level that doesn't exist, like `urgent`, the program should fail loudly, not quietly let it through. The test has to prove that when it should raise an error, it really does.
+--- prompt
+Complete the test function: check that `parse_risk("urgent")` raises `ValueError`, and that the error message contains `unknown risk`.
+--- template
+import pytest
+
+def parse_risk(text):
+    risk = text.strip().lower()
+    if risk not in ("low", "medium", "high"):
+        raise ValueError(f"unknown risk: {text}")
+    return risk
+
+def test_bad_risk_raises():
+    [[with]] pytest.[[raises]](ValueError, [[match]]="unknown risk"):
+        parse_risk("urgent")
+--- tests
+expect("the test passes on the correct function", lambda: (test_bad_risk_raises(), "passed")[1], "passed")
+def _swallowing():
+    global parse_risk
+    real = parse_risk
+    parse_risk = lambda text: None
+    try:
+        test_bad_risk_raises()
+        return "the test found no problem"
+    except AssertionError:
+        return "the test failed (it caught the bug)"
+    finally:
+        parse_risk = real
+expect("with a version that swallows the error, the test fails", _swallowing, "the test failed (it caught the bug)")
+--- hints
+- The shape: `with pytest.raises(ErrorType, match="regex"):`, and on the next line, indented, the call that should raise.
+
+@@ item d9-08
+type: testwrite
+title: Write tests: parsing the verdict
+level: 2
+cards: Testing errors and floats: raises, approx; How to come up with test cases
+--- context
+Now and then the model doesn't answer with JSON as asked, but opens with a polite sentence instead. The parser must then raise an error, so that a retry or a person can take over; if it quietly returns an empty value, the clause "disappears" from the report.
+--- prompt
+The function under test is `parse_verdict(raw)`, where `raw` is the JSON text the model returned:
+
+- valid: return its `verdict`
+- not valid JSON: `raise ValueError` with a message that starts with `not JSON`
+- `verdict` is not one of the three: `raise ValueError` with the message `bad verdict: ` plus that value, for example `bad verdict: HIGH`
+
+Test the error cases with `with pytest.raises(ValueError, match=...)`. One buggy version **swallows** the error: instead of raising, it quietly returns None. The program doesn't crash, so this kind of bug is the hardest to spot.
+--- impl
+import json
+
+VALID = ("accept", "flag", "redline")
+
+def parse_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"not JSON: {raw[:30]}")
+    verdict = data.get("verdict")
+    if verdict not in VALID:
+        raise ValueError(f"bad verdict: {verdict}")
+    return verdict
+--- mutants
+===== Broken JSON: quietly returns None when it should raise
+import json
+
+VALID = ("accept", "flag", "redline")
+
+def parse_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    verdict = data.get("verdict")
+    if verdict not in VALID:
+        raise ValueError(f"bad verdict: {verdict}")
+    return verdict
+===== The value: verdict is not one of the three
+import json
+
+VALID = ("accept", "flag", "redline")
+
+def parse_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"not JSON: {raw[:30]}")
+    return data.get("verdict")
+===== Error message: it doesn't say which value is wrong
+import json
+
+VALID = ("accept", "flag", "redline")
+
+def parse_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"not JSON: {raw[:30]}")
+    verdict = data.get("verdict")
+    if verdict not in VALID:
+        raise ValueError("bad verdict")
+    return verdict
+--- starter
+import pytest
+
+def test_valid_json():
+    assert parse_verdict('{"verdict": "flag"}') == "flag"
+--- solution
+import pytest
+
+def test_valid_json():
+    assert parse_verdict('{"verdict": "flag"}') == "flag"
+
+def test_bad_json_raises():
+    with pytest.raises(ValueError, match="not JSON"):
+        parse_verdict("Sure! Here is the JSON")
+
+def test_unknown_verdict_names_the_value():
+    with pytest.raises(ValueError, match="bad verdict: HIGH"):
+        parse_verdict('{"verdict": "HIGH"}')
+--- hints
+- The broken-JSON test: `with pytest.raises(ValueError, match="not JSON"):`, and on the next line, indented, `parse_verdict("Sure! ...")`.
+- `match` is a regex searched for in the error message. To catch the bug "the message doesn't include the value", `match` has to include the value too: `"bad verdict: HIGH"`.
+
+@@ item d9-09
+type: testwrite
+title: Write tests: pass rate
+level: 2
+cards: Testing errors and floats: raises, approx; d4:Randomness: one run is not enough
+--- context
+Evals run the same test case several times and look at the share of runs that passed (the pass rate in the real project's `run_evals.py` table). Whether a test case counts as passing depends on this share; if it is computed wrong, the eval's conclusion is wrong too.
+--- prompt
+The function under test, `pass_rate(results)`: `results` is a list saying whether each run passed (True / False); it returns the share that passed (a decimal from 0 to 1); an empty list returns `0.0`.
+
+When the result is a decimal, compare it with `pytest.approx`: `2 / 3` comes out as `0.6666666666666666`; don't copy that long string by hand, write `pytest.approx(2 / 3)`.
+--- impl
+def pass_rate(results):
+    if not results:
+        return 0.0
+    return sum(1 for r in results if r) / len(results)
+--- mutants
+===== Division: the result should be a decimal
+def pass_rate(results):
+    if not results:
+        return 0.0
+    return sum(1 for r in results if r) // len(results)
+===== An empty list
+def pass_rate(results):
+    return sum(1 for r in results if r) / len(results)
+===== Counted the wrong way: it counts the failures
+def pass_rate(results):
+    if not results:
+        return 0.0
+    return sum(1 for r in results if not r) / len(results)
+--- starter
+import pytest
+
+def test_all_passed():
+    assert pass_rate([True, True]) == 1.0
+--- solution
+import pytest
+
+def test_all_passed():
+    assert pass_rate([True, True]) == 1.0
+
+def test_partial_is_a_fraction():
+    assert pass_rate([True, True, False]) == pytest.approx(2 / 3)
+
+def test_empty_is_zero():
+    assert pass_rate([]) == 0.0
+--- hints
+- The starter test only covers "all passed". Still missing: some passed (the result is a decimal), and the empty list.
+- `assert pass_rate([True, True, False]) == pytest.approx(2 / 3)`.
+
+@@ item d9-10
+type: order
+title: Put the code in order: a test file
+level: 2
+cards: Test functions and pytest; Testing errors and floats: raises, approx
+--- context
+When tallying usage, you often need the average number of tokens per call, to estimate roughly how many the next contract will need. Even a small function like this deserves a test file, just like the ones in the real project's `tests/` folder.
+--- prompt
+Put the lines in order to build a small test file: the function under test, `average_tokens(calls)`, returns the average number of tokens; one test checks the normal case, the other checks that an empty list raises `ZeroDivisionError`. Two lines are distractors.
+--- lines
+import pytest
+def average_tokens(calls):
+    return sum(c["tokens"] for c in calls) / len(calls)
+def test_average():
+    calls = [{"tokens": 100}, {"tokens": 250}]
+    assert average_tokens(calls) == pytest.approx(175.0)
+def test_empty_raises():
+    with pytest.raises(ZeroDivisionError):
+        average_tokens([])
+--- distractors
+    assert average_tokens(calls) == pytest.approx(350.0)
+    with pytest.raises(ValueError):
+--- tests
+expect("test_average passes", lambda: (test_average(), "passed")[1], "passed")
+expect("test_empty_raises passes", lambda: (test_empty_raises(), "passed")[1], "passed")
+--- hints
+- What is (100 + 250) / 2?
+- With an empty list, `len(calls)` is 0. Which error does dividing by 0 raise?
+
+@@ item d9-11
+type: code
+title: Find the first input that fails
+level: 2
+cards: Debugging: reproduce, then guess, change one thing at a time; d3:try / except: catch the errors you expect
+--- context
+A contract has dozens of clauses, and the program crashed on one of them. First find out which one and what error it raised; then you can investigate that one clause on its own instead of running the whole contract every time.
+--- prompt
+The first step of debugging is to find the **smallest input that fails every time**. Write `first_failing(inputs, fn)`: call `fn(input)` with each input in order, and for the first input that makes `fn` raise an exception, return `(input, "ErrorType: error message")`; if every call runs fine, return `None`.
+
+The name of the error type is `type(e).__name__`. Here you want to catch **any** error, so write `except Exception as e:`; in everyday code, catch only the errors you expect (Day 3).
+
+```python
+def section_number(cid):
+    return int(cid.split(".")[0])
+
+first_failing(["8.1", "", "12"], section_number)
+# → ("", "ValueError: invalid literal for int() with base 10: ''")
+```
+--- starter
+def first_failing(inputs, fn):
+    for x in inputs:
+        fn(x)
+    return None
+--- solution
+def first_failing(inputs, fn):
+    for x in inputs:
+        try:
+            fn(x)
+        except Exception as e:
+            return x, f"{type(e).__name__}: {e}"
+    return None
+--- tests
+def section_number(cid):
+    return int(cid.split(".")[0])
+def lookup(cid):
+    return {"8.1": "flag"}[cid]
+expect("finds the first one that fails", lambda: first_failing(["8.1", "10.2", "", "x.1"], section_number), ("", "ValueError: invalid literal for int() with base 10: ''"))
+expect("KeyError counts too", lambda: first_failing(["8.1", "9.9"], lookup), ("9.9", "KeyError: '9.9'"))
+expect("everything runs fine", lambda: first_failing(["8.1", "12"], section_number), None)
+expect("empty list", lambda: first_failing([], section_number), None)
+--- hints
+- Put `fn(x)` inside `try:`, and in `except Exception as e:` return right away.
+- It returns a tuple: `return x, f"{type(e).__name__}: {e}"`.
+
+@@ item d9-12
+type: fix
+title: Fix the bug: read the traceback
+level: 2
+cards: Debugging: reproduce, then guess, change one thing at a time; d3:Reading a multi-level traceback
+--- context
+This code parses a batch of JSON answers from the model and lists the clauses a lawyer needs to look at. It crashes as soon as it runs, which makes it good practice for today's debugging order.
+--- prompt
+`attention(raws)` should return the numbers of the clauses a person needs to look at (high risk first). Running the tests raises an error. Follow today's debugging steps:
+
+1. Read the traceback from the **bottom** line: what error? Which key?
+2. One line up: which line of which function failed?
+3. Add `print(repr(reviews[0]))` near there, to see what one record **really** looks like
+
+Fix it once you have found the cause, then delete the print.
+--- starter
+import json
+
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def parse(raw):
+    return json.loads(raw)
+
+def rank(reviews):
+    return sorted(reviews, key=lambda r: RISK[r["risk"]])
+
+def attention(raws):
+    reviews = [parse(raw) for raw in raws]
+    return [r["clause_id"] for r in rank(reviews) if r["verdict"] != "accept"]
+--- solution
+import json
+
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def parse(raw):
+    return json.loads(raw)
+
+def rank(reviews):
+    return sorted(reviews, key=lambda r: RISK[r["risk_level"]])
+
+def attention(raws):
+    reviews = [parse(raw) for raw in raws]
+    return [r["clause_id"] for r in rank(reviews) if r["verdict"] != "accept"]
+--- tests
+RAWS = [
+    '{"clause_id": "3.1", "verdict": "accept", "risk_level": "low"}',
+    '{"clause_id": "6.2", "verdict": "flag", "risk_level": "medium"}',
+    '{"clause_id": "8.1", "verdict": "redline", "risk_level": "high"}',
+]
+expect("high risk first", lambda: attention(RAWS), ["8.1", "6.2"])
+expect("nothing needs a look", lambda: attention(RAWS[:1]), [])
+expect("empty", lambda: attention([]), [])
+--- hints
+- The last line is `KeyError: 'risk'`: the dictionary has no `risk` key at all.
+- In the printed data, the risk field is called `risk_level` (the same as what the mock server and the real DeepSeek return).
+
+@@ item d9-13
+type: choice
+title: The first step of debugging
+level: 2
+cards: Debugging: reproduce, then guess, change one thing at a time
+--- context
+In a long contract, only one clause has a wrong result. This is the situation you meet most often when debugging.
+--- prompt
+`review_all` reviewed a contract with 40 clauses. In the result, the verdict of the 17th clause is `None`; everything else is fine. Which approach best follows today's debugging steps?
+--- options
+- Rewrite `review_all` from scratch; maybe that fixes it
+- Add `try/except Exception: pass` where it is called, so that None stops showing up
+- Run the 17th clause on its own, print the `repr` of its input and of the model's raw answer, and first find out whether the problem is in the input, the model's answer or the parsing
+- Change the prompt, switch models and add retries all at once, and see which one helps
+answer: 3
+--- explain
+First reproduce with the smallest input (run only the 17th clause: fast and cheap), then look at the values in between to find which part is wrong, and change one thing at a time. If you change three things at once, even if it works you won't know which one did it; swallowing the exception only hides the bug. Once it is fixed, turn the 17th clause's input into a test, and the bug won't come back.
+
+@@ item d9-14
+type: predict
+title: What logging prints
+level: 2
+cards: logging: keep a record of what the program does
+--- context
+Clause Check's `api.py` can turn it into a network service that runs all the time, waiting for others to call it. When the service has a problem, nobody is watching the screen; all you can do is go through the logs afterward, and each log record is marked with how important it is.
+--- prompt
+Write the output. Think: which record is filtered out by `level=logging.INFO`?
+--- code
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger("clausecheck.demo")
+
+logger.debug("raw reply: %s", '{"verdict": "flag"}')
+logger.info("clause %s -> %s", "8.1", "flag")
+logger.warning("HTTP %d, retrying", 429)
+logger.error("gave up on clause %s", "10.1")
+print("done")
+--- explain
+DEBUG is lower than INFO, so that record is filtered out; the other three are printed through `format` as "level message". `%s` and `%d` are filled in, in order, by the arguments that follow. When you investigate a problem, change `level` to `logging.DEBUG` and the raw answer shows up, without changing a single line of the program's real code.
+
+@@ item d9-15
+type: code
+title: Add logging to a function
+level: 2
+cards: logging: keep a record of what the program does; d3:try / except: catch the errors you expect
+--- context
+In a batch review, if the answer for one clause fails to parse, that shouldn't stop the whole contract from being reviewed; but the failure must leave a record, so that afterward you know which clause it was and why.
+--- prompt
+Write `safe_classify(clause_id, text, classify)`:
+
+- call `classify(text)` to get the verdict, log an INFO record: `logger.info("clause %s -> %s", clause_id, verdict)`, and return the verdict
+- if `classify` raises `ValueError`: log a WARNING that reads `clause 3.1 failed: <error message>`, and return `"flag"` (a clause that failed goes to a person)
+- catch **only** `ValueError`; let other errors go through as usual, don't swallow them
+
+`classify` is passed in by the caller, so in tests you can pass a fake function instead of really calling the model.
+--- starter
+import logging
+
+logger = logging.getLogger("clausecheck.review")
+
+def safe_classify(clause_id, text, classify):
+    return classify(text)
+--- solution
+import logging
+
+logger = logging.getLogger("clausecheck.review")
+
+def safe_classify(clause_id, text, classify):
+    try:
+        verdict = classify(text)
+    except ValueError as e:
+        logger.warning("clause %s failed: %s", clause_id, e)
+        return "flag"
+    logger.info("clause %s -> %s", clause_id, verdict)
+    return verdict
+--- tests
+import logging
+
+class _Collect(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(f"{record.levelname} {record.getMessage()}")
+
+_log = logging.getLogger("clausecheck.review")
+for _old in list(_log.handlers):
+    _log.removeHandler(_old)
+_h = _Collect()
+_log.addHandler(_h)
+_log.setLevel(logging.INFO)
+
+def ok(text):
+    return "accept"
+
+def broken(text):
+    raise ValueError("bad json")
+
+def other_error(text):
+    return {}["verdict"]
+
+expect("returns the verdict when all goes well", lambda: safe_classify("8.1", "Fees are due.", ok), "accept")
+expect("returns flag on ValueError", lambda: safe_classify("3.1", "???", broken), "flag")
+def _logs():
+    _h.lines.clear()
+    safe_classify("8.1", "Fees are due.", ok)
+    safe_classify("3.1", "???", broken)
+    return _h.lines
+expect("what the log says", _logs, ["INFO clause 8.1 -> accept", "WARNING clause 3.1 failed: bad json"])
+expect_raises("other errors are not swallowed", lambda: safe_classify("4.2", "x", other_error), KeyError)
+--- hints
+- The structure: call `classify` inside `try:`; in `except ValueError as e:` log a warning and `return "flag"`; outside the try, log the info and return the verdict.
+- The warning line: `logger.warning("clause %s failed: %s", clause_id, e)`.
+
+@@ item d9-16
+type: fix
+title: Fix the bug: the first one is missing
+level: 2
+cards: Common bug patterns; d8:enumerate and zip
+--- context
+If the list of clause numbers exported for the lawyer is missing one, the lawyer will skip that clause, and it is hard to notice.
+--- prompt
+The lawyer reports: in the exported list, **the first clause is always missing**. Run it, compare with the output to find the cause, and fix it. Once it is fixed, think: for a contract with just one clause, what would the original code have output?
+--- starter
+def numbered_lines(ids):
+    lines = []
+    for i in range(1, len(ids)):
+        lines.append(f"{i}. {ids[i]}")
+    return lines
+
+print(numbered_lines(["3.1", "8.1", "10.1"]))
+--- solution
+def numbered_lines(ids):
+    return [f"{i}. {cid}" for i, cid in enumerate(ids, 1)]
+
+print(numbered_lines(["3.1", "8.1", "10.1"]))
+--- tests
+expect("all three are there", lambda: numbered_lines(["3.1", "8.1", "10.1"]), ["1. 3.1", "2. 8.1", "3. 10.1"])
+expect("just one", lambda: numbered_lines(["12"]), ["1. 12"])
+expect("empty", lambda: numbered_lines([]), [])
+--- hints
+- `range(1, len(ids))` starts at index 1, so the first one, at index 0, is skipped.
+- Numbering from 1 and indexes from 0 are two different things. With Day 8's `enumerate(ids, 1)`, you don't have to work it out yourself.
+
+@@ item d9-17
+type: fix
+title: Fix the bug: removing while looping
+level: 2
+cards: Common bug patterns; d2:List comprehensions: filter and transform in one line
+--- context
+The report's "to do" list has to leave out clauses that were already accepted. The original full list is still needed later to build the whole report, so it must not be changed.
+--- prompt
+`drop_accepted(reviews)` should remove every accept and keep only the ones that need a person. But sometimes it misses one. Run it first and look at the output, then fix it.
+
+Requirement: **don't change** the list that is passed in; return a new list.
+--- starter
+def drop_accepted(reviews):
+    for r in reviews:
+        if r["verdict"] == "accept":
+            reviews.remove(r)
+    return reviews
+
+data = [
+    {"id": "3.1", "verdict": "accept"},
+    {"id": "3.2", "verdict": "accept"},
+    {"id": "8.1", "verdict": "flag"},
+]
+print([r["id"] for r in drop_accepted(data)])
+--- solution
+def drop_accepted(reviews):
+    return [r for r in reviews if r["verdict"] != "accept"]
+
+data = [
+    {"id": "3.1", "verdict": "accept"},
+    {"id": "3.2", "verdict": "accept"},
+    {"id": "8.1", "verdict": "flag"},
+]
+print([r["id"] for r in drop_accepted(data)])
+--- tests
+def _data():
+    return [
+        {"id": "3.1", "verdict": "accept"},
+        {"id": "3.2", "verdict": "accept"},
+        {"id": "8.1", "verdict": "flag"},
+        {"id": "9.1", "verdict": "accept"},
+    ]
+expect("two accepts in a row are both removed", lambda: [r["id"] for r in drop_accepted(_data())], ["8.1"])
+def _untouched():
+    d = _data()
+    drop_accepted(d)
+    return len(d)
+expect("the original list is not changed", _untouched, 4)
+expect("empty list", lambda: drop_accepted([]), [])
+--- hints
+- After an element is removed, every element after it moves forward one place, but the loop's position still moves on, so one gets skipped.
+- Don't remove from the original list: build a new list with a comprehension, `[r for r in reviews if ...]`.
+
+@@ item d9-18
+type: fix
+title: Fix the bug: is vs ==
+level: 2
+cards: Common bug patterns
+--- context
+The program needs to tell whether the model accepted a clause. When this kind of comparison is written wrong, the program doesn't raise an error; it just quietly gives the wrong result.
+--- prompt
+`is_accept(raw)` checks whether the text the model returned is accept. The input is clearly `" Accept "`, yet it says False. Run it and see; at the very top of the output there is also a `SyntaxWarning` from Python. Read what it says.
+--- starter
+def is_accept(raw):
+    return raw.strip().lower() is "accept"
+
+print(is_accept(" Accept "))
+print(is_accept("accept"))
+--- solution
+def is_accept(raw):
+    return raw.strip().lower() == "accept"
+
+print(is_accept(" Accept "))
+print(is_accept("accept"))
+--- tests
+expect("spaces around it, capital first letter", lambda: is_accept(" Accept "), True)
+expect("already accept", lambda: is_accept("accept"), True)
+expect("not accept", lambda: is_accept("flag"), False)
+--- hints
+- `is` asks "is it the same object". `.lower()` creates a new string, which is not the same object as the `"accept"` written in the code, even though the content is the same.
+- Always compare values with `==`; use `is` only in `x is None`.
+
+@@ item d9-19
+type: testwrite
+title: Write tests: truncating text
+level: 3
+cards: How to come up with test cases; Testing errors and floats: raises, approx
+--- context
+The web page's table has no room for the full clause text, so it shows only the beginning. If truncation is wrong, either the table layout breaks or the lawyer sees a beginning with characters missing.
+--- prompt
+The function under test, `truncate(text, n)`, shortens the clause text so it can be shown in a table:
+
+- length at most `n`: return it unchanged
+- longer: cut it to a string whose **total length is exactly n**, with `"…"` as the last character (that is one character)
+- `n` less than 1: `raise ValueError`
+
+Fewer hints this time: list the normal, edge-case and invalid inputs yourself, with at least one test for each group.
+--- impl
+def truncate(text, n):
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    if len(text) <= n:
+        return text
+    return text[:n - 1] + "…"
+--- mutants
+===== Edge case: the length is exactly n
+def truncate(text, n):
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    if len(text) < n:
+        return text
+    return text[:n - 1] + "…"
+===== Length: one character too many after truncating
+def truncate(text, n):
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    if len(text) <= n:
+        return text
+    return text[:n] + "…"
+===== Invalid argument: n is 0
+def truncate(text, n):
+    if len(text) <= n:
+        return text
+    return text[:n - 1] + "…"
+--- starter
+def test_short_text_unchanged():
+    assert truncate("Fees", 10) == "Fees"
+--- solution
+import pytest
+
+def test_short_text_unchanged():
+    assert truncate("Fees", 10) == "Fees"
+
+def test_exactly_n_unchanged():
+    assert truncate("Fees", 4) == "Fees"
+
+def test_long_text_is_cut_to_n():
+    result = truncate("Liability is unlimited", 10)
+    assert result == "Liability…"
+    assert len(result) == 10
+
+def test_n_below_one_raises():
+    with pytest.raises(ValueError):
+        truncate("Fees", 0)
+--- hints
+- Edge case: the text's length is **exactly equal** to n. Invalid: n is 0.
+- The truncation test checks both the content and the length: `assert len(result) == 10`.
+
+@@ item d9-20
+type: local
+title: Local task: see red and green once
+level: 2
+cards: Test functions and pytest; How to come up with test cases
+--- context
+Running tests with pytest on your own computer is exactly how the real project's `tests/` folder is used day to day. Only once you have watched a test turn red and then green with your own eyes will you believe that tests really catch bugs.
+--- prompt
+On your own computer, watch a test go from green to red and back to green, once.
+
+1. In VS Code, create `G:\Contract Clause Reviewer\work\test_my_first.py`
+2. **Without looking at the page**, write from a blank file `truncate(text, n)` (same rules as the previous exercise) and at least 3 `test_` functions: short text is unchanged, length exactly equal to n, and for long text, the length after truncating is exactly n
+3. In the terminal, run:
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m pytest work/test_my_first.py
+```
+
+You should see `3 passed` (the project's `pyproject.toml` already sets `-q`).
+
+4. Plant a bug on purpose: change `<=` to `<`, then run it again. Read the failure message pytest prints: it shows the actual values on both sides of the assert
+5. Change it back, run it once more, and make sure everything is green
+6. Paste the output of all three runs below
+placeholder: Paste the output of the three pytest runs
+verify: \d+ failed[\s\S]*\d+ passed|\d+ passed[\s\S]*\d+ failed
+--- hints
+- If you see `No module named pytest`: first run `python -m pip install pytest`.
+- pytest only collects files and functions whose names start with `test_`. If a name is misspelled, it shows `no tests ran`.
+
+@@ item d9-e1
+type: scratch
+title: Closed book: validate a review result
+exam: yes
+level: 3
+cards: d3:raise: report an error on purpose; How to come up with test cases
+--- context
+Every review result the model returns is checked before it goes into the report. The error message must say clearly what is missing and which value is wrong, so that on a retry it can be passed back to the model as is, for it to fix.
+--- prompt
+Write `validate_review(d)`, which checks one review result (a dictionary) returned by the model:
+
+1. Check `clause_id`, `verdict`, `risk_level` in this order; if one is missing, `raise ValueError("missing field: <field name>")`
+2. `verdict` is not `accept` / `flag` / `redline`: `raise ValueError("bad verdict: <value>")`
+3. `risk_level` is not `low` / `medium` / `high`: `raise ValueError("bad risk_level: <value>")`
+4. Everything is valid: return `True`
+
+Example: `validate_review({"clause_id": "8.1", "verdict": "HIGH", "risk_level": "high"})` raises `ValueError("bad verdict: HIGH")`.
+--- solution
+REQUIRED = ("clause_id", "verdict", "risk_level")
+
+def validate_review(d):
+    for key in REQUIRED:
+        if key not in d:
+            raise ValueError(f"missing field: {key}")
+    if d["verdict"] not in ("accept", "flag", "redline"):
+        raise ValueError(f"bad verdict: {d['verdict']}")
+    if d["risk_level"] not in ("low", "medium", "high"):
+        raise ValueError(f"bad risk_level: {d['risk_level']}")
+    return True
+--- tests
+def _msg(d):
+    try:
+        validate_review(d)
+    except ValueError as e:
+        return str(e)
+    return "no error raised"
+GOOD = {"clause_id": "8.1", "verdict": "flag", "risk_level": "high"}
+expect("valid", lambda: validate_review(GOOD), True)
+expect("missing fields: reports the first one in order", lambda: _msg({"risk_level": "low"}), "missing field: clause_id")
+expect("invalid verdict", lambda: _msg({**GOOD, "verdict": "HIGH"}), "bad verdict: HIGH")
+expect("invalid risk level", lambda: _msg({**GOOD, "risk_level": "urgent"}), "bad risk_level: urgent")
+
+@@ item d9-e2
+type: scratch
+title: Closed book: remove duplicates, keep the order
+exam: yes
+level: 2
+cards: d8:The set type
+--- context
+The rules the model based its answer on (`rule_ids`) are listed in the report for the lawyer to check. If the same rule shows up twice, the lawyer will think they are two different rules.
+--- prompt
+The `rule_ids` the model returns often have duplicates and stray spaces. Write `dedupe_keep_order(items)`:
+
+- `.strip()` each item first
+- items that are the same after strip count as duplicates; keep only the **first occurrence**, in the original order
+- drop items that are an empty string after strip
+
+Return a new list.
+
+`dedupe_keep_order([" PB-03", "PB-01", "PB-03 ", ""])` → `["PB-03", "PB-01"]`
+--- solution
+def dedupe_keep_order(items):
+    seen = set()
+    result = []
+    for item in items:
+        x = item.strip()
+        if x and x not in seen:
+            seen.add(x)
+            result.append(x)
+    return result
+--- tests
+expect("removes duplicates and whitespace, keeps the order", lambda: dedupe_keep_order([" PB-03", "PB-01", "PB-03 ", ""]), ["PB-03", "PB-01"])
+expect("no duplicates: order unchanged", lambda: dedupe_keep_order(["PB-09", "PB-02"]), ["PB-09", "PB-02"])
+expect("all whitespace", lambda: dedupe_keep_order(["", "  "]), [])
+expect("empty list", lambda: dedupe_keep_order([]), [])
+
+@@ item d9-e3
+type: scratch
+title: Closed book: sliding window
+exam: yes
+level: 2
+cards: d1:Lists; Common bug patterns
+--- context
+Some clauses can't be understood on their own: for example `3.2` says "the above fees", and you have to read it together with `3.1` to know what it means. In this exercise, neighboring clause numbers are put into groups, and the groups go to the model one at a time.
+--- prompt
+When you review a clause, you often need to read the clauses before and after it too. Write `window(items, size)`: return every **consecutive** slice of length `size` (each slice is a list), in order.
+
+- `window(["3.1", "3.2", "3.3", "4.1"], 2)` → `[["3.1", "3.2"], ["3.2", "3.3"], ["3.3", "4.1"]]`
+- `size` longer than the list: return `[]`
+- `size` less than 1: `raise ValueError`
+--- solution
+def window(items, size):
+    if size < 1:
+        raise ValueError("size must be at least 1")
+    return [items[i:i + size] for i in range(len(items) - size + 1)]
+--- tests
+IDS = ["3.1", "3.2", "3.3", "4.1"]
+expect("length 2", lambda: window(IDS, 2), [["3.1", "3.2"], ["3.2", "3.3"], ["3.3", "4.1"]])
+expect("exactly the length of the list", lambda: window(IDS, 4), [IDS])
+expect("longer than the list", lambda: window(IDS, 5), [])
+expect_raises("size is 0", lambda: window(IDS, 0), ValueError)

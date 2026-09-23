@@ -1,0 +1,1246 @@
+@@ day 24
+title: Databases and Python: creating tables, writing rows, transactions, stopping injection
+lang: py
+langs: SQL + Python
+hours: 5 hours
+--- goal
+Design a table (primary key, NOT NULL, UNIQUE, CHECK, foreign key) and change data with INSERT / UPDATE / DELETE / UPSERT; read and write safely from Python with `sqlite3`: parameterized queries against injection, `with conn:` transactions, `sqlite3.Row` to turn rows into dictionaries, and store the model's call records in a table; know where Postgres, the usual production database, and pgvector, which stores vectors, fit in.
+
+In the project: `clausecheck/graph.py` uses `SqliteSaver` to keep LangGraph's checkpoints in the SQLite file `data/checkpoints.sqlite`; `ReviewTrace` in `models.py` (model, prompt_version, tokens, latency), once stored in a database, is one row of the `reviews` table.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change one thing in each before you run it
+- Pass every practice exercise (including the local task: open the project's checkpoint database read-only)
+- The 3 closed-book exercises
+- Say in your own words why `with conn:` guarantees that "half a batch" never stays in the database
+
+@@ concept
+title: CREATE TABLE: rules for your data
+lang: sql
+dataset: clausecheck
+--- body
+A table is not just a grid that holds data. The **constraints** you write when you create a table are the last gate before bad data gets in: now and then the model returns `risk_level: "critical"` (that is exactly how review 1047 in the sample data failed), and a value like that should never get into the database. Below is the lawyer feedback table `feedback`, already created:
+
+```sql
+CREATE TABLE feedback (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL REFERENCES reviews(id),
+  reviewer TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline')),
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (review_id, reviewer)
+);
+```
+
+- Types: `INTEGER`, `TEXT`, `REAL` (decimal numbers)
+- `PRIMARY KEY`: each row's unique number. In SQLite, an `INTEGER PRIMARY KEY` that is given no value takes the next number automatically (Postgres doesn't; there you write `BIGINT GENERATED ALWAYS AS IDENTITY` or `BIGSERIAL`)
+- `NOT NULL`: must have a value; `DEFAULT`: the value used when none is given; `UNIQUE`: no repeats (it can be a combination of several columns); `CHECK (...)`: the value must meet the condition
+- `REFERENCES reviews(id)`: a **foreign key**; it must point to a row that really exists in reviews
+- One table per kind of thing: customers, contracts, reviews and feedback each get their own table, connected by ids (yesterday's JOIN)
+
+Two SQLite traps: foreign keys are **not checked** by default, so run `PRAGMA foreign_keys = ON` first; and types are loose, so you can store `'abc'` in an INTEGER column. Postgres is strict about both.
+
+Run the insert below, then change `'accept'` to `'maybe'`, or delete the `reviewer` column together with its value `'anna'`, run it again, and read the error.
+--- schema
+CREATE TABLE feedback (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL REFERENCES reviews(id),
+  reviewer TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline')),
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (review_id, reviewer)
+);
+--- code
+INSERT INTO feedback (review_id, reviewer, verdict, note)
+VALUES (1005, 'anna', 'accept', 'A 12-month cap is fine for this customer')
+RETURNING *;
+
+@@ concept
+title: INSERT, UPDATE, DELETE: SELECT first, then change
+lang: sql
+dataset: clausecheck
+--- body
+Three statements that change data:
+
+```sql
+INSERT INTO customers (name, country, plan, signed_up)
+VALUES ('Oslo Maritime AS', 'NO', 'pro', '2026-09-20');
+UPDATE contracts SET status = 'reviewed' WHERE id = 109;
+DELETE FROM reviews WHERE id = 1061;
+```
+
+- With INSERT, **always write the column names**; don't rely on the order of the columns in the table. Columns you leave out get their DEFAULT, or NULL if there is no default. Several rows at once: `VALUES (...), (...)`; you can also insert from a query: `INSERT INTO table (columns) SELECT ...`
+- The most dangerous mistake with UPDATE / DELETE is **forgetting the WHERE**: the whole table gets changed or deleted
+- A good habit: first write `SELECT * FROM contracts WHERE id = 109`, look closely at which rows it selects, then replace the first half with `UPDATE ... SET ...` or `DELETE`
+- Add `RETURNING columns` at the end to get the changed rows straight back so you can look at them (Postgres and SQLite both support it)
+
+Clause 8.1 of contract 109 later succeeded on a retry (review 1065), so below we change the contract's status from failed back to reviewed. Every run on this page starts from a fresh copy of the sample data, so change whatever you like: try removing the WHERE line and see how many rows RETURNING gives back.
+--- code
+UPDATE contracts
+SET status = 'reviewed'
+WHERE id = 109
+RETURNING id, title, status;
+
+@@ concept
+title: UPSERT: safe to run again
+lang: sql
+dataset: clausecheck
+--- body
+After a worker crashes, it reruns a contract (Day 17's idempotency): the result for the same clause is written a second time. The table `latest_verdicts` has `(contract_id, clause_id)` as its primary key, so a plain INSERT runs into `UNIQUE constraint failed` the second time.
+
+**UPSERT**: insert if the row doesn't exist, update it if it already does.
+
+```sql
+INSERT INTO table (columns...) VALUES (...)
+ON CONFLICT (primary key or UNIQUE columns) DO UPDATE SET column = excluded.column;
+```
+
+- `excluded.verdict` means the value from "the row you tried to insert this time, the one that collided"
+- The columns in `ON CONFLICT (...)` must be exactly one PRIMARY KEY or UNIQUE constraint, or you get an error
+- `ON CONFLICT (...) DO NOTHING`: skip the row if it's already there
+- This is Postgres syntax; SQLite copied it, so it works in both; in BigQuery the equivalent is `MERGE`
+
+The table already has `(103, '8.1', 'redline', 1022)`; below, we update it with the result of re-review 1064. Change `'8.1'` to `'8.2'` and run again: this time it inserts a new row.
+--- schema
+CREATE TABLE latest_verdicts (
+  contract_id INTEGER NOT NULL,
+  clause_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  review_id INTEGER NOT NULL,
+  PRIMARY KEY (contract_id, clause_id)
+);
+INSERT INTO latest_verdicts VALUES (103, '8.1', 'redline', 1022);
+--- code
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (103, '8.1', 'flag', 1064)
+ON CONFLICT (contract_id, clause_id) DO UPDATE SET
+  verdict = excluded.verdict,
+  review_id = excluded.review_id
+RETURNING *;
+
+@@ concept
+title: sqlite3: a database from Python
+dataset: clausecheck
+--- body
+Python comes with `sqlite3`; there is nothing to install.
+
+- `conn = sqlite3.connect("app.db")` opens a database file (and creates it if it doesn't exist); `":memory:"` is a database that lives only in memory
+- `conn.execute(sql)` returns a cursor: `.fetchall()` gets all the rows (a list of tuples), `.fetchone()` gets one row, or `None` when there are no rows
+- After `conn.row_factory = sqlite3.Row`, you can get a row's values by column name: `row["verdict"]`, and `dict(row)` turns the row into a dictionary. Set it right after you open the connection
+- After you change data (INSERT / UPDATE / DELETE) you need `conn.commit()`: only then are the changes really written to the file, and only then can other connections (other programs) see them. Exit without committing and the changes are lost
+
+On this page, `fresh_db()` gives you a new in-memory database with the sample data loaded, every time. Every function you write today takes `conn` as a parameter (dependency injection), so the tests can pass in a fresh database and production code passes in the real one.
+
+The last part below opens the same file with two connections, so you can see the difference before and after commit.
+--- code
+import sqlite3
+from pathlib import Path
+
+conn = fresh_db()
+rows = conn.execute("SELECT id, clause_id, verdict FROM reviews WHERE contract_id = 108").fetchall()
+print(rows)
+print(conn.execute("SELECT MAX(latency_ms) FROM reviews").fetchone())
+
+conn.row_factory = sqlite3.Row
+row = conn.execute("SELECT id, heading, risk FROM reviews WHERE id = 1022").fetchone()
+print(row["heading"], row[0], dict(row))
+
+Path("work/d24").mkdir(parents=True, exist_ok=True)
+a = sqlite3.connect("work/d24/app.db")
+a.execute("CREATE TABLE IF NOT EXISTS notes (text TEXT)")
+a.execute("DELETE FROM notes")
+a.commit()
+a.execute("INSERT INTO notes VALUES ('8.1 needs a lawyer')")
+b = sqlite3.connect("work/d24/app.db")
+print("before commit:", b.execute("SELECT COUNT(*) FROM notes").fetchone())
+a.commit()
+print("after commit: ", b.execute("SELECT COUNT(*) FROM notes").fetchone())
+
+@@ concept
+title: Parameterized queries and SQL injection
+dataset: clausecheck
+--- body
+Customer names, topics, filters: they all come from users or from the model. Day 12's prompt injection tricks the model; **SQL injection** tricks the database.
+
+If you paste a value into SQL with an f-string, a `'` inside the value becomes part of the SQL: `O'Brien Legal` turns the statement into a syntax error; `x' OR '1'='1` makes the WHERE always true and returns every customer. Some drivers let you run several statements at once (for example psycopg for Postgres), and then even a "drop the table" like `'; DROP TABLE customers; --` can sneak in. The `execute` of Python's `sqlite3` runs only one statement at a time, which blocks the table drop, but the two attacks above still work.
+
+**Parameterized**: the SQL contains only placeholders, and the values are handed to the database separately. The database always treats the values as data and never runs them as SQL:
+
+- `?` with a tuple: `conn.execute("... WHERE name = ?", (name,))`. Even a single value must be written `(name,)`; `(name)` is just a string
+- `:name` with a dictionary: `conn.execute("... WHERE contract_id = :cid", {"cid": 103})`
+- Placeholders can only stand for **values**. Table names, column names and `ASC` / `DESC` can't be parameters: first check that the name is on an allowlist, then paste it into the SQL
+- In Postgres, psycopg writes placeholders as `%s`; BigQuery writes `@name`. The idea is exactly the same
+--- code
+conn = fresh_db()
+
+def find_unsafe(name):
+    sql = f"SELECT id, name FROM customers WHERE name = '{name}'"
+    return conn.execute(sql).fetchall()
+
+def find(name):
+    return conn.execute("SELECT id, name FROM customers WHERE name = ?", (name,)).fetchall()
+
+print(find_unsafe("Nordlys AB"))
+print(len(find_unsafe("x' OR '1'='1")), "rows: injected!")
+try:
+    find_unsafe("O'Brien Legal")
+except Exception as e:
+    print(type(e).__name__, e)
+
+print(find("x' OR '1'='1"))
+conn.execute("INSERT INTO customers (name, country, plan, signed_up) VALUES (?, ?, ?, ?)", ("O'Brien Legal", "IE", "pro", "2026-09-22"))
+print(find("O'Brien Legal"))
+print(conn.execute("SELECT id FROM reviews WHERE contract_id = :cid AND risk = :risk", {"cid": 101, "risk": "high"}).fetchall())
+
+@@ concept
+title: Transactions: all or nothing
+dataset: clausecheck
+--- body
+A contract has 12 review results, and writing fails at the 7th: the database is left with 6 rows, "half a report". That is worse than writing none at all, because it looks as if the review is finished.
+
+A **transaction** ties a group of changes together: either they all take effect, or they are all undone.
+
+- Everything in a `with conn:` block succeeds → automatic `commit`; an exception is raised → automatic `rollback`, and the exception keeps going up
+- `with conn:` **does not close the connection**. That is different from `with open(...)`, and it is the most common misunderstanding
+- You can do it without `with` too: `conn.commit()` on success, `conn.rollback()` on error
+- `executemany(sql, many sets of parameters)` inserts many rows with the same SQL. If it fails partway, the earlier rows have actually already run; they just aren't committed yet: without a rollback, the same connection can still see them, and the next commit writes them in along with everything else
+
+The first batch below has one bad row (`maybe` is not one of the values the CHECK allows), so the whole batch is undone; the second batch has only good rows and is written successfully.
+--- code
+import sqlite3
+
+conn = fresh_db()
+conn.execute("CREATE TABLE feedback (review_id INTEGER NOT NULL, reviewer TEXT NOT NULL, verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline')))")
+rows = [
+    (1062, "anna", "accept"),
+    (1063, "anna", "flag"),
+    (1064, "anna", "maybe"),
+]
+
+try:
+    with conn:
+        conn.executemany("INSERT INTO feedback VALUES (?, ?, ?)", rows)
+except sqlite3.IntegrityError as e:
+    print("rolled back:", e)
+print("rows:", conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0])
+
+with conn:
+    conn.executemany("INSERT INTO feedback VALUES (?, ?, ?)", rows[:2])
+print("rows:", conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0])
+
+@@ concept
+title: JSON columns: json_extract and json_each
+lang: sql
+dataset: clausecheck
+--- body
+Two columns in the sample data hold JSON text: `reviews.rule_ids` looks like `'["PB-01", "PB-02"]'`, and `tool_calls.args` looks like `'{"topic": "payment"}'`. SQLite can read them directly:
+
+- `json_extract(args, '$.topic')` (or `args ->> '$.topic'`) gets one field
+- `json_array_length(rule_ids)`: how many elements the array has
+- `json_each(rule_ids)` "explodes" an array into rows, one row per element, with the element in the `value` column. It goes in FROM and works like JOINing another table: `FROM reviews AS r, json_each(r.rule_ids) AS j`. In BigQuery the same thing is called `UNNEST`
+
+When should you not use a JSON column, and split the data into a separate table instead (for example `review_rules(review_id, rule_id)`, one row per citation)? When you need to **filter, count or JOIN** on it, add **constraints** (every rule_id must really exist), or add an **index**. For things you only store as a whole and read as a whole (the model's full reply, tool arguments), a JSON column is a good fit.
+
+Below, we expand the rules cited by each review of contract 101: review 1005 cites two rules, so it appears twice.
+--- code
+SELECT r.id, r.clause_id, j.value AS rule_id
+FROM reviews AS r, json_each(r.rule_ids) AS j
+WHERE r.contract_id = 101
+ORDER BY r.id;
+
+@@ concept
+title: Production: Postgres, pgvector, and indexes
+dataset: clausecheck
+--- body
+SQLite is a single file, good for one machine, tests and small tools (the project's checkpoints use it). The database behind a production app is usually **Postgres**: many services read and write at the same time, and it has permissions and backups. Today's SQL runs in Postgres almost unchanged. The differences: types are strict, foreign keys are always checked, auto-increment primary keys are written `GENERATED ALWAYS AS IDENTITY`, `LIKE` is case-sensitive, JSON uses `JSONB`, and times with a time zone use `TIMESTAMPTZ`. In Python you use psycopg (placeholder `%s`) or SQLAlchemy; in TypeScript, Prisma, Drizzle or node-postgres (placeholder `$1`).
+
+**pgvector** is a Postgres extension that can store embeddings, which moves Day 11's RAG into the database:
+
+```sql
+CREATE EXTENSION vector;
+CREATE TABLE chunks (id BIGSERIAL PRIMARY KEY, text TEXT, embedding vector(1536));
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+SELECT id, text FROM chunks ORDER BY embedding <=> %s LIMIT 5;
+```
+
+`<=>` is the **cosine distance** (1 − cosine similarity; the smaller, the more similar); 1536 is the length of a `text-embedding-3-small` vector. What goes into `%s` is the embedding of the question: in Python, first install the `pgvector` package and call `register_vector(conn)` once on the connection (`from pgvector.psycopg import register_vector`), so that psycopg understands the vector type (the pgvector docs are what counts).
+
+An **index** works like the index at the back of a book: without one, finding rows by `contract_id` means scanning the whole table (SCAN); with one, the database jumps straight to them (SEARCH ... USING INDEX). The cost: writes get a little slower and it takes more space. `EXPLAIN QUERY PLAN` (`EXPLAIN` in Postgres) tells you how the database plans to run a query.
+--- code
+conn = fresh_db()
+q = "SELECT id, verdict FROM reviews WHERE contract_id = ?"
+
+def plan():
+    return [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + q, (103,))]
+
+print(plan())
+conn.execute("CREATE INDEX idx_reviews_contract ON reviews (contract_id)")
+print(plan())
+print(conn.execute(q, (103,)).fetchall()[:3])
+
+@@ item d24-01
+type: sql
+title: Recap: contracts with many redlines
+level: 2
+lang: sql
+dataset: clausecheck
+ordered: yes
+cards: d23:JOIN: connect tables; d22:GROUP BY and HAVING
+--- context
+Today you start writing data into the database, so first warm up with the queries from the last two days. Contracts with many redlines are the hardest to negotiate, so the lawyers need to put people on them first.
+--- prompt
+Review Days 22 and 23: find the contracts with **at least 2** redlines. Return four columns: `contract_id`, `title`, `customer` (the customer's name) and `redlines` (the number of redlines), sorted by redlines from most to fewest, ties by contract_id from smallest to largest.
+--- solution
+SELECT c.id AS contract_id, c.title, cu.name AS customer, COUNT(*) AS redlines
+FROM reviews AS r
+JOIN contracts AS c ON c.id = r.contract_id
+JOIN customers AS cu ON cu.id = c.customer_id
+WHERE r.verdict = 'redline'
+GROUP BY c.id, c.title, cu.name
+HAVING COUNT(*) >= 2
+ORDER BY redlines DESC, contract_id;
+--- hints
+- Two JOINs: reviews → contracts → customers; first use WHERE to keep only the redline rows.
+- Group by contract (every non-aggregate column in SELECT goes into GROUP BY); "at least 2" is a condition on the groups, so it goes in HAVING.
+- Finally `ORDER BY redlines DESC, contract_id`.
+
+@@ item d24-02
+type: sql
+title: Create the playbook rules table
+level: 1
+lang: sql
+dataset: clausecheck
+ordered: yes
+check: SELECT p.name, upper(p.type) AS type, (p."notnull" OR p.pk > 0) AS required, p.pk, p.dflt_value, (SELECT sql LIKE '%CHECK%severity%' AND sql LIKE '%''low''%' AND sql LIKE '%''medium''%' AND sql LIKE '%''high''%' FROM sqlite_master WHERE name = 'playbook_rules') AS has_check FROM pragma_table_info('playbook_rules') AS p ORDER BY p.cid
+cards: CREATE TABLE: rules for your data
+--- context
+The project's review rules (the playbook) live in a JSON file for now; each rule has an ID (like `PB-01`), a topic, a title and a severity. Once they are in the database, other tables can reference them, and wrong values can be stopped at the moment they are written.
+--- prompt
+Put the playbook rules into the database too. Write one `CREATE TABLE playbook_rules`, with the columns in this order:
+
+- `id`: TEXT, primary key (values look like `'PB-01'`. SQLite has a trap left over from history: a primary key that isn't INTEGER allows NULL by default; to be safer you can add `NOT NULL` as well; the grader accepts both)
+- `topic`: TEXT, cannot be NULL
+- `title`: TEXT, cannot be NULL
+- `severity`: TEXT, cannot be NULL, and must be one of `'low'`, `'medium'`, `'high'` (use CHECK)
+- `active`: INTEGER, cannot be NULL, default 1
+
+After your statement runs, the grader reads `pragma_table_info('playbook_rules')` (SQLite's built-in "table structure" query) and compares the columns one by one, in order: name, type, whether it is required, whether it is the primary key, and the default value. Then it checks whether a CHECK limits `severity` to the three values.
+--- solution
+CREATE TABLE playbook_rules (
+  id TEXT PRIMARY KEY,
+  topic TEXT NOT NULL,
+  title TEXT NOT NULL,
+  severity TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high')),
+  active INTEGER NOT NULL DEFAULT 1
+);
+--- hints
+- The shape: `CREATE TABLE table_name (column type constraints, column type constraints, ...);`, with no comma after the last column.
+- Limit the values: `severity TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high'))`.
+- The default goes with the constraints: `active INTEGER NOT NULL DEFAULT 1`. To see the structure you created, click Just run: what it shows is the table structure the grader reads.
+
+@@ item d24-03
+type: code
+title: Constraints stop bad data
+level: 2
+dataset: clausecheck
+cards: CREATE TABLE: rules for your data
+--- context
+Day 18's workflow stops before exporting the rewrites and waits for a lawyer to approve or reject them. That decision has to be stored reliably: the later steps use it to decide whether to really change the contract.
+--- prompt
+In Day 18's workflow, a lawyer has to approve or reject each redline. Store the decisions in the table `approvals`: write the CREATE TABLE statement in the string `SCHEMA`. Requirements:
+
+- `id`: INTEGER, primary key
+- `review_id`: INTEGER, required, a foreign key to `reviews(id)`; **each review can have only one decision** (UNIQUE)
+- `decision`: TEXT, required, only `'approved'` or `'rejected'`
+- `approver`: TEXT, required
+- `decided_at`: TEXT, required, default `CURRENT_TIMESTAMP`
+
+The tests take a fresh database with the sample data, first run `PRAGMA foreign_keys = ON`, then run your `SCHEMA`, and then insert one good row and all kinds of bad rows: the database must reject every bad row (raise `sqlite3.IntegrityError`). The starter code's table can be created, but it stops nothing.
+--- starter
+SCHEMA = """
+CREATE TABLE approvals (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER,
+  decision TEXT,
+  approver TEXT,
+  decided_at TEXT
+);
+"""
+--- solution
+SCHEMA = """
+CREATE TABLE approvals (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id),
+  decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+  approver TEXT NOT NULL,
+  decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+--- tests
+import sqlite3
+def _db():
+    conn = fresh_db()
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA)
+    return conn
+def _ins(conn, review_id, decision, approver):
+    conn.execute("INSERT INTO approvals (review_id, decision, approver) VALUES (?, ?, ?)", (review_id, decision, approver))
+def _try(review_id, decision, approver, first=None):
+    conn = _db()
+    if first:
+        _ins(conn, *first)
+    try:
+        _ins(conn, review_id, decision, approver)
+    except sqlite3.IntegrityError:
+        return "rejected"
+    return "accepted"
+def _good():
+    conn = _db()
+    _ins(conn, 1005, "approved", "anna")
+    return conn.execute("SELECT review_id, decision, approver, decided_at IS NOT NULL FROM approvals").fetchall()
+expect("good data goes in, decided_at is filled in automatically", _good, [(1005, "approved", "anna", 1)])
+expect("decision is not an allowed value", lambda: _try(1005, "maybe", "anna"), "rejected")
+expect("decision is NULL (CHECK lets NULL through; only NOT NULL stops it)", lambda: _try(1005, None, "anna"), "rejected")
+expect("approver is NULL", lambda: _try(1005, "approved", None), "rejected")
+expect("review_id is NULL (the foreign key and UNIQUE both let NULL through)", lambda: _try(None, "approved", "anna"), "rejected")
+expect("a second decision for the same review", lambda: _try(1005, "rejected", "ben", first=(1005, "approved", "anna")), "rejected")
+expect("review_id does not exist in reviews (foreign key)", lambda: _try(9999, "approved", "anna"), "rejected")
+expect("a decision for another review can be inserted", lambda: _try(1022, "rejected", "ben", first=(1005, "approved", "anna")), "accepted")
+--- hints
+- One column can have several constraints, written one after another: `review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id)`.
+- Limit the values with `CHECK (decision IN ('approved', 'rejected'))`; set the default with `DEFAULT CURRENT_TIMESTAMP`.
+- Foreign keys are only checked when `PRAGMA foreign_keys = ON`; the tests already turned it on for you. Watch out for NULL: `CHECK`, `UNIQUE` and foreign keys all ignore NULL, so only `NOT NULL` can make a column required.
+
+@@ item d24-04
+type: sql
+title: Fix the bug: UPDATE changes nothing
+level: 2
+lang: sql
+dataset: clausecheck
+check: SELECT id, verdict, risk FROM reviews ORDER BY id
+cards: INSERT, UPDATE, DELETE: SELECT first, then change; d22:NULL: unknown
+--- context
+Clauses whose review failed have no verdict. A report that builds the to-do list only from flag and redline misses them, and then nobody ever looks at those clauses. Before changing data in bulk, also make sure the condition really selects the rows you mean to change.
+--- prompt
+Failed reviews (`error` is not NULL) must not be treated as "no problem". The team's rule: every failed row is marked `verdict = 'flag'`, `risk = 'high'`, so that a lawyer looks at it by hand.
+
+The UPDATE below runs without an error, yet it doesn't change a single row. Fix it. The grader compares the verdict and risk of every row in the whole reviews table, so you also **must not change any extra rows**.
+
+In exercises like this that change data, Just run shows the table the grader reads (as it looks after your script runs); the results of your own SELECT or RETURNING are not shown. To try out a condition with SELECT first, run it in the editor of the "INSERT, UPDATE, DELETE" knowledge card above.
+--- starter
+UPDATE reviews
+SET verdict = 'flag', risk = 'high'
+WHERE error = NULL;
+--- solution
+UPDATE reviews
+SET verdict = 'flag', risk = 'high'
+WHERE error IS NOT NULL;
+--- hints
+- Try this in the knowledge card's editor: how many rows does `SELECT id, error FROM reviews WHERE error = NULL;` return?
+- Comparing with NULL needs `IS NULL` / `IS NOT NULL` (Day 22). The result of `= NULL` is never true.
+- The condition is "error is not NULL": `WHERE error IS NOT NULL`, which selects exactly the two rows 1047 and 1061. Writing `IS NULL` would change all the other 63 rows.
+
+@@ item d24-05
+type: sql
+title: Delete the test data
+level: 2
+lang: sql
+dataset: clausecheck
+check: SELECT c.id, c.title, COUNT(r.id) AS reviews FROM contracts AS c LEFT JOIN reviews AS r ON r.contract_id = c.id GROUP BY c.id, c.title ORDER BY c.id
+cards: INSERT, UPDATE, DELETE: SELECT first, then change; CREATE TABLE: rules for your data
+--- context
+Someone who was testing wrote fake contracts into the real database. They would end up in the dashboard and in the bills, so they have to go. A delete has no undo button, and not a single real row may be hit by mistake.
+--- prompt
+While testing, someone inserted a few fake contracts into the database. Their titles all start with `TEST: ` (note the colon and the space), and they come with a few reviews. Write a script (two DELETEs) that deletes these **test contracts and their reviews**, without touching a single row of real data.
+
+This database has foreign key checks turned on (`PRAGMA foreign_keys = ON`). Careful: one real contract's title also starts with Test. The grader checks every remaining contract and its number of reviews; Just run shows that same table, so first write any statement, like `SELECT 1;`, and run it to see the titles of all the contracts before you delete anything.
+--- schema
+PRAGMA foreign_keys = ON;
+INSERT INTO contracts VALUES (901, 5, 'TEST: smoke contract', '2026-09-20 08:00:00', 1, 'reviewed');
+INSERT INTO contracts VALUES (902, 5, 'TEST: empty file', '2026-09-20 08:05:00', 0, 'failed');
+INSERT INTO contracts VALUES (903, 5, 'Testing Services Agreement', '2026-09-21 09:00:00', 11, 'in_review');
+INSERT INTO reviews VALUES (1901, 901, '1.1', 'Definitions', 'other', 'accept', 'low', '[]', 'deepseek-v4-flash', 'v2', 100, 10, 0, 500, 0.000042, NULL, '2026-09-20 08:01:00');
+INSERT INTO reviews VALUES (1902, 901, '8.1', 'Cap on Liability', 'liability_cap', 'redline', 'high', '["PB-01"]', 'deepseek-v4-flash', 'v2', 100, 10, 0, 500, 0.000042, NULL, '2026-09-20 08:01:05');
+INSERT INTO reviews VALUES (1903, 903, '3.1', 'Fees', 'payment', 'accept', 'low', '[]', 'deepseek-v4-flash', 'v2', 2012, 148, 1210, 2104, 0.000425, NULL, '2026-09-21 09:02:00');
+--- solution
+DELETE FROM reviews
+WHERE contract_id IN (SELECT id FROM contracts WHERE title LIKE 'TEST: %');
+DELETE FROM contracts
+WHERE title LIKE 'TEST: %';
+--- hints
+- 3 titles start with Test: 901 and 902 are test data, and 903 `Testing Services Agreement` is a real contract. `LIKE 'TEST%'` would select 903 too (SQLite's LIKE ignores case; Postgres's LIKE doesn't), so the pattern must include the colon and the space: `'TEST: %'`.
+- With foreign keys on, a contract that reviews still point to can't be deleted (FOREIGN KEY constraint failed): delete from the child table reviews first, then from the parent table contracts.
+- When you delete the reviews, pick the contracts with a subquery: `WHERE contract_id IN (SELECT id FROM contracts WHERE ...)`.
+
+@@ item d24-06
+type: sql
+title: Fix the bug: a rerun collides
+level: 2
+lang: sql
+dataset: clausecheck
+check: SELECT * FROM latest_verdicts ORDER BY contract_id, clause_id
+cards: UPSERT: safe to run again
+--- context
+When a worker (the program that reviews contracts in the background) crashes, it reruns the whole contract (Day 17's idempotency), so the result for the same clause is written a second time. A lawyer's handwritten note is human work, and a rerun must not wipe it out.
+--- prompt
+`latest_verdicts` keeps the latest result for each clause, and its primary key is `(contract_id, clause_id)`; `note` is a note written by a lawyer. The table already has `(103, '8.1', 'redline', 1022, 'anna: ask for a 12-month cap')` and `(109, '3.1', 'accept', 1060, NULL)`.
+
+The script below tries to write two new review results: 1064 is the re-review of 103's clause 8.1 (this row already exists), and 1065 is 109's clause 8.1 (not there yet). Running it gives `UNIQUE constraint failed`. Change both statements into UPSERTs: insert if the row doesn't exist; if it does, update **only** `verdict` and `review_id` to the new values and keep the lawyer's `note`. That way the same script gives the right result whether the rows exist or not.
+--- schema
+CREATE TABLE latest_verdicts (
+  contract_id INTEGER NOT NULL,
+  clause_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  review_id INTEGER NOT NULL,
+  note TEXT,
+  PRIMARY KEY (contract_id, clause_id)
+);
+INSERT INTO latest_verdicts VALUES (103, '8.1', 'redline', 1022, 'anna: ask for a 12-month cap');
+INSERT INTO latest_verdicts VALUES (109, '3.1', 'accept', 1060, NULL);
+--- starter
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (103, '8.1', 'flag', 1064);
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (109, '8.1', 'accept', 1065);
+--- solution
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (103, '8.1', 'flag', 1064)
+ON CONFLICT (contract_id, clause_id) DO UPDATE SET
+  verdict = excluded.verdict,
+  review_id = excluded.review_id;
+INSERT INTO latest_verdicts (contract_id, clause_id, verdict, review_id)
+VALUES (109, '8.1', 'accept', 1065)
+ON CONFLICT (contract_id, clause_id) DO UPDATE SET
+  verdict = excluded.verdict,
+  review_id = excluded.review_id;
+--- hints
+- After the VALUES of each INSERT, add `ON CONFLICT (contract_id, clause_id) DO UPDATE SET ...`, and move the semicolon to the end.
+- Take the new values from `excluded`: `verdict = excluded.verdict, review_id = excluded.review_id`.
+- You may have seen `INSERT OR REPLACE`: it deletes the old row and then inserts a new one, so columns you didn't write (`note` here) lose their old values, and the grader can tell. UPSERT changes only the columns you name, which is safer.
+
+@@ item d24-07
+type: predict
+title: fetchone and fetchall
+level: 1
+dataset: clausecheck
+cards: sqlite3: a database from Python
+--- context
+After backend code reads results from the database, it goes on to take values out and check whether anything was found. Get clear on what comes back first, so the code that follows isn't wrong.
+--- prompt
+Write the output. Notice: what does a row look like when there is only one column? What do `fetchone()` and `fetchall()` each return when there are no rows? What does a database NULL become in Python?
+--- code
+import sqlite3
+
+conn = fresh_db()
+print(conn.execute("SELECT COUNT(*) FROM reviews WHERE error IS NOT NULL").fetchone())
+print(conn.execute("SELECT id, verdict FROM reviews WHERE contract_id = 110").fetchall())
+print(conn.execute("SELECT id FROM reviews WHERE contract_id = 999").fetchone())
+print(conn.execute("SELECT id FROM reviews WHERE contract_id = 999").fetchall())
+
+conn.row_factory = sqlite3.Row
+row = conn.execute("SELECT clause_id, risk FROM reviews WHERE id = 1047").fetchone()
+print(row["clause_id"], row[1], dict(row))
+--- explain
+Every row is a tuple, even with only one column: `(2,)`, so to get the number you write `[0]`. With no rows, `fetchone()` returns `None` and `fetchall()` returns an empty list `[]`: before you write `conn.execute(...).fetchone()[0]`, think about whether there could be no rows at all. A database NULL becomes `None` in Python (1047 is the failed review, and its risk is NULL). Once `sqlite3.Row` is set, you can get values by column name or by position, and `dict(row)` is the easiest thing to hand to JSON or Pydantic.
+
+@@ item d24-08
+type: code
+title: The reviews of one contract
+level: 2
+dataset: clausecheck
+cards: sqlite3: a database from Python; Parameterized queries and SQL injection
+--- context
+Suppose the review results are already stored in the database. When the web page opens a contract, the backend has to fetch all the reviews of that contract and hand them to the front end to display. The contract number comes from the web request, and users can change it to anything.
+--- prompt
+Write `reviews_for(conn, contract_id)`: return all reviews of this contract, **by id from smallest to largest**, each row as a dictionary with the keys `id`, `clause_id`, `verdict`, `risk`. Return `[]` when the contract doesn't exist.
+
+- pass `contract_id` as a `?` parameter; don't paste it into the string
+- use `sqlite3.Row` to turn rows into dictionaries
+
+Example: `reviews_for(conn, 110)` → `[{"id": 1062, "clause_id": "4.2", "verdict": "redline", "risk": "medium"}, {"id": 1063, "clause_id": "15.4", "verdict": "accept", "risk": "low"}]`
+--- starter
+import sqlite3
+
+def reviews_for(conn, contract_id):
+    pass
+--- solution
+import sqlite3
+
+def reviews_for(conn, contract_id):
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, clause_id, verdict, risk FROM reviews WHERE contract_id = ? ORDER BY id",
+        (contract_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+--- tests
+expect("contract 110", lambda: reviews_for(fresh_db(), 110), [
+    {"id": 1062, "clause_id": "4.2", "verdict": "redline", "risk": "medium"},
+    {"id": 1063, "clause_id": "15.4", "verdict": "accept", "risk": "low"},
+])
+expect("failed review: verdict and risk are None", lambda: reviews_for(fresh_db(), 106)[2], {"id": 1047, "clause_id": "10.1", "verdict": None, "risk": None})
+expect("sorted by id, not by clause_id (1064 is a later re-review)", lambda: [r["id"] for r in reviews_for(fresh_db(), 103)][-3:], [1028, 1029, 1064])
+def _shuffled_db():
+    conn = fresh_db()
+    conn.execute("PRAGMA reverse_unordered_selects = ON")  # queries without ORDER BY return their rows reversed, on purpose
+    return conn
+expect("has ORDER BY: unsorted results come in no guaranteed order", lambda: [r["id"] for r in reviews_for(_shuffled_db(), 110)], [1062, 1063])
+expect("contract does not exist", lambda: reviews_for(fresh_db(), 999), [])
+expect("parameter: a strange value just finds nothing, it never becomes SQL", lambda: reviews_for(fresh_db(), "110 OR 1=1"), [])
+--- hints
+- First `conn.row_factory = sqlite3.Row`, then `conn.execute("SELECT ... WHERE contract_id = ? ORDER BY id", (contract_id,))`.
+- Without ORDER BY, the database may return rows in any order: here they happen to come in id order, but another database or an added index could change that. One test deliberately reverses unsorted results.
+- Turn each row from `fetchall()` into a dictionary with `dict(row)`: `return [dict(row) for row in rows]`.
+
+@@ item d24-09
+type: fix
+title: Fix the bug: apostrophes and injection
+level: 2
+dataset: clausecheck
+cards: Parameterized queries and SQL injection
+--- context
+The customer name is what a user types into the search box. It may contain an apostrophe (`O'Brien`), or it may be malicious input built on purpose. This function talks straight to the database: once it is fooled, other customers' data leaks.
+--- prompt
+`customer_ids(conn, name)` finds ids by customer name (sorted by id). It has two problems: a name with an apostrophe (`O'Brien Legal`) causes an error, and anyone who types `x' OR '1'='1` gets the ids of every customer.
+
+Run it, look at the errors and the Got results in the tests, then change it into a parameterized query.
+--- starter
+def customer_ids(conn, name):
+    sql = f"SELECT id FROM customers WHERE name = '{name}' ORDER BY id"
+    return [row[0] for row in conn.execute(sql).fetchall()]
+--- solution
+def customer_ids(conn, name):
+    sql = "SELECT id FROM customers WHERE name = ? ORDER BY id"
+    return [row[0] for row in conn.execute(sql, (name,)).fetchall()]
+--- tests
+def _db():
+    conn = fresh_db()
+    conn.execute("INSERT INTO customers (id, name, country, plan, signed_up) VALUES (7, 'O''Brien Legal', 'IE', 'pro', '2026-09-22')")
+    return conn
+expect("an ordinary name", lambda: customer_ids(_db(), "Nordlys AB"), [1])
+expect("a name with an apostrophe", lambda: customer_ids(_db(), "O'Brien Legal"), [7])
+expect("injection: just a strange name that finds nothing", lambda: customer_ids(_db(), "x' OR '1'='1"), [])
+expect("not found", lambda: customer_ids(_db(), "Nobody AB"), [])
+--- hints
+- Look at the error in the second test: the `'` in `O'Brien` ends the string in the SQL too early, and the `Brien Legal'` after it becomes a syntax error.
+- Write `WHERE name = ?` in the SQL (no quotes), and pass the value as the second argument: `conn.execute(sql, (name,))`. Note the comma in `(name,)`.
+
+@@ item d24-10
+type: choice
+title: Can a column name use ?
+level: 2
+dataset: clausecheck
+cards: Parameterized queries and SQL injection
+--- context
+The table on the dashboard can be sorted by clicking a column name, and the backend then queries the database by the column the user clicked. The column name comes from the user too, so it also has to be protected against injection.
+--- prompt
+The function below wants to sort by the column the caller gives, from largest to smallest, so it wrote the column name as `?` too. What happens with `top_reviews(conn, "cost_usd")`?
+--- code
+def top_reviews(conn, column):
+    sql = "SELECT id, cost_usd FROM reviews ORDER BY ? DESC LIMIT 3"
+    return conn.execute(sql, (column,)).fetchall()
+
+top_reviews(conn, "cost_usd")
+--- options
+- It returns the 3 most expensive reviews
+- Error: column names can't be parameters
+- No error, but `?` is treated as a fixed string value `'cost_usd'` that is the same for every row, so nothing gets sorted and it returns the first 3 rows of the table
+- The database treats `cost_usd` as an injection attack and refuses to run it
+answer: 3
+--- explain
+A parameter is always just a "value". In SQLite, `ORDER BY ?` sorts by the constant `'cost_usd'`: every row is equal, so the order stays as it was, and there is no error, which makes it the hardest to notice (it actually returns 1001, 1002, 1003). On Postgres, many drivers raise an error right away; either way, nothing gets sorted. Table names, column names and `ASC` / `DESC` are part of the SQL's **structure** and can't be parameterized: first check that the name is on an allowlist, then paste it into the string. The Write tests exercise later is exactly such a function.
+
+@@ item d24-11
+type: fill
+title: Fill in: named parameters
+level: 2
+dataset: clausecheck
+cards: Parameterized queries and SQL injection; sqlite3: a database from Python
+--- context
+A lawyer wants to see only the clauses of one risk level in one contract, high risk by default. Both the contract number and the risk level come from the filters on the web page.
+--- prompt
+Complete `risky_clauses(conn, contract_id, risk="high")`: use **named parameters** (`:name`) to find the clauses with the given risk level in this contract, sorted by id, and return a list of dictionaries, each with `clause_id` and `verdict`.
+
+Example: `risky_clauses(conn, 101)` → `[{"clause_id": "8.1", "verdict": "redline"}, {"clause_id": "8.2", "verdict": "flag"}]`
+--- template
+import sqlite3
+
+def risky_clauses(conn, contract_id, risk="high"):
+    conn.row_factory = sqlite3.[[Row]]
+    rows = conn.execute(
+        "SELECT clause_id, verdict FROM reviews WHERE contract_id = [[:cid]] AND risk = [[:risk]] ORDER BY id",
+        {"cid": contract_id, "risk": risk},
+    ).[[fetchall()]]
+    return [dict(row) for row in rows]
+--- tests
+expect("high-risk clauses of contract 101", lambda: risky_clauses(fresh_db(), 101), [{"clause_id": "8.1", "verdict": "redline"}, {"clause_id": "8.2", "verdict": "flag"}])
+expect("a different risk level", lambda: risky_clauses(fresh_db(), 103, "medium"), [{"clause_id": "3.4", "verdict": "flag"}, {"clause_id": "6.2", "verdict": "redline"}, {"clause_id": "10.3", "verdict": "flag"}, {"clause_id": "11.3", "verdict": "flag"}])
+expect("no match", lambda: risky_clauses(fresh_db(), 108), [])
+--- hints
+- The placeholder names must match the dictionary keys: the dictionary has `"cid"` and `"risk"`, so the SQL says `:cid` and `:risk`.
+- The row type that lets you get values by column name is `sqlite3.Row`; get all rows with `fetchall()`.
+
+@@ item d24-12
+type: code
+title: Log one call in a table
+level: 2
+cards: sqlite3: a database from Python; Parameterized queries and SQL injection
+--- context
+Day 13's tracing records, for every model call, which model was used, how many tokens it took and how long it ran. Now store these records in a database, so that later you can compute costs and find slow calls with SQL.
+--- prompt
+Every call to the model logs one row of trace data (Day 13's span, stored in a database this time). The table structure is in `SCHEMA` in the starter code, and `init_db(conn)` creates the table. Write `log_call(conn, call)`:
+
+- `call` is a dictionary that always has `review_id`, `model`, `prompt_tokens`, `completion_tokens`, `latency_ms`; `error` may be missing (then store NULL); it may also have other keys (ignore them)
+- insert one row with **named parameters**, then `commit`, and return the new row's id (`cur.lastrowid`, where `cur` is the cursor that `conn.execute(...)` returns)
+
+Example: on an empty table, the first call returns `1` and the second returns `2`.
+--- starter
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_calls (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL,
+  completion_tokens INTEGER NOT NULL,
+  latency_ms INTEGER NOT NULL,
+  error TEXT
+);
+"""
+
+def init_db(conn):
+    conn.executescript(SCHEMA)
+
+def log_call(conn, call):
+    pass
+--- solution
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_calls (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL,
+  completion_tokens INTEGER NOT NULL,
+  latency_ms INTEGER NOT NULL,
+  error TEXT
+);
+"""
+
+def init_db(conn):
+    conn.executescript(SCHEMA)
+
+def log_call(conn, call):
+    params = {"error": None, **call}
+    cur = conn.execute(
+        "INSERT INTO llm_calls (review_id, model, prompt_tokens, completion_tokens, latency_ms, error) "
+        "VALUES (:review_id, :model, :prompt_tokens, :completion_tokens, :latency_ms, :error)",
+        params,
+    )
+    conn.commit()
+    return cur.lastrowid
+--- tests
+import sqlite3
+from pathlib import Path
+CALL = {"review_id": 1062, "model": "deepseek-flash", "prompt_tokens": 1915, "completion_tokens": 222, "latency_ms": 3348}
+def _mem():
+    conn = sqlite3.connect(":memory:")
+    init_db(conn)
+    return conn
+def _two_ids():
+    conn = _mem()
+    return [log_call(conn, CALL), log_call(conn, CALL)]
+expect("returns the new row's id", _two_ids, [1, 2])
+def _stored(call):
+    conn = _mem()
+    log_call(conn, call)
+    return conn.execute("SELECT review_id, model, prompt_tokens, completion_tokens, latency_ms, error FROM llm_calls").fetchone()
+expect("no error key: stores NULL", lambda: _stored(CALL), (1062, "deepseek-flash", 1915, 222, 3348, None))
+expect("quotes inside error are fine", lambda: _stored({**CALL, "error": "ValidationError: risk_level 'critical' is not allowed"})[5], "ValidationError: risk_level 'critical' is not allowed")
+expect("extra keys are ignored", lambda: _stored({**CALL, "trace_id": "t-42", "cost_usd": 0.0006}), (1062, "deepseek-flash", 1915, 222, 3348, None))
+def _committed():
+    Path("work/d24").mkdir(parents=True, exist_ok=True)
+    Path("work/d24/calls.db").unlink(missing_ok=True)
+    writer = sqlite3.connect("work/d24/calls.db")
+    init_db(writer)
+    log_call(writer, CALL)
+    reader = sqlite3.connect("work/d24/calls.db")
+    return reader.execute("SELECT COUNT(*) FROM llm_calls").fetchone()[0]
+expect("committed: another connection can see it", _committed, 1)
+--- hints
+- Fill in the missing key with a default first: `params = {"error": None, **call}` (`**call` comes after it, so when call has an error, it overrides None).
+- In the SQL, write `VALUES (:review_id, :model, ...)` and pass the dictionary as the second argument; extra keys in the dictionary don't get in the way.
+- `cur = conn.execute(...)`, then `conn.commit()`, and finally `return cur.lastrowid`.
+
+@@ item d24-13
+type: order
+title: Put the code in order: counts per topic
+level: 2
+dataset: clausecheck
+cards: Parameterized queries and SQL injection; d22:GROUP BY and HAVING
+--- context
+The report page lets users set their own threshold and see only the topics with enough reviews, so they learn which kinds of clauses are most common in contracts.
+--- prompt
+Put `topic_counts(conn, min_n)` in order: it returns the topics with **at least** `min_n` reviews, as a list of `(topic, n)` tuples, sorted by n from largest to smallest, ties in alphabetical order of topic. The SQL is split into several strings (Python joins strings that sit next to each other automatically), and their order has to be right too. There are two distractor lines.
+--- lines
+def topic_counts(conn, min_n):
+    sql = (
+        "SELECT topic, COUNT(*) AS n FROM reviews "
+        "GROUP BY topic "
+        "HAVING COUNT(*) >= ? "
+        "ORDER BY n DESC, topic"
+    )
+    rows = conn.execute(sql, (min_n,)).fetchall()
+    return rows
+--- distractors
+        "WHERE COUNT(*) >= ? "
+    rows = conn.execute(sql, min_n).fetchall()
+--- tests
+expect("at least 7", lambda: topic_counts(fresh_db(), 7), [("liability_cap", 12), ("payment", 10), ("data_processing", 8), ("confidentiality", 7)])
+expect("ties in alphabetical order", lambda: topic_counts(fresh_db(), 6)[4:], [("auto_renewal", 6), ("governing_law", 6), ("other", 6)])
+expect("threshold too high", lambda: topic_counts(fresh_db(), 13), [])
+--- hints
+- The order of the SQL clauses: SELECT … FROM → GROUP BY → HAVING → ORDER BY (Day 22). A condition on a group's count can only go in HAVING; WHERE can't use COUNT.
+- Parameters go in a tuple: `(min_n,)`. Passing just `min_n` gives the error "parameters are of unsupported type".
+
+@@ item d24-14
+type: testwrite
+title: Write tests for the ORDER BY allowlist
+level: 3
+cards: Parameterized queries and SQL injection
+--- context
+Column names can't be passed as parameters, so sorting on the dashboard relies on an allowlist (it accepts only a few column names written in advance). If a bad value ever gets through this code, anyone could slip any SQL they like into the query, so it is worth guarding with tests.
+--- prompt
+The dashboard lets users choose "what to sort by". Column names can't use a `?` parameter (the choice exercise earlier), so `order_by(column, direction="desc")` builds a safe ORDER BY with an allowlist:
+
+- `column` must be in `SORTABLE`, otherwise `raise ValueError`
+- `direction` ignores case and can only be asc or desc, otherwise `raise ValueError`; when it is not given, it is desc
+- it returns a string like `"ORDER BY cost_usd DESC"` (with the direction in uppercase)
+
+Write tests for it: each `test_` function tests one case. Your tests must all pass on the correct version and catch every version with a bug planted on purpose.
+--- impl
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="desc"):
+    if column not in SORTABLE:
+        raise ValueError(f"cannot sort by {column!r}")
+    d = direction.upper()
+    if d not in ("ASC", "DESC"):
+        raise ValueError(f"bad direction {direction!r}")
+    return f"ORDER BY {column} {d}"
+--- mutants
+===== Allowlist: a column that is not on the allowlist (for example an injection)
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="desc"):
+    d = direction.upper()
+    if d not in ("ASC", "DESC"):
+        raise ValueError(f"bad direction {direction!r}")
+    return f"ORDER BY {column} {d}"
+===== Direction: an unknown direction is quietly treated as DESC
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="desc"):
+    if column not in SORTABLE:
+        raise ValueError(f"cannot sort by {column!r}")
+    d = "ASC" if direction.upper() == "ASC" else "DESC"
+    return f"ORDER BY {column} {d}"
+===== Case: a lowercase "asc"
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="DESC"):
+    if column not in SORTABLE:
+        raise ValueError(f"cannot sort by {column!r}")
+    if direction not in ("ASC", "DESC"):
+        raise ValueError(f"bad direction {direction!r}")
+    return f"ORDER BY {column} {direction}"
+===== Default: when no direction is given
+SORTABLE = ("created_at", "cost_usd", "latency_ms")
+
+def order_by(column, direction="asc"):
+    if column not in SORTABLE:
+        raise ValueError(f"cannot sort by {column!r}")
+    d = direction.upper()
+    if d not in ("ASC", "DESC"):
+        raise ValueError(f"bad direction {direction!r}")
+    return f"ORDER BY {column} {d}"
+--- starter
+import pytest
+
+def test_sort_by_cost():
+    assert order_by("cost_usd", "DESC") == "ORDER BY cost_usd DESC"
+--- solution
+import pytest
+
+def test_sort_by_cost():
+    assert order_by("cost_usd", "DESC") == "ORDER BY cost_usd DESC"
+
+def test_default_is_desc():
+    assert order_by("latency_ms") == "ORDER BY latency_ms DESC"
+
+def test_lowercase_direction():
+    assert order_by("created_at", "asc") == "ORDER BY created_at ASC"
+
+def test_unknown_column_rejected():
+    with pytest.raises(ValueError):
+        order_by("cost_usd; DROP TABLE reviews")
+
+def test_bad_direction_rejected():
+    with pytest.raises(ValueError):
+        order_by("cost_usd", "sideways")
+--- hints
+- One `test_` function per case: the normal case, no direction, a lowercase direction, a column that is not on the allowlist, an unknown direction.
+- The most important test for a security function is "bad input must be rejected": on the line under `with pytest.raises(ValueError):`, pass in an injection, for example `"cost_usd; DROP TABLE reviews"`.
+- Don't test only with an uppercase `"DESC"`: real callers often pass lowercase.
+
+@@ item d24-15
+type: fix
+title: Fix the bug: half a batch left behind
+level: 3
+cards: Transactions: all or nothing
+--- context
+A lawyer submits a batch of feedback at once on the web page. If an error happens halfway through the writing and half the batch stays in the database, it looks as if the submission worked, but some rows are missing, and nobody will notice.
+--- prompt
+`insert_batch(conn, rows)` writes a batch of lawyer feedback into the `feedback` table, and it should **either write all of it or write none of it**:
+
+- `rows` is a list of dictionaries with the keys `review_id`, `reviewer`, `verdict`; on success it returns the number of rows written, and `0` for an empty list
+- when the database rejects one bad row: `sqlite3.IntegrityError` keeps going up, and no row of this batch may be left in the database
+
+Right now it inserts one row at a time, and when it hits a bad row, the rows before it stay in the connection (not committed yet, but the same connection can see them, and the next commit writes them in too). Run the tests, then fix it with `with conn:` plus `executemany`.
+--- starter
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS feedback (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  reviewer TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline'))
+);
+"""
+
+def insert_batch(conn, rows):
+    for row in rows:
+        conn.execute(
+            "INSERT INTO feedback (review_id, reviewer, verdict) VALUES (:review_id, :reviewer, :verdict)",
+            row,
+        )
+    conn.commit()
+    return len(rows)
+--- solution
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS feedback (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  reviewer TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accept', 'flag', 'redline'))
+);
+"""
+
+def insert_batch(conn, rows):
+    with conn:
+        conn.executemany(
+            "INSERT INTO feedback (review_id, reviewer, verdict) VALUES (:review_id, :reviewer, :verdict)",
+            rows,
+        )
+    return len(rows)
+--- tests
+import sqlite3
+def _db():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    return conn
+def _count(conn):
+    return conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+GOOD = [{"review_id": 1005, "reviewer": "anna", "verdict": "accept"}, {"review_id": 1006, "reviewer": "anna", "verdict": "flag"}]
+BAD = GOOD + [{"review_id": 1007, "reviewer": "anna", "verdict": "maybe"}]
+expect("good batch: returns the count", lambda: insert_batch(_db(), GOOD), 2)
+def _good_rows():
+    conn = _db()
+    insert_batch(conn, GOOD)
+    return _count(conn)
+expect("good batch: 2 rows in the database", _good_rows, 2)
+expect_raises("bad data: IntegrityError is still raised", lambda: insert_batch(_db(), BAD), sqlite3.IntegrityError)
+def _after_bad():
+    conn = _db()
+    insert_batch(conn, GOOD[:1])
+    try:
+        insert_batch(conn, BAD)
+    except sqlite3.IntegrityError:
+        pass
+    return _count(conn)
+expect("a bad batch leaves no rows (the earlier successful batch is still there)", _after_bad, 1)
+expect("empty list", lambda: insert_batch(_db(), []), 0)
+--- hints
+- Look at the fourth test: the database should have only 1 row, but it also has the good rows from the front of the bad batch. They were not undone.
+- When an exception happens inside a `with conn:` block, it rolls back automatically and the exception still goes up, which is exactly what we want.
+- `conn.executemany(the same SQL, rows)` inserts the whole batch at once, and a list of dictionaries can go straight to named parameters.
+
+@@ item d24-16
+type: sql
+title: How often each rule is cited
+level: 2
+lang: sql
+dataset: clausecheck
+ordered: yes
+cards: JSON columns: json_extract and json_each
+--- context
+When the model gives a verdict, it names the playbook rules it is based on, and they are stored in the `rule_ids` column. Counting how often each rule is used shows which rules matter most and which are almost never used.
+--- prompt
+`reviews.rule_ids` is JSON array text. Count how many times each rule id is cited across all reviews. Return two columns, `rule_id` and `n`, sorted by n from most to fewest, ties by rule_id.
+
+Failed reviews have `rule_ids` NULL, and `json_each(NULL)` produces no rows, so they need no special handling. Look at the result: which rule is cited most?
+--- solution
+SELECT j.value AS rule_id, COUNT(*) AS n
+FROM reviews AS r, json_each(r.rule_ids) AS j
+GROUP BY j.value
+ORDER BY n DESC, rule_id;
+--- hints
+- Expand the array the way the knowledge card does: `FROM reviews AS r, json_each(r.rule_ids) AS j`, one row per citation, with the rule id in `j.value`.
+- After that it is an ordinary group-and-count: `GROUP BY j.value`, then `ORDER BY n DESC, rule_id`.
+- The top one is PB-00 (the rule "plain boilerplate is simply accepted"): most clauses in a contract are boilerplate, so it was worth having the v2 prompt handle them specially.
+
+@@ item d24-17
+type: choice
+title: JSON column or a separate table
+level: 2
+cards: JSON columns: json_extract and json_each; CREATE TABLE: rules for your data
+--- context
+The legal team has a few new requests about rule citations. How the data is stored in the first place decides how easy these requests are later.
+--- prompt
+The legal team asks for three new things: ① count how many times each rule is cited per month; ② guarantee that every rule id cited in a review really exists in the `playbook_rules` table; ③ quickly find all related reviews by rule id. Should `rule_ids` stay JSON text, or be stored another way?
+--- options
+- Keep the JSON column: json_each can query anything, so there's no need to change
+- Split it into a table `review_rules(review_id, rule_id)`, one row per citation: rule_id can get a foreign key to playbook_rules, and it can get an index
+- Split rule_ids into three columns `rule_1`, `rule_2`, `rule_3`
+- Store it as a comma-separated string `'PB-01,PB-02'` and query it with `LIKE '%PB-01%'`
+answer: 2
+--- explain
+① can be done with json_each too, but the foreign key constraint in ② can only go on a real column, and the index in ③ has to be built on a column as well, so split it into a table (this is called **normalization**). The three-column version has no room for a 4th rule; the LIKE version `'%PB-01%'` would also match a future `PB-010`. A JSON column suits things you "store as a whole and read as a whole", like the model's full reply or tool arguments. Today's closed-book exercise 3 turns rule_ids into exactly this table.
+
+@@ item d24-18
+type: choice
+title: What this pgvector query does
+level: 2
+lang: sql
+cards: Production: Postgres, pgvector, and indexes
+--- context
+Day 11's RAG used embeddings (a list of numbers that stands for the meaning of a text). Production systems often store playbook chunks together with their embeddings in Postgres, and interviews often ask about this kind of query.
+--- prompt
+Clause Check stores the embeddings of playbook chunks in Postgres (pgvector). `%s` is psycopg's parameter placeholder, and what goes into it is the embedding of the user's question. What does the query below do?
+--- code
+SELECT id, text
+FROM playbook_chunks
+ORDER BY embedding <=> %s
+LIMIT 5;
+--- options
+- It finds the 5 chunks most similar to the question (smallest cosine distance): Day 11's top-k retrieval, only computed inside the database
+- It finds the 5 chunks least similar to the question, because it sorts from small to large
+- It changes the embeddings of the first 5 chunks to the question's embedding
+- It inserts the question's embedding into the table, at most 5 times
+answer: 1
+--- explain
+`<=>` is the cosine **distance** = 1 − cosine similarity: the more similar, the smaller the distance, so sorting from small to large and taking the first 5 gives the top 5. The result is the same as Day 11's Python version ("compute every cosine, sort, take the first k"), but without reading all the vectors into memory. With more data, add an HNSW index: it is an **approximate** nearest-neighbor search, much faster, at the cost of very occasionally missing the truly nearest one.
+
+@@ item d24-19
+type: local
+title: Local task: open the project's database
+level: 2
+cards: sqlite3: a database from Python; Production: Postgres, pgvector, and indexes
+--- context
+The project's LangGraph flow saves a checkpoint at every step, in a SQLite file; that is what lets a review that stopped halfway carry on later. Now open that file with the `sqlite3` you just learned and see what's inside.
+--- prompt
+The project already has a real SQLite database: LangGraph's checkpoint file `data/checkpoints.sqlite` (written by `SqliteSaver` in `clausecheck/graph.py`). Open it **read-only** with today's `sqlite3` and take a look.
+
+**Step 1**: In VS Code, create the file `work\d24_peek.py` (you created the `work` folder on Day 10; if it isn't there, create it first) with this content:
+
+```python
+import sqlite3
+
+# mode=ro: open read-only, so the checkpoint file is never changed
+conn = sqlite3.connect("file:data/checkpoints.sqlite?mode=ro", uri=True)
+tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+for name in tables:
+    # the table names come from the database itself (not from user input), and table names can't use a ? parameter, so pasting them into the string is safe here
+    count = conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+    print(name, count)
+print(conn.execute("SELECT thread_id, COUNT(*) FROM checkpoints GROUP BY thread_id").fetchall())
+```
+
+**Step 2**: In the VS Code terminal (PowerShell), run it from the project root:
+
+```
+cd "G:\Contract Clause Reviewer"
+python work\d24_peek.py
+```
+
+**Step 3**: Paste the output below. Think about it: each `thread_id` is a separate run (the `--thread` argument of the command line, `cli-1` by default), and Day 18's "resume from a checkpoint after an interrupt" reads exactly this table.
+placeholder: Paste the output: you should see the row counts of the two tables checkpoints and writes
+verify: ^(?=[\s\S]*checkpoints)(?=[\s\S]*writes)
+--- hints
+- `unable to open database file`: you are not in the project root, or no checkpoints have been created yet. First `cd "G:\Contract Clause Reviewer"`; if it still fails, run the graph once: `python -m clausecheck review data/sample_contract.txt --mode mock --graph --approve yes --out work/graph.report.json`, then run this exercise's script.
+- `no such table: checkpoints`: the file exists but is empty; again, run the graph command above first.
+
+@@ item d24-e1
+type: scratch
+title: Closed book: save the latest verdicts in one batch
+exam: yes
+level: 3
+cards: UPSERT: safe to run again; Transactions: all or nothing
+--- context
+Every time a contract has been reviewed, the worker saves the verdicts of all its clauses into `latest_verdicts`; the report and the dashboard both read from this table.
+--- prompt
+The database already has this table (the tests create it; you don't need to):
+
+```sql
+CREATE TABLE latest_verdicts (
+  contract_id INTEGER NOT NULL,
+  clause_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  risk TEXT NOT NULL,
+  review_id INTEGER NOT NULL,
+  PRIMARY KEY (contract_id, clause_id)
+);
+```
+
+Write `save_reviews(conn, reviews)`:
+
+- `reviews` is a list of dictionaries with the keys `contract_id`, `clause_id`, `verdict`, `risk`, `review_id`
+- write every one of them into the table: insert if `(contract_id, clause_id)` doesn't exist yet, and if it already exists, update `verdict`, `risk`, `review_id` to the new values; if the same clause appears twice in one batch, the later one wins
+- the whole batch is in **one transaction**: if the database rejects any one row (for example when verdict is None), nothing from this batch stays, and `sqlite3.IntegrityError` keeps going up
+- pass every value as a parameter; return `len(reviews)`
+--- solution
+import sqlite3
+
+SQL = (
+    "INSERT INTO latest_verdicts (contract_id, clause_id, verdict, risk, review_id) "
+    "VALUES (:contract_id, :clause_id, :verdict, :risk, :review_id) "
+    "ON CONFLICT (contract_id, clause_id) DO UPDATE SET "
+    "verdict = excluded.verdict, risk = excluded.risk, review_id = excluded.review_id"
+)
+
+def save_reviews(conn, reviews):
+    with conn:
+        conn.executemany(SQL, reviews)
+    return len(reviews)
+--- tests
+import sqlite3
+def _db():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE latest_verdicts (contract_id INTEGER NOT NULL, clause_id TEXT NOT NULL, verdict TEXT NOT NULL, risk TEXT NOT NULL, review_id INTEGER NOT NULL, PRIMARY KEY (contract_id, clause_id))")
+    conn.execute("INSERT INTO latest_verdicts VALUES (103, '8.1', 'redline', 'high', 1022)")
+    conn.commit()
+    return conn
+def _rows(conn):
+    return conn.execute("SELECT * FROM latest_verdicts ORDER BY contract_id, clause_id").fetchall()
+BATCH = [
+    {"contract_id": 103, "clause_id": "8.1", "verdict": "flag", "risk": "high", "review_id": 1064},
+    {"contract_id": 109, "clause_id": "8.1", "verdict": "accept", "risk": "low", "review_id": 1065},
+]
+AFTER = [(103, "8.1", "flag", "high", 1064), (109, "8.1", "accept", "low", 1065)]
+def _once():
+    conn = _db()
+    n = save_reviews(conn, BATCH)
+    return n, _rows(conn)
+expect("existing row updated, missing row inserted", _once, (2, AFTER))
+def _twice():
+    conn = _db()
+    save_reviews(conn, BATCH)
+    save_reviews(conn, BATCH)
+    return _rows(conn)
+expect("saving the same batch twice gives the same result (idempotent)", _twice, AFTER)
+def _dup():
+    conn = _db()
+    save_reviews(conn, [BATCH[1], {**BATCH[1], "verdict": "flag", "risk": "medium", "review_id": 1070}])
+    return _rows(conn)[1]
+expect("the same clause twice in one batch: the later one wins", _dup, (109, "8.1", "flag", "medium", 1070))
+def _bad():
+    conn = _db()
+    bad = BATCH + [{"contract_id": 110, "clause_id": "4.2", "verdict": None, "risk": "medium", "review_id": 1062}]
+    try:
+        save_reviews(conn, bad)
+    except sqlite3.IntegrityError:
+        return _rows(conn)
+    return "IntegrityError was not raised"
+expect("one bad row: nothing from the batch is written, the original row is unchanged", _bad, [(103, "8.1", "redline", "high", 1022)])
+
+@@ item d24-e2
+type: scratch
+title: Closed book: search with optional filters
+exam: yes
+level: 3
+dataset: clausecheck
+cards: Parameterized queries and SQL injection; sqlite3: a database from Python
+--- context
+The dashboard has a search box that can filter reviews by topic and by risk level, or not filter at all. Every filter value comes from user input.
+--- prompt
+Write `search_reviews(conn, topic=None, risk=None, limit=20)` that searches the `reviews` table and returns a list of review ids (integers), sorted by id from smallest to largest, at most `limit` of them:
+
+- `topic` is not None: only this topic; `risk` is not None: only this risk level; both given: both must match; both None: no filtering. **Only None means no filter**; an empty string `""` is also a value to match
+- `limit` must be an integer greater than or equal to 1, otherwise `raise ValueError`
+- pass every value (limit included) as a `?` parameter; the SQL string only joins fixed pieces
+
+Example: `search_reviews(conn, topic="termination")` → `[1010, 1027, 1033, 1043, 1053]`
+--- solution
+def search_reviews(conn, topic=None, risk=None, limit=20):
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    where = []
+    params = []
+    if topic is not None:
+        where.append("topic = ?")
+        params.append(topic)
+    if risk is not None:
+        where.append("risk = ?")
+        params.append(risk)
+    sql = "SELECT id FROM reviews"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id LIMIT ?"
+    params.append(limit)
+    return [row[0] for row in conn.execute(sql, params).fetchall()]
+--- tests
+def _shuffled_db():
+    conn = fresh_db()
+    conn.execute("PRAGMA reverse_unordered_selects = ON")  # queries without ORDER BY return their rows reversed, on purpose
+    return conn
+expect("two conditions", lambda: search_reviews(fresh_db(), topic="liability_cap", risk="high"), [1005, 1006, 1022, 1023, 1046, 1051, 1064])
+expect("risk only, at most 3 (the first 3 after sorting by id)", lambda: search_reviews(_shuffled_db(), risk="high", limit=3), [1005, 1006, 1013])
+expect("no filter: the first 20", lambda: search_reviews(fresh_db()), list(range(1001, 1021)))
+expect("an injection string just finds nothing", lambda: search_reviews(fresh_db(), topic="x' OR '1'='1"), [])
+expect("an empty string is a condition too", lambda: search_reviews(fresh_db(), topic=""), [])
+expect_raises("limit is 0", lambda: search_reviews(fresh_db(), limit=0), ValueError)
+
+@@ item d24-e3
+type: sql
+title: Closed book: turn JSON into a table
+exam: yes
+level: 3
+lang: sql
+dataset: clausecheck
+check: SELECT rule_id, COUNT(*) AS n, MIN(review_id) AS first_review, (SELECT COUNT(*) FROM pragma_table_info('review_rules') WHERE pk > 0) AS pk_columns, (SELECT SUM("notnull") FROM pragma_table_info('review_rules')) AS required_columns, (SELECT COUNT(*) FROM pragma_foreign_key_list('review_rules') WHERE "table" = 'reviews' AND "from" = 'review_id') AS fk_to_reviews FROM review_rules GROUP BY rule_id ORDER BY rule_id
+cards: JSON columns: json_extract and json_each; CREATE TABLE: rules for your data
+--- context
+The rule citations in `reviews.rule_ids` should be something the database can check and something you can look up quickly by rule. This exercise really moves the existing data into a new table.
+--- prompt
+Normalize `reviews.rule_ids` (JSON array text) into a table. Write a script:
+
+1. Create the table `review_rules` with two columns: `review_id` INTEGER, required, a foreign key to `reviews(id)`; `rule_id` TEXT, required. The two columns `(review_id, rule_id)` together are the primary key
+2. With **one** `INSERT INTO ... SELECT ...`, split every rule cited by every review into its own row and insert it (failed reviews have no rules, so they naturally produce no rows)
+
+The grader checks how many rows each rule_id has and the smallest review_id for each, and also whether the primary key has two columns, whether both columns are required, and whether `review_id` has a foreign key to `reviews`.
+--- solution
+CREATE TABLE review_rules (
+  review_id INTEGER NOT NULL REFERENCES reviews(id),
+  rule_id TEXT NOT NULL,
+  PRIMARY KEY (review_id, rule_id)
+);
+INSERT INTO review_rules (review_id, rule_id)
+SELECT r.id, j.value
+FROM reviews AS r, json_each(r.rule_ids) AS j;

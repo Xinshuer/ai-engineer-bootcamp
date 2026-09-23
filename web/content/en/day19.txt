@@ -1,0 +1,1369 @@
+@@ day 19
+title: Graphs and citations: a Python graph runner + RAG with citations
+lang: py
+hours: 5 hours
+--- goal
+Write the Day 18 graph runner again, this time in Python: node functions, fixed edges and routing functions, JSON checkpoint files, resuming after an interrupt. Then read the real `clausecheck/graph.py` (LangGraph) side by side with it and understand it. In the second half of the day, give RAG answers citations that can be checked: check that every citation id was actually retrieved and that the text in quotes really appears in the chunk, and use dependency injection so the whole flow can be tested without a network.
+--- checklist
+- Clear your Review list first
+- Read all 7 knowledge cards, and change something in each one before you run it
+- Pass every practice exercise (including the local task: run the "interrupt → approve → resume" graph once in the real project)
+- The 3 closed-book challenges
+- Open `clausecheck/graph.py` and, going through `build_graph` line by line, say which piece of today's code each line matches
+
+@@ concept
+title: Graph runner (Python version)
+--- body
+On Day 18 you wrote a graph runner in TypeScript. Clause Check's `graph.py` is written in Python, so today you write it again in Python. Three things:
+
+- `nodes`: name → function. A node gets the whole state and returns only **the keys it changed** (a small dictionary)
+- `edges`: name → the name of the next node (a string), or a **routing function** that looks at the state and decides where to go
+- The runner: begin at the start node, then run the node → merge → find the next one, until `"END"`
+
+Merge with `{**state, **update}`: later keys overwrite earlier ones, and you get a **new dictionary**; the original stays unchanged. The classic mistake is writing it backwards, `{**update, **state}`, so the old values overwrite the new ones.
+
+`callable(x)` checks whether x can be called like a function; use it to tell a fixed edge from a routing function. Below, two steps are taken by hand; in the exercises you'll turn this into a loop.
+--- code
+def load(state):
+    return {"clauses": ["3.1", "8.1", "10.1"]}
+
+def review(state):
+    verdicts = {"3.1": "accept", "8.1": "redline", "10.1": "redline"}
+    return {"reviews": [verdicts[c] for c in state["clauses"]]}
+
+def route(state):
+    return "approve" if "redline" in state["reviews"] else "export"
+
+nodes = {"load": load, "review": review}
+edges = {"load": "review", "review": route}
+
+state = {"contract_path": "data/sample_contract.txt"}
+node = "load"
+for _ in range(2):
+    update = nodes[node](state)
+    state = {**state, **update}
+    edge = edges[node]
+    nxt = edge(state) if callable(edge) else edge
+    print(f"{node:<7} -> {nxt:<8} changed {sorted(update)}")
+    node = nxt
+print(state)
+
+@@ concept
+title: TypedDict: types for dictionary state
+--- body
+The `State` in `graph.py` is neither a dataclass nor Pydantic. It is a `TypedDict`:
+
+```python
+class State(TypedDict, total=False):
+    contract_path: str
+    reviews: list[dict]
+    approved: bool | None
+```
+
+- At runtime it **is just a plain dict**: `state["reviews"]`, `state.get("approved")` and `{**state, **update}` work as usual
+- The type hints are only for the editor (Pylance in VS Code) and mypy: a misspelled key or a wrong type gets a red underline, but there is **no error** at runtime
+- `total=False`: any key may be missing for now. The graph's state fills up step by step; at first it holds only `contract_path`
+- Why not Pydantic? A graph framework merges the state and saves it as checkpoints all the time, and a dict is the simplest thing for that. What really needs strict validation is **the model's output**, and that is where Pydantic goes
+--- code
+from typing import TypedDict
+
+class State(TypedDict, total=False):
+    contract_path: str
+    reviews: list[dict]
+    approved: bool | None
+
+s: State = {"contract_path": "data/sample_contract.txt"}
+s["approved"] = None
+print(type(s).__name__, s)
+s["reviews"] = "oops"   # the editor underlines this in red, but nothing stops it at runtime
+print(s["reviews"])
+print(sorted(State.__optional_keys__))   # total=False: every key is optional
+
+@@ concept
+title: Checkpoint files
+--- body
+Reviewing one contract takes several minutes. It may crash halfway, or it may wait a whole day for a lawyer to approve. A **checkpoint** means that every time a node finishes, you save "where to go next + the current state":
+
+```python
+{"next": "summarise", "state": {...}}
+```
+
+To resume, read the file and carry on from `next`. Nodes that are done don't run again, so you don't pay for the same model calls twice.
+
+- Path: `Path("work/checkpoints") / f"{run_id}.json"`; call `mkdir(parents=True, exist_ok=True)` first
+- The state may only hold things JSON can store (strings, numbers, lists, dictionaries, True/False/None). That is why `graph.py` stores `r.model_dump()` and not the Pydantic object
+- Order matters: **work out the next node first, then save**. If you save the node that just ran, it runs again when you resume
+
+On this page, files live on a virtual disk in your browser; they stay there until you reload the page.
+--- code
+import json
+from pathlib import Path
+
+folder = Path("work/d19/demo")
+folder.mkdir(parents=True, exist_ok=True)
+path = folder / "run-1.json"
+
+saved = {"next": "summarise", "state": {"contract_path": "a.txt", "reviews": ["accept", "redline"], "approved": None}}
+path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+
+loaded = json.loads(path.read_text(encoding="utf-8"))
+print(path.name, path.exists())
+print(loaded["next"], loaded["state"]["reviews"], loaded["state"]["approved"])
+print(loaded == saved)
+
+@@ concept
+title: Reading graph.py: it maps to what you wrote
+--- body
+Open `build_graph` in `clausecheck/graph.py`. Every line matches something you wrote yourself:
+
+```python
+g = StateGraph(State)
+g.add_node("review", review)                  # nodes["review"] = review
+g.add_edge(START, "load")                     # start = "load"
+g.add_edge("load", "review")                  # edges["load"] = "review"
+g.add_conditional_edges("summarise", route)   # edges["summarise"] = route
+g.add_edge("export", END)                     # edges["export"] = "END"
+return g.compile(checkpointer=checkpointer)
+```
+
+- The `approve` node calls `interrupt({...})`: the graph stops, `SqliteSaver` saves the state to `data/checkpoints.sqlite`, and the process can exit
+- Each run has a `thread_id` (like our `run_id`). When you continue with `Command(resume=True)`, the interrupted node **runs again from the top**, and this time `interrupt()` returns True right away
+- After approval, the code in `export` changes the files; the model can't change its mind anymore
+
+Today's simplified version: a node that returns `{"__interrupt__": question}` counts as an interrupt.
+--- code
+mapping = [
+    ("StateGraph(State)", "State TypedDict + a plain dict"),
+    ('add_node("review", review)', 'nodes["review"] = review'),
+    ('add_edge("load", "review")', 'edges["load"] = "review"'),
+    ('add_conditional_edges("summarise", route)', 'edges["summarise"] = route'),
+    ("interrupt({...})", 'return {"__interrupt__": ...}'),
+    ("SqliteSaver + thread_id", "work/checkpoints/<run_id>.json"),
+    ("Command(resume=True)", "resume(..., approved=True)"),
+]
+for langgraph, ours in mapping:
+    print(f"{langgraph:<42} -> {ours}")
+
+@@ concept
+title: Answers with citations
+--- body
+A RAG answer must be **verifiable**: every sentence says where it comes from. Three steps:
+
+1. In the prompt, give each chunk an id, `[c1] ...`, `[c2] ...`, and ask the model to "answer only from these chunks, and mark the source of every sentence like [c1]"
+2. Pull the citations out of the answer: `re.findall(r"\[(c\d+)\]", answer)`
+3. Check: every citation must be an id **retrieved this time**; an answer with no citations at all counts as having no support ("unsupported")
+
+Square brackets have a special meaning in regular expressions, so write them as `\[` and `\]`. Mind the `+` in `\d+`: without it, `[c10]` won't match.
+--- code
+import re
+
+chunks = [
+    {"id": "c1", "text": "Either party may terminate for convenience upon sixty (60) days' notice."},
+    {"id": "c2", "text": "Fees are payable within thirty (30) days of the invoice date."},
+]
+lines = [f"[{c['id']}] {c['text']}" for c in chunks]
+prompt = "Answer only from the sources. Cite like [c1].\n\n" + "\n".join(lines) + "\n\nQuestion: How long is the notice period?"
+print(prompt)
+print("---")
+answer = "Sixty days' notice is required [c1]. See also [c7]."
+cited = re.findall(r"\[(c\d+)\]", answer)
+allowed = {c["id"] for c in chunks}
+print("cited:", cited)
+print("unknown:", [c for c in cited if c not in allowed])
+
+@@ concept
+title: Groundedness: is the quoted text real?
+--- body
+Even when every citation id is right, the "original text" inside the quotes may still be made up by the model. The groundedness check: every passage the answer puts in quotes must **really appear in the chunk it cites**.
+
+- Normalize before comparing: collapse all whitespace into single spaces and make everything lowercase (`" ".join(s.split()).lower()`); otherwise line breaks and capital letters cause false alarms
+- Models often output curly quotes `“…”`; recognize them together with straight quotes `"…"`
+- This is a very cheap automatic eval (Day 13): no extra model call, just code, so it can run on every answer
+
+It catches "made-up quotes", but not "the quote is real, yet the conclusion drawn from it is wrong".
+--- code
+import re
+
+def norm(s):
+    return " ".join(s.split()).lower()
+
+chunk = "Provider may  terminate this Agreement\nfor convenience upon thirty (30) days' notice."
+answer = 'The clause says “Provider may terminate this Agreement for convenience” [c3], and "without any notice" [c3].'
+quotes = re.findall(r'["“]([^"”]+)["”]', answer)
+for q in quotes:
+    print(repr(q), "->", norm(q) in norm(chunk))
+
+@@ concept
+title: Dependency injection makes RAG testable
+mock: yes
+--- body
+When you test a RAG flow, what you want to test is **your code** (retrieval, building the prompt, checking citations), not the model's mood today. The trick: pass "call the model" in as a parameter:
+
+```python
+def answer(question, chunks, llm):   # llm: any function that takes a string and returns a string
+    return llm(build_prompt(question, chunks))
+```
+
+- In tests, pass a fake `llm`: it returns a fixed string, costs nothing, needs no network, gives the same result every time, and can even record the prompts it receives so you can check them
+- In production, pass the real one: a function that calls DeepSeek
+- Injecting the clock on Day 13 and `fetchFn` on Day 16 are the same idea: **things that change are passed in from outside**
+--- code
+import os
+import requests
+
+def build_prompt(question, chunks):
+    return "\n".join(f"[{c['id']}] {c['text']}" for c in chunks) + f"\n\nQuestion: {question}"
+
+def answer(question, chunks, llm):
+    return llm(build_prompt(question, chunks))
+
+def deepseek_llm(prompt):
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
+    # thinking mode is on by default: the answer is in content, the thinking in reasoning_content (we only need the answer here)
+    return data["choices"][0]["message"]["content"]
+
+seen = []
+def fake_llm(prompt):
+    seen.append(prompt)
+    return "Sixty days' notice [c1]."
+
+chunks = [{"id": "c1", "text": "Either party may terminate upon sixty days' notice."}]
+print(answer("Notice period?", chunks, fake_llm))
+print(len(seen), "prompt(s), first line:", seen[0].splitlines()[0])
+reply = answer("Notice period?", chunks, deepseek_llm)   # on this page it is a mock server: it only repeats the start of the prompt
+print(reply.splitlines()[0])
+
+@@ item d19-01
+type: code
+title: Recap: keyword search
+level: 1
+cards: d11:Keyword search
+--- context
+This afternoon you add citations to RAG answers, so first review the retrieval step: the user asks a question about the contract, and the program first picks the most relevant chunks out of the chunked contract, then hands them to the model to answer.
+--- prompt
+A review of Day 11. Write `top_k(query, chunks, k)`:
+
+- `chunks` is `[{"id": "c1", "text": "..."}, ...]`
+- Split text into words with the `tokenize` that is already written
+- A chunk's score = how many of the query's words (duplicates removed) appear among the chunk's words
+- Return the `k` chunks with the highest scores (the dictionaries themselves), highest first; **ties keep their original order**; leave out chunks that score 0
+
+Example: `top_k("fees payable", CHUNKS, 1)` → `[{"id": "c2", ...}]`
+--- starter
+import re
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def top_k(query, chunks, k):
+    pass
+--- solution
+import re
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def top_k(query, chunks, k):
+    words = set(tokenize(query))
+    scored = []
+    for c in chunks:
+        score = len(words & set(tokenize(c["text"])))
+        if score > 0:
+            scored.append((score, c))
+    scored.sort(key=lambda pair: -pair[0])
+    return [c for _, c in scored[:k]]
+--- tests
+CHUNKS = [
+    {"id": "c1", "text": "Either party may terminate this Agreement upon sixty days' notice."},
+    {"id": "c2", "text": "Fees are payable within thirty days of the invoice date."},
+    {"id": "c3", "text": "Customer may terminate for material breach after thirty days."},
+]
+ids = lambda result: [c["id"] for c in result]
+expect("the most relevant one", lambda: ids(top_k("fees payable", CHUNKS, 1)), ["c2"])
+expect("higher scores first, ties keep their original order", lambda: ids(top_k("terminate after thirty days", CHUNKS, 3)), ["c3", "c1", "c2"])
+expect("chunks that score 0 are left out", lambda: ids(top_k("invoice", CHUNKS, 5)), ["c2"])
+expect("nothing relevant", lambda: top_k("gdpr", CHUNKS, 2), [])
+expect("returns the chunk dictionaries", lambda: top_k("invoice", CHUNKS, 1), [CHUNKS[1]])
+--- hints
+- Make a set of the query's words, `set(tokenize(query))`, and a set of the chunk's words too; the length of their intersection `&` is the score.
+- First collect `(score, chunk)` pairs, then `sort(key=lambda pair: -pair[0])`. Python's sort is stable, so ties keep their original order automatically.
+- Finally take the first k: `[c for _, c in scored[:k]]`.
+
+@@ item d19-02
+type: predict
+title: Recap: merging state
+level: 1
+cards: Graph runner (Python version); TypedDict: types for dictionary state
+--- context
+The state in `graph.py` is a dictionary. Each node hands back only the few keys it changed, and they get merged in. On Day 18 you did the same thing in TypeScript; here is how it looks in Python.
+--- prompt
+Write the output. On Day 18 you merged state in TypeScript with `{ ...state, ...update }`; in Python it is `{**state, **update}`. Watch which one comes last, and what a TypedDict really is at runtime.
+--- code
+from typing import TypedDict
+
+class State(TypedDict, total=False):
+    clauses: list[str]
+    redlines: int
+    approved: bool | None
+
+state: State = {"clauses": ["3.1", "8.1"], "redlines": 0}
+update = {"redlines": 2, "approved": None}
+new = {**state, **update}
+print(new)
+print(state)
+wrong = {**update, **state}
+print(wrong["redlines"])
+print(type(new).__name__)
+--- explain
+`{**a, **b}` puts in a's keys first, then overwrites them with b's, giving a new dictionary; `state` itself doesn't change. Written backwards (`{**update, **state}`), the old `redlines: 0` overwrites the new value, a bug that is very hard to spot in a graph runner. A TypedDict is only a type for the editor; at runtime it is a `dict`.
+
+@@ item d19-03
+type: fill
+title: Find the next node
+level: 1
+cards: Graph runner (Python version)
+--- context
+Just like on Day 18, every time a node finishes, the graph runner has to find the next step. This time you write it in Python, the same language as the real project's `graph.py`.
+--- prompt
+Complete `next_node(edges, node, state)`: `edges[node]` can be a string (a fixed next node) or a routing function (it takes the state and returns the name of the next node). When `node` is not in `edges`, raise `ValueError`.
+--- template
+def next_node(edges, node, state):
+    if node not in edges:
+        raise [[ValueError]](f"no edge from {node!r}")
+    edge = edges[node]
+    if [[callable(edge)]]:
+        return [[edge(state)]]
+    return [[edge]]
+--- tests
+EDGES = {"load": "review", "summarise": lambda s: "approve" if s["redlines"] > 0 else "export", "export": "END"}
+expect("fixed edge", lambda: next_node(EDGES, "load", {}), "review")
+expect("routing function: has a redline", lambda: next_node(EDGES, "summarise", {"redlines": 2}), "approve")
+expect("routing function: no redline", lambda: next_node(EDGES, "summarise", {"redlines": 0}), "export")
+expect_raises("misspelled node name", lambda: next_node(EDGES, "reviw", {}), ValueError)
+--- hints
+- If `callable(edge)` is True, it is a function, so call it: `edge(state)`.
+- If it isn't a function, it is a string: return it as it is.
+
+@@ item d19-04
+type: code
+title: Graph runner
+level: 2
+cards: Graph runner (Python version)
+--- context
+The real project's `graph.py` is written in Python, so write the Day 18 runner again in Python. Once you have written it, you can match LangGraph's code to it line by line.
+--- prompt
+Write `run_graph(nodes, edges, state, start, max_steps=20)` that returns `(final state, path)`:
+
+1. Begin at `start`; stop when the current node is `"END"`
+2. Run the node, `update = nodes[node](state)`, and merge into a **new dictionary**, `state = {**state, **update}` (don't change the dictionary that was passed in)
+3. Add the node's name to `path`, and find the next one with `next_node`
+4. If `max_steps` nodes have already run and END still hasn't been reached: `raise RuntimeError` (this prevents an endless loop when the graph has a cycle)
+5. If the node isn't in `nodes`: `raise ValueError`
+
+Example: three nodes in a row → `({...}, ["load", "review", "export"])`
+--- starter
+def next_node(edges, node, state):
+    if node not in edges:
+        raise ValueError(f"no edge from {node!r}")
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def run_graph(nodes, edges, state, start, max_steps=20):
+    path = []
+    node = start
+    return state, path
+--- solution
+def next_node(edges, node, state):
+    if node not in edges:
+        raise ValueError(f"no edge from {node!r}")
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def run_graph(nodes, edges, state, start, max_steps=20):
+    path = []
+    node = start
+    while node != "END":
+        if len(path) >= max_steps:
+            raise RuntimeError(f"stopped after {max_steps} steps")
+        if node not in nodes:
+            raise ValueError(f"unknown node {node!r}")
+        update = nodes[node](state)
+        state = {**state, **update}
+        path.append(node)
+        node = next_node(edges, node, state)
+    return state, path
+--- tests
+def load(s):
+    return {"clauses": ["3.1", "8.1"]}
+def review(s):
+    return {"reviews": {"3.1": "accept", "8.1": "redline"}}
+def summarise(s):
+    return {"redlines": list(s["reviews"].values()).count("redline")}
+def approve(s):
+    return {"approved": True}
+def export(s):
+    return {"exported": True}
+NODES = {"load": load, "review": review, "summarise": summarise, "approve": approve, "export": export}
+EDGES = {"load": "review", "review": "summarise", "summarise": lambda s: "approve" if s["redlines"] > 0 else "export", "approve": "export", "export": "END"}
+expect("path", lambda: run_graph(NODES, EDGES, {"contract_path": "a.txt"}, "load")[1], ["load", "review", "summarise", "approve", "export"])
+expect("final state", lambda: run_graph(NODES, EDGES, {}, "load")[0]["redlines"], 1)
+def _no_mutation():
+    start = {"contract_path": "a.txt"}
+    run_graph(NODES, EDGES, start, "load")
+    return start
+expect("doesn't change the state passed in", _no_mutation, {"contract_path": "a.txt"})
+LOOP = {"a": lambda s: {"n": s.get("n", 0) + 1}, "b": lambda s: {}}
+expect_raises("cycle: more than max_steps", lambda: run_graph(LOOP, {"a": "b", "b": "a"}, {}, "a", max_steps=5), RuntimeError)
+expect_raises("node doesn't exist", lambda: run_graph(NODES, {"load": "reviw"}, {}, "load"), ValueError)
+--- hints
+- Skeleton: `while node != "END":`, and in the loop body, in this order: check the limit → check that the node exists → run it → merge → record the path → find the next one.
+- Check the limit **before** running the node: `if len(path) >= max_steps: raise RuntimeError(...)`.
+- Use `state = {**state, **update}`, not `state.update(update)`: the latter changes the caller's dictionary.
+
+@@ item d19-05
+type: predict
+title: Which way does the graph go?
+level: 2
+cards: Graph runner (Python version)
+--- context
+The model's first output was broken, so the graph loops back and has it review again. Loops like this, "go back and redo it", are common in review flows. You need to read the path a graph took to find out why it ran one step too many or too few.
+--- prompt
+Write the output. The first time `review` runs, the model's output is broken, and the routing sends it back to itself to review once more.
+--- code
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def review(state):
+    tries = state.get("tries", 0) + 1
+    return {"tries": tries, "ok": tries >= 2}
+
+nodes = {
+    "load": lambda s: {"clauses": 3},
+    "review": review,
+    "summarise": lambda s: {"redlines": 0},
+    "export": lambda s: {"exported": True},
+}
+edges = {
+    "load": "review",
+    "review": lambda s: "summarise" if s["ok"] else "review",
+    "summarise": lambda s: "approve" if s["redlines"] > 0 else "export",
+    "export": "END",
+}
+state, node, path = {}, "load", []
+while node != "END":
+    state = {**state, **nodes[node](state)}
+    path.append(node)
+    node = next_node(edges, node, state)
+print(" -> ".join(path))
+print(state["tries"], state["ok"], "approve" in path)
+--- explain
+A routing function can point back to its own node: that is how you write a retry in a graph. The first time, `tries` is 1 and `ok` is False, so it goes back to `review`; only the second time does it move on. There is no redline, so `approve` is skipped. Because edges can form a cycle, a runner must have `max_steps`.
+
+@@ item d19-06
+type: code
+title: Routing function: four destinations
+level: 2
+cards: Graph runner (Python version); d18:Edges and conditional routing
+--- context
+In this exercise the review node may leave some clauses unreviewed (for example when the model's answer is broken). After the review there are several possible next steps. A routing function only looks at the state and never calls the model, so it can be tested on its own. Reviewing again can't go on forever: every round costs money.
+--- prompt
+Write `route_after_review(state)`, checking in this order:
+
+1. `state["errors"]` is not empty (some clauses weren't reviewed) and `state.get("retries", 0) < 2` → `"review"` (review again)
+2. There are still errors, but it has already retried 2 times → `"human"` (hand it to a person)
+3. Some entry in `state["reviews"]` has `verdict` `"redline"` → `"approve"`
+4. Otherwise → `"export"`
+
+Example: `route_after_review({"errors": [], "reviews": [{"id": "8.1", "verdict": "redline"}]})` → `"approve"`
+--- starter
+def route_after_review(state):
+    return "export"
+--- solution
+def route_after_review(state):
+    if state["errors"]:
+        if state.get("retries", 0) < 2:
+            return "review"
+        return "human"
+    if any(r["verdict"] == "redline" for r in state["reviews"]):
+        return "approve"
+    return "export"
+--- tests
+R = [{"id": "3.1", "verdict": "accept"}, {"id": "8.1", "verdict": "redline"}]
+expect("has a redline", lambda: route_after_review({"errors": [], "reviews": R}), "approve")
+expect("all accept", lambda: route_after_review({"errors": [], "reviews": R[:1]}), "export")
+expect("errors, not retried yet", lambda: route_after_review({"errors": ["4.2"], "reviews": R}), "review")
+expect("errors, retried once", lambda: route_after_review({"errors": ["4.2"], "reviews": R, "retries": 1}), "review")
+expect("errors, already retried 2 times", lambda: route_after_review({"errors": ["4.2"], "reviews": R, "retries": 2}), "human")
+expect("no clauses", lambda: route_after_review({"errors": [], "reviews": []}), "export")
+--- hints
+- Check for errors first: while some clauses are unreviewed, the number of redlines can't be trusted yet.
+- "Is any of them a redline": `any(r["verdict"] == "redline" for r in state["reviews"])`.
+
+@@ item d19-07
+type: code
+title: Save a checkpoint, load a checkpoint
+level: 2
+cards: Checkpoint files; d10:pathlib: paths are objects; d10:JSON files: load and dump
+--- context
+Reviewing one contract takes several minutes. It may crash halfway, or wait a whole day for a lawyer. Save "where to go next + the current state" to a file, one file per run, and later you can read it back and carry on.
+--- prompt
+Write two functions:
+
+- `save_checkpoint(folder, run_id, next_node, state)`: write to `folder/<run_id>.json` with the content `{"next": next_node, "state": state}`, using `indent=2`; if the folder doesn't exist, create it first (parent folders too); return the file's `Path`
+- `load_checkpoint(folder, run_id)`: read the dictionary back; if the file doesn't exist, return `None`
+
+Example: `save_checkpoint("work/d19/ck", "run-1", "summarise", {"n": 3})` → `Path("work/d19/ck/run-1.json")`
+--- starter
+import json
+from pathlib import Path
+
+def save_checkpoint(folder, run_id, next_node, state):
+    pass
+
+def load_checkpoint(folder, run_id):
+    pass
+--- solution
+import json
+from pathlib import Path
+
+def save_checkpoint(folder, run_id, next_node, state):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{run_id}.json"
+    path.write_text(json.dumps({"next": next_node, "state": state}, indent=2), encoding="utf-8")
+    return path
+
+def load_checkpoint(folder, run_id):
+    path = Path(folder) / f"{run_id}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+--- tests
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d19/ck07", ignore_errors=True)
+STATE = {"contract_path": "a.txt", "reviews": [{"id": "8.1", "verdict": "redline"}], "approved": None}
+expect("returns the path, parent folders are created", lambda: save_checkpoint("work/d19/ck07/deep", "run-1", "summarise", STATE), Path("work/d19/ck07/deep/run-1.json"))
+expect("reads back exactly the same", lambda: load_checkpoint("work/d19/ck07/deep", "run-1"), {"next": "summarise", "state": STATE})
+expect_true("uses indent=2", lambda: '\n  "state"' in Path("work/d19/ck07/deep/run-1.json").read_text(encoding="utf-8"))
+expect("file doesn't exist → None", lambda: load_checkpoint("work/d19/ck07/deep", "run-404"), None)
+def _overwrite():
+    save_checkpoint("work/d19/ck07", "run-2", "review", {"n": 1})
+    save_checkpoint("work/d19/ck07", "run-2", "export", {"n": 2})
+    return load_checkpoint("work/d19/ck07", "run-2")
+expect("saving the same run_id again overwrites it", _overwrite, {"next": "export", "state": {"n": 2}})
+--- hints
+- Start with `folder = Path(folder)`, so that `/` works for building the path even when a string is passed in.
+- Create the folder: `folder.mkdir(parents=True, exist_ok=True)`; write: `path.write_text(json.dumps(..., indent=2), encoding="utf-8")`.
+- Before reading, `if not path.exists(): return None`.
+
+@@ item d19-08
+type: fix
+title: Fix the bug: the checkpoint is saved at the wrong point
+level: 3
+cards: Checkpoint files
+--- context
+The whole point of a checkpoint: when you resume, nodes that are already done don't run again. Running the review node again means paying for the model calls on the whole contract a second time, and the token count gets doubled too.
+--- prompt
+`run_saving` saves a checkpoint every time a node finishes, and `resume_saving` carries on from the checkpoint. The test simulates a crash: the first time `export` runs, it throws an error (disk full), and then the run resumes from the checkpoint.
+
+Run the tests: after resuming, `review` runs again, which means paying for the model calls a second time, and the tokens are counted twice. Find the cause, and change only `run_saving`.
+--- starter
+import json
+from pathlib import Path
+
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def save(path, next_name, state):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps({"next": next_name, "state": state}), encoding="utf-8")
+
+def run_saving(nodes, edges, state, start, ckpt):
+    node = start
+    path = []
+    while node != "END":
+        state = {**state, **nodes[node](state)}
+        path.append(node)
+        save(ckpt, node, state)
+        node = next_node(edges, node, state)
+    return state, path
+
+def resume_saving(nodes, edges, ckpt):
+    saved = json.loads(Path(ckpt).read_text(encoding="utf-8"))
+    return run_saving(nodes, edges, saved["state"], saved["next"], ckpt)
+--- solution
+import json
+from pathlib import Path
+
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def save(path, next_name, state):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps({"next": next_name, "state": state}), encoding="utf-8")
+
+def run_saving(nodes, edges, state, start, ckpt):
+    node = start
+    path = []
+    while node != "END":
+        state = {**state, **nodes[node](state)}
+        path.append(node)
+        node = next_node(edges, node, state)
+        save(ckpt, node, state)
+    return state, path
+
+def resume_saving(nodes, edges, ckpt):
+    saved = json.loads(Path(ckpt).read_text(encoding="utf-8"))
+    return run_saving(nodes, edges, saved["state"], saved["next"], ckpt)
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d19/fix08", ignore_errors=True)
+CK = "work/d19/fix08/run.json"
+CALLS = {}
+def load(s):
+    return {"clauses": ["3.1", "8.1"]}
+def review(s):
+    CALLS["review"] = CALLS.get("review", 0) + 1
+    return {"tokens": s.get("tokens", 0) + 1000}
+def export(s):
+    CALLS["export"] = CALLS.get("export", 0) + 1
+    if CALLS["export"] == 1:
+        raise RuntimeError("disk full")
+    return {"exported": True}
+NODES = {"load": load, "review": review, "export": export}
+EDGES = {"load": "review", "review": "export", "export": "END"}
+def _crash_then_resume():
+    CALLS.clear()
+    try:
+        run_saving(NODES, EDGES, {}, "load", CK)
+    except RuntimeError:
+        pass
+    state, path = resume_saving(NODES, EDGES, CK)
+    return {"resumed_path": path, "tokens": state["tokens"], "review_calls": CALLS["review"]}
+expect("after resuming only export runs; review is called once", _crash_then_resume, {"resumed_path": ["export"], "tokens": 1000, "review_calls": 1})
+def _finished():
+    CALLS.clear()
+    CALLS["export"] = 1
+    run_saving(NODES, EDGES, {}, "load", CK)
+    return json.loads(Path(CK).read_text(encoding="utf-8"))["next"]
+expect("after a normal run, the checkpoint points to END", _finished, "END")
+--- hints
+- Resuming starts from the `next` stored in the checkpoint. Before `export` crashed, which node was the last `next` that got saved?
+- The checkpoint must store "the next node to run", so work out the next node first, then save.
+- Move `node = next_node(...)` above `save(...)`; at that point `node` is already the next node.
+
+@@ item d19-09
+type: order
+title: Put the code in order: resume from a file
+level: 2
+cards: Checkpoint files
+--- context
+This is the "carry on the next day" half: for example, after the lawyer approves, another process reads the saved checkpoint and runs the remaining nodes from where the run stopped last time.
+--- prompt
+Put `resume_from_file(nodes, edges, path)` in order: read the checkpoint file, carry on from `next` until END, and return the final state. Two lines are distractors.
+--- lines
+import json
+from pathlib import Path
+def resume_from_file(nodes, edges, path):
+    saved = json.loads(Path(path).read_text(encoding="utf-8"))
+    state = saved["state"]
+    node = saved["next"]
+    while node != "END":
+        state = {**state, **nodes[node](state)}
+        edge = edges[node]
+        node = edge(state) if callable(edge) else edge
+    return state
+--- distractors
+        state = {**nodes[node](state), **state}
+    node = saved["state"]["next"]
+--- tests
+import json
+from pathlib import Path
+Path("work/d19/order09").mkdir(parents=True, exist_ok=True)
+Path("work/d19/order09/run.json").write_text(json.dumps({"next": "summarise", "state": {"reviews": ["accept", "redline"], "tokens": 500}}), encoding="utf-8")
+Path("work/d19/order09/late.json").write_text(json.dumps({"next": "export", "state": {"approved": False}}), encoding="utf-8")
+NODES = {
+    "summarise": lambda s: {"redlines": s["reviews"].count("redline"), "tokens": s["tokens"] + 100},
+    "approve": lambda s: {"approved": True},
+    "export": lambda s: {"exported": s["approved"]},
+}
+EDGES = {"summarise": lambda s: "approve" if s["redlines"] else "export", "approve": "export", "export": "END"}
+expect("carries on from summarise to the end", lambda: resume_from_file(NODES, EDGES, "work/d19/order09/run.json"), {"reviews": ["accept", "redline"], "tokens": 600, "redlines": 1, "approved": True, "exported": True})
+expect("starts at export", lambda: resume_from_file(NODES, EDGES, "work/d19/order09/late.json"), {"approved": False, "exported": False})
+--- hints
+- `next` and `state` are the two top-level keys of the checkpoint.
+- When merging, the new values go last: `{**state, **update}`. Written the other way around, `tokens` never becomes 600.
+
+@@ item d19-10
+type: code
+title: Interrupt and resume
+level: 3
+cards: Reading graph.py: it maps to what you wrote; Graph runner (Python version); d18:Interrupt and resume: stop and wait for a person
+--- context
+This is the core of the approval step in `graph.py`: when there is a redline, the graph stops and hands the question to the lawyer; once the lawyer replies, it carries on and exports according to their decision. Write it once yourself and you'll know what LangGraph's `interrupt()` does for you.
+--- prompt
+Add "interrupt → resume" to the runner, like `interrupt()` plus `Command(resume=...)` in `graph.py`.
+
+Write `run(nodes, edges, state, start)`:
+
+- Run step by step like `run_graph` (ignore max_steps in this exercise)
+- If the dictionary a node returns has the key `"__interrupt__"`: **stop right away**, don't merge, don't move on, and return `{"status": "interrupted", "next": <this node's name>, "state": state, "question": update["__interrupt__"]}`
+- On reaching END: return `{"status": "done", "state": state, "path": path}`
+
+Write `resume(nodes, edges, saved, approved)`: `saved` is the interrupt result above. Merge `"approved": approved` into `saved["state"]`, then `run` again from `saved["next"]`. The interrupted node runs once more; this time it sees that `approved` has a value and doesn't interrupt, just like in LangGraph.
+--- starter
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def run(nodes, edges, state, start):
+    pass
+
+def resume(nodes, edges, saved, approved):
+    pass
+--- solution
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def run(nodes, edges, state, start):
+    node = start
+    path = []
+    while node != "END":
+        update = nodes[node](state)
+        if "__interrupt__" in update:
+            return {"status": "interrupted", "next": node, "state": state, "question": update["__interrupt__"]}
+        state = {**state, **update}
+        path.append(node)
+        node = next_node(edges, node, state)
+    return {"status": "done", "state": state, "path": path}
+
+def resume(nodes, edges, saved, approved):
+    state = {**saved["state"], "approved": approved}
+    return run(nodes, edges, state, saved["next"])
+--- tests
+import json
+def summarise(s):
+    return {"redlines": [r["id"] for r in s["reviews"] if r["verdict"] == "redline"]}
+def approve(s):
+    if s.get("approved") is None:
+        return {"__interrupt__": f"Apply {len(s['redlines'])} redline(s)?"}
+    return {}
+def export(s):
+    files = ["report.json"]
+    if s.get("approved"):
+        files.append("report.redlined.txt")
+    return {"exported": files}
+NODES = {"summarise": summarise, "approve": approve, "export": export}
+EDGES = {"summarise": lambda s: "approve" if s["redlines"] else "export", "approve": "export", "export": "END"}
+REVIEWS = [{"id": "3.1", "verdict": "accept"}, {"id": "8.1", "verdict": "redline"}]
+first = lambda: run(NODES, EDGES, {"reviews": REVIEWS}, "summarise")
+expect("redline: stops at approve", lambda: [first()["status"], first()["next"], first()["question"]], ["interrupted", "approve", "Apply 1 redline(s)?"])
+expect("the state at the interrupt already has the result of summarise", lambda: first()["state"]["redlines"], ["8.1"])
+expect("approved: carries on from approve and exports two files", lambda: [resume(NODES, EDGES, first(), True)["path"], resume(NODES, EDGES, first(), True)["state"]["exported"]], [["approve", "export"], ["report.json", "report.redlined.txt"]])
+expect("rejected: exports only the report", lambda: resume(NODES, EDGES, first(), False)["state"]["exported"], ["report.json"])
+expect("the interrupt result saved as JSON and read back can still resume", lambda: resume(NODES, EDGES, json.loads(json.dumps(first())), True)["status"], "done")
+expect("no redline: no interrupt", lambda: run(NODES, EDGES, {"reviews": REVIEWS[:1]}, "summarise")["path"], ["summarise", "export"])
+--- hints
+- The loop in `run` is almost the same as in `run_graph`, with one extra line before merging: `if "__interrupt__" in update: return {...}`.
+- The `state` returned at an interrupt is the state **before** this update is merged, and `next` is the current node itself (it has to run again on resume).
+- `resume`: `state = {**saved["state"], "approved": approved}`, then `return run(nodes, edges, state, saved["next"])`.
+
+@@ item d19-11
+type: choice
+title: Reading graph.py: interrupt
+level: 2
+cards: Reading graph.py: it maps to what you wrote
+--- context
+The approval node in `graph.py` stops before export and waits for the lawyer to decide whether the redlines go into the exported copy of the contract. An interviewer may well ask you to explain exactly what happens at this step.
+--- prompt
+The `approve` node in `clausecheck/graph.py` calls `interrupt(...)`. Which statement is correct?
+--- options
+- `interrupt()` makes the Python process stop at that line and wait until someone types y in the terminal
+- On resume, LangGraph starts right at `export`, and the `approve` node doesn't run again
+- The graph stops here and the checkpointer (`SqliteSaver`, stored in `data/checkpoints.sqlite`) saves the state; later it continues with the same `thread_id` and `Command(resume=True)`, even from a different process
+- After approval, the model decides again whether to really apply these redlines
+answer: 3
+--- explain
+What asks y/N is the `decide` function in `cli.py` (it uses `input()`), not `interrupt()` itself: `run_graph` first invokes the graph up to the interrupt, takes what needs approval from the result's `__interrupt__`, asks the person, and then sends `Command(resume=approved)`. `graph.py` also has two functions, `pending_interrupt` and `resume`, which shows that another process can look at and continue the same thread. On resume, the interrupted node runs again from the top, and this time `interrupt()` returns the resume value right away; after that, the code in `export` carries out the decision, and the model has no part in it.
+
+@@ item d19-12
+type: local
+title: Local task: run the real graph once
+level: 2
+cards: Reading graph.py: it maps to what you wrote; d18:Interrupt and resume: stop and wait for a person
+--- context
+Take the "interrupt → a person approves → resume" you wrote by hand today and run it yourself in the real project. Mock mode uses the rule-based reviewer instead of the model, so it costs nothing, and the graph's flow is the same as with a real model.
+--- prompt
+Run the LangGraph version of the flow once in the real project, and see "interrupt → a person approves → resume" with your own eyes:
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck review data/sample_contract.txt --graph --approve ask --mode mock --out data/day19.report.json --thread day19-1
+```
+
+- `--graph`: go through the graph in `graph.py` instead of the plain pipeline
+- `--approve ask`: ask you when it reaches the interrupt. When you see `Apply to exported copy? [y/N]`, type `y` and press Enter
+- `--mode mock`: no model calls; it uses the rule-based reviewer, so it's free
+- `--thread`: the thread id of this run; the checkpoints are stored under it in `data/checkpoints.sqlite`
+
+When it finishes, open `data/day19.report.json` and `data/day19.report.redlined.txt` and take a look. Then run it again with `--thread day19-2`, type `n` this time, and compare `approved=` and `exported=` on the last line: what is different?
+
+Paste the full output of the first run below.
+placeholder: Paste the terminal output; it should include Interrupted before export and approved=True
+verify: Interrupted before export[\s\S]*approved=True
+--- hints
+- If you see `No module named 'langgraph'`: first run `python -m pip install langgraph langgraph-checkpoint-sqlite`.
+- The `RequestsDependencyWarning` and `UserWarning` lines at the start are version notices; they don't affect the run.
+- If you don't see `Interrupted before export`: check that the command includes `--graph`.
+
+@@ item d19-13
+type: code
+title: Pull out the citation ids
+level: 1
+cards: Answers with citations
+--- context
+The setting for these exercises: the user asks a question about the contract (for example "can the customer terminate early?"), the model may answer only from the retrieved chunks, and it marks every sentence with the id of its source. To check those sources, you first have to find the ids in the answer.
+--- prompt
+Write `extract_citations(answer)`: return the ids of all `[c<number>]` citations in the answer (without the square brackets), **in order of first appearance, with duplicates removed**.
+
+Example: `extract_citations("Cap is 12 months [c2]. Notice is 60 days [c1][c2].")` → `["c2", "c1"]`
+--- starter
+import re
+
+def extract_citations(answer):
+    pass
+--- solution
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+--- tests
+expect("removes duplicates and keeps the order", lambda: extract_citations("Cap is 12 months [c2]. Notice is 60 days [c1][c2]."), ["c2", "c1"])
+expect("two-digit ids", lambda: extract_citations("See [c10] and [c1]."), ["c10", "c1"])
+expect("no citations", lambda: extract_citations("No sources here."), [])
+expect("without square brackets it doesn't count", lambda: extract_citations("clause c3 and [3]"), [])
+--- hints
+- `re.findall(r"\[(c\d+)\]", answer)` returns only the part inside the parentheses, such as `"c2"`.
+- To remove duplicates and keep the order, you can't use `set` (it scrambles the order). Use a list: `if cid not in result: result.append(cid)`.
+
+@@ item d19-14
+type: testwrite
+title: Write tests: pulling out citations
+level: 2
+cards: Answers with citations; d9:How to come up with test cases
+--- context
+Citation checking is the foundation of RAG evals: if it quietly misses an id, every score built on it can't be trusted, and nobody will notice. Tests are its insurance.
+--- prompt
+The function under test is `extract_citations`, which you wrote in the last exercise. Write test functions (`assert` inside `def test_...():`) that all pass on the correct function and also catch several hidden buggy versions.
+
+The starter code has only one test, which is far too weak. Think about the places where you almost got the last exercise wrong, and write one test for each.
+--- impl
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+--- mutants
+===== Duplicates: the same id cited twice
+import re
+
+def extract_citations(answer):
+    return re.findall(r"\[(c\d+)\]", answer)
+===== Two-digit ids, like [c10]
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+===== Order: order of first appearance, not sorted
+import re
+
+def extract_citations(answer):
+    return sorted(set(re.findall(r"\[(c\d+)\]", answer)))
+===== A bare c3 without square brackets is not a citation
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"c\d+", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+--- starter
+def test_single_citation():
+    assert extract_citations("Fees are due in 30 days [c1].") == ["c1"]
+--- solution
+def test_single_citation():
+    assert extract_citations("Fees are due in 30 days [c1].") == ["c1"]
+
+def test_dedupe():
+    assert extract_citations("[c1] and again [c1]") == ["c1"]
+
+def test_two_digit_ids():
+    assert extract_citations("see [c10]") == ["c10"]
+
+def test_order_of_first_appearance():
+    assert extract_citations("[c2] then [c1]") == ["c2", "c1"]
+
+def test_bare_ids_are_not_citations():
+    assert extract_citations("clause c3 says so") == []
+--- hints
+- One test checks one thing: duplicates, two-digit ids, order, no square brackets. Write one for each.
+- To test the order, make the bigger id appear first: `"[c2] then [c1]"`. The sorting version returns `["c1", "c2"]`.
+
+@@ item d19-15
+type: code
+title: Check the citations
+level: 2
+cards: Answers with citations
+--- context
+Sometimes the model cites a chunk id it never saw: the answer looks sourced, but the source is made up. Or it cites nothing at all. Neither kind of answer can go straight to the lawyer.
+--- prompt
+Write `check_citations(answer, allowed_ids)`. `allowed_ids` are the ids of the chunks retrieved this time and put into the prompt (a list or a set both work). Return:
+
+```python
+{"cited": the ids the answer cites (order and duplicates handled as in the last exercise),
+ "unknown": the ids that are cited but not in allowed_ids,
+ "uncited": True when there are no citations at all, otherwise False}
+```
+
+Example: `check_citations("60 days [c1]. Also [c9].", ["c1", "c2"])` → `{"cited": ["c1", "c9"], "unknown": ["c9"], "uncited": False}`
+
+An id in `unknown` means the model cited a chunk it never saw: made up.
+--- starter
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def check_citations(answer, allowed_ids):
+    pass
+--- solution
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def check_citations(answer, allowed_ids):
+    cited = extract_citations(answer)
+    unknown = [c for c in cited if c not in allowed_ids]
+    return {"cited": cited, "unknown": unknown, "uncited": len(cited) == 0}
+--- tests
+expect("one made-up citation", lambda: check_citations("60 days [c1]. Also [c9].", ["c1", "c2"]), {"cited": ["c1", "c9"], "unknown": ["c9"], "uncited": False})
+expect("all valid (allowed is a set)", lambda: check_citations("[c2] and [c1]", {"c1", "c2"}), {"cited": ["c2", "c1"], "unknown": [], "uncited": False})
+expect("no citations", lambda: check_citations("I think 60 days.", ["c1"]), {"cited": [], "unknown": [], "uncited": True})
+expect("uncited is True/False, not a list or a number", lambda: check_citations("x", [])["uncited"], True)
+expect("a made-up citation that appears twice counts once", lambda: check_citations("[c7] [c7]", ["c1"])["unknown"], ["c7"])
+--- hints
+- Start with `cited = extract_citations(answer)`; the other two fields are both computed from it.
+- `unknown`: the list comprehension `[c for c in cited if c not in allowed_ids]`; `uncited`: `len(cited) == 0`.
+
+@@ item d19-16
+type: code
+title: Pull out the quotes
+level: 2
+cards: Groundedness: is the quoted text real?
+--- context
+Answers often quote the contract's original text inside quotation marks. The next exercise checks whether those quotes really appear in the chunks; here you first find them, one by one.
+--- prompt
+Write `extract_quotes(answer)`: return all the text inside double quotes in the answer, in order of appearance, with spaces at both ends removed, leaving out empty ones. Recognize both straight quotes `"…"` and curly quotes `“…”`: models often output curly quotes.
+
+Example: `extract_quotes('It says “in perpetuity” [c3] and "sixty days" [c1].')` → `["in perpetuity", "sixty days"]`
+
+The starter code recognizes only straight quotes.
+--- starter
+import re
+
+def extract_quotes(answer):
+    return re.findall(r'"([^"]+)"', answer)
+--- solution
+import re
+
+def extract_quotes(answer):
+    found = re.findall(r'["“]([^"”]*)["”]', answer)
+    return [q.strip() for q in found if q.strip()]
+--- tests
+expect("straight quotes", lambda: extract_quotes('The clause says "sixty days" [c1].'), ["sixty days"])
+expect("curly quotes", lambda: extract_quotes("It survives “in perpetuity” [c3]."), ["in perpetuity"])
+expect("both kinds mixed, in order", lambda: extract_quotes('It says “in perpetuity” [c3] and "sixty days" [c1].'), ["in perpetuity", "sixty days"])
+expect("spaces at both ends removed, empty ones left out", lambda: extract_quotes('A " unlimited liability " and "" here'), ["unlimited liability"])
+expect("single quotes (apostrophes) don't count", lambda: extract_quotes("Customer's data [c2]"), [])
+--- hints
+- In a regex, square brackets mean "one of these characters": `["“]` matches a straight quote or a left curly quote, and `["”]` matches a straight quote or a right curly quote.
+- In the middle, write `([^"”]*)`: any number of characters that are not a closing quote. Use `*` rather than `+` so that empty quotes match too, then filter them out of the result.
+- Finally, `[q.strip() for q in found if q.strip()]`.
+
+@@ item d19-17
+type: code
+title: Groundedness check
+level: 3
+cards: Groundedness: is the quoted text real?; Answers with citations
+--- context
+Even when every citation id is right, the "original text" inside the quotes may still be made up by the model, and quoted text is exactly what lawyers trust most. This check is pure code with no extra model call, so it can run on every answer: a very cheap automatic eval.
+--- prompt
+Write `grounded(answer, chunks)`: return the list of quotes in the answer that have **no support** (in order of appearance).
+
+- `chunks`: `[{"id": "c1", "text": "..."}, ...]`, the chunks retrieved this time
+- A quote is supported = after normalizing, it is part of some chunk that the answer **cites**
+- Normalize: `" ".join(s.split()).lower()`
+- Search only in the cited chunks (use `extract_citations`). If the text appears only in a chunk that wasn't cited, it still counts as unsupported: the source is wrong
+- `extract_citations` and `extract_quotes` are already written
+
+Example: `'It lasts “in perpetuity” [c3] and is "mutual" [c3].'`, where c3 contains in perpetuity but not mutual → `["mutual"]`
+--- starter
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def extract_quotes(answer):
+    found = re.findall(r'["“]([^"”]*)["”]', answer)
+    return [q.strip() for q in found if q.strip()]
+
+def grounded(answer, chunks):
+    pass
+--- solution
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def extract_quotes(answer):
+    found = re.findall(r'["“]([^"”]*)["”]', answer)
+    return [q.strip() for q in found if q.strip()]
+
+def norm(s):
+    return " ".join(s.split()).lower()
+
+def grounded(answer, chunks):
+    cited = extract_citations(answer)
+    sources = [norm(c["text"]) for c in chunks if c["id"] in cited]
+    unsupported = []
+    for q in extract_quotes(answer):
+        if not any(norm(q) in src for src in sources):
+            unsupported.append(q)
+    return unsupported
+--- tests
+CHUNKS = [
+    {"id": "c1", "text": "Either party may terminate this Agreement\nupon sixty (60) days' written notice."},
+    {"id": "c3", "text": "The obligations in this Section 6 survive termination in perpetuity."},
+    {"id": "c4", "text": "Customer's liability shall be unlimited."},
+]
+expect("supported: line breaks and capital letters don't matter", lambda: grounded('It says "Terminate this Agreement upon sixty (60) days" [c1].', CHUNKS), [])
+expect("made-up quote", lambda: grounded('It lasts “in perpetuity” [c3] and is "mutual" [c3].', CHUNKS), ["mutual"])
+expect("the text is in a chunk that wasn't cited: wrong source", lambda: grounded('Liability is "unlimited" [c1].', CHUNKS), ["unlimited"])
+expect("no citations at all: every quote is unsupported", lambda: grounded('It says "sixty (60) days".', CHUNKS), ["sixty (60) days"])
+expect("no quotes", lambda: grounded("Sixty days' notice [c1].", CHUNKS), [])
+--- hints
+- First compute the text of the cited chunks, already normalized: `[norm(c["text"]) for c in chunks if c["id"] in cited]`.
+- For each quote: if `any(norm(q) in src for src in sources)` is False, it is unsupported.
+- Return the quote as written (`q`), not the normalized one.
+
+@@ item d19-18
+type: choice
+title: What groundedness can catch
+level: 2
+cards: Groundedness: is the quoted text real?
+--- context
+Your RAG evals include a groundedness check. When an answer passes it, you need to be able to explain to a lawyer or an interviewer what that actually shows.
+--- prompt
+In your RAG evals, `grounded(answer, chunks)` returns `[]` for an answer (no unsupported quotes found). What can you conclude?
+--- options
+- Every quoted passage in the answer can be found in a chunk it cites; but whether the conclusion is right, or whether a more important chunk was missed, this check can't tell
+- The answer is correct and can go straight to the lawyer
+- The model didn't hallucinate at all
+- Retrieval found all the relevant chunks
+answer: 1
+--- explain
+Groundedness only checks "is the quote real?". A model can quote the real text and still draw the opposite conclusion (it quotes "sixty (60) days" but says 30 days), or it can make things up without any quotation marks; this check catches neither. Retrieval missing a key chunk is a recall problem, which needs retrieval evals with known correct answers. So it is a cheap first automatic check; it can't replace an eval set and human spot checks.
+
+@@ item d19-19
+type: code
+title: A RAG answer with citations
+level: 3
+cards: Dependency injection makes RAG testable; Answers with citations
+--- context
+Put today's pieces together into a complete contract Q&A: a lawyer asks a question, and the program gives a verifiable answer with sources. The function that calls the model is passed in from outside; in the tests it is swapped for a fake one: no network, no cost, and the same result every time.
+--- prompt
+Put the RAG part of today together. Write `rag_answer(question, chunks, llm, k=2)`:
+
+1. `retrieved = top_k(question, chunks, k)` (already written; it is exercise 1)
+2. If nothing was retrieved: **don't call** `llm`; return `{"answer": "", "sources": [], "status": "no_context"}` right away
+3. Build the prompt: `INSTRUCTIONS`, an empty line, one line per retrieved chunk in the form `[c2] chunk text`, an empty line, and last the line `Question: <question>`
+4. `raw = llm(prompt)`, where `llm` is the function passed in (a fake one in the tests)
+5. Check it with `check_citations(raw, <retrieved ids>)` (already written)
+6. Return `{"answer": raw, "sources": <list of retrieved ids>, "status": <status>}`. Status: no citations → `"unsupported"`; a made-up citation → `"bad_citation"`; otherwise `"ok"`
+
+The prompt looks like this:
+
+```
+Answer only from the sources below. ...
+
+[c3] Customer may terminate ...
+[c1] Either party may ...
+
+Question: Can Customer terminate after thirty days?
+```
+--- starter
+import re
+
+INSTRUCTIONS = "Answer only from the sources below. Cite every sentence like [c1]. If the sources do not answer the question, say so."
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def top_k(query, chunks, k):
+    words = set(tokenize(query))
+    scored = [(len(words & set(tokenize(c["text"]))), c) for c in chunks]
+    scored = [pair for pair in scored if pair[0] > 0]
+    scored.sort(key=lambda pair: -pair[0])
+    return [c for _, c in scored[:k]]
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def check_citations(answer, allowed_ids):
+    cited = extract_citations(answer)
+    return {"cited": cited, "unknown": [c for c in cited if c not in allowed_ids], "uncited": len(cited) == 0}
+
+def rag_answer(question, chunks, llm, k=2):
+    pass
+--- solution
+import re
+
+INSTRUCTIONS = "Answer only from the sources below. Cite every sentence like [c1]. If the sources do not answer the question, say so."
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def top_k(query, chunks, k):
+    words = set(tokenize(query))
+    scored = [(len(words & set(tokenize(c["text"]))), c) for c in chunks]
+    scored = [pair for pair in scored if pair[0] > 0]
+    scored.sort(key=lambda pair: -pair[0])
+    return [c for _, c in scored[:k]]
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def check_citations(answer, allowed_ids):
+    cited = extract_citations(answer)
+    return {"cited": cited, "unknown": [c for c in cited if c not in allowed_ids], "uncited": len(cited) == 0}
+
+def rag_answer(question, chunks, llm, k=2):
+    retrieved = top_k(question, chunks, k)
+    if not retrieved:
+        return {"answer": "", "sources": [], "status": "no_context"}
+    ids = [c["id"] for c in retrieved]
+    lines = [f"[{c['id']}] {c['text']}" for c in retrieved]
+    prompt = INSTRUCTIONS + "\n\n" + "\n".join(lines) + "\n\nQuestion: " + question
+    raw = llm(prompt)
+    report = check_citations(raw, ids)
+    if report["uncited"]:
+        status = "unsupported"
+    elif report["unknown"]:
+        status = "bad_citation"
+    else:
+        status = "ok"
+    return {"answer": raw, "sources": ids, "status": status}
+--- tests
+CHUNKS = [
+    {"id": "c1", "text": "Either party may terminate this Agreement upon sixty days' notice."},
+    {"id": "c2", "text": "Fees are payable within thirty days of the invoice date."},
+    {"id": "c3", "text": "Customer may terminate for material breach after thirty days."},
+]
+Q = "Can Customer terminate after thirty days?"
+PROMPTS = []
+def recording_llm(prompt):
+    PROMPTS.append(prompt)
+    return "Yes, for material breach [c3]."
+expect("normal: ok, the sources are the two retrieved chunks", lambda: rag_answer(Q, CHUNKS, recording_llm), {"answer": "Yes, for material breach [c3].", "sources": ["c3", "c1"], "status": "ok"})
+def _prompt():
+    PROMPTS.clear()
+    rag_answer(Q, CHUNKS, recording_llm)
+    return PROMPTS[0]
+expect("prompt format", _prompt, INSTRUCTIONS + "\n\n[c3] Customer may terminate for material breach after thirty days.\n[c1] Either party may terminate this Agreement upon sixty days' notice.\n\nQuestion: " + Q)
+expect("cites c2, which wasn't retrieved", lambda: rag_answer(Q, CHUNKS, lambda p: "Fees are due in thirty days [c2].")["status"], "bad_citation")
+expect("no citations", lambda: rag_answer(Q, CHUNKS, lambda p: "Yes, I believe so.")["status"], "unsupported")
+CALLS = []
+def _no_context():
+    CALLS.clear()
+    result = rag_answer("GDPR?", CHUNKS, lambda p: CALLS.append(p) or "x [c1]")
+    return [result, len(CALLS)]
+expect("nothing retrieved: the model is not called", _no_context, [{"answer": "", "sources": [], "status": "no_context"}, 0])
+--- hints
+- Write the retrieval and the "nothing retrieved, return early" part first, then build the prompt: `INSTRUCTIONS + "\n\n" + "\n".join(lines) + "\n\nQuestion: " + question`.
+- Each line: `f"[{c['id']}] {c['text']}"`.
+- The order of the status checks: `uncited` first, then `unknown`; if neither is a problem, it is `"ok"`.
+
+@@ item d19-e1
+type: scratch
+title: Closed book: a graph runner with conditional edges
+exam: yes
+level: 3
+cards: Graph runner (Python version)
+--- context
+Closed book: write a graph runner with conditional edges in Python, which is what LangGraph does for you behind `graph.py`. When an interviewer asks you to explain the framework, writing it from a blank page is the most convincing answer.
+--- prompt
+Write `run_graph(nodes, edges, state, start, max_steps=10)`:
+
+- `nodes`: node name → function. The function takes the state dictionary and returns the keys to update (a dictionary)
+- `edges`: node name → the name of the next node (a string), or a routing function (it takes the state and returns the name of the next node). `"END"` means the end
+- For each node that runs: new state = old state merged with this update (**don't change** the dictionary passed in), and the node's name goes into `path`
+- On reaching END: return `{"state": <final state>, "path": path, "stop": "end"}`
+- If `max_steps` nodes have already run and END still hasn't been reached: stop and return the same structure, but with `"stop": "max_steps"`
+- If the node to run isn't in `nodes`, or the node has no outgoing edge in `edges`: `raise ValueError`
+--- solution
+def run_graph(nodes, edges, state, start, max_steps=10):
+    path = []
+    node = start
+    while node != "END":
+        if len(path) >= max_steps:
+            return {"state": state, "path": path, "stop": "max_steps"}
+        if node not in nodes or node not in edges:
+            raise ValueError(f"bad node {node!r}")
+        state = {**state, **nodes[node](state)}
+        path.append(node)
+        edge = edges[node]
+        node = edge(state) if callable(edge) else edge
+    return {"state": state, "path": path, "stop": "end"}
+--- tests
+NODES = {
+    "load": lambda s: {"clauses": ["3.1", "8.1", "10.1"]},
+    "review": lambda s: {"redlines": len(s["clauses"]) - 1},
+    "approve": lambda s: {"approved": True},
+    "export": lambda s: {"done": True},
+}
+EDGES = {"load": "review", "review": lambda s: "approve" if s["redlines"] > 0 else "export", "approve": "export", "export": "END"}
+expect("conditional edge: goes to approve", lambda: run_graph(NODES, EDGES, {}, "load")["path"], ["load", "review", "approve", "export"])
+expect("conditional edge: goes to export", lambda: run_graph({**NODES, "load": lambda s: {"clauses": ["3.1"]}}, EDGES, {}, "load")["path"], ["load", "review", "export"])
+expect("finishing in exactly max_steps steps counts as end", lambda: run_graph(NODES, EDGES, {}, "load", max_steps=4)["stop"], "end")
+def _loop():
+    start = {}
+    r = run_graph({"a": lambda s: {"n": s.get("n", 0) + 1}}, {"a": "a"}, start, "a", max_steps=4)
+    return [r["state"], r["stop"], len(r["path"]), start]
+expect("cycle: stops at max_steps and doesn't change the state passed in", _loop, [{"n": 4}, "max_steps", 4, {}])
+expect_raises("no outgoing edge", lambda: run_graph({"a": lambda s: {}}, {}, {}, "a"), ValueError)
+
+@@ item d19-e2
+type: scratch
+title: Closed book: citation report
+exam: yes
+level: 3
+cards: Answers with citations
+--- context
+Closed book: write the citation check used in RAG evals. Besides made-up ids, it also looks at chunks that were retrieved but never used: they waste tokens in the prompt (the model bills by tokens), and they may also mean retrieval isn't precise enough.
+--- prompt
+In a RAG answer, citations are written as `[c<number>]`, for example `[c2]` or `[c10]`. Write `citation_report(answer, retrieved_ids)` that returns:
+
+- `"cited"`: the citation ids in the answer (without the square brackets), in order of first appearance, duplicates removed
+- `"unknown"`: the ids in cited that are not in `retrieved_ids` (in the order of cited)
+- `"unused"`: the ids in `retrieved_ids` that are never cited (in the order of `retrieved_ids`)
+- `"status"`: no citations at all → `"unsupported"`; any unknown → `"bad_citation"`; otherwise `"ok"`
+
+Example: `citation_report("60 days [c1]. Fees [c2][c1].", ["c1", "c2", "c3"])` → `{"cited": ["c1", "c2"], "unknown": [], "unused": ["c3"], "status": "ok"}`
+--- solution
+import re
+
+def citation_report(answer, retrieved_ids):
+    cited = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in cited:
+            cited.append(cid)
+    unknown = [c for c in cited if c not in retrieved_ids]
+    unused = [c for c in retrieved_ids if c not in cited]
+    if not cited:
+        status = "unsupported"
+    elif unknown:
+        status = "bad_citation"
+    else:
+        status = "ok"
+    return {"cited": cited, "unknown": unknown, "unused": unused, "status": status}
+--- tests
+expect("normal", lambda: citation_report("60 days [c1]. Fees [c2][c1].", ["c1", "c2", "c3"]), {"cited": ["c1", "c2"], "unknown": [], "unused": ["c3"], "status": "ok"})
+expect("made-up two-digit id", lambda: citation_report("See [c12] and [c1].", ["c1", "c2"]), {"cited": ["c12", "c1"], "unknown": ["c12"], "unused": ["c2"], "status": "bad_citation"})
+expect("no citations", lambda: citation_report("Probably yes, see c1.", ["c1"]), {"cited": [], "unknown": [], "unused": ["c1"], "status": "unsupported"})
+
+@@ item d19-e3
+type: scratch
+title: Closed book: checking the quotes
+exam: yes
+level: 3
+cards: Groundedness: is the quoted text real?
+--- context
+Closed book: write the quote check. Lawyers trust quoted text the most, so every quote must be found in a chunk it cites; the resulting score can go into the eval report, next to the other metrics.
+--- prompt
+Write `groundedness(answer, chunks)`:
+
+- `chunks`: a dictionary, chunk id → chunk text, like `{"c1": "Either party may ...", "c2": "..."}`
+- Quotes: the text in the answer between straight double quotes `"…"`, with spaces at both ends removed; empty ones are ignored
+- Citations: the `[c<number>]` in the answer
+- A quote is **supported** when, after normalizing (all whitespace collapsed into single spaces, everything lowercase), it is part of some (normalized) chunk **that the answer cites**. Citing an id that isn't in chunks gives no support
+- Return `{"quotes": <number of quotes>, "unsupported": [<the unsupported quotes as written, in order of appearance>], "score": <number of supported quotes> / <number of quotes>, rounded to 2 decimal places}`; when there are no quotes, `score` is `1.0`
+--- solution
+import re
+
+def norm(s):
+    return " ".join(s.split()).lower()
+
+def groundedness(answer, chunks):
+    cited = re.findall(r"\[(c\d+)\]", answer)
+    sources = [norm(chunks[c]) for c in cited if c in chunks]
+    quotes = [q.strip() for q in re.findall(r'"([^"]*)"', answer) if q.strip()]
+    unsupported = [q for q in quotes if not any(norm(q) in s for s in sources)]
+    if not quotes:
+        return {"quotes": 0, "unsupported": [], "score": 1.0}
+    score = round((len(quotes) - len(unsupported)) / len(quotes), 2)
+    return {"quotes": len(quotes), "unsupported": unsupported, "score": score}
+--- tests
+CHUNKS = {
+    "c1": "Either party may terminate this Agreement\nupon sixty (60) days' written notice.",
+    "c2": "Customer's liability shall be unlimited.",
+}
+expect("both are supported", lambda: groundedness('It needs "Sixty (60) days\' written notice" [c1] and "terminate this Agreement upon" [c1].', CHUNKS), {"quotes": 2, "unsupported": [], "score": 1.0})
+expect("one is made up", lambda: groundedness('It needs "thirty days notice" [c1] but "liability shall be unlimited" [c2].', CHUNKS), {"quotes": 2, "unsupported": ["thirty days notice"], "score": 0.5})
+expect("wrong source, and an id that doesn't exist", lambda: groundedness('"shall be unlimited" [c1], "processed in any country" [c9], "may terminate" [c1].', CHUNKS), {"quotes": 3, "unsupported": ["shall be unlimited", "processed in any country"], "score": 0.33})
+expect("no quotes", lambda: groundedness("Sixty days [c1].", CHUNKS), {"quotes": 0, "unsupported": [], "score": 1.0})

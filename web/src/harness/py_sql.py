@@ -28,6 +28,13 @@ _MAX_ROWS = 200
 # STRING_AGG(DISTINCT x[, sep]); DATE_TRUNC / TIMESTAMP_TRUNC and DATE_DIFF / TIMESTAMP_DIFF
 # with a bare date part (MONTH, not 'MONTH'); CURRENT_TIMESTAMP() / CURRENT_DATE().
 # Not emulated: UNNEST, ARRAY, STRUCT, QUALIFY, APPROX_QUANTILES, SELECT * EXCEPT, partitions ...
+
+def _tr(zh, en):
+    """The page's language: __main__._CC_LANG is "en" when the page is in English."""
+    import __main__
+    return en if getattr(__main__, "_CC_LANG", "zh") == "en" else zh
+
+
 class BigQueryError(Exception):
     """An error BigQuery itself would report (the mock client turns it into BadRequest)."""
 
@@ -161,7 +168,7 @@ def bq_translate(sql, tables=(), datasets=("clausecheck",), default_dataset=None
 
     def string_agg(inner):
         if _re.search(r"\border\s+by\b", inner, _re.I):
-            raise BigQueryError("本页的模拟不支持 STRING_AGG(... ORDER BY ...)：在真 BigQuery 里可以这样写")
+            raise BigQueryError(_tr("本页的模拟不支持 STRING_AGG(... ORDER BY ...)：在真 BigQuery 里可以这样写", "this page's simulation does not support STRING_AGG(... ORDER BY ...); real BigQuery does"))
         m = _re.match(r"\s*DISTINCT\s+(.*)$", inner, _re.I | _re.S)
         return f"_CC_STRING_AGG_DISTINCT({m.group(1)})" if m else f"STRING_AGG({inner})"
 
@@ -185,7 +192,7 @@ def _has_time(v):
 def _unit(part):
     part = str(part)
     if not part.startswith(_PART):
-        raise BigQueryError(f"日期部件要写成不带引号的关键字，比如 MONTH，而不是字符串 {part!r}（BigQuery 会报 A valid date part name is required）")
+        raise BigQueryError(_tr(f"日期部件要写成不带引号的关键字，比如 MONTH，而不是字符串 {part!r}（BigQuery 会报 A valid date part name is required）", f"write the date part as a keyword without quotes, like MONTH, not the string {part!r} (BigQuery says: A valid date part name is required)"))
     return part[len(_PART):]
 
 
@@ -209,7 +216,7 @@ def _trunc(v, part):
     elif unit == "MINUTE":
         t = t.replace(second=0)
     elif unit != "SECOND":
-        raise BigQueryError(f"本页的模拟不支持按 {unit} 截断")
+        raise BigQueryError(_tr(f"本页的模拟不支持按 {unit} 截断", f"this page's simulation cannot truncate to {unit}"))
     # keep the input's shape: a DATE stays a DATE, a TIMESTAMP stays a TIMESTAMP
     return t.strftime("%Y-%m-%d %H:%M:%S") if _has_time(v) else t.strftime("%Y-%m-%d")
 
@@ -366,7 +373,7 @@ def table_text(columns, rows, limit=20):
     out = [line, "| " + " | ".join(str(c).ljust(w) for c, w in zip(columns, widths)) + " |", line]
     out += ["| " + " | ".join(v.ljust(w) for v, w in zip(r, widths)) + " |" for r in shown]
     out.append(line)
-    out.append(f"... 一共 {len(rows)} 行，只显示前 {limit} 行" if len(rows) > limit else f"{len(rows)} 行")
+    out.append(_tr(f"... 一共 {len(rows)} 行，只显示前 {limit} 行", f"... {len(rows)} rows in total, showing the first {limit}") if len(rows) > limit else _tr(f"{len(rows)} 行", f"{len(rows)} row" + ("" if len(rows) == 1 else "s")))
     return "\n".join(out)
 
 
@@ -390,7 +397,7 @@ def _explain(exc):
     exc = udf_error(exc) or exc
     msg = str(exc)
     if "one statement at a time" in msg:
-        return "这里一次只能写一条查询（SELECT 或 WITH ... SELECT）：去掉多余的语句或分号后面的内容"
+        return _tr("这里一次只能写一条查询（SELECT 或 WITH ... SELECT）：去掉多余的语句或分号后面的内容", "write one query at a time here (SELECT or WITH ... SELECT): remove the extra statement or whatever follows the semicolon")
     return f"{type(exc).__name__}: {msg}"
 
 
@@ -402,12 +409,12 @@ def run_sql(user_sql, spec_json="{}", setup_sql=""):
     try:
         conn = _connect(setup_sql, bq)
     except Exception as exc:  # the dataset itself is broken
-        res["error"] = "（题目环境出错，请告诉出题人）" + _explain(exc)
+        res["error"] = _tr("（题目环境出错，请告诉出题人）", "(the exercise setup failed: please tell the course author) ") + _explain(exc)
         return _json.dumps(res, ensure_ascii=False)
     tables = table_names(conn)
     tr = (lambda s: bq_translate(s, tables)) if bq else (lambda s: s)
     if not user_sql.strip():
-        res["error"] = "还没有写 SQL"
+        res["error"] = _tr("还没有写 SQL", "no SQL written yet")
         return _json.dumps(res, ensure_ascii=False)
     try:
         if check:
@@ -416,7 +423,7 @@ def run_sql(user_sql, spec_json="{}", setup_sql=""):
         else:
             got = _query(conn, tr(user_sql))
             if got is None:
-                raise _sqlite3.ProgrammingError("这条语句没有返回结果：这里要写一条 SELECT 查询")
+                raise _sqlite3.ProgrammingError(_tr("这条语句没有返回结果：这里要写一条 SELECT 查询", "this statement returns no result: write a SELECT query here"))
     except Exception as exc:
         res["error"] = _explain(exc)
         return _json.dumps(res, ensure_ascii=False)
@@ -434,20 +441,20 @@ def run_sql(user_sql, spec_json="{}", setup_sql=""):
     ordered = bool(spec.get("ordered"))
     if not check:
         same_cols = [c.lower() for c in got["columns"]] == [c.lower() for c in want["columns"]]
-        res["tests"].append({"label": "列：个数、顺序和名字（别名）都一致", "passed": same_cols,
+        res["tests"].append({"label": _tr("列：个数、顺序和名字（别名）都一致", "columns: same number, order and names (aliases)"), "passed": same_cols,
                              "got": ", ".join(got["columns"]), "expected": ", ".join(want["columns"])})
     g_rows, w_rows = got["rows"], want["rows"]
     if not ordered:
         g_rows, w_rows = sorted(g_rows, key=_sort_key), sorted(w_rows, key=_sort_key)
     same_rows = g_rows == w_rows
-    rec = {"label": ("表里的数据和期望一致" if check else "结果的行一致") + ("（顺序也要一致）" if ordered else "（不看顺序）"),
-           "passed": same_rows, "got": f"{len(got['rows'])} 行", "expected": f"{len(want['rows'])} 行"}
+    rec = {"label": (_tr("表里的数据和期望一致", "the data in the table is as expected") if check else _tr("结果的行一致", "the result rows match")) + (_tr("（顺序也要一致）", " (in the same order)") if ordered else _tr("（不看顺序）", " (order does not matter)")),
+           "passed": same_rows, "got": _tr(f"{len(got['rows'])} 行", f"{len(got['rows'])} rows"), "expected": _tr(f"{len(want['rows'])} 行", f"{len(want['rows'])} rows")}
     if not same_rows and len(g_rows) == len(w_rows):
         if not ordered or sorted(g_rows, key=_sort_key) != sorted(w_rows, key=_sort_key):
             first = next(i for i, (a, b) in enumerate(zip(g_rows, w_rows)) if a != b)
-            rec["got"] = f"第 {first + 1} 行是 {g_rows[first]}"
+            rec["got"] = _tr(f"第 {first + 1} 行是 {g_rows[first]}", f"row {first + 1} is {g_rows[first]}")
             rec["expected"] = f"{w_rows[first]}"
         else:
-            rec["got"], rec["expected"] = "行都对，但顺序不对", "按题目要求 ORDER BY"
+            rec["got"], rec["expected"] = _tr("行都对，但顺序不对", "the rows are right but in the wrong order"), _tr("按题目要求 ORDER BY", "ORDER BY as the exercise asks")
     res["tests"].append(rec)
     return _json.dumps(res, ensure_ascii=False)

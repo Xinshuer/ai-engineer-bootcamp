@@ -1,0 +1,1314 @@
+@@ day 11
+title: RAG basics: cleaning, chunking, keyword search, vector search
+lang: py
+hours: 5 hours
+--- goal
+Clean contract text, cut it into chunks, and estimate tokens; find the chunks most relevant to a question in two ways, with keywords and with embeddings (cosine similarity, top-k); put the retrieved chunks into the prompt together with their ids. This is the smallest complete version of RAG (retrieval-augmented generation). In the project it matches `playbook.py` looking up rules by topic, "one clause is one chunk" in `split.py`, and `parse.py` removing headers and footers.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, change the examples and run them
+- Pass every practice exercise (including the local task: run your own search on a real contract)
+- The 3 closed-book challenges
+- Explain in your own words why keyword search can't find the termination clause when you ask about "cancel", and why embeddings can
+
+@@ concept
+title: Why we need retrieval (RAG)
+--- body
+The model has never seen this customer's playbook, and it has never seen this contract. When there is little material, you can put all of it into the prompt (in DeepSeek mode the project puts the whole contract into the system prompt; see `full_contract` in `config.py`). Once there is a lot, it gets expensive and slow, it can go over the context length, and unrelated content makes the model miss things.
+
+**RAG** (Retrieval-Augmented Generation): **first find the few passages related to the question, put only those into the prompt, then let the model answer.**
+
+Clause Check uses the simplest kind: the model first decides the clause's topic, then calls the tool `lookup_playbook(topic)`, and `playbook.py` returns only the few rules for that topic, not the whole playbook.
+
+When you debug, remember what Day 7 said: **a retrieval error looks just like a reasoning error by the model.** First check that the passages sent to the model are the right ones.
+--- code
+PLAYBOOK = [
+    {"id": "PB-01", "topic": "liability_cap", "text": "Liability is capped at 100% of the fees paid in the prior 12 months."},
+    {"id": "PB-03", "topic": "auto_renewal", "text": "Renewal periods must not exceed 12 months."},
+    {"id": "PB-05", "topic": "payment", "text": "Payment within 30 days; no suspension without notice."},
+    {"id": "PB-07", "topic": "termination", "text": "Customer may terminate for convenience on 30 days' notice."},
+]
+
+def lookup_playbook(topic):
+    return [r for r in PLAYBOOK if r["topic"] == topic]
+
+clause = "This Agreement renews automatically for successive twenty-four (24) month periods."
+rules = lookup_playbook("auto_renewal")
+prompt = "Rules:\n" + "\n".join(f"[{r['id']}] {r['text']}" for r in rules) + "\n\nClause:\n" + clause
+print(prompt)
+print(f"\nretrieved {len(rules)} of {len(PLAYBOOK)} rules")
+
+@@ concept
+title: Cleaning text
+--- body
+Text extracted from a PDF is messy: extra spaces and line breaks, plus the header and footer that appear on every page (`CloudNotes Confidential`, `Page 3 of 12`). If you don't clean it, the footer gets mixed into the clause text, and it may even be retrieved as "relevant content".
+
+- `re.sub(r"\s+", " ", text).strip()`: every run of whitespace (spaces, line breaks, tabs) becomes one space
+- Removing headers and footers: go line by line and drop every line where the **whole line** matches a pattern like `page \d+ of \d+`. `re.fullmatch(pattern, text)` requires the whole text to match; a match in just part of it is not enough. The project's `_strip_repeated_lines` in `parse.py` is smarter: a line that repeats on most pages is treated as a header or footer and deleted
+- **Lowercase only for comparing**: use `text.lower()` when you search; when you show text to the lawyer or quote it, use the original
+--- code
+import re
+
+page = """CloudNotes Confidential
+3.2   Late Payment
+Overdue amounts accrue   interest at three percent
+(3%) per month.
+Page 3 of 12
+"""
+kept = []
+for line in page.splitlines():
+    s = line.strip()
+    if re.fullmatch(r"page \d+ of \d+", s.lower()) or s == "CloudNotes Confidential":
+        continue
+    kept.append(line)
+clean = re.sub(r"\s+", " ", " ".join(kept)).strip()
+print(repr(clean))
+print(clean.lower())
+# a sentence in the body that mentions page: the whole line is not "page <number> of <number>", so no match (None), and it is not deleted
+print(re.fullmatch(r"page \d+ of \d+", "see page 3 of the order form"))
+
+@@ concept
+title: Chunking: by structure, by length, with overlap
+--- body
+The unit of retrieval is called a **chunk**. How you cut the text decides what you can find:
+
+- **By structure**: contracts come with numbered headings, so one clause is one chunk. That is what the project's `split.py` does (the top of the file says structure-aware chunking); each chunk carries its number, its heading and its cross-references
+- **By length**: long text without structure is cut every `size` characters. Neighboring chunks **overlap** by `overlap` characters, so that a sentence cut right in half is not left incomplete on both sides. Each time, move forward by `step = size - overlap`
+- Every chunk must carry an `id` and where it came from (for example its start position `start`); citing and debugging later both rely on it
+
+The classic mistake: when `overlap >= size`, `step <= 0` and the loop never moves forward. So check the arguments first, and `raise ValueError` if they don't make sense.
+--- code
+text = "ABCDEFGHIJ"
+size, overlap = 4, 1
+step = size - overlap
+start = 0
+while True:
+    print(" " * start + text[start:start + size], "start =", start)
+    if start + size >= len(text):
+        break
+    start += step
+
+@@ concept
+title: Token estimates and budgets
+--- body
+Models charge by the **token**, and the context length is counted in tokens too. A token is a small piece cut out by the tokenizer; it is not a character, and not a word either. Before you write code, make a rough estimate:
+
+- English: about **4 characters ≈ 1 token**
+- Chinese: tokenizers differ a lot between models. OpenAI's older tokenizers often need 1–2 tokens per Chinese character; DeepSeek's docs give a rough conversion of about 0.6 tokens per Chinese character and about 0.3 tokens per English character (the official docs have the final word)
+- For exact numbers, look at the `usage` the API returns (Day 4); estimates are only for planning
+
+**Budget** = context length − system prompt and question − room left for the answer. Fill the remaining room chunk by chunk, from most relevant to least relevant, and skip what doesn't fit.
+--- code
+import math
+
+def estimate_tokens(text):
+    return math.ceil(len(text) / 4)
+
+chunks = [
+    {"id": "c3", "text": "Liability is capped at 100% of the fees paid in the prior 12 months."},
+    {"id": "c7", "text": "Either party may terminate for material breach on thirty days' notice."},
+    {"id": "c1", "text": "Definitions."},
+]
+context_window = 120
+prompt_tokens = 60
+answer_tokens = 30
+budget = context_window - prompt_tokens - answer_tokens
+print("budget:", budget)
+for c in chunks:
+    print(c["id"], len(c["text"]), "chars ->", estimate_tokens(c["text"]), "tokens")
+
+@@ concept
+title: Keyword search
+--- body
+The simplest kind of search: the more of the question's words appear in a chunk, the more relevant the chunk is.
+
+1. Split into words (tokenize): `re.findall(r"[a-z0-9]+", text.lower())`
+2. Remove the **stop words** (the, of, and: words that are everywhere and would only add noise)
+3. Score: how many **different** words from the question appear in the chunk (set intersection, Day 8)
+4. Sort by score from high to low and take the first k; drop chunks with a score of 0
+
+Python's `sorted` is **stable**: elements with equal scores keep their original order, so sorting by `-score` alone is enough. The project's rule-based review (`rule_based_review` in `review.py`) picks the topic exactly this way: it counts how many times each topic's keywords hit in the clause.
+
+The downside: it only matches the literal words. Ask about cancel and it won't find the clause that says terminate. This is called the **synonym problem**. BM25, which is common in production, is also a keyword method, just with a smarter score (rarer words score higher); the synonym problem is still there.
+--- code
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+chunks = [
+    {"id": "c1", "text": "Either party may terminate this Agreement for material breach."},
+    {"id": "c2", "text": "Fees are payable within thirty (30) days of the invoice date."},
+    {"id": "c3", "text": "Late fees accrue interest; Provider may suspend the Service."},
+]
+for q in ["When are fees payable?", "Can we cancel early?"]:
+    words = set(tokenize(q))
+    scores = {c["id"]: len(words & set(tokenize(c["text"]))) for c in chunks}
+    print(q, tokenize(q), scores)
+
+@@ concept
+title: Vectors and cosine similarity
+--- body
+Another approach: turn each piece of text into a **vector** (a list of decimal numbers). Texts with similar meanings have vectors that point in similar **directions**. To compare two directions, use **cosine similarity**:
+
+```python
+dot = sum(x * y for x, y in zip(a, b))       # dot product
+norm_a = math.sqrt(sum(x * x for x in a))    # the length of the vector
+cos = dot / (norm_a * norm_b)
+```
+
+- 1: exactly the same direction; 0: unrelated; -1: opposite directions
+- Only the direction counts, not the length: the cosine of `[1, 2]` and `[2, 4]` is 1
+- Edge case: an all-zero vector has no direction. Its length is 0, and dividing by it directly raises `ZeroDivisionError`. By convention, return `0.0`
+- Put the denominator in parentheses: `dot / norm_a * norm_b` divides first and then multiplies, and the wrong result raises no error
+--- code
+import math
+
+a = [1.0, 2.0, 0.0]
+b = [2.0, 4.0, 0.0]
+c = [0.0, 0.0, 3.0]
+
+dot_ab = sum(x * y for x, y in zip(a, b))
+norm_a = math.sqrt(sum(x * x for x in a))
+norm_b = math.sqrt(sum(x * x for x in b))
+print(dot_ab, round(norm_a, 3), round(norm_b, 3))
+print("cos(a, b) =", round(dot_ab / (norm_a * norm_b), 3))
+print("wrong    =", round(dot_ab / norm_a * norm_b, 3))
+
+dot_ac = sum(x * y for x, y in zip(a, c))
+print("cos(a, c) =", dot_ac / (norm_a * math.sqrt(sum(x * x for x in c))))
+
+@@ concept
+title: The embeddings API
+mock: yes
+--- body
+An **embedding model** turns a piece of text into a vector of fixed length, and texts with similar meanings point in similar directions. That is why asking about cancel can still find the clause that says terminate.
+
+- Request: `POST https://api.openai.com/v1/embeddings`, header `Authorization: Bearer <OPENAI_API_KEY>`, body `{"model": "text-embedding-3-small", "input": [text1, text2, ...]}`
+- Response: a `data` list; each item has `index` and `embedding`, and item i belongs to text i
+- **DeepSeek has no embeddings API.** Common choices are OpenAI's `text-embedding-3-small` (1536 dimensions), or a local embedding model loaded in LM Studio (`http://127.0.0.1:1234/v1/embeddings`, same format)
+- The mock API on this page has the same format as OpenAI's, but it is not a real model: it hashes the words (with stop words removed and a few groups of contract synonyms merged) into 256-dimensional vectors, so don't take its scores seriously
+- Compute the documents' vectors **once and store them**; for each question, compute only the question's vector. Send a batch of texts in **one request**
+--- code
+import math
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+texts = [
+    "Can we cancel the contract early?",
+    "Either party may terminate this Agreement for material breach.",
+    "Fees are payable within thirty (30) days of the invoice date.",
+]
+data = requests.post(EMBED_URL, headers=headers, json={"model": "text-embedding-3-small", "input": texts}).json()
+vectors = [d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"])]
+print(len(vectors), "vectors,", len(vectors[0]), "numbers each")
+print("usage:", data["usage"])
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+print("question vs termination:", round(cosine(vectors[0], vectors[1]), 3))
+print("question vs payment:    ", round(cosine(vectors[0], vectors[2]), 3))
+
+@@ concept
+title: Putting retrieved chunks into the prompt
+--- body
+Put the retrieved chunks into the prompt **with their ids**, and tell the model how to use them:
+
+- **Answer only from the excerpts**: the model may not fill the gaps with "most contracts work like this"
+- **Cite the ids**: when the answer contains `[c7]`, your code can check whether the excerpt it cites was really given to it, and whether the original text really says that (Day 19 writes this check)
+- **Allow "I don't know"**: much safer than making up an answer
+- Order: rules first, excerpts in the middle, the question last
+
+The code below uses a triple-quoted f-string: inside triple quotes you can break lines directly, and `{...}` is still replaced.
+--- code
+import re
+
+chunks = [
+    {"id": "c3", "text": "Either party may terminate this Agreement for material breach."},
+    {"id": "c7", "text": "Customer may terminate for convenience on 30 days' notice."},
+]
+question = "Can we cancel early?"
+excerpts = "\n".join(f"[{c['id']}] {c['text']}" for c in chunks)
+prompt = f"""Answer using ONLY the excerpts below.
+After each claim, cite the excerpt id in brackets, e.g. [c2].
+If the excerpts do not contain the answer, say: not found in the excerpts.
+
+{excerpts}
+
+Question: {question}"""
+print(prompt)
+
+answer = "Yes: the Customer may terminate for convenience on 30 days' notice [c7]."
+print("\ncited:", re.findall(r"\[(c\d+)\]", answer))
+
+@@ item d11-01
+type: code
+title: Recap: read the documents in
+level: 1
+cards: Why we need retrieval (RAG); d10:Folders: mkdir, glob, and the current directory
+--- context
+Today you build a small "ask the contract" tool with RAG (first find the few relevant passages, then let the model answer only from them). The first step is reading the material in: in this exercise each `.txt` file is one document, and its file name is its name.
+--- prompt
+The first step of RAG is reading the material in (a review of Day 10). Write `load_docs(folder)`: read every `.txt` file in the folder, **sorted by file name**, and return `[{"id": the file name without its extension, "text": the file's contents}, ...]`. If the folder does not exist, return `[]`.
+
+Example: `termination.txt` → `{"id": "termination", "text": "..."}`
+--- starter
+from pathlib import Path
+
+def load_docs(folder):
+    pass
+--- solution
+from pathlib import Path
+
+def load_docs(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    return [{"id": p.stem, "text": p.read_text(encoding="utf-8")} for p in sorted(folder.glob("*.txt"))]
+--- tests
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d11/docs", ignore_errors=True)
+_d = Path("work/d11/docs")
+_d.mkdir(parents=True)
+(_d / "termination.txt").write_text("Customer may terminate on 30 days' notice.", encoding="utf-8")
+(_d / "liability.txt").write_text("Liability is capped at 12 months of fees.", encoding="utf-8")
+(_d / "readme.md").write_text("# not a document", encoding="utf-8")
+expect("sorted by file name, .txt only", lambda: load_docs("work/d11/docs"), [
+    {"id": "liability", "text": "Liability is capped at 12 months of fees."},
+    {"id": "termination", "text": "Customer may terminate on 30 days' notice."},
+])
+expect("folder does not exist", lambda: load_docs("work/d11/nothing"), [])
+--- hints
+- `sorted(Path(folder).glob("*.txt"))` puts them in order by name; read a file with `.read_text(encoding="utf-8")`.
+- The file name without its extension is `.stem`.
+
+@@ item d11-02
+type: choice
+title: The model says the contract doesn't cover it
+level: 1
+cards: Why we need retrieval (RAG)
+--- context
+Today's "ask the contract" tool first retrieves a few relevant passages of the original text, then has the model answer only from them. This is what happened the first time it answered wrongly.
+--- prompt
+You built a small "ask the contract" tool: it first retrieves the 3 most relevant excerpts, then has the model answer only from those excerpts. A user asks "Can we cancel the contract early?", and the model answers "the excerpts don't mention it". But clause 11.2 of the sample contract clearly says Customer may terminate this Agreement only at the end of the then-current Term, which answers exactly this question (you can't end it early). What should you do first?
+--- options
+- Switch to a smarter model
+- Add "please read carefully" to the prompt
+- Print the 3 excerpts retrieved this time and see whether 11.2 is among them
+- Set temperature to 0
+answer: 3
+--- explain
+The model only sees the excerpts you give it. If retrieval didn't find 11.2, the model is actually right to say "not mentioned": this is a **retrieval error disguised as a reasoning error** (Day 7's "check the input first"). This example also has a typical cause: the user says cancel, the contract says terminate, and keyword search can't match the two. The embeddings in the second half of today are there for exactly this.
+
+@@ item d11-03
+type: code
+title: Clean a page of PDF text
+level: 2
+cards: Cleaning text
+--- context
+Contract text extracted from a PDF has the page number from every page mixed in, along with messy spaces and line breaks. If you don't clean them out first, page numbers get mixed into the clause text and may even be retrieved as relevant content. The real project's `parse.py` also removes headers and footers first.
+--- prompt
+Write `clean(text)` to clean one page of text extracted from a PDF:
+
+1. Go line by line: after removing the whitespace at both ends and converting to lowercase, delete every line where the **whole line** is `page <number> of <number>`, for example `Page 3 of 12`, `PAGE 1 OF 2`
+2. Join the remaining lines with spaces, turn every run of whitespace (spaces, line breaks, tabs) into one space, then remove the whitespace at both ends
+
+Example: `clean("3.2  Late\nPayment\nPage 3 of 12\n")` → `"3.2 Late Payment"`
+--- starter
+import re
+
+def clean(text):
+    pass
+--- solution
+import re
+
+FOOTER = re.compile(r"page \d+ of \d+")
+
+def clean(text):
+    kept = [line for line in text.splitlines() if not FOOTER.fullmatch(line.strip().lower())]
+    return re.sub(r"\s+", " ", " ".join(kept)).strip()
+--- tests
+PAGE = "CloudNotes SaaS Agreement\n3.2   Late Payment\nOverdue amounts accrue\tinterest at three percent\n\n(3%) per month.\n   Page 3 of 12  \n"
+expect("removes the page-number line, merges whitespace", lambda: clean(PAGE), "CloudNotes SaaS Agreement 3.2 Late Payment Overdue amounts accrue interest at three percent (3%) per month.")
+expect("an uppercase page-number line is removed too", lambda: clean("PAGE 1 OF 2\nFees are payable."), "Fees are payable.")
+expect("a sentence in the text that mentions page must stay", lambda: clean("See page 3 of the Order Form."), "See page 3 of the Order Form.")
+expect("empty string", lambda: clean(""), "")
+--- hints
+- First split the text into lines with `text.splitlines()`, and keep the lines that are "not page-number lines".
+- To check the whole line: `re.fullmatch(r"page \d+ of \d+", line.strip().lower())`; if it matches (is not `None`), skip the line.
+- Finally `re.sub(r"\s+", " ", " ".join(kept)).strip()`.
+
+@@ item d11-04
+type: code
+title: Chunk by length, with overlap
+level: 2
+cards: Chunking: by structure, by length, with overlap
+--- context
+The unit of retrieval is called a "chunk". Some material has no numbered headings to cut at, for example a very long negotiation email. It can only be cut by length into small chunks, which are then searched.
+--- prompt
+Write `chunk_fixed(text, size, overlap)`:
+
+- The first chunk starts at position 0; each time, move forward by `step = size - overlap`
+- Each chunk is `{"id": "c1", "start": start position, "text": text[start:start + size]}`; the ids start at `c1`
+- Once a chunk reaches the end of the text (`start + size >= len(text)`), stop; don't cut another chunk
+- If `text` is empty, return `[]`
+- If the arguments don't make sense, `raise ValueError`: `size <= 0`, `overlap < 0`, `overlap >= size`
+
+Example: `chunk_fixed("abcdefghij", 4, 1)` cuts three chunks, with the texts `"abcd"`, `"defg"`, `"ghij"`.
+--- starter
+def chunk_fixed(text, size, overlap):
+    chunks = []
+    return chunks
+--- solution
+def chunk_fixed(text, size, overlap):
+    if size <= 0 or overlap < 0 or overlap >= size:
+        raise ValueError(f"bad size/overlap: {size}/{overlap}")
+    chunks = []
+    if not text:
+        return chunks
+    step = size - overlap
+    start = 0
+    while True:
+        chunks.append({"id": f"c{len(chunks) + 1}", "start": start, "text": text[start:start + size]})
+        if start + size >= len(text):
+            break
+        start += step
+    return chunks
+--- tests
+texts = lambda chunks: [c["text"] for c in chunks]
+expect("overlap of 1 character", lambda: texts(chunk_fixed("abcdefghij", 4, 1)), ["abcd", "defg", "ghij"])
+expect("the whole second chunk", lambda: chunk_fixed("abcdefghij", 4, 1)[1], {"id": "c2", "start": 3, "text": "defg"})
+expect("no overlap, the last chunk is shorter", lambda: texts(chunk_fixed("abcdefghij", 4, 0)), ["abcd", "efgh", "ij"])
+expect("text shorter than size", lambda: chunk_fixed("abc", 10, 2), [{"id": "c1", "start": 0, "text": "abc"}])
+expect("empty text", lambda: chunk_fixed("", 4, 1), [])
+expect_raises("overlap >= size", lambda: chunk_fixed("abcdef", 4, 4), ValueError)
+expect_raises("size is 0", lambda: chunk_fixed("abcdef", 0, 0), ValueError)
+--- hints
+- Put the argument check first: `if size <= 0 or overlap < 0 or overlap >= size: raise ValueError(...)`.
+- Use `while True:`: first cut a chunk and add it to the list, then if `start + size >= len(text)`, `break`; otherwise `start += size - overlap`.
+- Work out the id before adding the chunk to the list: `f"c{len(chunks) + 1}"`.
+
+@@ item d11-05
+type: fix
+title: Fix the bug: extra chunks at the end
+level: 2
+cards: Chunking: by structure, by length, with overlap; d9:Common bug patterns
+--- context
+A colleague wrote chunking by word count, and the chunks are stored for later searches. Every extra chunk takes up storage and search time, and it costs extra tokens if it gets picked for the prompt.
+--- prompt
+A colleague wrote `chunk_words(words, size, overlap)`, which chunks by **words**: `size` words per chunk, with neighboring chunks overlapping by `overlap` words. But there are always one or two extra chunks at the end whose content is fully contained in the chunk before. They get hit a second time in searches and waste tokens.
+
+Run it, compare Expected and Got in the test results, and fix it: once a chunk reaches the end, don't cut any more.
+--- starter
+def chunk_words(words, size, overlap):
+    step = size - overlap
+    chunks = []
+    for start in range(0, len(words), step):
+        chunks.append(words[start:start + size])
+    return chunks
+--- solution
+def chunk_words(words, size, overlap):
+    step = size - overlap
+    chunks = []
+    for start in range(0, len(words), step):
+        chunks.append(words[start:start + size])
+        if start + size >= len(words):
+            break
+    return chunks
+--- tests
+W = "either party may terminate this agreement for material breach".split()
+expect("9 words, 4 per chunk, overlap 2", lambda: chunk_words(W, 4, 2), [
+    ["either", "party", "may", "terminate"],
+    ["may", "terminate", "this", "agreement"],
+    ["this", "agreement", "for", "material"],
+    ["for", "material", "breach"],
+])
+expect("5 words, 3 per chunk, overlap 1", lambda: chunk_words(["a", "b", "c", "d", "e"], 3, 1), [["a", "b", "c"], ["c", "d", "e"]])
+expect("without overlap it comes out exactly", lambda: chunk_words(["a", "b", "c", "d"], 2, 0), [["a", "b"], ["c", "d"]])
+--- hints
+- `range(0, len(words), step)` keeps going all the way to the end, even when the previous chunk already contains the last word.
+- After adding each chunk, check: `if start + size >= len(words): break`.
+
+@@ item d11-06
+type: choice
+title: How big should a chunk be?
+level: 2
+cards: Chunking: by structure, by length, with overlap
+--- context
+Chunk size is the first parameter you have to decide when you build retrieval, and interviews often ask about it.
+--- prompt
+In contract retrieval, what is the most likely problem with chunks that are **too big** (say 3000 characters each), and with chunks that are **too small** (say 50 characters each)?
+--- options
+- Too big: one chunk mixes several things, the relevant sentence is diluted by unrelated content, and putting it into the prompt costs a lot of tokens; too small: sentences are cut to pieces and a chunk on its own makes no sense (for example "Subject to Section 12" ends up in another chunk)
+- Too big: the model raises an error; too small: search gets much slower
+- Chunk size doesn't affect how well retrieval works, only the cost
+- Too big: nothing can be found; too small: every search hits exactly
+answer: 1
+--- explain
+Chunk size is a trade-off between "precise" and "complete". Contracts have a numbered structure, so Clause Check simply uses "one clause, one chunk" (`split.py`): each chunk is naturally one complete thing, and it carries its cross-references too. Fixed length plus overlap is only for long text without structure. The exact size should be decided by comparing with evals (Day 13), not by guessing.
+
+@@ item d11-07
+type: testwrite
+title: Write tests: token estimate
+level: 2
+cards: Token estimates and budgets; d9:How to come up with test cases
+--- context
+Before you put material into the prompt, first estimate roughly how long it is: models charge by the token, and the length they can read at once has a limit. If the estimate is wrong, you either go over the limit and get an error, or waste space.
+--- prompt
+The `estimate_tokens(text)` below estimates tokens with a rough rule: **each Chinese character counts as 1, every 4 other characters count as 1, and the total is rounded up**; an empty string is 0. (`[\u4e00-\u9fff]` is the range of common Chinese characters.)
+
+Write tests for it the Day 9 way, and catch every version with a planted bug. First think of several cases: English only with exactly 4 characters, 5 characters, Chinese only, Chinese mixed with English, and the empty string.
+--- impl
+import math
+import re
+
+def estimate_tokens(text):
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    other = len(text) - cjk
+    return math.ceil(cjk + other / 4)
+--- mutants
+===== Rounding: how many tokens should 5 English characters be?
+import math
+import re
+
+def estimate_tokens(text):
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    other = len(text) - cjk
+    return (cjk * 4 + other) // 4
+===== Chinese: Chinese characters are not counted separately
+import math
+import re
+
+def estimate_tokens(text):
+    return math.ceil(len(text) / 4)
+===== Edge case: the empty string
+import math
+import re
+
+def estimate_tokens(text):
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    other = len(text) - cjk
+    return max(1, math.ceil(cjk + other / 4))
+--- starter
+def test_four_letters_is_one_token():
+    assert estimate_tokens("abcd") == 1
+--- solution
+def test_four_letters_is_one_token():
+    assert estimate_tokens("abcd") == 1
+
+def test_five_letters_round_up():
+    assert estimate_tokens("abcde") == 2
+
+def test_chinese_one_token_per_char():
+    assert estimate_tokens("律师") == 2  # keep-zh
+
+def test_mixed():
+    assert estimate_tokens("律师 ok") == 3  # keep-zh
+
+def test_empty_is_zero():
+    assert estimate_tokens("") == 0
+--- hints
+- Each `test_` function tests only one case: `assert estimate_tokens("...") == expected_value`.
+- Test "divides exactly" once and "one character more" once; only then can you tell whether it rounds up or down.
+- Don't forget Chinese-only text and the empty string.
+
+@@ item d11-08
+type: fill
+title: Fill in: pack chunks within the budget
+level: 2
+cards: Token estimates and budgets
+--- context
+The chunks that retrieval returns are already sorted by relevance, but the prompt can only hold so many tokens, and you still have to leave room for the system prompt and the model's answer.
+--- prompt
+Complete `pack_chunks(chunks, budget)`: `chunks` is already sorted from most to least relevant. Put the chunks into the prompt in order; the estimated total of tokens **must not exceed** `budget` (exactly equal is fine). If a chunk doesn't fit, **skip** it and go on with the later chunks, which may be smaller. Return the chunks that went in (in their original order).
+--- template
+import math
+
+def estimate_tokens(text):
+    return math.ceil(len(text) / 4)
+
+def pack_chunks(chunks, budget):
+    picked = []
+    used = 0
+    for c in chunks:
+        cost = estimate_tokens(c["text"])
+        if used + cost [[>]] budget:
+            [[continue]]
+        picked.append(c)
+        used [[+=]] cost
+    return picked
+--- tests
+C = [
+    {"id": "c3", "text": "x" * 16},
+    {"id": "c7", "text": "x" * 32},
+    {"id": "c1", "text": "x" * 12},
+    {"id": "c9", "text": "x" * 8},
+]
+ids = lambda cs: [c["id"] for c in cs]
+expect("the four chunks are 4, 8, 3 and 2 tokens; budget 7: skip the one that doesn't fit", lambda: ids(pack_chunks(C, 7)), ["c3", "c1"])
+expect("budget 9: using it up exactly is fine", lambda: ids(pack_chunks(C, 9)), ["c3", "c1", "c9"])
+expect("budget 0", lambda: ids(pack_chunks(C, 0)), [])
+expect("a big enough budget: everything goes in", lambda: ids(pack_chunks(C, 100)), ["c3", "c7", "c1", "c9"])
+--- hints
+- "Must not exceed" means: when `used + cost > budget`, the chunk doesn't fit (exactly equal is fine).
+- Not fitting means "skip this chunk and go on to the next one", not ending the whole loop.
+- `used` has to add up as you go.
+
+@@ item d11-09
+type: predict
+title: Tokenizing and keyword overlap
+level: 2
+cards: Keyword search
+--- context
+Keyword search first splits both the lawyer's question and the clause text into words, then compares which words the two have in common.
+--- prompt
+Write the output. Watch the upper and lower case, the punctuation, `'s`, and cancel and terminate in the last line.
+--- code
+import re
+
+STOP = {"the", "a", "of", "to", "and", "is", "in", "we", "can"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+q = "Can we TERMINATE the agreement?"
+c = "Either party may terminate this Agreement for material breach."
+print(tokenize(q))
+print(sorted(set(tokenize(q)) & set(tokenize(c))))
+print(tokenize("Customer's fees: 30 days"))
+print(len(set(tokenize("Cancel early")) & set(tokenize(c))))
+--- explain
+`lower()` runs before the words are found, so `TERMINATE` matches `terminate`, and `Agreement` matches `agreement`; punctuation is thrown away, and `Customer's` is split into `customer` and `s`. The last line is 0: cancel and terminate mean the same thing, but to keyword search they have nothing to do with each other.
+
+@@ item d11-10
+type: code
+title: Tokenizing and keyword scoring
+level: 2
+cards: Keyword search
+--- context
+Lawyers ask their questions in English, and the program has to find the most relevant clauses in the contract. The real project's rule-based review, which calls no model (`rule_based_review`), also counts keyword hits to decide which topic a clause belongs to.
+--- prompt
+Write two functions:
+
+- `tokenize(text)`: convert to lowercase, pull out the words with `re.findall(r"[a-z0-9]+", ...)`, remove the stop words in `STOP`, and return a list (keep the order, **don't remove duplicates**)
+- `keyword_score(query, text)`: `tokenize` both first, then return how many **different** words from `query` appear in `text`
+
+Example: `keyword_score("fees payable fees", "Fees are payable within 30 days")` → `2` (`fees` counts only once)
+--- starter
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    pass
+
+def keyword_score(query, text):
+    pass
+--- solution
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+def keyword_score(query, text):
+    return len(set(tokenize(query)) & set(tokenize(text)))
+--- tests
+expect("lowercase, no punctuation, no stop words", lambda: tokenize("Fees are payable within thirty (30) days."), ["fees", "payable", "within", "thirty", "30", "days"])
+expect("repeated words are kept", lambda: tokenize("fee FEE"), ["fee", "fee"])
+expect("empty text", lambda: tokenize(""), [])
+expect("only different words count", lambda: keyword_score("fees payable fees", "Fees are payable within 30 days"), 2)
+expect("synonyms don't match", lambda: keyword_score("Can we cancel early?", "Either party may terminate this Agreement."), 0)
+--- hints
+- `re.findall(r"[a-z0-9]+", text.lower())` pulls out all the words; then keep the ones that are `not in STOP` with a list comprehension.
+- For "different words", use sets: `set(tokenize(query)) & set(tokenize(text))`, then take `len(...)`.
+
+@@ item d11-11
+type: code
+title: Keyword top-k
+level: 3
+cards: Keyword search; d8:Sorting by several keys
+--- context
+After scoring, only the few most relevant chunks go into the prompt, and the model doesn't see the rest: this saves tokens and keeps unrelated content from distracting it.
+--- prompt
+Write `top_k(query, chunks, k)`: score each chunk's `text` with `keyword_score` (already written), and return the list of `id`s of the `k` chunks with the highest scores:
+
+- From high score to low; **on a tie, keep the original order in `chunks`** (don't sort by id: sorted as strings, `"c10"` comes before `"c2"`)
+- Drop chunks with a score of 0
+- If there are fewer than `k` chunks, return as many as there are
+--- starter
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+def keyword_score(query, text):
+    return len(set(tokenize(query)) & set(tokenize(text)))
+
+def top_k(query, chunks, k):
+    pass
+--- solution
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+def keyword_score(query, text):
+    return len(set(tokenize(query)) & set(tokenize(text)))
+
+def top_k(query, chunks, k):
+    scored = []
+    for c in chunks:
+        score = keyword_score(query, c["text"])
+        if score > 0:
+            scored.append((score, c["id"]))
+    scored = sorted(scored, key=lambda pair: -pair[0])
+    return [cid for score, cid in scored[:k]]
+--- tests
+CHUNKS = [
+    {"id": "c10", "text": "Late fees accrue interest; unpaid fees may lead to suspension."},
+    {"id": "c2", "text": "Fees are payable within thirty (30) days of the invoice date."},
+    {"id": "c3", "text": "Either party may terminate this Agreement for material breach."},
+    {"id": "c1", "text": "Fees are invoiced annually in advance."},
+    {"id": "c4", "text": "Payable fees are non-refundable."},
+]
+expect("the top 3", lambda: top_k("When are fees payable?", CHUNKS, 3), ["c2", "c4", "c10"])
+expect("ties keep the original order, score 0 is dropped", lambda: top_k("When are fees payable?", CHUNKS, 10), ["c2", "c4", "c10", "c1"])
+expect("nothing relevant", lambda: top_k("Can we cancel early?", CHUNKS, 3), [])
+expect("k is 1", lambda: top_k("terminate for breach", CHUNKS, 1), ["c3"])
+--- hints
+- First collect `(score, id)` pairs, only for scores above 0.
+- `sorted` is stable: `sorted(scored, key=lambda pair: -pair[0])` sorts only by score from high to low, and ties automatically keep the original order.
+- Finally slice `[:k]`, then take out the ids.
+
+@@ item d11-12
+type: predict
+title: Cosine similarity
+level: 2
+cards: Vectors and cosine similarity
+--- context
+Another way to search: turn each piece of text into a list of decimal numbers (a vector). The closer the meanings of two texts, the closer the directions of their vectors. This code measures how close two directions are.
+--- prompt
+Write the output. First think it through in your head: what is it for the same direction, for directions at right angles, and for opposite directions?
+--- code
+import math
+
+def cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+print(cosine([3, 4], [3, 4]))
+print(cosine([3, 4], [6, 8]))
+print(cosine([1, 0], [0, 5]))
+print(cosine([1, 0], [-2, 0]))
+print(round(cosine([1, 1], [1, 0]), 3))
+print(cosine([0, 0], [1, 2]))
+--- explain
+`[3, 4]` and `[6, 8]` point the same way and differ only in length, so the cosine is still 1.0; `[1, 0]` and `[0, 5]` are at right angles, so it is 0.0; opposite directions give -1.0; a 45-degree angle gives about 0.707. An all-zero vector has no direction, so by convention it returns 0.0 instead of failing with a division by zero.
+
+@@ item d11-13
+type: code
+title: Dot product, length, cosine
+level: 2
+cards: Vectors and cosine similarity
+--- context
+The core of vector search is this similarity function: for every question, the question's vector is compared with the vector of every chunk. If it computes something wrong, there is no error; it just quietly puts unrelated chunks at the top.
+--- prompt
+Write three functions:
+
+- `dot(a, b)`: the dot product. When the two vectors have **different lengths**, `raise ValueError`. `zip` quietly stops at the shorter one, and different lengths usually mean you mixed up two different embedding models, so it must fail loudly
+- `norm(a)`: the length of the vector, `math.sqrt(the sum of the squares of all the numbers)`
+- `cosine(a, b)`: `dot(a, b) / (norm(a) * norm(b))`; return `0.0` when either length is 0
+
+The tests compare decimals with `round(..., 3)`.
+--- starter
+import math
+
+def dot(a, b):
+    pass
+
+def norm(a):
+    pass
+
+def cosine(a, b):
+    pass
+--- solution
+import math
+
+def dot(a, b):
+    if len(a) != len(b):
+        raise ValueError(f"vector lengths differ: {len(a)} vs {len(b)}")
+    return sum(x * y for x, y in zip(a, b))
+
+def norm(a):
+    return math.sqrt(sum(x * x for x in a))
+
+def cosine(a, b):
+    na = norm(a)
+    nb = norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot(a, b) / (na * nb)
+--- tests
+expect("dot product", lambda: dot([1, 2, 3], [4, 5, 6]), 32)
+expect_raises("different lengths must raise an error", lambda: dot([1, 2], [1, 2, 3]), ValueError)
+expect("length", lambda: norm([3, 4]), 5.0)
+expect("same direction", lambda: round(cosine([1, 2, 0], [2, 4, 0]), 3), 1.0)
+expect("45 degrees", lambda: round(cosine([1, 1], [1, 0]), 3), 0.707)
+expect("a zero vector returns 0.0", lambda: cosine([0, 0], [1, 2]), 0.0)
+--- hints
+- `dot`: first compare `len(a) != len(b)` and raise if they differ, then `sum(x * y for x, y in zip(a, b))`.
+- `cosine`: compute both lengths first, and `return 0.0` if either one is 0; put the denominator in parentheses: `dot(a, b) / (na * nb)`.
+
+@@ item d11-14
+type: fix
+title: Fix the bug: the embeddings API returns 400
+level: 2
+mock: yes
+cards: The embeddings API; d4:Status codes and retries
+--- context
+Vector search first turns each piece of text into a vector, which takes a call to a dedicated vector API (embeddings). This exercise talks to a mock API whose requests and responses have the same format as the real one.
+--- prompt
+This code is meant to get the embedding of a piece of text. The person who wrote it normally only uses DeepSeek, so they adapted their chat API code. Run it, look at the printed status code and the server's error message, and fix it.
+--- starter
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+
+def embed(text):
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+    body = {"model": "deepseek-flash", "input": text}
+    resp = requests.post(EMBED_URL, headers=headers, json=body)
+    print(resp.status_code, resp.json())
+    return resp.json()["data"][0]["embedding"]
+--- solution
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+
+def embed(text):
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+    body = {"model": "text-embedding-3-small", "input": text}
+    resp = requests.post(EMBED_URL, headers=headers, json=body)
+    print(resp.status_code)
+    return resp.json()["data"][0]["embedding"]
+--- tests
+expect("returns 256 decimal numbers", lambda: len(embed("Either party may terminate this Agreement.")), 256)
+expect("the same as the mock API computes", lambda: embed("Fees are payable within 30 days.") == MOCK.embed("Fees are payable within 30 days."), True)
+expect("the request uses an embedding model", lambda: (embed("x"), "embedding" in MOCK.calls[-1]["body"]["model"])[1], True)
+--- hints
+- Status code 400, and the error message says the model does not exist: `deepseek-flash` is a chat model. **DeepSeek has no embeddings API**, so you need an embedding model here.
+- Change `"model"` to `"text-embedding-3-small"`; then change the print so it prints only the status code (on success the response holds 256 decimal numbers, which is too long).
+
+@@ item d11-15
+type: code
+title: Get a batch of vectors in one request
+level: 2
+mock: yes
+cards: The embeddings API; d4:Sending requests with requests
+--- context
+A contract has dozens of clauses, and each one has to become a vector. That is the first step in building vector search; after that, every question is compared against these vectors.
+--- prompt
+Write `embed_texts(texts)`: get the embeddings of a batch of texts in **one request**, and return a list of vectors in the same order as `texts`.
+
+- Request body `{"model": "text-embedding-3-small", "input": texts}`; pass the whole list as `input`
+- Each item of `data` in the response has `index` and `embedding`: sort by `index`, then take `embedding`; don't assume the order
+- If `texts` is empty: return `[]` right away, **without sending a request**
+- If the request fails, call `resp.raise_for_status()`; it raises `requests.HTTPError`
+
+Why send a whole batch at once? Sending 100 chunks as 100 requests is slow and easily runs into 429; a batch needs only one round trip.
+--- starter
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    pass
+--- solution
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    body = {"model": "text-embedding-3-small", "input": texts}
+    resp = requests.post(EMBED_URL, headers=HEADERS, json=body)
+    resp.raise_for_status()
+    items = sorted(resp.json()["data"], key=lambda d: d["index"])
+    return [d["embedding"] for d in items]
+--- tests
+TEXTS = ["Fees are payable within 30 days.", "Either party may terminate.", "Liability is capped."]
+def _batch():
+    MOCK.reset()
+    vectors = embed_texts(TEXTS)
+    return [len(vectors), len(MOCK.calls), MOCK.calls[0]["body"]["input"]]
+expect("three texts, only one request", _batch, [3, 1, TEXTS])
+expect("same order as the input", lambda: embed_texts(TEXTS)[1] == MOCK.embed(TEXTS[1]), True)
+def _empty():
+    MOCK.reset()
+    return [embed_texts([]), len(MOCK.calls)]
+expect("empty list: no request", _empty, [[], 0])
+def _fail():
+    MOCK.reset()
+    MOCK.fail_next(503)
+    return embed_texts(TEXTS)
+expect_raises("a server error must raise HTTPError", _fail, requests.HTTPError)
+--- hints
+- Handle the empty list first: `if not texts: return []`.
+- After sending the request, call `resp.raise_for_status()` first; `resp.json()["data"]` is a list: sort it with `sorted(..., key=lambda d: d["index"])`, then `[d["embedding"] for d in ...]`.
+
+@@ item d11-16
+type: code
+title: Semantic search top-k
+level: 3
+mock: yes
+cards: The embeddings API; Vectors and cosine similarity; Keyword search
+--- context
+Keyword search only matches the literal words, so when the lawyer's wording differs from the contract's, it finds nothing. Searching by meaning is the most common approach in RAG systems, and a common interview topic too.
+--- prompt
+Write `semantic_top_k(query, chunks, k)`, which finds the most relevant chunks with embeddings:
+
+1. Use `embed_texts` (already written) to get the vectors of all the chunks and the question in **one** call: put the question last in the list, `embed_texts([...each chunk's text..., query])`
+2. Use `cosine` (already written) to compute the similarity between the question's vector and each chunk's vector
+3. Sort from high to low, with ties keeping the original order, and return the `id`s of the first `k` chunks
+4. If `chunks` is empty, return `[]`
+
+The tests make a comparison: asked "Can we cancel the contract early?", keyword search finds no chunk at all, while your function finds the termination clause.
+--- starter
+import math
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    resp = requests.post(EMBED_URL, headers=HEADERS, json={"model": "text-embedding-3-small", "input": texts})
+    resp.raise_for_status()
+    return [d["embedding"] for d in sorted(resp.json()["data"], key=lambda d: d["index"])]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+def semantic_top_k(query, chunks, k):
+    pass
+--- solution
+import math
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    resp = requests.post(EMBED_URL, headers=HEADERS, json={"model": "text-embedding-3-small", "input": texts})
+    resp.raise_for_status()
+    return [d["embedding"] for d in sorted(resp.json()["data"], key=lambda d: d["index"])]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+def semantic_top_k(query, chunks, k):
+    if not chunks:
+        return []
+    vectors = embed_texts([c["text"] for c in chunks] + [query])
+    q = vectors[-1]
+    scored = [(cosine(q, v), c["id"]) for c, v in zip(chunks, vectors[:-1])]
+    scored = sorted(scored, key=lambda pair: -pair[0])
+    return [cid for score, cid in scored[:k]]
+--- tests
+import re
+CHUNKS = [
+    {"id": "c1", "text": "Fees are payable within thirty (30) days of the invoice date."},
+    {"id": "c2", "text": "Each party's liability is capped at the fees paid in the prior 12 months."},
+    {"id": "c3", "text": "Either party may terminate this Agreement for material breach on thirty days' written notice."},
+    {"id": "c4", "text": "Confidentiality obligations survive for five years."},
+]
+Q = "Can we cancel the contract early?"
+def _keyword_ids(query, chunks):
+    words = set(re.findall(r"[a-z0-9]+", query.lower())) - {"can", "we", "the"}
+    return [c["id"] for c in chunks if words & set(re.findall(r"[a-z0-9]+", c["text"].lower()))]
+expect("for comparison: keyword search finds no chunk at all", lambda: _keyword_ids(Q, CHUNKS), [])
+expect("embeddings: the top result is the termination clause", lambda: semantic_top_k(Q, CHUNKS, 1), ["c3"])
+expect("asking about payment: the top result is the payment clause", lambda: semantic_top_k("When do we have to pay the invoice?", CHUNKS, 2)[0], "c1")
+def _one_call():
+    MOCK.reset()
+    semantic_top_k(Q, CHUNKS, 2)
+    return len(MOCK.calls)
+expect("only one embeddings request", _one_call, 1)
+expect("no chunks", lambda: semantic_top_k(Q, [], 3), [])
+--- hints
+- `vectors = embed_texts([c["text"] for c in chunks] + [query])`; the question's vector is `vectors[-1]`, and the chunks' vectors are `vectors[:-1]`.
+- Pair each chunk with its vector using `zip(chunks, vectors[:-1])`, and compute `(similarity, id)`.
+- Sorting works the same as in keyword top-k: `sorted(..., key=lambda pair: -pair[0])`, then slice `[:k]`.
+
+@@ item d11-17
+type: code
+title: Compute vectors only once: save them as an index
+level: 3
+mock: yes
+cards: The embeddings API; d10:JSON files: load and dump
+--- context
+Contracts rarely change, but lawyers ask questions again and again. Vectors computed ahead of time and saved to a file are called an "index". It is like the index at the back of a book: to look something up, you don't reread the whole book.
+--- prompt
+In real systems, the documents' vectors are computed **only once** and stored; each question computes only the question's vector. Write two functions:
+
+- `build_index(chunks, path)`: compute the vectors of all the chunks at once with `embed_texts`, write `[{"id": ..., "text": ..., "vector": [...]}, ...]` to a JSON file (create the parent folder automatically), and return the number of chunks written
+- `search(path, query, k)`: read the index file, call `embed_texts([query])` once **only for the question**, and return the `id`s of the first `k` chunks by `cosine` from high to low (ties keep the original order)
+
+`embed_texts` and `cosine` are already written.
+--- starter
+import json
+import math
+import os
+from pathlib import Path
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    resp = requests.post(EMBED_URL, headers=HEADERS, json={"model": "text-embedding-3-small", "input": texts})
+    resp.raise_for_status()
+    return [d["embedding"] for d in sorted(resp.json()["data"], key=lambda d: d["index"])]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+def build_index(chunks, path):
+    pass
+
+def search(path, query, k):
+    pass
+--- solution
+import json
+import math
+import os
+from pathlib import Path
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    resp = requests.post(EMBED_URL, headers=HEADERS, json={"model": "text-embedding-3-small", "input": texts})
+    resp.raise_for_status()
+    return [d["embedding"] for d in sorted(resp.json()["data"], key=lambda d: d["index"])]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+def build_index(chunks, path):
+    vectors = embed_texts([c["text"] for c in chunks])
+    rows = [{"id": c["id"], "text": c["text"], "vector": v} for c, v in zip(chunks, vectors)]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    return len(rows)
+
+def search(path, query, k):
+    rows = json.loads(Path(path).read_text(encoding="utf-8"))
+    q = embed_texts([query])[0]
+    ranked = sorted(rows, key=lambda r: -cosine(q, r["vector"]))
+    return [r["id"] for r in ranked[:k]]
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d11/index", ignore_errors=True)
+CHUNKS = [
+    {"id": "c1", "text": "Fees are payable within thirty (30) days of the invoice date."},
+    {"id": "c2", "text": "Each party's liability is capped at the fees paid in the prior 12 months."},
+    {"id": "c3", "text": "Either party may terminate this Agreement for material breach on thirty days' written notice."},
+    {"id": "c4", "text": "Confidentiality obligations survive for five years."},
+]
+IDX = "work/d11/index/v1/chunks.json"
+expect("building the index returns the number of chunks", lambda: build_index(CHUNKS, IDX), 4)
+def _saved():
+    build_index(CHUNKS, IDX)
+    rows = json.loads(Path(IDX).read_text(encoding="utf-8"))
+    return [rows[2]["id"], rows[2]["text"][:6], len(rows[2]["vector"])]
+expect("the file stores id, text and a 256-dimensional vector", _saved, ["c3", "Either", 256])
+def _search():
+    build_index(CHUNKS, IDX)
+    MOCK.reset()
+    first = search(IDX, "Can we cancel the contract early?", 1)
+    second = search(IDX, "When do we have to pay the invoice?", 1)
+    return [first, second, len(MOCK.calls), MOCK.calls[0]["body"]["input"]]
+expect("two questions: each one computes only the question's vector", _search, [["c3"], ["c1"], 2, ["Can we cancel the contract early?"]])
+--- hints
+- `build_index`: like Day 10's `save_report`, first `path.parent.mkdir(parents=True, exist_ok=True)`, then write the JSON.
+- Pair chunks and vectors with `zip(chunks, vectors)`, and build the dictionaries to save.
+- `search`: `q = embed_texts([query])[0]`, then `sorted(rows, key=lambda r: -cosine(q, r["vector"]))`.
+
+@@ item d11-18
+type: order
+title: Put the code in order: the RAG prompt
+level: 2
+cards: Putting retrieved chunks into the prompt
+--- context
+The last step of RAG: join the retrieved excerpts and the lawyer's question into the text that is sent to the model. How you join them decides whether the model answers only from the excerpts or makes things up.
+--- prompt
+Put `build_rag_prompt(question, chunks)` in order: the rules first, then the numbered excerpts, and **the question last**. Two lines are distractors.
+
+Why number them? When the model writes `[c7]` in its answer, you can check whether it was really given the excerpt it cites.
+--- lines
+def build_rag_prompt(question, chunks):
+    lines = ["Answer using ONLY the excerpts below.", "Cite the excerpt id in brackets after each claim, e.g. [c2]."]
+    lines.append("")
+    for c in chunks:
+        lines.append(f"[{c['id']}] {c['text']}")
+    lines.append("")
+    lines.append(f"Question: {question}")
+    return "\n".join(lines)
+--- distractors
+        lines.append(c["text"])
+    return " ".join(lines)
+--- tests
+CH = [
+    {"id": "c3", "text": "Either party may terminate for material breach."},
+    {"id": "c7", "text": "Customer may terminate for convenience on 30 days' notice."},
+]
+expect("the full prompt", lambda: build_rag_prompt("Can we cancel early?", CH), "Answer using ONLY the excerpts below.\nCite the excerpt id in brackets after each claim, e.g. [c2].\n\n[c3] Either party may terminate for material breach.\n[c7] Customer may terminate for convenience on 30 days' notice.\n\nQuestion: Can we cancel early?")
+expect("the question is on the last line", lambda: build_rag_prompt("Is liability capped?", CH).splitlines()[-1], "Question: Is liability capped?")
+--- hints
+- The order: rules → empty line → one line per excerpt → empty line → question → join with `"\n"`.
+- Each excerpt needs its `[id]` in front, or the model can't cite it.
+
+@@ item d11-19
+type: local
+title: Local task: search a real contract
+level: 3
+cards: Keyword search; d10:Command-line arguments: argparse; d10:JSON files: load and dump
+--- context
+Try your own search once on the real sample contract, and see with your own eyes what keyword search can find and what it can't. In an interview, when you explain "why we need vector search", this is the best example.
+--- prompt
+Run your own keyword search on the real Clause Check contract.
+
+1. In the project root, export the split clauses:
+
+```
+cd "G:\Contract Clause Reviewer"
+New-Item -ItemType Directory -Force work | Out-Null
+python -m clausecheck clauses data/sample_contract.txt --json work/clauses.json
+```
+
+2. Open `work/clauses.json` in VS Code and take a look: each item has fields such as `clause_id`, `heading` and `text`
+3. Create `work/my_search.py` and, **without looking at this page**, write it by hand from a blank file:
+   - Use argparse to read one positional argument `query`, and `--k` (an integer, default 3) (Day 10)
+   - Read `work/clauses.json` (Day 10)
+   - With today's `tokenize` and `keyword_score`, score each clause's `heading + " " + text`; drop scores of 0, and take the top k from high score to low
+   - Print one line per clause, for example `3.2  score=3  Late Payment and Non-Refundability` (number, score, heading); if there are none at all, print `no match`
+4. Run it twice, and paste the output of both runs below:
+
+```
+python work/my_search.py "Can the provider suspend the service?"
+python work/my_search.py "Can we cancel early?"
+```
+
+The second question should give `no match`: this contract says terminate, never cancel. This is keyword search's synonym problem, and the reason embeddings exist.
+placeholder: Paste the output of both runs: there should be lines with score=… and one no match line
+verify: ^(?=[\s\S]*score=\d)(?=[\s\S]*no match)
+--- hints
+- When you get stuck, first get the smallest version running: print only `len(clauses)` first, then add the scoring, and add argparse last.
+- For the first question, the top results should include 3.2 (overdue payment lets the provider suspend the service) and 11.1.
+- If running it gives `FileNotFoundError: work/clauses.json`: check step 1, and check that you are running it from the project root (relative paths are relative to the current directory).
+
+@@ item d11-e1
+type: scratch
+title: Closed book: chunk by heading
+exam: yes
+level: 3
+cards: Chunking: by structure, by length, with overlap; Cleaning text
+--- context
+Contracts come with numbered headings, so one clause is one chunk. This is the best way to cut a contract, and the real project's `split.py` cuts it this way too.
+--- prompt
+Write `chunk_by_heading(text)`, which cuts a contract into chunks at its numbered headings:
+
+- **Heading line**: after removing the whitespace at both ends, it starts with a number (like `8`, `8.1`, `10.2.1`), followed by a space and a capital letter. You can check with `re.match(r"\d+(\.\d+)*\s+[A-Z]", line)`
+- Each heading line starts a chunk, and the lines below it, up to the next heading, are its body; ignore anything before the first heading
+- Join the body lines with spaces, merge runs of whitespace into one space, and remove the whitespace at both ends; **drop chunks with an empty body (just a section heading)**
+- Return `[{"id": "c1", "heading": "8.1 Cap on Liability", "text": body}, ...]`: `id` numbers the kept chunks starting from `c1`, and `heading` is the whole heading line with the whitespace at both ends removed
+--- solution
+import re
+
+HEAD = re.compile(r"\d+(\.\d+)*\s+[A-Z]")
+
+def chunk_by_heading(text):
+    blocks = []
+    for line in text.splitlines():
+        s = line.strip()
+        if HEAD.match(s):
+            blocks.append({"heading": s, "lines": []})
+        elif blocks:
+            blocks[-1]["lines"].append(s)
+    chunks = []
+    for b in blocks:
+        body = re.sub(r"\s+", " ", " ".join(b["lines"])).strip()
+        if body:
+            chunks.append({"id": f"c{len(chunks) + 1}", "heading": b["heading"], "text": body})
+    return chunks
+--- tests
+DOC = """CLOUDNOTES AGREEMENT
+Preamble text.
+8 Limitation of Liability
+8.1 Cap on Liability
+Each party's liability shall not
+exceed   the fees paid.
+12 Exclusions
+The limitations in Section 8 do not apply.
+30 days' notice applies.
+"""
+expect("section heading 8 has no body, so it is dropped", lambda: [c["id"] + " " + c["heading"] for c in chunk_by_heading(DOC)], ["c1 8.1 Cap on Liability", "c2 12 Exclusions"])
+expect("body whitespace is merged", lambda: chunk_by_heading(DOC)[0]["text"], "Each party's liability shall not exceed the fees paid.")
+expect("starts with a number but lowercase follows: not a heading", lambda: chunk_by_heading(DOC)[1]["text"], "The limitations in Section 8 do not apply. 30 days' notice applies.")
+expect("no headings", lambda: chunk_by_heading("just text\nmore text"), [])
+
+@@ item d11-e2
+type: scratch
+title: Closed book: keyword search
+exam: yes
+level: 3
+cards: Keyword search
+--- context
+The search part of the "ask the contract" tool: a lawyer asks a question, and the program picks the few most relevant chunks from the split contract to hand to the model.
+--- prompt
+Write `retrieve(query, chunks, k)`, which finds the most relevant chunks with keyword search (each chunk is `{"id": ..., "text": ...}`):
+
+- Tokenize: after converting to lowercase, `re.findall(r"[a-z0-9]+", ...)`, then remove the stop words `{"the", "a", "an", "of", "to", "and", "is", "are", "we", "can", "do"}`
+- A chunk's score = how many **different** words from the question appear in the chunk's `text`
+- Drop scores of 0; sort from high to low, with ties keeping the original order in `chunks`; return the `id`s of the first `k` chunks
+--- solution
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "is", "are", "we", "can", "do"}
+
+def tokenize(text):
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP}
+
+def retrieve(query, chunks, k):
+    q = tokenize(query)
+    scored = []
+    for c in chunks:
+        score = len(q & tokenize(c["text"]))
+        if score > 0:
+            scored.append((score, c["id"]))
+    scored = sorted(scored, key=lambda pair: -pair[0])
+    return [cid for score, cid in scored[:k]]
+--- tests
+CHUNKS = [
+    {"id": "c5", "text": "Provider may suspend the Service if fees are overdue."},
+    {"id": "c1", "text": "Customer may terminate for convenience."},
+    {"id": "c2", "text": "Provider may suspend or terminate the Service on notice."},
+    {"id": "c9", "text": "Fees are payable annually."},
+]
+expect("ties keep the original order", lambda: retrieve("When can the provider suspend the service?", CHUNKS, 5), ["c5", "c2"])
+expect("higher scores first, take the top 2", lambda: retrieve("terminate or suspend", CHUNKS, 2), ["c2", "c5"])
+expect("nothing relevant", lambda: retrieve("Can we cancel early?", CHUNKS, 3), [])
+
+@@ item d11-e3
+type: scratch
+title: Closed book: search + budget + prompt
+exam: yes
+level: 3
+cards: Putting retrieved chunks into the prompt; Token estimates and budgets; Keyword search
+--- context
+Everything the "ask the contract" tool prepares before it sends a request: from the lawyer's one-sentence question to the text actually sent to the model. When nothing is found, it is better to say so directly than to let the model answer out of thin air.
+--- prompt
+Write `answer_context(query, chunks, k, budget)`, which returns the prompt string to send to the model (each chunk is `{"id": ..., "text": ...}`):
+
+1. **Search**: the query words = the words in the query that are **at least 4 characters long** (convert to lowercase, pull out the words with `re.findall(r"[a-z0-9]+", ...)`, remove duplicates). A chunk's score = how many query words appear among the words of the chunk's `text` (lowercased and split into words the same way). Drop scores of 0; sort from high to low, with ties keeping the original order, and take the first `k` chunks
+2. **Fit the budget**: in the order from step 1, estimate `math.ceil(len(text) / 4)` tokens for each chunk; if adding a chunk would go over `budget`, skip it and go on to the next one
+3. **Build the prompt**: the first line is `Answer using only these excerpts and cite their ids.`, then one line `[id] text` per chunk, and the last line is `Question: <query>`, joined with `"\n"`
+4. If no chunk was picked, return `"No relevant excerpts found."`
+--- solution
+import math
+import re
+
+def _words(text):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+def answer_context(query, chunks, k, budget):
+    q = {w for w in _words(query) if len(w) >= 4}
+    scored = []
+    for c in chunks:
+        score = len(q & _words(c["text"]))
+        if score > 0:
+            scored.append((score, c))
+    ranked = [c for score, c in sorted(scored, key=lambda p: -p[0])][:k]
+    picked = []
+    used = 0
+    for c in ranked:
+        cost = math.ceil(len(c["text"]) / 4)
+        if used + cost > budget:
+            continue
+        picked.append(c)
+        used += cost
+    if not picked:
+        return "No relevant excerpts found."
+    lines = ["Answer using only these excerpts and cite their ids."]
+    lines += [f"[{c['id']}] {c['text']}" for c in picked]
+    lines.append(f"Question: {query}")
+    return "\n".join(lines)
+--- tests
+CHUNKS = [
+    {"id": "c1", "text": "Fees are payable annually in advance."},
+    {"id": "c2", "text": "Provider may terminate or suspend the Service at any time for convenience, with or without cause, upon notice."},
+    {"id": "c3", "text": "Customer may terminate for convenience on thirty days' notice."},
+]
+Q = "Can the customer terminate for convenience?"
+HEAD = "Answer using only these excerpts and cite their ids."
+expect("both chunks fit: c3, with the higher score, comes first", lambda: answer_context(Q, CHUNKS, 3, 100), HEAD + "\n[c3] " + CHUNKS[2]["text"] + "\n[c2] " + CHUNKS[1]["text"] + "\nQuestion: " + Q)
+expect("the budget fits only one chunk: skip c2, which doesn't fit", lambda: answer_context(Q, CHUNKS, 3, 20), HEAD + "\n[c3] " + CHUNKS[2]["text"] + "\nQuestion: " + Q)
+expect("k is 1", lambda: answer_context(Q, CHUNKS, 1, 100).count("\n[c"), 1)
+expect("nothing relevant", lambda: answer_context("What about personal data?", CHUNKS, 3, 100), "No relevant excerpts found.")

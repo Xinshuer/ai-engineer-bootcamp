@@ -599,7 +599,7 @@ DATA = [
 expect("完整汇总", lambda: summarise(DATA), {"total": 4, "counts": {"accept": 2, "flag": 1, "redline": 1}, "needs_attention": ["8.1", "4.2"]})
 expect("空合同", lambda: summarise([]), {"total": 0, "counts": {}, "needs_attention": []})
 --- hints
-- 分三步：先算 counts（昨天的计数写法），再算 needs_attention，最后拼成字典 return。
+- 分三步：先算 counts（今天「计数的标准写法」卡片里的写法），再算 needs_attention，最后拼成字典 return。
 - 字典可以跨多行写，每个键值对后面加逗号。
 
 @@ item d2-16

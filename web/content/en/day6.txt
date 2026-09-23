@@ -1,0 +1,963 @@
+@@ day 6
+title: TypeScript for AI: async, fetch, Zod, retries
+lang: ts
+hours: 5 hours
+--- goal
+Rewrite all of Day 4's Python AI code in TypeScript: async/await for API calls, try/catch for errors, Zod to validate model output, retries, tool dispatch, pass rate. Zod is the Pydantic of the TypeScript world, and Mastra defines tool arguments with Zod.
+--- checklist
+- Clear your Review list first
+- Read all 7 knowledge cards, and change and run each example
+- Pass every practice exercise (including the local task at the end: call DeepSeek for real with TypeScript)
+- The 3 closed-book challenges
+- Compare the functions that have the same name on Day 4 and today (ask, classify, passRate), and name every difference in how they are written
+
+@@ concept
+title: async / await: wait for the network without freezing
+--- body
+Network requests take time. TypeScript uses a **Promise** to stand for "a result that arrives later":
+
+```ts
+async function ask(prompt: string): Promise<string> {
+  const res = await fetch(URL, ...);   // waits here, then carries on once it arrives
+  const data = await res.json();       // json() has to be awaited too
+  return data.choices[0].message.content;
+}
+```
+
+- Put `async` in front of the function and write the return type as `Promise<the real type>`
+- Inside an async function, use `await` to wait until a Promise finishes
+- **The most common bug: forgetting await**. You get a Promise that hasn't finished yet instead of the result
+- Calling an async function needs `await` too: `const text = await ask("hi");`
+--- code
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function review(id: string): Promise<string> {
+  console.log("start", id);
+  await wait(10);
+  return `done ${id}`;
+}
+
+async function main() {
+  const r = await review("8.1");
+  console.log(r);
+  const p = review("4.2");
+  console.log("without await:", p);
+  console.log("after await:", await p);
+}
+main();
+
+@@ concept
+title: fetch: the requests.post of TypeScript
+--- body
+```ts
+const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+  method: "POST",
+  headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-flash", messages }),
+});
+res.status;             // the status code
+res.ok;                 // true for 200–299
+const data = await res.json();
+```
+
+Three differences from Python: you must write `method: "POST"`; you `JSON.stringify` the request body yourself; `res.json()` needs await.
+
+`process.env.DEEPSEEK_API_KEY` reads an environment variable, just like `os.getenv`. On this page it talks to a mock server; on your own computer it talks to the real one.
+
+Thinking mode works as on Day 4: it is on by default, the reasoning is in `message.reasoning_content`, and thinking tokens are billed as output. Requests that review clauses add `thinking: { type: "disabled" }` to turn it off (faster, cheaper, and only then does `temperature` take effect).
+--- code
+async function main() {
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: "Say hello" }] }),
+  });
+  console.log(res.status, res.ok);
+  const data = await res.json();
+  console.log(data.choices[0].message.content);
+  console.log(data.usage.total_tokens, "reasoning:", data.usage.completion_tokens_details.reasoning_tokens);
+
+  const off = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: "Say hello" }], thinking: { type: "disabled" } }),
+  });
+  const offData = await off.json();
+  // thinking off: no reasoning_content, and far fewer tokens (when it is off, completion_tokens_details may be missing, so don't read it directly)
+  console.log(offData.usage.total_tokens);
+}
+main();
+
+@@ concept
+title: try / catch / throw
+--- body
+```ts
+try {
+  const data = JSON.parse(raw);
+} catch (e) {
+  console.log("bad json:", e instanceof Error ? e.message : String(e));
+}
+```
+
+- Python's `except` → `catch`; `raise ValueError("...")` → `throw new Error("...")`
+- In TypeScript the `e` in `catch (e)` has the type `unknown` (anything can be thrown), so check `e instanceof Error` before you use it
+- An error thrown inside an async function is caught by the caller's try/catch when the caller `await`s it
+--- code
+function parseRisk(text: string): string {
+  const risk = text.trim().toLowerCase();
+  if (!["low", "medium", "high"].includes(risk)) {
+    throw new Error(`unknown risk: ${text}`);
+  }
+  return risk;
+}
+console.log(parseRisk(" HIGH "));
+try {
+  parseRisk("urgent");
+} catch (e) {
+  console.log("caught:", e instanceof Error ? e.message : String(e));
+}
+try {
+  JSON.parse("{oops");
+} catch (e) {
+  console.log("bad json:", e instanceof Error ? e.name : "?");
+}
+
+@@ concept
+title: Zod: the Pydantic of TypeScript
+--- body
+```ts
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  confidence: z.number().default(0.5),
+});
+```
+
+- `z.enum([...])` is `Literal[...]`; `z.object({...})` is `BaseModel`
+- `Schema.parse(data)`: returns the data if it is valid, otherwise **throws**
+- `Schema.safeParse(data)`: doesn't throw; returns `{ success: true, data }` or `{ success: false, error }`, with the errors in `error.issues`
+- Note that Zod validates **objects**: `JSON.parse` the model's text first
+--- code
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  confidence: z.number().default(0.5),
+});
+
+console.log(VerdictSchema.parse({ clause_id: "8.1", verdict: "flag" }));
+const bad = VerdictSchema.safeParse({ clause_id: "8.1", verdict: "HIGH" });
+if (!bad.success) {
+  console.log(bad.error.issues[0].path, bad.error.issues[0].message);
+}
+
+@@ concept
+title: z.infer: one definition, two uses
+--- body
+A Pydantic class is itself a type. A Zod schema is a **value**; use `z.infer` to get a **type** from it:
+
+```ts
+type Verdict = z.infer<typeof VerdictSchema>;
+// { clause_id: string; verdict: "accept" | "flag" | "redline"; confidence: number }
+```
+
+This way the runtime validation (the schema) and the compile-time type (the type) always agree, and you don't write them twice. In Clause Check, Pydantic also generates the JSON Schema the model sees: the same idea.
+--- code
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function describe(v: Verdict): string {
+  return `${v.clause_id}: ${v.verdict}`;
+}
+const v: Verdict = VerdictSchema.parse(JSON.parse('{"clause_id": "8.1", "verdict": "redline"}'));
+console.log(describe(v));
+
+@@ concept
+title: Tool dispatch: a table from names to functions
+--- body
+The model says "call lookup_playbook with the arguments {"topic": "payment"}". The code has to find the function by its name:
+
+```ts
+const tools: Record<string, (args: any) => string> = {
+  lookup_playbook: (args) => `rule for ${args.topic}`,
+};
+const result = tools[name](JSON.parse(argumentsText));
+```
+
+`Record<string, function type>` is the Python dictionary `{"name": function}`. `(args: any) => string` is a function type: it takes one argument and returns a string.
+--- code
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+const tools: Record<string, (args: any) => string> = {
+  lookup_playbook: (args) => `rule for ${args.topic}`,
+  word_count: (args) => String(args.text.split(" ").length),
+};
+const call: ToolCall = { id: "call_1", function: { name: "lookup_playbook", arguments: '{"topic": "payment"}' } };
+console.log(tools[call.function.name](JSON.parse(call.function.arguments)));
+console.log(Object.keys(tools));
+
+@@ concept
+title: import / export and what Mastra looks like
+--- body
+In real projects the code is split across several files: one file has `export function classify(...)`, another has `import { classify } from "./review"`. On this page every exercise is a single file, but you will use `import { z } from "zod"`.
+
+A Mastra tool definition has roughly this shape (a sketch; the official docs at mastra.ai have the exact syntax):
+
+```ts
+const lookupPlaybook = createTool({
+  id: "lookup_playbook",
+  description: "Return the customer's rule for one topic. Call before deciding.",
+  inputSchema: z.object({ topic: z.enum(["payment", "liability_cap"]) }),
+  execute: async (...) => { ... },
+});
+```
+
+You can already read every part of it: Zod defines the arguments (like Pydantic), description says when to use the tool, and execute is an async function. Python's `@tool + Pydantic` and Mastra's `createTool + Zod` are the same concept. In an interview, say: "The concepts are the same. Everything I have done in Python has a counterpart in Mastra."
+--- code
+import { z } from "zod";
+
+const ToolInput = z.object({ topic: z.enum(["payment", "liability_cap"]) });
+type ToolInput = z.infer<typeof ToolInput>;
+
+async function execute(input: ToolInput): Promise<string> {
+  return `rule for ${input.topic}`;
+}
+
+async function main() {
+  const raw = JSON.parse('{"topic": "payment"}');
+  console.log(await execute(ToolInput.parse(raw)));
+  console.log(ToolInput.safeParse({ topic: "gdpr" }).success);
+}
+main();
+
+@@ item d6-01
+type: choice
+title: What await does
+level: 1
+cards: async / await: wait for the network without freezing
+--- context
+When you call a model API from TypeScript, sending the request and reading the answer both wait for the network. How to write that wait, and what happens when you leave it out, is today's most important lesson.
+--- prompt
+Inside an async function you write `const data = res.json();` (forgetting await). What is `data`?
+--- options
+- The parsed object
+- A Promise that hasn't finished yet; `data.choices` gives a type error
+- undefined
+- A string
+answer: 2
+--- explain
+`res.json()` returns a `Promise<any>`. Without await you get the Promise itself, and TypeScript reports `Property 'choices' does not exist on type 'Promise<any>'`. When you see that error, your first thought should be: did I forget an await?
+
+@@ item d6-02
+type: predict
+title: The order of async code
+level: 2
+cards: async / await: wait for the network without freezing
+--- context
+When you write the review program in TypeScript, log lines often print in a different order from the one the code is written in, and that can easily confuse you while debugging. First get the order clear with a tiny example.
+--- prompt
+Write the output. The key: the callback in `.then` runs only after all of the synchronous code that is running now has finished.
+--- code
+async function review(): Promise<string> {
+  console.log("B: start review");
+  return "done";
+}
+console.log("A");
+review().then((r) => console.log("C:", r));
+console.log("D");
+
+@@ item d6-03
+type: code
+title: Build the request body (TS version)
+level: 1
+cards: fetch: the requests.post of TypeScript; d5:Functions and arrow functions
+--- context
+Just like the Python version on Day 4, every time the model reviews a clause you build a request body (everything sent to the API). This time you write it in TypeScript.
+--- prompt
+Write `buildBody(messages, model, temperature)`: `model` defaults to `"deepseek-flash"` and `temperature` defaults to `0.3`; return an object with four keys: `model`, `messages`, `thinking` and `temperature`. As on Day 4, `thinking` is always `{ type: "disabled" }`.
+--- starter
+type Message = { role: "system" | "user" | "assistant"; content: string };
+
+function buildBody(messages: Message[]) {
+  return {};
+}
+--- solution
+type Message = { role: "system" | "user" | "assistant"; content: string };
+
+function buildBody(messages: Message[], model = "deepseek-flash", temperature = 0.3) {
+  return { model, messages, thinking: { type: "disabled" }, temperature };
+}
+--- tests
+const msgs: Message[] = [{ role: "user", content: "hi" }];
+expect("defaults", () => buildBody(msgs), { model: "deepseek-flash", messages: msgs, thinking: { type: "disabled" }, temperature: 0.3 });
+expect("switch to a bigger model", () => buildBody(msgs, "deepseek-v4-pro", 0).model, "deepseek-v4-pro");
+expect("custom temperature", () => buildBody(msgs, "deepseek-flash", 0).temperature, 0);
+--- hints
+- `{ model, messages, temperature }` is short for `{ model: model, ... }`.
+- `thinking` is not a parameter; write it directly as `thinking: { type: "disabled" }`.
+
+@@ item d6-04
+type: code
+title: Your first API call (TS version)
+level: 2
+cards: fetch: the requests.post of TypeScript; async / await: wait for the network without freezing
+--- context
+This is the TypeScript version of "send a question to the model, get the answer back". Mastra, a framework many AI teams use, is written in TypeScript, and an interview may ask you to write these lines on the spot.
+--- prompt
+Write `ask(prompt)`: POST to `API_URL` with the API key as `Bearer` in the headers, the model `deepseek-flash` and one user message; return the answer text.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const API_KEY = process.env.DEEPSEEK_API_KEY;
+
+async function ask(prompt: string): Promise<string> {
+  return "";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const API_KEY = process.env.DEEPSEEK_API_KEY;
+
+async function ask(prompt: string): Promise<string> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = await res.json();
+  return data.choices[0].message.content;
+}
+--- tests
+expectAsync("answer", () => ask("hello"), "Mock reply: hello");
+expectAsync("model used", async () => { await ask("x"); return MOCK.calls[MOCK.calls.length - 1].body.model; }, "deepseek-flash");
+--- hints
+- `fetch(API_URL, { method: "POST", headers: {...}, body: JSON.stringify({...}) })`, with await in front.
+- `const data = await res.json();`, then take `data.choices[0].message.content`.
+
+@@ item d6-05
+type: fix
+title: Fix the bug: forgot await
+level: 2
+cards: async / await: wait for the network without freezing; d5:Type annotations and type errors
+--- context
+The function that calls the model is written, but the type check that runs before the code reports an error. Good thing it does: without type checking, this kind of problem would only show up when the API is really called.
+--- prompt
+The type check reports an error. Read the error and fix the code.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+async function ask(prompt: string): Promise<string> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = res.json();
+  return data.choices[0].message.content;
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+async function ask(prompt: string): Promise<string> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = await res.json();
+  return data.choices[0].message.content;
+}
+--- tests
+expectAsync("after the fix", () => ask("ping"), "Mock reply: ping");
+expectAsync("another question", () => ask("pong"), "Mock reply: pong");
+--- hints
+- The error says there is no `choices` on `Promise<any>`: `data` is a Promise.
+
+@@ item d6-06
+type: code
+title: Record the tokens as you go (TS version)
+level: 2
+cards: fetch: the requests.post of TypeScript; async / await: wait for the network without freezing
+--- context
+Models charge by the token (a token is the unit a model uses to measure the text it reads and writes). Recording the usage of every call as you go is how you can work out, at the end, what reviewing one contract cost. You did the Python version on Day 4.
+--- prompt
+Write `askWithUsage(prompt)` that returns `{ text, tokens }`: the answer text and this call's `total_tokens`. The return type is already written.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function askWithUsage(prompt: string): Promise<{ text: string; tokens: number }> {
+  return { text: "", tokens: 0 };
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function askWithUsage(prompt: string): Promise<{ text: string; tokens: number }> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = await res.json();
+  return { text: data.choices[0].message.content, tokens: data.usage.total_tokens };
+}
+--- tests
+expectAsync("text", async () => (await askWithUsage("cost?")).text, "Mock reply: cost?");
+expectTrueAsync("tokens is positive", async () => (await askWithUsage("cost?")).tokens > 0);
+--- hints
+- `data.usage.total_tokens`.
+
+@@ item d6-07
+type: code
+title: Throw when the status code is wrong
+level: 2
+cards: try / catch / throw; fetch: the requests.post of TypeScript
+--- context
+When the API fails, report the status code together with the server's own message: then the log tells you whether the API key is wrong, the request is written wrongly, or the server is busy. The calling code can catch this error and decide whether to retry or give up.
+--- prompt
+Write `callApi(body)`: send the request; if `res.ok` is true, return the parsed data; otherwise `throw new Error(\`API error ${status code}: ${error message}\`)`, where the error message is in `(await res.json()).error.message`.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function callApi(body: object): Promise<any> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  return res.json();
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function callApi(body: object): Promise<any> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${data.error.message}`);
+  }
+  return data;
+}
+--- tests
+const GOOD = { model: "deepseek-flash", messages: [{ role: "user", content: "hi" }] };
+expectAsync("success", async () => (await callApi(GOOD)).choices[0].message.content, "Mock reply: hi");
+expectRejects("wrong model name", () => callApi({ model: "gpt-9", messages: [{ role: "user", content: "x" }] }));
+expectAsync("error message format", async () => {
+  MOCK.failNext(500);
+  try { await callApi(GOOD); return "no error thrown"; } catch (e) { return e instanceof Error ? e.message : String(e); }
+}, "API error 500: Internal server error");
+--- hints
+- First `const data = await res.json();`, then check `if (!res.ok) { throw ... }`.
+
+@@ item d6-08
+type: code
+title: Retry on failure (TS version)
+level: 3
+cards: d4:Status codes and retries; fetch: the requests.post of TypeScript; try / catch / throw
+--- context
+Reviewing one contract calls the API dozens of times in a row. Now and then you hit "too many requests" or a temporary server failure, and waiting a moment before trying again usually works. This time you implement the retry rules from Day 4 in TypeScript.
+--- prompt
+Write `askWithRetry(prompt, maxAttempts = 3)`: on 200 return the text; retry on 429 / 500 / 503; throw right away on any other status code; throw when the attempts run out. The rules are the same as on Day 4.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const RETRYABLE = [429, 500, 503];
+
+async function askWithRetry(prompt: string, maxAttempts = 3): Promise<string> {
+  const body = JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] });
+  return "";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const RETRYABLE = [429, 500, 503];
+
+async function askWithRetry(prompt: string, maxAttempts = 3): Promise<string> {
+  const body = JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }] });
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body });
+    if (res.status === 200) {
+      const data = await res.json();
+      return data.choices[0].message.content;
+    }
+    if (!RETRYABLE.includes(res.status)) {
+      throw new Error(`not retryable: ${res.status}`);
+    }
+  }
+  throw new Error(`gave up after ${maxAttempts} attempts`);
+}
+--- tests
+expectAsync("two 429s, then success: 3 requests in total", async () => {
+  MOCK.reset(); MOCK.failNext(429, 2);
+  const text = await askWithRetry("hi");
+  return [text, MOCK.calls.length];
+}, ["Mock reply: hi", 3]);
+expectAsync("always 503: throws after only 3 requests", async () => {
+  MOCK.reset(); MOCK.failNext(503, 5);
+  try { await askWithRetry("hi"); return "no error thrown"; } catch { return MOCK.calls.length; }
+}, 3);
+expectAsync("401 is not retried", async () => {
+  MOCK.reset(); MOCK.failNext(401);
+  try { await askWithRetry("hi"); return "no error thrown"; } catch { return MOCK.calls.length; }
+}, 1);
+--- hints
+- `for (let attempt = 1; attempt <= maxAttempts; attempt++) { ... }`
+- To check whether a status can be retried: `RETRYABLE.includes(res.status)`. After the loop, throw "out of attempts".
+
+@@ item d6-09
+type: code
+title: Parse model output with Zod
+level: 2
+cards: Zod: the Pydantic of TypeScript; try / catch / throw; z.infer: one definition, two uses
+--- context
+The verdict the model sends back must be checked before it is used. Zod does in TypeScript what Pydantic does in Python, and Mastra uses it to define tool arguments too. Keep the reason for a failure: later you can send it back to the model so it can fix its answer.
+--- prompt
+Complete `VerdictSchema` (`clause_id` is a string, `verdict` is one of the three verdicts), then write `parseVerdict(raw)`:
+
+- valid: return the parsed object
+- broken JSON: return `"INVALID: bad json"`
+- invalid fields: return `"INVALID: "` + the `message` of the first issue
+--- starter
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function parseVerdict(raw: string): Verdict | string {
+  return "";
+}
+--- solution
+import { z } from "zod";
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function parseVerdict(raw: string): Verdict | string {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return "INVALID: bad json";
+  }
+  const result = VerdictSchema.safeParse(data);
+  if (!result.success) {
+    return "INVALID: " + result.error.issues[0].message;
+  }
+  return result.data;
+}
+--- tests
+expect("valid", () => parseVerdict('{"clause_id": "8.1", "verdict": "flag"}'), { clause_id: "8.1", verdict: "flag" });
+expect("bad JSON", () => parseVerdict("Sure! {"), "INVALID: bad json");
+expectTrue("invalid verdict", () => String(parseVerdict('{"clause_id": "8.1", "verdict": "HIGH"}')).startsWith("INVALID: "));
+expectTrue("missing field", () => String(parseVerdict('{"verdict": "flag"}')).startsWith("INVALID: "));
+--- hints
+- `verdict: z.enum(["accept", "flag", "redline"])`.
+- Put JSON.parse inside a try/catch; with Zod use `safeParse`, and when the data is invalid look at `result.error.issues[0].message`.
+
+@@ item d6-10
+type: predict
+title: What safeParse returns
+level: 2
+cards: Zod: the Pydantic of TypeScript
+--- context
+The model's answer is not always complete, or correct. First see exactly what Zod hands back when it checks an answer with a missing field and an answer with a wrong verdict.
+--- prompt
+Write the output. `default(0.5)` fills in the default value when the field is missing.
+--- code
+import { z } from "zod";
+
+const Verdict = z.object({
+  verdict: z.enum(["accept", "flag", "redline"]),
+  confidence: z.number().default(0.5),
+});
+const a = Verdict.safeParse({ verdict: "flag" });
+console.log(a.success, a.data);
+const b = Verdict.safeParse({ verdict: "maybe" });
+console.log(b.success, b.error?.issues[0].path);
+
+@@ item d6-11
+type: code
+title: Structured verdict (TS version)
+level: 3
+cards: Zod: the Pydantic of TypeScript; fetch: the requests.post of TypeScript; async / await: wait for the network without freezing
+--- context
+This exercise joins up the earlier ones from today: send off one clause, get back a checked verdict. That is the core of the TypeScript reviewer, and a review agent written in Mastra does the same thing.
+--- prompt
+Write `classify(clauseText)`: use the model `deepseek-flash`, add `response_format: { type: "json_object" }` to the request, and turn off thinking mode with `thinking: { type: "disabled" }` (judging one clause should be fast and cheap); `JSON.parse` the answer text, validate it with `VerdictSchema.parse`, and return a `Verdict`.
+--- starter
+import { z } from "zod";
+
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  risk_level: z.enum(["low", "medium", "high"]),
+  rationale: z.string(),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+async function classify(clauseText: string): Promise<Verdict> {
+  throw new Error("not implemented");
+}
+--- solution
+import { z } from "zod";
+
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  risk_level: z.enum(["low", "medium", "high"]),
+  rationale: z.string(),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+async function classify(clauseText: string): Promise<Verdict> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({
+      model: "deepseek-flash",
+      messages: [{ role: "user", content: clauseText }],
+      response_format: { type: "json_object" },
+      thinking: { type: "disabled" },
+    }),
+  });
+  const data = await res.json();
+  return VerdictSchema.parse(JSON.parse(data.choices[0].message.content));
+}
+--- tests
+const TEXT = "Review clause 8.1: Customer's liability shall be unlimited.";
+expectAsync("unlimited → redline", async () => (await classify(TEXT)).verdict, "redline");
+expectAsync("clause number", async () => (await classify(TEXT)).clause_id, "8.1");
+expectAsync("sends response_format", async () => { await classify(TEXT); return MOCK.calls[MOCK.calls.length - 1].body.response_format; }, { type: "json_object" });
+expectAsync("thinking mode is off", async () => { await classify(TEXT); return MOCK.calls[MOCK.calls.length - 1].body.thinking; }, { type: "disabled" });
+--- hints
+- Compared with exercise 4, the request body has two more keys: `response_format: { type: "json_object" }` and `thinking: { type: "disabled" }`.
+- Answer text → `JSON.parse(...)` → `VerdictSchema.parse(...)`.
+
+@@ item d6-12
+type: code
+title: Run a tool call (TS version)
+level: 2
+cards: Tool dispatch: a table from names to functions
+--- context
+While reviewing a clause, the model may say "look up the payment rules for me": it gives a tool name and some argument text. The program has to use that name to find the function that does the real work, and run it. You did the Python version on Day 4.
+--- prompt
+Write `runToolCall(call, tools)`: find the function in `tools` by `call.function.name`, parse `arguments` (JSON text) and pass it in, and return the result. If there is no such function, return `"UNKNOWN_TOOL: <name>"`.
+--- starter
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type Tools = Record<string, (args: any) => string>;
+
+function runToolCall(call: ToolCall, tools: Tools): string {
+  return "";
+}
+--- solution
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type Tools = Record<string, (args: any) => string>;
+
+function runToolCall(call: ToolCall, tools: Tools): string {
+  const fn = tools[call.function.name];
+  if (!fn) {
+    return `UNKNOWN_TOOL: ${call.function.name}`;
+  }
+  return fn(JSON.parse(call.function.arguments));
+}
+--- tests
+const TOOLS: Tools = {
+  lookup_playbook: (args) => `rule for ${args.topic}`,
+  add: (args) => String(args.a + args.b),
+};
+const mk = (name: string, args: string): ToolCall => ({ id: "c", function: { name, arguments: args } });
+expect("look up the playbook", () => runToolCall(mk("lookup_playbook", '{"topic": "payment"}'), TOOLS), "rule for payment");
+expect("two arguments", () => runToolCall(mk("add", '{"a": 2, "b": 3}'), TOOLS), "5");
+expect("does not exist", () => runToolCall(mk("delete_all", "{}"), TOOLS), "UNKNOWN_TOOL: delete_all");
+--- hints
+- First get the function with `tools[call.function.name]`; when it doesn't exist it is `undefined`, so check with `if (!fn)`.
+
+@@ item d6-13
+type: code
+title: Pass rate (TS version)
+level: 2
+cards: async / await: wait for the network without freezing; d4:Randomness: one run is not enough
+--- context
+Ask the model about the same clause several times and the answers may differ, so evals ask several times and look at the proportion. Going one request at a time, in order, also avoids sending too many requests at once and being refused by the server for "too many requests".
+--- prompt
+Write `passRate(text, expected, n)`: call `classify(text)` `n` times (**await each call, one at a time, in order**) and return the fraction of verdicts that equal `expected`. `classify` is already written.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function classify(text: string): Promise<{ verdict: string }> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function passRate(text: string, expected: string, n: number): Promise<number> {
+  return 0;
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function classify(text: string): Promise<{ verdict: string }> {
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: text }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function passRate(text: string, expected: string, n: number): Promise<number> {
+  let hits = 0;
+  for (let i = 0; i < n; i++) {
+    const v = await classify(text);
+    if (v.verdict === expected) {
+      hits += 1;
+    }
+  }
+  return hits / n;
+}
+--- tests
+const UNLIMITED = "Review clause 8.1: Customer's liability shall be unlimited.";
+const AS_IS = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS".';
+expectAsync("a stable clause", () => passRate(UNLIMITED, "redline", 5), 1);
+expectAsync("a wrong expected verdict", () => passRate(UNLIMITED, "accept", 3), 0);
+expectTrueAsync("a wavering clause is between 0 and 1", async () => { const r = await passRate(AS_IS, "accept", 20); return r > 0 && r < 1; });
+--- hints
+- In the loop, `const v = await classify(text);`, and when it matches, `hits += 1`.
+
+@@ item d6-14
+type: translate
+title: Translate: ask
+level: 2
+cards: fetch: the requests.post of TypeScript; async / await: wait for the network without freezing
+--- context
+You wrote the Python version of the same "ask the model one question" on Day 4. Learn the two languages side by side, and you can write it in whichever one an interview asks for.
+--- prompt
+Translate Day 4's Python `ask` into TypeScript. Watch for the three differences: `method: "POST"`, `JSON.stringify`, and two `await`s.
+--- source
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+def ask(prompt):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}]}
+    data = requests.post(API_URL, headers=headers, json=body).json()
+    return data["choices"][0]["message"]["content"]
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+async function ask(prompt: string): Promise<string> {
+  return "";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+async function ask(prompt: string): Promise<string> {
+  const headers = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+  const body = { model: "deepseek-flash", messages: [{ role: "user", content: prompt }] };
+  const res = await fetch(API_URL, { method: "POST", headers, body: JSON.stringify(body) });
+  const data = await res.json();
+  return data.choices[0].message.content;
+}
+--- tests
+expectAsync("answer", () => ask("translate me"), "Mock reply: translate me");
+expectAsync("messages", async () => { await ask("m"); return MOCK.calls[MOCK.calls.length - 1].body.messages; }, [{ role: "user", content: "m" }]);
+--- hints
+- `os.getenv('X')` → `process.env.X`; f-string → template string.
+
+@@ item d6-15
+type: order
+title: Put the code in order: a call that asks for JSON (TS version)
+level: 2
+cards: fetch: the requests.post of TypeScript; async / await: wait for the network without freezing
+--- context
+Asking the model to answer only in JSON, then turning the answer into an object: these lines are the standard pattern for calling a model in TypeScript, worth knowing so well that you don't have to think about them.
+--- prompt
+Put `askJson` in order: it asks for JSON format, turns off thinking mode and returns the parsed object. The three lines `method`, `headers` and `body` in the object literal can go in any order. One line is a distractor.
+--- lines
+async function askJson(prompt: string): Promise<any> {
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }),
+  });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+--- distractors
+  const data = res.json();
+--- tests
+expectAsync("verdict", async () => (await askJson("Review clause 6.2: survives in perpetuity")).verdict, "redline");
+expectAsync("topic", async () => (await askJson("Review clause 6.2: survives in perpetuity")).topic, "confidentiality");
+--- hints
+- The distractor is missing await.
+
+@@ item d6-16
+type: choice
+title: What z.infer is for
+level: 2
+cards: z.infer: one definition, two uses; Zod: the Pydantic of TypeScript
+--- context
+When you read Mastra or other TypeScript projects, you will often see a line like this right below a Zod definition.
+--- prompt
+What does the line `type Verdict = z.infer<typeof VerdictSchema>;` do?
+--- options
+- Validates data at runtime
+- Derives a TypeScript type from the Zod schema, so the validation rules and the type are written only once
+- Converts an object to JSON
+- Makes VerdictSchema optional
+answer: 2
+--- explain
+A Zod schema is a value at runtime and does the validation; `z.infer` derives a type from it at compile time. So when you change the schema, the type follows automatically, and you never get "the validation let it through, but the type is wrong". In Pydantic the class is both the validator and the type, so this step isn't needed.
+
+@@ item d6-17
+type: choice
+title: Python and Mastra side by side
+level: 1
+cards: import / export and what Mastra looks like; Zod: the Pydantic of TypeScript
+--- context
+The company interviewing you uses Mastra (TypeScript); your project uses Python. If you can match the concepts on the two sides one to one, you show that what you have learned carries straight over.
+--- prompt
+Mastra defines tool arguments with `createTool({ inputSchema: z.object({...}) })`. What is the counterpart in Python / Clause Check?
+--- options
+- `json.dumps`
+- Define the arguments with a Pydantic model, then generate the JSON Schema the model sees with `model_json_schema()`
+- `requests.post`
+- `print`
+answer: 2
+--- explain
+Both sides use the same concept: one "schema object" does two jobs, (1) generating the description of the arguments that the model sees, and (2) validating the arguments the model sends. In Python that is Pydantic; in TypeScript it is Zod. Clause Check's `tools.py` works exactly this way.
+
+@@ item d6-18
+type: local
+title: Local task: call DeepSeek once with TypeScript
+level: 2
+cards: fetch: the requests.post of TypeScript; async / await: wait for the network without freezing
+--- context
+All the exercises so far talked to the mock server. This time you call the model for real with TypeScript on your own computer, writing the code yourself from a blank file, and see whether you can use what you learned these two days on your own.
+--- prompt
+**Without looking at this page**, write one real TypeScript call by hand.
+
+1. In `G:\Contract Clause Reviewer\work`, create `my_first_call.ts`
+2. On the first line write `process.loadEnvFile();` (built into Node; it reads the `.env` file in the current folder)
+3. Write an async `main()` by hand: fetch DeepSeek (model `deepseek-flash`), print the answer and `total_tokens`, and call `main()` at the end
+4. Run it from the project root folder (so that `.env` can be found):
+
+```
+cd "G:\Contract Clause Reviewer"
+npx tsx work/my_first_call.ts
+```
+
+5. Paste the output below
+
+The first time you run `npx tsx`, it asks whether to install it; type y.
+
+Optional: as on Day 4, first print `usage.completion_tokens_details.reasoning_tokens` to see how many tokens the thinking used; then run it again with `thinking: { type: "disabled" }` and compare `completion_tokens` for the two runs (with thinking off, `completion_tokens_details` may be missing, so don't read it directly).
+placeholder: Paste the terminal output; it should include the answer and total_tokens
+verify: tokens?\D{0,30}\d+
+--- hints
+- If you see `fetch is not defined`: your Node version is too old; you need 18 or later (Node 22 is fine).
+- If you see 401: check `.env` and the `Bearer ` prefix.
+- If you see 400 and the error says `The supported API model names are ...`: the model name is wrong; use `deepseek-flash`.
+
+@@ item d6-e1
+type: scratch
+title: Closed book: Rule schema
+exam: yes
+level: 2
+cards: Zod: the Pydantic of TypeScript; z.infer: one definition, two uses; try / catch / throw
+--- context
+The company's review rules (the playbook) are stored in a JSON file. People write them by hand, so they may contain mistakes. The TypeScript program must also check the rules when it reads them, so that a broken rule never gets into a review.
+--- prompt
+Define `RuleSchema` with Zod: `id` is a string, `topic` is a string, `severity` is one of `low` / `medium` / `high`. Then write `loadRule(raw: string)`: return the parsed object when it is valid; return `null` both when the JSON is broken and when a field is invalid.
+--- solution
+import { z } from "zod";
+
+const RuleSchema = z.object({
+  id: z.string(),
+  topic: z.string(),
+  severity: z.enum(["low", "medium", "high"]),
+});
+type Rule = z.infer<typeof RuleSchema>;
+
+function loadRule(raw: string): Rule | null {
+  try {
+    const result = RuleSchema.safeParse(JSON.parse(raw));
+    return result.success ? result.data : null;
+  } catch {
+    return null;
+  }
+}
+--- tests
+expect("valid", () => loadRule('{"id": "PB-01", "topic": "liability_cap", "severity": "high"}')?.severity, "high");
+expect("invalid", () => loadRule('{"id": "PB-01", "topic": "x", "severity": "urgent"}'), null);
+expect("bad JSON", () => loadRule("{"), null);
+
+@@ item d6-e2
+type: scratch
+title: Closed book: a call that asks for JSON (TS)
+exam: yes
+level: 2
+cards: fetch: the requests.post of TypeScript; async / await: wait for the network without freezing
+--- context
+When you want a structured result from the model, this is the most basic call in TypeScript: send the question, get back an object whose fields you can read directly.
+--- prompt
+Write `askJson(prompt: string): Promise<any>`: call `https://api.deepseek.com/v1/chat/completions` (model `deepseek-flash`, API key `process.env.DEEPSEEK_API_KEY`), ask for the `json_object` format and turn off thinking mode, and return the parsed object.
+--- solution
+async function askJson(prompt: string): Promise<any> {
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" }, thinking: { type: "disabled" } }),
+  });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+--- tests
+expectAsync("verdict", async () => (await askJson("Review clause 10.1: processed in any country")).verdict, "redline");
+expectAsync("topic", async () => (await askJson("Review clause 10.1: processed in any country")).topic, "data_processing");
+expectAsync("thinking mode is off", async () => { await askJson("Review clause 10.1: processed in any country"); return MOCK.calls[MOCK.calls.length - 1].body.thinking; }, { type: "disabled" });
+
+@@ item d6-e3
+type: scratch
+title: Closed book: how many tokens in total (TS)
+exam: yes
+level: 2
+cards: async / await: wait for the network without freezing; fetch: the requests.post of TypeScript
+--- context
+Models charge by the token (a token is the unit a model uses to measure the text it reads and writes). When a batch of requests has run, add up the usage of each one and you know how much the whole batch used.
+--- prompt
+Write `countTokens(prompts: string[]): Promise<number>`: call the API once for each prompt, in order (same URL and API key as the previous exercise, model `deepseek-flash`, no need to turn off thinking mode), and return the sum of `total_tokens`; for an empty array return 0.
+--- solution
+async function countTokens(prompts: string[]): Promise<number> {
+  let total = 0;
+  for (const p of prompts) {
+    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: p }] }),
+    });
+    const data = await res.json();
+    total += data.usage.total_tokens;
+  }
+  return total;
+}
+--- tests
+expectTrueAsync("two calls use more than one", async () => (await countTokens(["a", "b"])) > (await countTokens(["a"])));
+expectAsync("empty array", () => countTokens([]), 0);
+expectAsync("number of calls", async () => { MOCK.reset(); await countTokens(["x", "y", "z"]); return MOCK.calls.length; }, 3);

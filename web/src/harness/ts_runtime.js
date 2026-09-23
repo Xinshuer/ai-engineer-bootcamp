@@ -71,10 +71,12 @@ function __errText(e) {
   if (e && typeof e === "object" && "message" in e) return `${e.name || "Error"}: ${e.message}`;
   return "Uncaught " + __fmt(e, 0, true);
 }
-const __PROMISE_HINT = "返回的是 Promise：这个函数是 async 的，测试拿到的是还没完成的结果";
+// the page prepends `var __CC_LANG = "en";` when it is in English
+const __L = (zh, en) => (typeof __CC_LANG !== "undefined" && __CC_LANG === "en" ? en : zh);
+const __PROMISE_HINT = __L("返回的是 Promise：这个函数是 async 的，测试拿到的是还没完成的结果", "it returned a Promise: the function is async, so the test got a result that is not finished yet");
 function __rec(label) { const r = { label, passed: false }; __tests.push(r); return r; }
 function __withTimeout(p, ms) {
-  return Promise.race([p, new Promise((_, rej) => __st(() => rej(new Error(`超时：${ms / 1000} 秒内没有结果（是不是忘了 await 或 return？）`)), ms))]);
+  return Promise.race([p, new Promise((_, rej) => __st(() => { const e = new Error(__L(`超时：${ms / 1000} 秒内没有结果（是不是忘了 await 或 return？）`, `timed out: no result within ${ms / 1000} s (a missing await or return?)`)); e.__ccTimeout = true; rej(e); }, ms))]);
 }
 
 function expect(label, fn, expected) {
@@ -92,9 +94,9 @@ function expectTrue(label, fn) {
   catch (e) { r.error = __errText(e); }
 }
 function expectThrows(label, fn) {
-  const r = __rec(label); r.expected = "抛出错误";
-  try { const got = fn(); r.got = "没有报错，返回了 " + __fmt(got, 0, true); }
-  catch (e) { r.passed = true; r.got = "抛出了 " + __errText(e); }
+  const r = __rec(label); r.expected = __L("抛出错误", "throws an error");
+  try { const got = fn(); r.got = __L("没有报错，返回了 ", "no error, returned ") + __fmt(got, 0, true); }
+  catch (e) { r.passed = true; r.got = __L("抛出了 ", "threw ") + __errText(e); }
 }
 function expectOutput(label, fn, expected) {
   const r = __rec(label);
@@ -126,10 +128,10 @@ function expectTrueAsync(label, fn) {
   });
 }
 function expectRejects(label, fn) {
-  const r = __rec(label); r.expected = "抛出错误（Promise 被 reject）";
+  const r = __rec(label); r.expected = __L("抛出错误（Promise 被 reject）", "throws an error (the Promise rejects)");
   __queue(async () => {
-    try { const got = await __withTimeout(Promise.resolve().then(fn), 3000); r.got = "没有报错，返回了 " + __fmt(got, 0, true); }
-    catch (e) { r.passed = !String(e && e.message).startsWith("超时"); r.got = "抛出了 " + __errText(e); }
+    try { const got = await __withTimeout(Promise.resolve().then(fn), 3000); r.got = __L("没有报错，返回了 ", "no error, returned ") + __fmt(got, 0, true); }
+    catch (e) { r.passed = !(e && e.__ccTimeout); r.got = __L("抛出了 ", "threw ") + __errText(e); }
   });
 }
 
@@ -357,6 +359,6 @@ const process = { env: { DEEPSEEK_API_KEY: "sk-mock-0000", OPENAI_API_KEY: "sk-m
 const exports = {};
 const module = { exports };
 function require(name) {
-  if (name === "zod") { if (!__Zod) throw new Error("zod 没有加载成功"); return __Zod; }
-  throw new Error(`这里只能 import "zod"，不能 import "${name}"`);
+  if (name === "zod") { if (!__Zod) throw new Error(__L("zod 没有加载成功", "zod did not load")); return __Zod; }
+  throw new Error(__L(`这里只能 import "zod"，不能 import "${name}"`, `only "zod" can be imported here, not "${name}"`));
 }

@@ -10,6 +10,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/addon/runmode/runmode.min.js"></script>
 <script src="harness.js"></script>
 <script src="course.js"></script>
+<script>try { if ((new URLSearchParams(location.search).get("lang") || localStorage.getItem("cc-lang")) === "en") document.write('<script src="course-en.js"><\/script>'); } catch (e) { /* storage blocked: Chinese */ }</script>
 <style>
 /*CODEMIRROR_CSS*/
 :root {
@@ -82,6 +83,7 @@ p code, li code, .md code { background: var(--code-bg); border: 1px solid var(--
 .chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
 .chip.ok .dot { background: var(--pass); } .chip.busy .dot { background: var(--warn); } .chip.bad .dot { background: var(--fail); }
 .chip label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.langBtn { font: 600 12px var(--font-ui); color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; }
 
 .app { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 20px; padding-block: 20px 40px; padding-inline: 20px; max-width: 1440px; margin: 0 auto; }
 .rail { display: flex; flex-direction: column; gap: 4px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 68px); align-self: start; max-height: calc(100vh - 88px); overflow-y: auto; }
@@ -315,12 +317,21 @@ details.schema[open] > summary { margin-bottom: 8px; }
 
 <script>
 "use strict";
-const COURSE = window.CC_COURSE || { days: [] };
+// language: Chinese unless the viewer chose English (?lang=en, or the choice kept in this browser)
+// and course-en.js loaded; UI text is written as tr("中文", "English")
+const WANT_EN = (() => { try { return (new URLSearchParams(location.search).get("lang") || localStorage.getItem("cc-lang")) === "en"; } catch (e) { return false; } })();
+const UI_LANG = WANT_EN && window.CC_COURSE_EN ? "en" : "zh";
+const tr = (zh, en) => (UI_LANG === "en" ? en : zh);
+const COURSE = UI_LANG === "en" ? { ...(window.CC_COURSE || {}), days: window.CC_COURSE_EN.days } : window.CC_COURSE || { days: [] };
 const H = window.CC_HARNESS || {};
 const BASE = new URL(".", document.baseURI).href;
 const HAS_CM = typeof window.CodeMirror === "function";
-const KIND = { choice: "选择", predict: "预测输出", code: "写函数", fix: "修 bug", fill: "填空", order: "排代码", scratch: "从零手写", translate: "翻译", local: "本机任务", testwrite: "写测试", sql: "写 SQL" };
-const WEEK_TITLE = { 1: "第 1 周 · 入门", 2: "第 2 周 · 写成小程序", 3: "第 3 周 · 工程与 Agent", 4: "第 4 周 · 云与数据", 5: "第 5 周 · LangChain 与 LangGraph" };
+const KIND = UI_LANG === "en"
+  ? { choice: "Choice", predict: "Predict", code: "Write a function", fix: "Fix the bug", fill: "Fill in", order: "Order the lines", scratch: "From scratch", translate: "Translate", local: "Local task", testwrite: "Write tests", sql: "Write SQL" }
+  : { choice: "选择", predict: "预测输出", code: "写函数", fix: "修 bug", fill: "填空", order: "排代码", scratch: "从零手写", translate: "翻译", local: "本机任务", testwrite: "写测试", sql: "写 SQL" };
+const WEEK_TITLE = UI_LANG === "en"
+  ? { 1: "Week 1 · Getting started", 2: "Week 2 · Small programs", 3: "Week 3 · Engineering and agents", 4: "Week 4 · Cloud and data", 5: "Week 5 · LangChain and LangGraph" }
+  : { 1: "第 1 周 · 入门", 2: "第 2 周 · 写成小程序", 3: "第 3 周 · 工程与 Agent", 4: "第 4 周 · 云与数据", 5: "第 5 周 · LangChain 与 LangGraph" };
 const weekOf = (dayId) => Math.ceil(Number(dayId) / 7);
 const LANG = { py: "Python", ts: "TypeScript", sql: "SQL", docker: "Dockerfile" };
 const RUNNABLE = new Set(["code", "fix", "scratch", "translate", "fill", "order"]);
@@ -484,6 +495,28 @@ function mergeDrafts(items) {
   }
 }
 let saveTimer = null;
+// the page's fixed text (header, title) in the viewer's language, and the language switch
+const PY_LANG_LINE = UI_LANG === "en" ? '\n_CC_LANG = "en"\n' : "";
+function applyChrome() {
+  document.documentElement.lang = UI_LANG === "en" ? "en" : "zh-CN";
+  document.title = tr("Clause Check 编程营", "Clause Check Bootcamp");
+  $(".brand").replaceChildren(tr("Clause Check 编程营", "Clause Check Bootcamp") + " ", h("small", {}, "Python · TypeScript · SQL · LangChain"));
+  const meter = $(".meter");
+  meter.title = tr("掌握 = 通过，并且没有进复习区", "Mastered = solved and not in Review");
+  meter.querySelector("span").textContent = tr("已掌握", "Mastered");
+  $("#allowPaste").parentElement.lastChild.textContent = " " + tr("允许粘贴", "Allow paste");
+  $("#syncChip").lastElementChild.textContent = tr("进度：本机", "Progress: this browser");
+  $("#rail").setAttribute("aria-label", tr("课程", "Course"));
+  const other = UI_LANG === "en" ? "zh" : "en";
+  const btn = h("button", { type: "button", class: "langBtn", lang: other === "en" ? "en" : "zh-CN", title: other === "en" ? "Switch to English" : "切换到中文", onclick: () => {
+    try { saveNow(); } catch (e) { /* progress is also saved as you go */ }
+    try { localStorage.setItem("cc-lang", other); } catch (e) { /* storage blocked: the URL still switches */ }
+    const u = new URL(location.href);
+    if (u.searchParams.has("lang")) { u.searchParams.set("lang", other); location.replace(u.href); } else location.reload();
+  } }, other === "en" ? "English" : "中文");
+  $(".chips").append(h("span", { class: "chip" }, btn));
+  if (WANT_EN && UI_LANG !== "en") toast("The English course could not be loaded; showing Chinese.");
+}
 function writeLocal() { try { localStorage.setItem(STORE_KEY, JSON.stringify(STATE)); } catch (e) { /* ignore */ } }
 function save() {
   clearTimeout(saveTimer);
@@ -521,11 +554,11 @@ async function flushCloud() {
       catch (e) { if (!(e && e.code === "invalid_argument")) throw e; }   // an oversized day stays local only
       CLOUD.sent[key] = text;
     }
-    setChip("syncChip", "ok", "进度：已同步");
+    setChip("syncChip", "ok", tr("进度：已同步", "Progress: synced"));
   }
   catch (e) {
-    if (e && e.code === "invalid_argument") { CLOUD.ready = false; setChip("syncChip", "bad", "进度：只能存本机"); }
-    else { CLOUD.dirty = true; setChip("syncChip", "busy", "进度：同步重试中"); }
+    if (e && e.code === "invalid_argument") { CLOUD.ready = false; setChip("syncChip", "bad", tr("进度：只能存本机", "Progress: this browser only")); }
+    else { CLOUD.dirty = true; setChip("syncChip", "busy", tr("进度：同步重试中", "Progress: retrying sync")); }
   } finally { CLOUD.busy = false; if (CLOUD.dirty) scheduleCloud(); }
 }
 async function initCloud() {
@@ -536,13 +569,13 @@ async function initCloud() {
     const uid = user ? await user.id() : null;
     CLOUD.ref = db.doc("progress/" + (uid || "me"));
     CLOUD.drafts = CLOUD.ref.collection("drafts");
-    setChip("syncChip", "busy", "进度：读取中");
+    setChip("syncChip", "busy", tr("进度：读取中", "Progress: loading"));
     const [snap, drafts] = await Promise.all([CLOUD.ref.get(), CLOUD.drafts.get().catch(() => null)]);
     if (snap.exists) { merge.done = true; merge(snap.data()); }   // older (v1) docs still carry drafts inline
     if (drafts) for (const d of drafts.docs) { const body = d.data() || {}; mergeDrafts(body.items); CLOUD.sent[d.id] = JSON.stringify(body); }
     if (snap.exists || (drafts && !drafts.empty)) render();
     CLOUD.ready = true;
-    setChip("syncChip", "ok", "进度：已同步");
+    setChip("syncChip", "ok", tr("进度：已同步", "Progress: synced"));
     // push what only this browser has (e.g. work done offline, or a v1 doc to move to the new layout)
     const stable = (o) => JSON.stringify(o, (k, v) => (v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort()) : v));
     const cloudDoc = snap.exists ? snap.data() || {} : {};
@@ -550,7 +583,7 @@ async function initCloud() {
     const differs = ["items", "exams", "checks", "seen"].some((k) => stable(mine[k] || {}) !== stable(cloudDoc[k] || {}));
     const draftsDiffer = Object.entries(draftDocs()).some(([key, body]) => CLOUD.sent[key] === undefined || stable(JSON.parse(CLOUD.sent[key])) !== stable(body));
     if ((snap.exists && cloudDoc.v !== 2) || differs || draftsDiffer) scheduleCloud();
-  } catch (e) { setChip("syncChip", "", "进度：本机"); }
+  } catch (e) { setChip("syncChip", "", tr("进度：本机", "Progress: this browser")); }
 }
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { saveNow(); clearTimeout(CLOUD.timer); flushCloud(); } });
 window.addEventListener("pagehide", saveNow);
@@ -558,7 +591,7 @@ window.addEventListener("pagehide", saveNow);
 // ---------------------------------------------------------------- Python runtime (Pyodide in a module worker)
 const PY = { state: "idle", worker: null, ready: null, main: null, seq: 0, waiters: new Map() };
 function pySetChip() {
-  const map = { idle: ["", "Python：点运行时启动"], loading: ["busy", "Python：首次下载约 14 MB…"], ready: ["ok", "Python 3.14：就绪"], failed: ["bad", "Python：无法启动"] };
+  const map = { idle: ["", tr("Python：点运行时启动", "Python: starts when you run")], loading: ["busy", tr("Python：首次下载约 14 MB…", "Python: first download about 14 MB…")], ready: ["ok", tr("Python 3.14：就绪", "Python 3.14: ready")], failed: ["bad", tr("Python：无法启动", "Python: could not start")] };
   setChip("pyChip", ...map[PY.state]);
 }
 // Shared by the worker and the on-page fallback: install Pydantic on first use.
@@ -568,7 +601,7 @@ async function ccEnsurePydantic(py, idx, wheels, code) {
   const site = py.runPython("import site; site.getsitepackages()[0]");
   for (const f of wheels) {
     const res = await fetch(idx + "pkg/" + f);
-    if (!res.ok) throw new Error("下载 " + f + " 失败：" + res.status);
+    if (!res.ok) throw new Error(tr("下载 " + f + " 失败：", "download of " + f + " failed: ") + res.status);
     py.unpackArchive(new Uint8Array(await res.arrayBuffer()), "wheel", { extractDir: site });
   }
   py.runPython("import importlib; importlib.invalidate_caches()");
@@ -581,7 +614,7 @@ async function ccEnsureLangchain(py, idx, wheels, lcWheels, tiktoken) {
   await ccEnsurePydantic(py, idx, wheels, "pydantic");
   const get = async (f) => {
     const res = await fetch(idx + "pkg/" + f);
-    if (!res.ok) throw new Error("下载 " + f + " 失败：" + res.status);
+    if (!res.ok) throw new Error(tr("下载 " + f + " 失败：", "download of " + f + " failed: ") + res.status);
     return new Uint8Array(await res.arrayBuffer());
   };
   const [files, enc] = await Promise.all([Promise.all(lcWheels.map(get)), get(tiktoken.file)]);
@@ -631,11 +664,11 @@ function pyStart() {
   PY.lc = null;   // a new runtime has not loaded LangChain yet
   if (typeof WebAssembly !== "object" || !wasmAllowed()) {
     PY.state = "failed"; pySetChip();
-    return Promise.reject(new Error("这个浏览器环境不允许运行 WebAssembly，所以没法在页面里跑 Python"));
+    return Promise.reject(new Error(tr("这个浏览器环境不允许运行 WebAssembly，所以没法在页面里跑 Python", "this browser does not allow WebAssembly, so Python cannot run in the page")));
   }
   PY.state = "loading"; pySetChip();
   PY.ready = new Promise((resolve, reject) => {
-    setTimeout(() => reject(new Error("启动超过 3 分钟：网络太慢或运行环境加载失败，刷新页面再试")), 180000);
+    setTimeout(() => reject(new Error(tr("启动超过 3 分钟：网络太慢或运行环境加载失败，刷新页面再试", "starting took more than 3 minutes: the network is too slow or the runtime failed to load; reload the page and try again"))), 180000);
     let w;
     try { w = new Worker(URL.createObjectURL(new Blob([pyWorkerSource()], { type: "text/javascript" })), { type: "module" }); }
     catch (e) { return pyStartMain().then(resolve, reject); }
@@ -647,7 +680,7 @@ function pyStart() {
       else { const done = PY.waiters.get(m.id); if (done) { PY.waiters.delete(m.id); done(m); } }
     };
     w.onerror = (e) => { if (PY.state === "loading") { e.preventDefault(); w.terminate(); PY.worker = null; pyStartMain().then(resolve, reject); } };
-    w.postMessage({ type: "init", runner: H.PY_RUNNER, modules: PY_MODULES(), wheels: H.WHEELS || [] });
+    w.postMessage({ type: "init", runner: H.PY_RUNNER + PY_LANG_LINE, modules: PY_MODULES(), wheels: H.WHEELS || [] });
   });
   PY.ready.catch(() => { PY.state = "failed"; pySetChip(); PY.ready = null; });
   return PY.ready;
@@ -656,7 +689,7 @@ async function pyStartMain() {
   // fallback: same runtime on the page itself (an endless loop would freeze the tab)
   const mod = await import(BASE + "pyodide/pyodide.mjs");
   const py = await mod.loadPyodide({ indexURL: BASE + "pyodide/", stdLibURL: BASE + "pyodide/python_stdlib.wasm" });
-  py.runPython(H.PY_RUNNER);
+  py.runPython(H.PY_RUNNER + PY_LANG_LINE);
   for (const [name, src] of PY_MODULES()) py.globals.get("_cc_load_module")(name, src);
   PY.main = { py, run: py.globals.get("run"), runSql: py.globals.get("_cc_run_sql") };
   PY.state = "ready"; pySetChip();
@@ -682,11 +715,11 @@ function runSql(o, code, judge) {
 }
 async function runPython(code, tests, setup, kind) {
   try { await pyStart(); }
-  catch (e) { return { runtimeError: "浏览器里的 Python 启动失败：" + (e && e.message || e) + "。可以用「复制为本机文件」在 VS Code 里运行同样的题目和测试。" }; }
+  catch (e) { return { runtimeError: tr("浏览器里的 Python 启动失败：", "Python failed to start in the browser: ") + (e && e.message || e) + tr("。可以用「复制为本机文件」在 VS Code 里运行同样的题目和测试。", ". You can use Copy as local file to run the same exercise and tests in VS Code.") }; }
   setup = setup || "";
   if (setup.includes(LC_PREP)) {
     try { await pyPrepLangchain(); }
-    catch (e) { return { runtimeError: "浏览器里的 LangChain 加载失败：" + (e && e.message || e) + "。刷新页面再试；也可以用「复制为本机文件」在本机运行。" }; }
+    catch (e) { return { runtimeError: tr("浏览器里的 LangChain 加载失败：", "LangChain failed to load in the browser: ") + (e && e.message || e) + tr("。刷新页面再试；也可以用「复制为本机文件」在本机运行。", ". Reload the page and try again, or use Copy as local file to run it on your own computer.") }; }
   }
   if (PY.main) {
     if (kind === "sql") return JSON.parse(PY.main.runSql(code, tests || "", setup));
@@ -698,7 +731,7 @@ async function runPython(code, tests, setup, kind) {
     const timer = setTimeout(() => {
       PY.waiters.delete(id);
       PY.worker.terminate(); PY.worker = null; PY.ready = null; PY.state = "idle"; pySetChip();
-      resolve({ runtimeError: "运行超过 10 秒被强制停止。最常见的原因是死循环：while 的条件永远成立，或者循环里忘了更新变量。" });
+      resolve({ runtimeError: tr("运行超过 10 秒被强制停止。最常见的原因是死循环：while 的条件永远成立，或者循环里忘了更新变量。", "Stopped after running for more than 10 seconds. The usual cause is an endless loop: a while condition that is always true, or a loop that never updates its variable.") });
     }, 10000);
     PY.waiters.set(id, (m) => { clearTimeout(timer); resolve(m.type === "result" ? m.result : { runtimeError: m.error }); });
     PY.worker.postMessage({ type: "run", id, code, tests, setup, kind });
@@ -707,17 +740,17 @@ async function runPython(code, tests, setup, kind) {
 // Load LangChain once per runtime, outside the 10-second limit of a run (~11 MB the first time, then cached).
 function pyPrepLangchain() {
   if (PY.lc) return PY.lc;
-  setChip("pyChip", "busy", "LangChain：首次加载约 11 MB…");
+  setChip("pyChip", "busy", tr("LangChain：首次加载约 11 MB…", "LangChain: first load about 11 MB…"));
   PY.lc = (async () => {
     if (PY.main) await ccEnsureLangchain(PY.main.py, BASE + "pyodide/", H.WHEELS || [], H.LC_WHEELS || [], H.TIKTOKEN);
     else {
       const id = ++PY.seq;
       const m = await new Promise((resolve) => {
-        const timer = setTimeout(() => { PY.waiters.delete(id); resolve({ error: "超过 3 分钟：网络太慢" }); }, 180000);
+        const timer = setTimeout(() => { PY.waiters.delete(id); resolve({ error: tr("超过 3 分钟：网络太慢", "more than 3 minutes: the network is too slow") }); }, 180000);
         PY.waiters.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
         PY.worker.postMessage({ type: "prep", id, lcWheels: H.LC_WHEELS || [], tiktoken: H.TIKTOKEN });
       });
-      if (m.type !== "prepped") throw new Error(m.error || "未知错误");
+      if (m.type !== "prepped") throw new Error(m.error || tr("未知错误", "unknown error"));
     }
   })();
   PY.lc.then(pySetChip, () => { PY.lc = null; pySetChip(); });
@@ -727,11 +760,11 @@ function pyPrepLangchain() {
 // ---------------------------------------------------------------- TypeScript runtime (compiler in page, code in a worker)
 const TSR = { state: "idle", ready: null, libs: null };
 function tsSetChip() {
-  const map = { idle: ["", "TypeScript：点运行时启动"], loading: ["busy", "TypeScript：加载编译器…"], ready: ["ok", "TypeScript 5.6：就绪"], failed: ["bad", "TypeScript：无法启动"] };
+  const map = { idle: ["", tr("TypeScript：点运行时启动", "TypeScript: starts when you run")], loading: ["busy", tr("TypeScript：加载编译器…", "TypeScript: loading the compiler…")], ready: ["ok", tr("TypeScript 5.6：就绪", "TypeScript 5.6: ready")], failed: ["bad", tr("TypeScript：无法启动", "TypeScript: could not start")] };
   setChip("tsChip", ...map[TSR.state]);
 }
 function loadScript(src) {
-  return new Promise((resolve, reject) => { const s = document.createElement("script"); s.src = src; s.onload = resolve; s.onerror = () => reject(new Error("加载失败 " + src)); document.head.append(s); });
+  return new Promise((resolve, reject) => { const s = document.createElement("script"); s.src = src; s.onload = resolve; s.onerror = () => reject(new Error(tr("加载失败 ", "failed to load ") + src)); document.head.append(s); });
 }
 function tsStart() {
   if (TSR.ready) return TSR.ready;
@@ -750,20 +783,20 @@ function tsStart() {
 }
 async function runTypeScript(code, tests) {
   try { await tsStart(); }
-  catch (e) { return { runtimeError: "TypeScript 编译器加载失败：" + (e && e.message || e) }; }
+  catch (e) { return { runtimeError: tr("TypeScript 编译器加载失败：", "The TypeScript compiler failed to load: ") + (e && e.message || e) }; }
   let compiled;
   try { compiled = CCTS.compile(window.ts, TSR.libs, code, tests || ""); }
-  catch (e) { return { runtimeError: "编译器内部错误：" + (e && e.message || e) }; }
-  const job = CCTS.buildJob(H.TS_RUNTIME, compiled.js);
+  catch (e) { return { runtimeError: tr("编译器内部错误：", "Internal compiler error: ") + (e && e.message || e) }; }
+  const job = CCTS.buildJob((UI_LANG === "en" ? 'var __CC_LANG = "en";\n' : "") + H.TS_RUNTIME, compiled.js);
   const needsZod = /from\s+["']zod["']|require\(["']zod["']\)/.test(code + tests);
   const src = (needsZod ? `importScripts(${JSON.stringify(BASE + "zod.iife.js")});\n` : "") + job;
   const result = await new Promise((resolve) => {
     let w;
     try { w = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" }))); }
-    catch (e) { resolve({ runtimeError: "无法创建运行环境：" + e.message }); return; }
-    const timer = setTimeout(() => { w.terminate(); resolve({ runtimeError: "运行超过 6 秒被强制停止。检查是否有死循环，或 await 了一个永远不会完成的 Promise。" }); }, 6000);
+    catch (e) { resolve({ runtimeError: tr("无法创建运行环境：", "Could not create the runtime: ") + e.message }); return; }
+    const timer = setTimeout(() => { w.terminate(); resolve({ runtimeError: tr("运行超过 6 秒被强制停止。检查是否有死循环，或 await 了一个永远不会完成的 Promise。", "Stopped after running for more than 6 seconds. Look for an endless loop, or an await on a Promise that never finishes.") }); }, 6000);
     w.onmessage = (e) => { clearTimeout(timer); w.terminate(); resolve(e.data); };
-    w.onerror = (e) => { e.preventDefault(); clearTimeout(timer); w.terminate(); resolve({ error: "SyntaxError / 运行错误：" + (e.message || "脚本无法执行"), tests: [] }); };
+    w.onerror = (e) => { e.preventDefault(); clearTimeout(timer); w.terminate(); resolve({ error: tr("SyntaxError / 运行错误：", "SyntaxError / runtime error: ") + (e.message || tr("脚本无法执行", "the script could not run")), tests: [] }); };
   });
   return { ...result, diagnostics: compiled.diagnostics };
 }
@@ -774,74 +807,74 @@ function runCode(item, code) {
 
 // ---------------------------------------------------------------- error glosses (Chinese hints for common errors)
 const PY_GLOSS = {
-  NameError: "名字没定义：多半是拼错了，或者在定义之前就用了它。",
-  TypeError: "类型不对：比如字符串和数字相加、调用函数时参数个数不对、对 None 取值。",
-  SyntaxError: "写法错误：检查冒号、括号、引号是否成对，关键字是否拼对。",
-  IndentationError: "缩进错误：同一层代码要对齐，if/for/def 下面的代码要多缩进 4 个空格。",
-  KeyError: "字典里没有这个键：先用 in 判断，或者用 .get(键, 默认值)。",
-  IndexError: "下标越界：列表没有那么多元素。空列表的 [0] 也会报这个错。",
-  AttributeError: "对象没有这个属性或方法：检查拼写，或者这个值其实是 None。",
-  ValueError: "值的内容不对：比如 int(\"abc\")，或者 JSON 格式错误。",
-  ZeroDivisionError: "除以了 0。",
-  JSONDecodeError: "JSON 格式不对：检查引号（JSON 只能用双引号）和逗号。",
-  ValidationError: "Pydantic 校验失败：数据不符合模型的定义，看报错里的字段名和原因。",
-  ModuleNotFoundError: "找不到这个模块：检查 import 的名字。",
-  RecursionError: "函数无限调用自己，停不下来。",
-  UnboundLocalError: "在函数里给变量赋值之前就读取了它。",
-  RuntimeError: "运行时错误，看报错信息的具体说明。",
-  HTTPError: "请求返回了错误状态码，看数字：401 是密钥问题，429 是请求太频繁，5xx 是服务器问题。",
-  AssertionError: "assert 的条件不成立：看这一行在检查什么，再打印一下实际的值。",
-  FileNotFoundError: "找不到文件：检查路径和文件名，文件是不是还没写出来。相对路径是相对「当前工作目录」算的。",
-  IsADirectoryError: "这是一个文件夹，不是文件：路径少写了文件名。",
-  NotADirectoryError: "路径中间有一段是文件，不是文件夹。",
-  FileExistsError: "文件或文件夹已经存在：mkdir 时加上 exist_ok=True。",
-  StopIteration: "迭代器已经没有下一个值了：常见于 next(...) 没有给默认值。",
-  NotImplementedError: "这个方法还没有实现（通常是留给你写的）。",
-  TimeoutError: "等待超时：请求或操作在规定时间内没有完成。",
-  ClientError: "AWS 返回了错误：看 e.response[\"Error\"][\"Code\"]，比如 NoSuchKey（对象不存在）、NoSuchBucket、AccessDenied（权限不够）、ThrottlingException（太频繁）。",
-  NoCredentialsError: "boto3 找不到 AWS 凭证：本机要先配置（aws configure / 环境变量 / IAM 角色）。",
-  NotFound: "Google Cloud 返回 404：桶、对象、表或密钥不存在，检查名字和项目。",
-  BadRequest: "Google Cloud 返回 400：请求本身有问题，BigQuery 里通常是 SQL 写错了或参数没传。",
-  Forbidden: "Google Cloud 返回 403：服务账号没有这个权限（IAM）。",
-  TooManyRequests: "请求太频繁（429）：等一会儿再重试，最好用指数退避。",
-  OperationalError: "SQL 执行出错：多半是表名或列名写错、SQL 语法错误。看报错里的 near 或 no such。",
-  IntegrityError: "违反数据库约束：主键重复、NOT NULL 列没给值，或外键指向不存在的行。",
-  ProgrammingError: "数据库 API 用法不对：比如一次 execute 里写了多条语句，或参数个数和 ? 的个数不一致。",
+  NameError: tr("名字没定义：多半是拼错了，或者在定义之前就用了它。", "The name is not defined: usually a typo, or it is used before it is defined."),
+  TypeError: tr("类型不对：比如字符串和数字相加、调用函数时参数个数不对、对 None 取值。", "Wrong type: for example adding a string and a number, calling a function with the wrong number of arguments, or indexing None."),
+  SyntaxError: tr("写法错误：检查冒号、括号、引号是否成对，关键字是否拼对。", "The code is not written correctly: check colons, that brackets and quotes come in pairs, and the spelling of keywords."),
+  IndentationError: tr("缩进错误：同一层代码要对齐，if/for/def 下面的代码要多缩进 4 个空格。", "Indentation error: lines at the same level must line up, and the lines under if/for/def are indented 4 more spaces."),
+  KeyError: tr("字典里没有这个键：先用 in 判断，或者用 .get(键, 默认值)。", "The dictionary has no such key: check with in first, or use .get(key, default)."),
+  IndexError: tr("下标越界：列表没有那么多元素。空列表的 [0] 也会报这个错。", "Index out of range: the list does not have that many elements. [0] on an empty list raises this too."),
+  AttributeError: tr("对象没有这个属性或方法：检查拼写，或者这个值其实是 None。", "The object has no such attribute or method: check the spelling, or the value is actually None."),
+  ValueError: tr("值的内容不对：比如 int(\"abc\")，或者 JSON 格式错误。", "The value is not right: for example int(\"abc\"), or malformed JSON."),
+  ZeroDivisionError: tr("除以了 0。", "Division by 0."),
+  JSONDecodeError: tr("JSON 格式不对：检查引号（JSON 只能用双引号）和逗号。", "Malformed JSON: check the quotes (JSON only allows double quotes) and the commas."),
+  ValidationError: tr("Pydantic 校验失败：数据不符合模型的定义，看报错里的字段名和原因。", "Pydantic validation failed: the data does not match the model; read the field names and reasons in the error."),
+  ModuleNotFoundError: tr("找不到这个模块：检查 import 的名字。", "The module was not found: check the name after import."),
+  RecursionError: tr("函数无限调用自己，停不下来。", "The function keeps calling itself and never stops."),
+  UnboundLocalError: tr("在函数里给变量赋值之前就读取了它。", "The variable is read inside the function before it is assigned."),
+  RuntimeError: tr("运行时错误，看报错信息的具体说明。", "Runtime error: read the message for details."),
+  HTTPError: tr("请求返回了错误状态码，看数字：401 是密钥问题，429 是请求太频繁，5xx 是服务器问题。", "The request returned an error status; look at the number: 401 is a key problem, 429 is too many requests, 5xx is the server."),
+  AssertionError: tr("assert 的条件不成立：看这一行在检查什么，再打印一下实际的值。", "The assert condition is false: see what this line checks, then print the actual value."),
+  FileNotFoundError: tr("找不到文件：检查路径和文件名，文件是不是还没写出来。相对路径是相对「当前工作目录」算的。", "File not found: check the path and the file name, and whether the file was written yet. Relative paths start from the current working directory."),
+  IsADirectoryError: tr("这是一个文件夹，不是文件：路径少写了文件名。", "This is a folder, not a file: the path is missing the file name."),
+  NotADirectoryError: tr("路径中间有一段是文件，不是文件夹。", "A part in the middle of the path is a file, not a folder."),
+  FileExistsError: tr("文件或文件夹已经存在：mkdir 时加上 exist_ok=True。", "The file or folder already exists: pass exist_ok=True to mkdir."),
+  StopIteration: tr("迭代器已经没有下一个值了：常见于 next(...) 没有给默认值。", "The iterator has no next value: common with next(...) without a default."),
+  NotImplementedError: tr("这个方法还没有实现（通常是留给你写的）。", "This method is not implemented yet (usually it is yours to write)."),
+  TimeoutError: tr("等待超时：请求或操作在规定时间内没有完成。", "Timed out: the request or operation did not finish in time."),
+  ClientError: tr("AWS 返回了错误：看 e.response[\"Error\"][\"Code\"]，比如 NoSuchKey（对象不存在）、NoSuchBucket、AccessDenied（权限不够）、ThrottlingException（太频繁）。", "AWS returned an error: look at e.response[\"Error\"][\"Code\"], for example NoSuchKey (no such object), NoSuchBucket, AccessDenied (missing permission), ThrottlingException (too frequent)."),
+  NoCredentialsError: tr("boto3 找不到 AWS 凭证：本机要先配置（aws configure / 环境变量 / IAM 角色）。", "boto3 found no AWS credentials: configure them on your computer first (aws configure / environment variables / an IAM role)."),
+  NotFound: tr("Google Cloud 返回 404：桶、对象、表或密钥不存在，检查名字和项目。", "Google Cloud returned 404: the bucket, object, table or secret does not exist; check the name and the project."),
+  BadRequest: tr("Google Cloud 返回 400：请求本身有问题，BigQuery 里通常是 SQL 写错了或参数没传。", "Google Cloud returned 400: the request itself is wrong; in BigQuery it is usually a SQL mistake or a missing parameter."),
+  Forbidden: tr("Google Cloud 返回 403：服务账号没有这个权限（IAM）。", "Google Cloud returned 403: the service account lacks this permission (IAM)."),
+  TooManyRequests: tr("请求太频繁（429）：等一会儿再重试，最好用指数退避。", "Too many requests (429): wait and retry, ideally with exponential backoff."),
+  OperationalError: tr("SQL 执行出错：多半是表名或列名写错、SQL 语法错误。看报错里的 near 或 no such。", "The SQL failed: usually a wrong table or column name, or a syntax error. Look for near or no such in the message."),
+  IntegrityError: tr("违反数据库约束：主键重复、NOT NULL 列没给值，或外键指向不存在的行。", "A database constraint was violated: a duplicate primary key, no value for a NOT NULL column, or a foreign key pointing to a missing row."),
+  ProgrammingError: tr("数据库 API 用法不对：比如一次 execute 里写了多条语句，或参数个数和 ? 的个数不一致。", "The database API was used wrongly: for example several statements in one execute, or a different number of parameters than ? marks."),
 };
 const TS_GLOSS = {
-  2322: "类型不匹配：你给的值和声明的类型不一致。",
-  2345: "参数类型不匹配：传进函数的值和参数声明的类型不一致。",
-  2304: "找不到这个名字：拼错了，或者没有声明 / 没有 import。",
-  2339: "这个类型上没有这个属性：拼错了，或者值可能是 undefined / Promise。",
-  2554: "参数个数不对。",
-  2355: "声明了返回类型，但不是每条路径都 return 了值。",
-  2366: "函数缺少结尾的 return。",
-  7006: "参数没写类型：TypeScript 严格模式要求给参数标类型，例如 (text: string)。",
-  7005: "变量被推断成 any：给它加上类型标注。",
-  18047: "这个值可能是 null：先判断再用。",
-  18048: "这个值可能是 undefined：先判断再用（if 或 ?? 默认值）。",
-  2532: "这个对象可能是 undefined：先判断再用。",
-  2367: "这两个值的类型不可能相等，比较永远不成立。",
-  1005: "缺少符号：通常是少了括号、逗号或分号。",
-  1128: "这里需要一个声明或语句：检查括号是否成对。",
-  2448: "在声明之前就使用了这个变量。",
-  2588: "const 声明的变量不能重新赋值，需要改的话用 let。",
-  2349: "这个值不能被调用：它不是函数。",
-  1308: "await 只能写在 async 函数里。",
-  2801: "这里需要 await：这个值是 Promise。",
-  2741: "对象缺少必需的属性：按类型定义把字段补齐。",
-  2353: "对象里多了一个类型定义里没有的属性：拼错了，或者类型里没声明。",
-  2678: "switch 的这个 case 不可能出现：值的类型里没有它（多半是拼错了）。",
-  2564: "类的属性既没有初始值，也没有在 constructor 里赋值。",
-  18046: "这个值的类型是 unknown：先用 typeof / in / 类型守卫 检查，再使用。",
-  2571: "这个对象的类型是 unknown：先检查再使用。",
-  2769: "没有匹配的函数重载：参数的类型或个数不对。",
-  7053: "不能用这个字符串当下标：给对象标上 Record<string, ...> 类型，或者把键的类型收窄。",
-  2344: "类型参数不满足约束（泛型 extends 的要求）。",
-  2416: "子类的方法签名和父类的不兼容。",
-  2377: "子类的 constructor 必须先调用 super(...)。",
-  17009: "在 super(...) 之前不能使用 this。",
-  2352: "类型断言（as）不成立：这两个类型差得太远。",
+  2322: tr("类型不匹配：你给的值和声明的类型不一致。", "Type mismatch: the value does not match the declared type."),
+  2345: tr("参数类型不匹配：传进函数的值和参数声明的类型不一致。", "Argument type mismatch: the value passed in does not match the parameter's declared type."),
+  2304: tr("找不到这个名字：拼错了，或者没有声明 / 没有 import。", "Cannot find this name: a typo, or it was not declared / imported."),
+  2339: tr("这个类型上没有这个属性：拼错了，或者值可能是 undefined / Promise。", "This type has no such property: a typo, or the value may be undefined / a Promise."),
+  2554: tr("参数个数不对。", "Wrong number of arguments."),
+  2355: tr("声明了返回类型，但不是每条路径都 return 了值。", "A return type is declared, but not every path returns a value."),
+  2366: tr("函数缺少结尾的 return。", "The function is missing a final return."),
+  7006: tr("参数没写类型：TypeScript 严格模式要求给参数标类型，例如 (text: string)。", "The parameter has no type: strict TypeScript wants parameter types, for example (text: string)."),
+  7005: tr("变量被推断成 any：给它加上类型标注。", "The variable was inferred as any: give it a type annotation."),
+  18047: tr("这个值可能是 null：先判断再用。", "This value may be null: check before using it."),
+  18048: tr("这个值可能是 undefined：先判断再用（if 或 ?? 默认值）。", "This value may be undefined: check before using it (if, or ?? with a default)."),
+  2532: tr("这个对象可能是 undefined：先判断再用。", "This object may be undefined: check before using it."),
+  2367: tr("这两个值的类型不可能相等，比较永远不成立。", "These two types can never be equal, so the comparison is always false."),
+  1005: tr("缺少符号：通常是少了括号、逗号或分号。", "A symbol is missing: usually a bracket, a comma or a semicolon."),
+  1128: tr("这里需要一个声明或语句：检查括号是否成对。", "A declaration or statement is expected here: check that brackets come in pairs."),
+  2448: tr("在声明之前就使用了这个变量。", "The variable is used before it is declared."),
+  2588: tr("const 声明的变量不能重新赋值，需要改的话用 let。", "A const variable cannot be reassigned; use let if it has to change."),
+  2349: tr("这个值不能被调用：它不是函数。", "This value cannot be called: it is not a function."),
+  1308: tr("await 只能写在 async 函数里。", "await only works inside an async function."),
+  2801: tr("这里需要 await：这个值是 Promise。", "An await is needed here: this value is a Promise."),
+  2741: tr("对象缺少必需的属性：按类型定义把字段补齐。", "The object is missing a required property: add the fields the type defines."),
+  2353: tr("对象里多了一个类型定义里没有的属性：拼错了，或者类型里没声明。", "The object has a property the type does not define: a typo, or the type does not declare it."),
+  2678: tr("switch 的这个 case 不可能出现：值的类型里没有它（多半是拼错了）。", "This switch case can never happen: the value's type does not include it (usually a typo)."),
+  2564: tr("类的属性既没有初始值，也没有在 constructor 里赋值。", "The class property has no initial value and is not assigned in the constructor."),
+  18046: tr("这个值的类型是 unknown：先用 typeof / in / 类型守卫 检查，再使用。", "This value's type is unknown: check it with typeof / in / a type guard before using it."),
+  2571: tr("这个对象的类型是 unknown：先检查再使用。", "This object's type is unknown: check it before using it."),
+  2769: tr("没有匹配的函数重载：参数的类型或个数不对。", "No overload matches: the argument types or count are wrong."),
+  7053: tr("不能用这个字符串当下标：给对象标上 Record<string, ...> 类型，或者把键的类型收窄。", "This string cannot index the object: type the object as Record<string, ...>, or narrow the key's type."),
+  2344: tr("类型参数不满足约束（泛型 extends 的要求）。", "The type argument does not satisfy the constraint (the generic's extends)."),
+  2416: tr("子类的方法签名和父类的不兼容。", "The subclass method's signature is not compatible with the parent's."),
+  2377: tr("子类的 constructor 必须先调用 super(...)。", "A subclass constructor must call super(...) first."),
+  17009: tr("在 super(...) 之前不能使用 this。", "this cannot be used before super(...)."),
+  2352: tr("类型断言（as）不成立：这两个类型差得太远。", "The type assertion (as) is not valid: the two types are too different."),
 };
 function pyGloss(text) {
   const m = /(\w+(?:Error|Exception))\b/.exec(String(text).split("\n").filter(Boolean).pop() || "");
@@ -864,7 +897,7 @@ function makeEditor(host, { value, lang, exam, onRun, onChange, minHeight }) {
       },
     });
     cm.on("beforeChange", (c, ch) => {
-      if ((ch.origin === "paste" || ch.origin === "drop") && blockPaste()) { ch.cancel(); toast(exam ? "闭卷模式不能粘贴，请手写" : "粘贴已关闭：手敲一遍记得更牢（右上角可以打开）"); }
+      if ((ch.origin === "paste" || ch.origin === "drop") && blockPaste()) { ch.cancel(); toast(exam ? tr("闭卷模式不能粘贴，请手写", "No pasting in a closed-book exam: type it") : tr("粘贴已关闭：手敲一遍记得更牢（右上角可以打开）", "Pasting is off: typing it yourself sticks better (turn it on at the top right)")); }
     });
     if (onChange) cm.on("changes", () => onChange(cm.getValue()));
     if (minHeight) cm.getWrapperElement().style.minHeight = minHeight;
@@ -882,7 +915,7 @@ function makeEditor(host, { value, lang, exam, onRun, onChange, minHeight }) {
     if (e.key === "Tab") { e.preventDefault(); const s = ta.selectionStart; ta.setRangeText(" ".repeat(lang === "ts" ? 2 : 4), s, ta.selectionEnd, "end"); }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); onRun && onRun(); }
   });
-  ta.addEventListener("paste", (e) => { if (blockPaste()) { e.preventDefault(); toast("粘贴已关闭：请手写"); } });
+  ta.addEventListener("paste", (e) => { if (blockPaste()) { e.preventDefault(); toast(tr("粘贴已关闭：请手写", "Pasting is off: please type it")); } });
   if (onChange) ta.addEventListener("input", () => onChange(ta.value));
   host.append(ta);
   return { get: () => ta.value, set: (v) => (ta.value = v), focus: () => ta.focus(), refresh() {}, markLines() {} };
@@ -891,9 +924,9 @@ function makeEditor(host, { value, lang, exam, onRun, onChange, minHeight }) {
 // ---------------------------------------------------------------- local file export
 function sqlFile(item, code) {
   const py = (s) => JSON.stringify(s);   // a JSON string is also a valid Python string literal
-  return `# ${item.title} —— 从 Clause Check 编程营导出
-# 运行：python ${item.id}.py        （Python 自带 sqlite3，不用安装任何东西）
-${item.bq ? "# 注意：本页在 SQLite 上模拟了几个 BigQuery 写法（反引号表名、SAFE_DIVIDE、COUNTIF、DATE_TRUNC……），本机的 SQLite 没有它们。\n" : ""}import sqlite3
+  return `# ${item.title} ${tr("—— 从 Clause Check 编程营导出", "— exported from Clause Check Bootcamp")}
+# ${tr("运行", "Run")}: python ${item.id}.py        ${tr("（Python 自带 sqlite3，不用安装任何东西）", "(Python ships with sqlite3, nothing to install)")}
+${item.bq ? tr("# 注意：本页在 SQLite 上模拟了几个 BigQuery 写法（反引号表名、SAFE_DIVIDE、COUNTIF、DATE_TRUNC……），本机的 SQLite 没有它们。\n", "# Note: the page simulates a few BigQuery forms on SQLite (backtick table names, SAFE_DIVIDE, COUNTIF, DATE_TRUNC, ...); SQLite on your computer does not have them.\n") : ""}import sqlite3
 
 SETUP = ${py(sqlSetup(item))}
 QUERY = ${py(code)}
@@ -910,8 +943,8 @@ function cloudPrelude(item) {
   if (!item.cloud && !item.dataset) return "";
   const py = (s) => JSON.stringify(s);
   return `
-# ---- 本页的模拟云 SDK 和样例数据 ----
-# 真项目里：pip install boto3 google-cloud-storage google-cloud-bigquery ...，配置好凭证，再删掉这一段。
+${PY_LANG_LINE.trim() ? PY_LANG_LINE.trim() + "\n" : ""}# ---- ${tr("本页的模拟云 SDK 和样例数据", "the page's simulated cloud SDKs and sample data")} ----
+# ${tr("真项目里：pip install boto3 google-cloud-storage google-cloud-bigquery ...，配置好凭证，再删掉这一段。", "In a real project: pip install boto3 google-cloud-storage google-cloud-bigquery ..., set up credentials, then delete this section.")}
 import sys as _sys, types as _types
 def _cc_load_module(name, source):
     mod = _types.ModuleType(name)
@@ -920,31 +953,31 @@ def _cc_load_module(name, source):
     return mod
 _cc_load_module("_ccsql", ${py(H.PY_SQL || "")})
 _cc_load_module("_cccloud", ${py(H.PY_CLOUD || "")})
-${pySetup({ dataset: item.dataset, cloud: item.cloud })}# ---- 模拟结束 ----
+${pySetup({ dataset: item.dataset, cloud: item.cloud })}# ---- ${tr("模拟结束", "end of the simulation")} ----
 `;
 }
 const LC_INSTALL = "python -m pip install langchain langgraph langchain-deepseek langchain-openai langchain-text-splitters langgraph-checkpoint-sqlite numpy";
 function lcPrelude(item) {
   if (!item.langchain) return "";
   return `
-# ---- 本页的 LangChain 环境：真正的 LangChain / LangGraph，模型调用都走上面的模拟服务器 ----
-# 先安装：${LC_INSTALL}
-# 想调用真实的 DeepSeek：删掉这一段和上面的模拟服务器，把 DEEPSEEK_API_KEY 放进环境变量（或 .env + python-dotenv）
+# ---- ${tr("本页的 LangChain 环境：真正的 LangChain / LangGraph，模型调用都走上面的模拟服务器", "the page's LangChain setup: the real LangChain / LangGraph, with model calls going to the mock server above")} ----
+# ${tr("先安装", "Install first")}: ${LC_INSTALL}
+# ${tr("想调用真实的 DeepSeek：删掉这一段和上面的模拟服务器，把 DEEPSEEK_API_KEY 放进环境变量（或 .env + python-dotenv）", "To call the real DeepSeek: delete this section and the mock server above, and put DEEPSEEK_API_KEY in an environment variable (or .env + python-dotenv)")}
 import sys as _sys, types as _types
 _cclc = _types.ModuleType("_cclc")
 exec(compile(${JSON.stringify(H.PY_LANGCHAIN || "")}, "_cclc.py", "exec"), _cclc.__dict__)
 _sys.modules["_cclc"] = _cclc
 _cclc.prepare()
 _cclc.use_mock(MOCK)
-# ---- LangChain 环境结束 ----
+# ---- ${tr("LangChain 环境结束", "end of the LangChain setup")} ----
 `;
 }
 function localFile(item, code) {
   if (item.lang === "sql") return sqlFile(item, code);
   if (item.lang === "py") {
     if (item.type === "testwrite") return testwriteFile(item, code);
-    const prelude = `# ${item.title} —— 从 Clause Check 编程营导出
-# 运行：python ${item.id}.py
+    const prelude = `# ${item.title} ${tr("—— 从 Clause Check 编程营导出", "— exported from Clause Check Bootcamp")}
+# ${tr("运行", "Run")}: python ${item.id}.py
 import io, sys
 _passed = _total = 0
 def _show(ok, label, detail=""):
@@ -953,59 +986,59 @@ def _show(ok, label, detail=""):
     print(("√ " if ok else "× ") + label + ("" if ok else "  " + detail))
 def expect(label, fn, expected):
     try:
-        got = fn(); _show(got == expected, label, f"得到 {got!r}，期望 {expected!r}")
-    except Exception as e: _show(False, label, f"报错 {type(e).__name__}: {e}")
+        got = fn(); _show(got == expected, label, f"${tr("得到", "got")} {got!r}${tr("，期望", ", expected")} {expected!r}")
+    except Exception as e: _show(False, label, f"${tr("报错", "error")} {type(e).__name__}: {e}")
 def expect_true(label, fn):
-    try: got = fn(); _show(bool(got), label, f"得到 {got!r}")
-    except Exception as e: _show(False, label, f"报错 {type(e).__name__}: {e}")
+    try: got = fn(); _show(bool(got), label, f"${tr("得到", "got")} {got!r}")
+    except Exception as e: _show(False, label, f"${tr("报错", "error")} {type(e).__name__}: {e}")
 def expect_raises(label, fn, exc):
-    try: fn(); _show(False, label, "没有报错")
+    try: fn(); _show(False, label, "${tr("没有报错", "no error raised")}")
     except exc: _show(True, label)
-    except Exception as e: _show(False, label, f"报了别的错 {type(e).__name__}")
+    except Exception as e: _show(False, label, f"${tr("报了别的错", "raised a different error")} {type(e).__name__}")
 def expect_output(label, fn, expected):
     buf, old = io.StringIO(), sys.stdout
     sys.stdout = buf
     try: fn()
     finally: sys.stdout = old
-    got = buf.getvalue().rstrip("\\n"); _show(got == expected.rstrip("\\n"), label, f"输出 {got!r}，期望 {expected!r}")
+    got = buf.getvalue().rstrip("\\n"); _show(got == expected.rstrip("\\n"), label, f"${tr("输出", "output")} {got!r}${tr("，期望", ", expected")} {expected!r}")
 `;
-    const mock = item.mock || item.langchain ? `\n# ---- 模拟 DeepSeek 服务器（删掉这一段、pip install requests python-dotenv、在 .env 放真 key，就会调用真实 API）----\n${H.PY_MOCK}\n# ---- 模拟服务器结束 ----\n` : "";
-    return `${prelude}${mock}${lcPrelude(item)}${cloudPrelude(item)}\n# ---- 你的代码 ----\n${code}\n\n# ---- 测试 ----\n${item.tests || ""}\nprint(f"\\n{_passed}/{_total} 通过")\n`;
+    const mock = item.mock || item.langchain ? `\n# ---- ${tr("模拟 DeepSeek 服务器（删掉这一段、pip install requests python-dotenv、在 .env 放真 key，就会调用真实 API）", "mock DeepSeek server (delete this section, pip install requests python-dotenv and put a real key in .env to call the real API)")} ----\n${H.PY_MOCK}\n# ---- ${tr("模拟服务器结束", "end of the mock server")} ----\n` : "";
+    return `${prelude}${mock}${lcPrelude(item)}${cloudPrelude(item)}\n# ---- ${tr("你的代码", "your code")} ----\n${code}\n\n# ---- ${tr("测试", "tests")} ----\n${item.tests || ""}\nprint(f"\\n{_passed}/{_total} ${tr("通过", "passed")}")\n`;
   }
   const imports = (code.match(/^import .*$/gm) || []).join("\n");
   const body = code.replace(/^import .*$/gm, "");
   return `${imports}
-// ${item.title} —— 从 Clause Check 编程营导出
-// 运行：npx tsx ${item.id}.ts      （需要先 npm install zod 才能用 zod）
+// ${item.title} ${tr("—— 从 Clause Check 编程营导出", "— exported from Clause Check Bootcamp")}
+// ${tr("运行", "Run")}: npx tsx ${item.id}.ts      ${tr("（需要先 npm install zod 才能用 zod）", "(npm install zod first if it uses zod)")}
 let _passed = 0, _total = 0;
 const _pending: Promise<void>[] = [];
 const _show = (ok: boolean, label: string, detail = "") => { _total++; if (ok) _passed++; console.log((ok ? "✓ " : "✗ ") + label + (ok ? "" : "  " + detail)); };
 const _eq = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-function expect(label: string, fn: () => unknown, expected: unknown) { try { const got = fn(); _show(_eq(got, expected), label, \`得到 \${JSON.stringify(got)}，期望 \${JSON.stringify(expected)}\`); } catch (e) { _show(false, label, "报错 " + e); } }
-function expectTrue(label: string, fn: () => unknown) { try { _show(Boolean(fn()), label); } catch (e) { _show(false, label, "报错 " + e); } }
-function expectThrows(label: string, fn: () => unknown) { try { fn(); _show(false, label, "没有报错"); } catch { _show(true, label); } }
-function expectOutput(label: string, fn: () => void, expected: string) { const lines: string[] = []; const old = console.log; console.log = (...a: unknown[]) => { lines.push(a.join(" ")); }; try { fn(); } finally { console.log = old; } _show(lines.join("\\n") === expected, label, "输出 " + JSON.stringify(lines.join("\\n"))); }
-function expectAsync(label: string, fn: () => Promise<unknown>, expected: unknown) { _pending.push(fn().then((got) => _show(_eq(got, expected), label, \`得到 \${JSON.stringify(got)}，期望 \${JSON.stringify(expected)}\`), (e) => _show(false, label, "报错 " + e))); }
-function expectTrueAsync(label: string, fn: () => Promise<unknown>) { _pending.push(fn().then((got) => _show(Boolean(got), label), (e) => _show(false, label, "报错 " + e))); }
-function expectRejects(label: string, fn: () => Promise<unknown>) { _pending.push(fn().then(() => _show(false, label, "没有报错"), () => _show(true, label))); }
+function expect(label: string, fn: () => unknown, expected: unknown) { try { const got = fn(); _show(_eq(got, expected), label, \`${tr("得到", "got")} \${JSON.stringify(got)}${tr("，期望", ", expected")} \${JSON.stringify(expected)}\`); } catch (e) { _show(false, label, "${tr("报错", "error")} " + e); } }
+function expectTrue(label: string, fn: () => unknown) { try { _show(Boolean(fn()), label); } catch (e) { _show(false, label, "${tr("报错", "error")} " + e); } }
+function expectThrows(label: string, fn: () => unknown) { try { fn(); _show(false, label, "${tr("没有报错", "no error thrown")}"); } catch { _show(true, label); } }
+function expectOutput(label: string, fn: () => void, expected: string) { const lines: string[] = []; const old = console.log; console.log = (...a: unknown[]) => { lines.push(a.join(" ")); }; try { fn(); } finally { console.log = old; } _show(lines.join("\\n") === expected, label, "${tr("输出", "output")} " + JSON.stringify(lines.join("\\n"))); }
+function expectAsync(label: string, fn: () => Promise<unknown>, expected: unknown) { _pending.push(fn().then((got) => _show(_eq(got, expected), label, \`${tr("得到", "got")} \${JSON.stringify(got)}${tr("，期望", ", expected")} \${JSON.stringify(expected)}\`), (e) => _show(false, label, "${tr("报错", "error")} " + e))); }
+function expectTrueAsync(label: string, fn: () => Promise<unknown>) { _pending.push(fn().then((got) => _show(Boolean(got), label), (e) => _show(false, label, "${tr("报错", "error")} " + e))); }
+function expectRejects(label: string, fn: () => Promise<unknown>) { _pending.push(fn().then(() => _show(false, label, "${tr("没有报错", "no error thrown")}"), () => _show(true, label))); }
 
-// ---- 你的代码 ----
+// ---- ${tr("你的代码", "your code")} ----
 ${body}
 
-// ---- 测试 ----
+// ---- ${tr("测试", "tests")} ----
 ${item.tests || ""}
-Promise.all(_pending).then(() => console.log(\`\\n\${_passed}/\${_total} 通过\`));
+Promise.all(_pending).then(() => console.log(\`\\n\${_passed}/\${_total} ${tr("通过", "passed")}\`));
 `;
 }
 function testwriteFile(item, code) {
-  return `# ${item.title} —— 从 Clause Check 编程营导出
-# 运行：python -m pytest ${item.id}.py        （需要 pip install pytest）
-${item.langchain ? "#   先安装真正的 LangChain：" + LC_INSTALL + "\n" : ""}#   或：python ${item.id}.py                （不用 pytest 也能跑，但不能 import pytest）
+  return `# ${item.title} ${tr("—— 从 Clause Check 编程营导出", "— exported from Clause Check Bootcamp")}
+# ${tr("运行", "Run")}: python -m pytest ${item.id}.py        ${tr("（需要 pip install pytest）", "(needs pip install pytest)")}
+${item.langchain ? tr("#   先安装真正的 LangChain：", "#   install the real LangChain first: ") + LC_INSTALL + "\n" : ""}#   ${tr("或", "or")}: python ${item.id}.py                ${tr("（不用 pytest 也能跑，但不能 import pytest）", "(runs without pytest too, but then it cannot import pytest)")}
 
-# ---- 被测函数（正确版本）----
+# ---- ${tr("被测函数（正确版本）", "the function under test (correct version)")} ----
 ${item.impl}
 
-# ---- 你的测试 ----
+# ---- ${tr("你的测试", "your tests")} ----
 ${code}
 
 
@@ -1021,11 +1054,11 @@ if __name__ == "__main__":
         except Exception:
             print("×", name)
             traceback.print_exc()
-    print(f"\\n{passed}/{len(tests)} 通过")
+    print(f"\\n{passed}/{len(tests)} ${tr("通过", "passed")}")
 `;
 }
 async function copyText(text) {
-  try { await navigator.clipboard.writeText(text); toast("已复制"); return true; }
+  try { await navigator.clipboard.writeText(text); toast(tr("已复制", "Copied")); return true; }
   catch (e) { return false; }
 }
 
@@ -1044,12 +1077,12 @@ function dayProgress(day) {
   return { done, total: day.items.length };
 }
 function canSeeSolution(item, r) {
-  if (isExamLive(item)) return { ok: false, why: "闭卷进行中" };
+  if (isExamLive(item)) return { ok: false, why: tr("闭卷进行中", "closed-book exam in progress") };
   if (r.s === "solved") return { ok: true };
   if (r.a >= SOLUTION_AFTER_TRIES) return { ok: true };
   const opened = SESSION.opened[item.id];
   if (opened && Date.now() - opened >= SOLUTION_AFTER_MS) return { ok: true };
-  return { ok: false, why: `再认真试 ${SOLUTION_AFTER_TRIES - r.a} 次（或独立思考 10 分钟）后可以看答案` };
+  return { ok: false, why: tr(`再认真试 ${SOLUTION_AFTER_TRIES - r.a} 次（或独立思考 10 分钟）后可以看答案`, `The answer unlocks after ${SOLUTION_AFTER_TRIES - r.a} more real ${SOLUTION_AFTER_TRIES - r.a === 1 ? "try" : "tries"} (or 10 minutes of thinking on your own)`) };
 }
 function isExamLive(item) { return !!(STATE.exam && STATE.exam.active && item.exam && Number(STATE.exam.day) === item.day); }
 const SESSION = { opened: {}, results: {}, hintsShown: {}, solShown: {}, choice: {}, redo: {} };
@@ -1091,7 +1124,7 @@ function renderRail() {
     const total = days.reduce((n, d) => n + d.items.length, 0);
     const open = w === openWeek;
     rail.append(h("button", { class: "weekBtn", "aria-expanded": open ? "true" : "false", onclick: () => { SESSION.railWeek = open ? null : w; renderRail(); } },
-      h("span", { class: "wt" }, WEEK_TITLE[w] || `第 ${w} 周`),
+      h("span", { class: "wt" }, WEEK_TITLE[w] || tr(`第 ${w} 周`, `Week ${w}`)),
       h("span", { class: "wp" }, `${done}/${total}`),
       h("span", { class: "bar" }, h("i", { style: `width:${total ? (100 * done) / total : 0}%` }))));
     if (!open) continue;
@@ -1100,14 +1133,14 @@ function renderRail() {
       const cur = STATE.current.view === "day" && Number(STATE.current.day) === Number(d.id);
       rail.append(h("button", { class: "dayBtn", "aria-current": cur ? "true" : "false", onclick: () => go({ view: "day", day: Number(d.id) }) },
         h("span", { class: "num" }, d.id),
-        h("span", { class: "t" }, d.title.split("：")[0]),
+        h("span", { class: "t" }, d.title.split(/：|: /)[0]),
         h("span", { class: "p" }, h("span", { class: "bar" }, h("i", { style: `width:${p.total ? (100 * p.done) / p.total : 0}%` })), `${p.done}/${p.total}`)));
     }
   }
   const reviewCount = ALL_ITEMS.filter((it) => STATE.items[it.id]?.review).length;
-  rail.append(h("h4", {}, "巩固"));
-  rail.append(h("button", { class: "navBtn", "aria-current": STATE.current.view === "review" ? "true" : "false", onclick: () => go({ view: "review" }) }, "复习区", reviewCount ? h("span", { class: "badge" }, reviewCount) : ""));
-  rail.append(h("button", { class: "navBtn", "aria-current": STATE.current.view === "stats" ? "true" : "false", onclick: () => go({ view: "stats" }) }, "我的进度", ""));
+  rail.append(h("h4", {}, tr("巩固", "Consolidate")));
+  rail.append(h("button", { class: "navBtn", "aria-current": STATE.current.view === "review" ? "true" : "false", onclick: () => go({ view: "review" }) }, tr("复习区", "Review"), reviewCount ? h("span", { class: "badge" }, reviewCount) : ""));
+  rail.append(h("button", { class: "navBtn", "aria-current": STATE.current.view === "stats" ? "true" : "false", onclick: () => go({ view: "stats" }) }, tr("我的进度", "My progress"), ""));
 }
 function go(patch) {
   if (patch.day !== undefined) SESSION.railWeek = undefined;   // follow the chosen day's week
@@ -1120,7 +1153,7 @@ function render() {
   renderRail(); renderMeter();
   const main = $("#main");
   main.replaceChildren();
-  if (!COURSE.days.length) { main.append(h("div", { class: "panel" }, h("h2", {}, "题库没有加载"), h("p", {}, "course.js 没能加载，请刷新页面。"))); return; }
+  if (!COURSE.days.length) { main.append(h("div", { class: "panel" }, h("h2", {}, tr("题库没有加载", "The course did not load")), h("p", {}, tr("course.js 没能加载，请刷新页面。", "course.js could not be loaded; reload the page.")))); return; }
   if (STATE.current.view === "review") return renderReview(main);
   if (STATE.current.view === "stats") return renderStats(main);
   renderDay(main);
@@ -1133,11 +1166,11 @@ function renderDay(main) {
   const checks = day.checklist || [];
   const head = h("section", { class: "dayHead" },
     h("div", {},
-      h("div", { class: "eyebrow" }, `第 ${weekOf(day.id)} 周 · 第 ${day.id} 天 · ${lang} · ${day.hours || ""}`),
+      h("div", { class: "eyebrow" }, tr(`第 ${weekOf(day.id)} 周 · 第 ${day.id} 天`, `Week ${weekOf(day.id)} · Day ${day.id}`) + ` · ${lang} · ${day.hours || ""}`),
       h("h1", {}, day.title),
       h("p", { html: inline(day.goal || "") })),
     h("div", {},
-      h("p", { class: "panelLabel", style: "margin-bottom:8px" }, "今天完成标准"),
+      h("p", { class: "panelLabel", style: "margin-bottom:8px" }, tr("今天完成标准", "Done for today when")),
       h("ul", { class: "checklist" }, checks.map((c, i) => {
         const key = `${day.id}-${i}`;
         const done = !!STATE.checks[key];
@@ -1149,7 +1182,7 @@ function renderDay(main) {
   const tab = STATE.current.tab || "learn";
   const exams = examItems(day);
   const tabs = h("div", { class: "tabs", role: "tablist" },
-    [["learn", `学 · ${day.concepts.length}`], ["practice", `练 · ${practiceItems(day).length}`], ["exam", `闭卷 · ${exams.length}`]].map(([k, label]) =>
+    [["learn", `${tr("学", "Learn")} · ${day.concepts.length}`], ["practice", `${tr("练", "Practice")} · ${practiceItems(day).length}`], ["exam", `${tr("闭卷", "Closed book")} · ${exams.length}`]].map(([k, label]) =>
       h("button", { role: "tab", "aria-selected": tab === k ? "true" : "false", onclick: () => go({ tab: k }) }, label)));
   main.append(tabs);
   if (tab === "learn") renderLearn(main, day);
@@ -1162,7 +1195,7 @@ function renderLearn(main, day) {
   day.concepts.forEach((c, i) => {
     const seenKey = c.id;
     const card = h("details", { class: "card", open: i === 0 && !STATE.seen[seenKey] ? true : undefined },
-      h("summary", {}, h("span", { class: "n" }, i + 1), h("span", {}, c.title), STATE.seen[seenKey] ? h("span", { class: "seen" }, "运行过") : ""));
+      h("summary", {}, h("span", { class: "n" }, i + 1), h("span", {}, c.title), STATE.seen[seenKey] ? h("span", { class: "seen" }, tr("运行过", "Ran")) : ""));
     const body = h("div", { class: "cardBody" + (c.code ? "" : " textOnly") });
     const text = h("div", { class: "md", html: md(c.body) });
     highlightIn(text, c.lang);
@@ -1172,15 +1205,15 @@ function renderLearn(main, day) {
       const host = h("div", { class: "editorWrap" });
       const out = h("div", { class: "results" });
       side.append(host, h("div", { class: "actions" },
-        h("button", { class: "btn primary", onclick: () => run() }, "运行 ", h("kbd", {}, "Ctrl+Enter")),
-        h("button", { class: "btn ghost", onclick: () => { ed.set(c.code); out.replaceChildren(); } }, "还原例子")),
+        h("button", { class: "btn primary", onclick: () => run() }, tr("运行 ", "Run "), h("kbd", {}, "Ctrl+Enter")),
+        h("button", { class: "btn ghost", onclick: () => { ed.set(c.code); out.replaceChildren(); } }, tr("还原例子", "Reset example"))),
         c.lang === "sql" && c.tables ? schemaPanel(c.tables, false) : "", out);
       body.append(side);
       let ed = null;
       const mount = () => { if (!ed) ed = makeEditor(host, { value: c.code, lang: c.lang, onRun: () => run(), minHeight: "120px" }); else ed.refresh(); };
       async function run() {
         mount();
-        out.replaceChildren(h("p", { class: "note" }, c.lang !== "ts" && PY.state !== "ready" ? "正在启动 Python（第一次需要下载运行环境）…" : "运行中…"));
+        out.replaceChildren(h("p", { class: "note" }, c.lang !== "ts" && PY.state !== "ready" ? tr("正在启动 Python（第一次需要下载运行环境）…", "Starting Python (the first time downloads the runtime)…") : tr("运行中…", "Running…")));
         const r = c.lang === "ts" ? await runTypeScript(ed.get(), "") : c.lang === "sql" ? await runSql(c, ed.get(), false) : await runPython(ed.get(), "", pySetup(c));
         out.replaceChildren(...resultView(r, { item: { lang: c.lang }, editor: ed, noTests: true }));
         if (!STATE.seen[seenKey]) { STATE.seen[seenKey] = Date.now(); save(); }
@@ -1192,19 +1225,19 @@ function renderLearn(main, day) {
     wrap.append(card);
   });
   main.append(wrap);
-  const nextTab = h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: () => go({ tab: "practice" }) }, "开始练习 →"),
-    h("span", { class: "note" }, "每张卡片的例子都改一改再运行：只看不动手，等于没学。"));
+  const nextTab = h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: () => go({ tab: "practice" }) }, tr("开始练习 →", "Start practice →")),
+    h("span", { class: "note" }, tr("每张卡片的例子都改一改再运行：只看不动手，等于没学。", "Change every card's example and run it: reading without doing is not learning.")));
   main.append(nextTab);
 }
 
 // ---------------------------------------------------------------- render: practice list + workspace
 function renderPractice(main, day, items, mode) {
-  if (!items.length) { main.append(h("div", { class: "panel" }, h("p", { class: "emptyNote" }, "这里还没有题目。"))); return; }
+  if (!items.length) { main.append(h("div", { class: "panel" }, h("p", { class: "emptyNote" }, tr("这里还没有题目。", "No exercises here yet.")))); return; }
   const key = mode === "exam" ? `exam-${day ? day.id : "x"}` : mode === "review" ? "review" : String(day.id);
   let currentId = STATE.current.item[key];
   if (!items.some((it) => it.id === currentId)) currentId = (items.find((it) => status(it.id) !== "solved") || items[0]).id;
   const grid = h("div", { class: "practice" });
-  const list = h("nav", { class: "itemList", "aria-label": "题目列表" });
+  const list = h("nav", { class: "itemList", "aria-label": tr("题目列表", "Exercises") });
   items.forEach((it, i) => {
     const st = status(it.id);
     list.append(h("button", { class: "itemBtn", "aria-current": it.id === currentId ? "true" : "false", onclick: () => { STATE.current.item[key] = it.id; save(); render(); } },
@@ -1225,17 +1258,17 @@ function renderItem(work, item, ctx) {
   SESSION.opened[item.id] ||= Date.now();
   const exam = isExamLive(item);
   const st = status(item.id);
-  const stLabel = { solved: "已通过", review: "需要重做", tried: "尝试中", new: "" }[st];
+  const stLabel = { solved: tr("已通过", "Solved"), review: tr("需要重做", "Redo"), tried: tr("尝试中", "In progress"), new: "" }[st];
   work.append(h("div", { class: "workHead" },
-    h("span", { class: "kindTag" + (item.exam ? " exam" : "") }, item.exam ? "闭卷 · " + (KIND[item.type] || "") : KIND[item.type] || item.type),
+    h("span", { class: "kindTag" + (item.exam ? " exam" : "") }, item.exam ? tr("闭卷 · ", "Closed book · ") + (KIND[item.type] || "") : KIND[item.type] || item.type),
     h("span", { class: "kindTag" }, LANG[item.lang]),
-    h("span", { class: "level" }, "难度 " + "●".repeat(item.level || 1) + "○".repeat(3 - (item.level || 1))),
+    h("span", { class: "level" }, tr("难度 ", "Level ") + "●".repeat(item.level || 1) + "○".repeat(3 - (item.level || 1))),
     stLabel ? h("span", { class: "status " + st }, stLabel) : "",
-    r.a ? h("span", { class: "note" }, `已提交 ${r.a} 次`) : "",
+    r.a ? h("span", { class: "note" }, tr(`已提交 ${r.a} 次`, `${r.a} ${r.a === 1 ? "try" : "tries"}`)) : "",
     h("h2", {}, item.title)));
-  if (st === "review") work.append(h("div", { class: "hintBox" }, "这道题之前看过答案或用了较多提示，现在进了复习区。点「从空白重做」，不看答案独立写对一次，它就会离开复习区。"));
+  if (st === "review") work.append(h("div", { class: "hintBox" }, tr("这道题之前看过答案或用了较多提示，现在进了复习区。点「从空白重做」，不看答案独立写对一次，它就会离开复习区。", "You looked at the answer or used several hints here, so this exercise is in Review. Click Redo from blank and get it right once on your own, without the answer, and it leaves Review.")));
   if (item.context) {
-    const bg = h("div", { class: "context" }, h("p", { class: "panelLabel" }, "背景"), h("div", { class: "md", html: md(item.context) }));
+    const bg = h("div", { class: "context" }, h("p", { class: "panelLabel" }, tr("背景", "Background")), h("div", { class: "md", html: md(item.context) }));
     highlightIn(bg, item.lang);
     work.append(bg);
   }
@@ -1267,17 +1300,17 @@ function cardLinks(item) {
       const text = h("div", { class: "md", html: md(c.body) });
       highlightIn(text, c.lang);
       peek.replaceChildren(h("div", { class: "cardPeek" },
-        h("h4", {}, (Number(day.id) === item.day ? "" : `第 ${day.id} 天 · `) + c.title), text,
-        c.code ? h("p", { class: "panelLabel" }, "卡片里的例子（去「学」页可以运行）") : "", c.code ? codeBlock(c.code, c.lang) : ""));
+        h("h4", {}, (Number(day.id) === item.day ? "" : tr(`第 ${day.id} 天 · `, `Day ${day.id} · `)) + c.title), text,
+        c.code ? h("p", { class: "panelLabel" }, tr("卡片里的例子（去「学」页可以运行）", "The card's example (run it on the Learn tab)")) : "", c.code ? codeBlock(c.code, c.lang) : ""));
     } }, (Number(day.id) === item.day ? "" : `D${day.id} `) + c.title);
     return b;
   });
-  return h("div", {}, h("div", { class: "cardLinks" }, h("span", {}, "要用到的知识卡片："), ...btns), peek);
+  return h("div", {}, h("div", { class: "cardLinks" }, h("span", {}, tr("要用到的知识卡片：", "Knowledge cards used:")), ...btns), peek);
 }
 function checksView(item) {
   const cs = item.checks || [];
   if (!cs.length) return "";
-  return h("div", { class: "checks" }, h("p", { class: "panelLabel" }, "判题会检查"),
+  return h("div", { class: "checks" }, h("p", { class: "panelLabel" }, tr("判题会检查", "What the grader checks")),
     h("ul", {}, cs.map((c) => h("li", {}, h("span", {}, c.label), c.call ? h("code", {}, `${c.call}  →  ${c.value}`) : ""))));
 }
 
@@ -1288,7 +1321,7 @@ function helpers(work, item, { exam, solution, onRedo }) {
   const hints = item.hints || [];
   const shown = () => SESSION.hintsShown[item.id] || 0;
   const hintArea = h("div", { style: "display:flex;flex-direction:column;gap:6px" });
-  const drawHints = () => hintArea.replaceChildren(...hints.slice(0, shown()).map((t, i) => { const el = h("div", { class: "hintBox", html: `<strong>提示 ${i + 1}：</strong>${inline(t)}` }); return el; }));
+  const drawHints = () => hintArea.replaceChildren(...hints.slice(0, shown()).map((t, i) => { const el = h("div", { class: "hintBox", html: `<strong>${tr(`提示 ${i + 1}：`, `Hint ${i + 1}: `)}</strong>${inline(t)}` }); return el; }));
   drawHints();
   const bar = h("div", { class: "actions" });
   if (!exam && hints.length) {
@@ -1296,8 +1329,8 @@ function helpers(work, item, { exam, solution, onRedo }) {
       if (shown() >= hints.length) return;
       SESSION.hintsShown[item.id] = shown() + 1;
       r.h = Math.max(r.h || 0, shown()); r.u = Date.now(); save();
-      drawHints(); hb.textContent = shown() >= hints.length ? "提示已用完" : `提示 ${shown() + 1}/${hints.length}`; hb.disabled = shown() >= hints.length;
-    } }, shown() >= hints.length ? "提示已用完" : `提示 ${shown() + 1}/${hints.length}`);
+      drawHints(); hb.textContent = shown() >= hints.length ? tr("提示已用完", "No more hints") : `${tr("提示", "Hint")} ${shown() + 1}/${hints.length}`; hb.disabled = shown() >= hints.length;
+    } }, shown() >= hints.length ? tr("提示已用完", "No more hints") : `${tr("提示", "Hint")} ${shown() + 1}/${hints.length}`);
     hb.disabled = shown() >= hints.length;
     bar.append(hb);
   }
@@ -1309,17 +1342,17 @@ function helpers(work, item, { exam, solution, onRedo }) {
       if (r.s !== "solved") { r.sol = true; r.review = true; }
       r.u = Date.now(); save(); renderRail(); renderMeter();
       solArea.replaceChildren(h("div", { class: "solution" },
-        h("p", { class: "panelLabel" }, "参考答案"),
+        h("p", { class: "panelLabel" }, tr("参考答案", "Reference solution")),
         codeBlock(solution, item.lang),
         item.explain ? h("div", { class: "md", html: md(item.explain) }) : "",
         h("div", { class: "actions" },
-          onRedo ? h("button", { class: "btn primary", onclick: () => { solArea.replaceChildren(); onRedo(); } }, "我看懂了，关掉答案从空白重写") : "",
-          h("span", { class: "note" }, r.s === "solved" ? "" : "看过答案的题会进复习区，之后独立重做一次才算掌握。"))));
-    } }, "看答案");
+          onRedo ? h("button", { class: "btn primary", onclick: () => { solArea.replaceChildren(); onRedo(); } }, tr("我看懂了，关掉答案从空白重写", "I get it: hide the answer and rewrite from blank")) : "",
+          h("span", { class: "note" }, r.s === "solved" ? "" : tr("看过答案的题会进复习区，之后独立重做一次才算掌握。", "Exercises where you saw the answer go to Review; redo them once on your own to master them.")))));
+    } }, tr("看答案", "Show answer"));
     bar.append(sb);
     if (!gate.ok && !exam) bar.append(h("span", { class: "note" }, gate.why));
   }
-  if (!exam && onRedo && (status(item.id) === "review" || r.s === "solved")) bar.append(h("button", { class: "btn ghost", onclick: () => { SESSION.redo[item.id] = true; SESSION.solShown[item.id] = false; onRedo(); } }, "从空白重做"));
+  if (!exam && onRedo && (status(item.id) === "review" || r.s === "solved")) bar.append(h("button", { class: "btn ghost", onclick: () => { SESSION.redo[item.id] = true; SESSION.solShown[item.id] = false; onRedo(); } }, tr("从空白重做", "Redo from blank")));
   box.append(bar, hintArea, solArea);
   work.append(box);
   return box;
@@ -1336,16 +1369,16 @@ function resultView(res, { item, editor, onPassNext, noTests }) {
   const ok = !noTests && !res.error && !diags.length && tests.length > 0 && passed === tests.length;
   if (!noTests) {
     const v = h("div", { class: "verdict " + (ok ? "pass" : "fail") },
-      ok ? `全部通过 ${passed}/${tests.length}` : res.error ? "代码没能运行完" : diags.length && !tests.length ? "类型检查没通过" : `通过 ${passed}/${tests.length}` + (diags.length ? " · 类型检查有错误" : ""));
-    if (ok && onPassNext) v.append(h("button", { class: "btn next", onclick: onPassNext }, "下一题 →"));
+      ok ? tr(`全部通过 ${passed}/${tests.length}`, `All passed ${passed}/${tests.length}`) : res.error ? tr("代码没能运行完", "The code did not run to the end") : diags.length && !tests.length ? tr("类型检查没通过", "The type check failed") : tr(`通过 ${passed}/${tests.length}`, `Passed ${passed}/${tests.length}`) + (diags.length ? tr(" · 类型检查有错误", " · type errors") : ""));
+    if (ok && onPassNext) v.append(h("button", { class: "btn next", onclick: onPassNext }, tr("下一题 →", "Next →")));
     els.push(v);
   }
   if (userDiags.length || testDiags.length) {
-    els.push(h("p", { class: "panelLabel" }, "类型检查（tsc）"));
+    els.push(h("p", { class: "panelLabel" }, tr("类型检查（tsc）", "Type check (tsc)")));
     const ul = h("ul", { class: "tests" });
     for (const d of [...userDiags, ...testDiags]) {
       ul.append(h("li", { class: "no" }, h("span", { class: "m" }, "✗"), h("div", {},
-        h("div", {}, d.inTests ? `测试代码第 ${d.line} 行（多半是你的函数名、参数或返回类型和题目要求不一致）` : `第 ${d.line} 行，第 ${d.col} 列`),
+        h("div", {}, d.inTests ? tr(`测试代码第 ${d.line} 行（多半是你的函数名、参数或返回类型和题目要求不一致）`, `Test code, line ${d.line} (usually your function name, parameters or return type differ from what the exercise asks for)`) : tr(`第 ${d.line} 行，第 ${d.col} 列`, `Line ${d.line}, column ${d.col}`)),
         h("div", { class: "detail" }, `TS${d.code}: ${d.message}`),
         TS_GLOSS[d.code] ? h("div", { class: "detail" }, TS_GLOSS[d.code]) : "")));
     }
@@ -1353,18 +1386,18 @@ function resultView(res, { item, editor, onPassNext, noTests }) {
     if (editor) editor.markLines(userDiags.map((d) => d.line));
   } else if (editor) editor.markLines(res.error_line ? [res.error_line] : []);
   if (res.error) {
-    els.push(h("p", { class: "panelLabel" }, "报错"), h("pre", { class: "outBox err" }, res.error));
+    els.push(h("p", { class: "panelLabel" }, tr("报错", "Error")), h("pre", { class: "outBox err" }, res.error));
     const g = item.lang === "py" ? pyGloss(res.error) : item.lang === "sql" ? sqlGloss(res.error) : null;
     if (g) els.push(h("div", { class: "gloss" }, g));
   }
   if (tests.length) {
-    els.push(h("p", { class: "panelLabel" }, "测试"));
+    els.push(h("p", { class: "panelLabel" }, tr("测试", "Tests")));
     const ul = h("ul", { class: "tests" });
     for (const t of tests) {
       const detail = [];
       if (!t.passed) {
-        if (t.got !== undefined) detail.push(h("div", { class: "detail", html: `<b>得到</b> ${esc(t.got)}` }));
-        if (t.expected !== undefined) detail.push(h("div", { class: "detail", html: `<b>期望</b> ${esc(t.expected)}` }));
+        if (t.got !== undefined) detail.push(h("div", { class: "detail", html: `<b>${tr("得到", "Got")}</b> ${esc(t.got)}` }));
+        if (t.expected !== undefined) detail.push(h("div", { class: "detail", html: `<b>${tr("期望", "Expected")}</b> ${esc(t.expected)}` }));
         if (t.error) { detail.push(h("div", { class: "detail" }, t.error)); const g = item.lang === "py" ? pyGloss(t.error) : null; if (g) detail.push(h("div", { class: "detail" }, "→ " + g)); }
       }
       ul.append(h("li", { class: t.passed ? "ok" : "no" }, h("span", { class: "m" }, t.passed ? "✓" : "✗"), h("div", {}, h("div", {}, t.label), ...detail)));
@@ -1372,12 +1405,12 @@ function resultView(res, { item, editor, onPassNext, noTests }) {
     els.push(ul);
   }
   if (res.table) {
-    els.push(h("p", { class: "panelLabel" }, "你的查询结果"), sqlTableEl(res.table));
-    if (res.expected_table && !ok && !noTests) els.push(h("p", { class: "panelLabel" }, "期望的结果"), sqlTableEl(res.expected_table));
+    els.push(h("p", { class: "panelLabel" }, tr("你的查询结果", "Your query's result")), sqlTableEl(res.table));
+    if (res.expected_table && !ok && !noTests) els.push(h("p", { class: "panelLabel" }, tr("期望的结果", "Expected result")), sqlTableEl(res.expected_table));
     return els;
   }
-  if (res.stdout) els.push(h("p", { class: "panelLabel" }, "输出（print / console.log）"), h("pre", { class: "outBox" }, res.stdout));
-  if (noTests && !res.error && !res.stdout && !diags.length) els.push(h("p", { class: "note" }, "运行完成，没有输出。加一行 print / console.log 看看结果。"));
+  if (res.stdout) els.push(h("p", { class: "panelLabel" }, tr("输出（print / console.log）", "Output (print / console.log)")), h("pre", { class: "outBox" }, res.stdout));
+  if (noTests && !res.error && !res.stdout && !diags.length) els.push(h("p", { class: "note" }, tr("运行完成，没有输出。加一行 print / console.log 看看结果。", "Finished without output. Add a print / console.log to see the result.")));
   return els;
 }
 // ---- SQL result tables and the schema panel
@@ -1387,36 +1420,36 @@ function sqlTableEl(t, max = 50) {
     h("thead", {}, h("tr", {}, t.columns.map((c) => h("th", {}, c)))),
     h("tbody", {}, t.rows.slice(0, max).map((row) => h("tr", {}, row.map((v) =>
       h("td", { class: v === null ? "null" : typeof v === "number" ? "num" : "" }, v === null ? "NULL" : String(v))))))));
-  wrap.append(h("p", { class: "note" }, t.rows.length > max ? `一共 ${t.rows.length} 行${t.rows.length >= 200 ? "（最多取 200 行）" : ""}，只显示前 ${max} 行` : `${t.rows.length} 行`));
+  wrap.append(h("p", { class: "note" }, t.rows.length > max ? tr(`一共 ${t.rows.length} 行${t.rows.length >= 200 ? "（最多取 200 行）" : ""}，只显示前 ${max} 行`, `${t.rows.length} rows${t.rows.length >= 200 ? " (at most 200 are fetched)" : ""}, showing the first ${max}`) : tr(`${t.rows.length} 行`, `${t.rows.length} row${t.rows.length === 1 ? "" : "s"}`)));
   return wrap;
 }
 function schemaPanel(key, open) {
   const info = (COURSE.tables || {})[key];
   if (!info) return "";
   return h("details", { class: "schema", open: open ? true : undefined },
-    h("summary", {}, `表结构：${info.map((t) => t.name).join("、")}`),
+    h("summary", {}, tr(`表结构：${info.map((t) => t.name).join("、")}`, `Table schema: ${info.map((t) => t.name).join(", ")}`)),
     ...info.map((t) => h("div", { class: "schemaTable" },
-      h("div", {}, h("strong", { class: "mono" }, t.name), h("span", { class: "note" }, `  ${t.count} 行`)),
+      h("div", {}, h("strong", { class: "mono" }, t.name), h("span", { class: "note" }, tr(`  ${t.count} 行`, `  ${t.count} rows`))),
       h("div", { class: "schemaCols mono" }, t.columns.map((c) => `${c.name} ${c.type || ""}`.trim()).join("  ·  ")),
       t.sample.length ? sqlTableEl({ columns: t.columns.map((c) => c.name), rows: t.sample }, 3) : "")));
 }
 const SQL_GLOSS = [
-  [/no such column/i, "没有这一列：列名拼错了，或者这张表里根本没有它。看上面的「表结构」。JOIN 之后别忘了写 表名.列名。"],
-  [/no such table/i, "没有这张表：表名拼错了。看上面的「表结构」。"],
-  [/syntax error/i, "SQL 写法错误：看 near 后面引号里的词，错误通常就在它前面一点（少了逗号、多了逗号、关键字拼错、括号不成对）。"],
-  [/ambiguous column name/i, "列名有歧义：JOIN 的两张表都有这一列，写成 表名.列名（或 别名.列名）。"],
-  [/misuse of aggregate/i, "聚合函数（COUNT、SUM……）不能写在 WHERE 里：先 GROUP BY，再用 HAVING 过滤分组。"],
-  [/one statement at a time|一次只能写一条/i, "一次只能写一条查询。"],
-  [/UNIQUE constraint failed/i, "违反唯一约束：这个主键（或唯一列）的值已经存在了。"],
-  [/NOT NULL constraint failed/i, "这一列不能为空（NOT NULL），插入时要给它一个值。"],
-  [/FOREIGN KEY constraint failed/i, "外键约束失败：引用的那一行在另一张表里不存在。"],
-  [/incomplete input/i, "SQL 没写完：括号或引号没有闭合。"],
-  [/wrong number of arguments/i, "函数的参数个数不对。"],
-  [/no such function/i, "没有这个函数：SQLite 和 BigQuery 的函数名不完全一样，看知识卡片里的对照。"],
-  [/missing dataset while no default dataset/i, "BigQuery 的表名要带数据集：写 clausecheck.reviews 或 `clausecheck-dev.clausecheck.reviews`，不能只写 reviews。"],
-  [/does not support the \w+ date part/i, "这个函数不支持这个日期部件：TIMESTAMP_DIFF 最大到 DAY；按月算差值用 DATE_DIFF(DATE(a), DATE(b), MONTH)。"],
-  [/日期部件要写成/, "日期部件是关键字，不加引号：DATE_TRUNC(DATE(created_at), MONTH)。"],
-  [/division by zero/i, "除数是 0：用 SAFE_DIVIDE(a, b)，除数为 0 时得到 NULL 而不是报错。"],
+  [/no such column/i, tr("没有这一列：列名拼错了，或者这张表里根本没有它。看上面的「表结构」。JOIN 之后别忘了写 表名.列名。", "No such column: the column name is misspelled, or this table does not have it. Look at Table schema above. After a JOIN, write table.column.")],
+  [/no such table/i, tr("没有这张表：表名拼错了。看上面的「表结构」。", "No such table: the table name is misspelled. Look at Table schema above.")],
+  [/syntax error/i, tr("SQL 写法错误：看 near 后面引号里的词，错误通常就在它前面一点（少了逗号、多了逗号、关键字拼错、括号不成对）。", "SQL syntax error: look at the word in quotes after near; the mistake is usually just before it (a missing or extra comma, a misspelled keyword, unmatched brackets).")],
+  [/ambiguous column name/i, tr("列名有歧义：JOIN 的两张表都有这一列，写成 表名.列名（或 别名.列名）。", "Ambiguous column name: both joined tables have this column; write table.column (or alias.column).")],
+  [/misuse of aggregate/i, tr("聚合函数（COUNT、SUM……）不能写在 WHERE 里：先 GROUP BY，再用 HAVING 过滤分组。", "Aggregate functions (COUNT, SUM, ...) cannot go in WHERE: GROUP BY first, then filter groups with HAVING.")],
+  [/one statement at a time|one query at a time|一次只能写一条/i, tr("一次只能写一条查询。", "Write one query at a time.")],
+  [/UNIQUE constraint failed/i, tr("违反唯一约束：这个主键（或唯一列）的值已经存在了。", "UNIQUE constraint failed: this primary key (or unique column) value already exists.")],
+  [/NOT NULL constraint failed/i, tr("这一列不能为空（NOT NULL），插入时要给它一个值。", "This column cannot be empty (NOT NULL): give it a value when inserting.")],
+  [/FOREIGN KEY constraint failed/i, tr("外键约束失败：引用的那一行在另一张表里不存在。", "FOREIGN KEY constraint failed: the referenced row does not exist in the other table.")],
+  [/incomplete input/i, tr("SQL 没写完：括号或引号没有闭合。", "The SQL is incomplete: a bracket or quote is not closed.")],
+  [/wrong number of arguments/i, tr("函数的参数个数不对。", "Wrong number of arguments to the function.")],
+  [/no such function/i, tr("没有这个函数：SQLite 和 BigQuery 的函数名不完全一样，看知识卡片里的对照。", "No such function: SQLite and BigQuery name some functions differently; see the comparison in the knowledge cards.")],
+  [/missing dataset while no default dataset/i, tr("BigQuery 的表名要带数据集：写 clausecheck.reviews 或 `clausecheck-dev.clausecheck.reviews`，不能只写 reviews。", "BigQuery table names need the dataset: write clausecheck.reviews or `clausecheck-dev.clausecheck.reviews`, not just reviews.")],
+  [/does not support the \w+ date part/i, tr("这个函数不支持这个日期部件：TIMESTAMP_DIFF 最大到 DAY；按月算差值用 DATE_DIFF(DATE(a), DATE(b), MONTH)。", "This function does not support that date part: TIMESTAMP_DIFF goes up to DAY; for months use DATE_DIFF(DATE(a), DATE(b), MONTH).")],
+  [/日期部件要写成|write the date part as a keyword/, tr("日期部件是关键字，不加引号：DATE_TRUNC(DATE(created_at), MONTH)。", "The date part is a keyword without quotes: DATE_TRUNC(DATE(created_at), MONTH).")],
+  [/division by zero/i, tr("除数是 0：用 SAFE_DIVIDE(a, b)，除数为 0 时得到 NULL 而不是报错。", "Division by zero: use SAFE_DIVIDE(a, b), which gives NULL instead of an error when the divisor is 0.")],
 ];
 function sqlGloss(text) { const hit = SQL_GLOSS.find(([re]) => re.test(String(text))); return hit ? hit[1] : null; }
 function isPass(res) {
@@ -1427,8 +1460,8 @@ function isPass(res) {
 // ---- code / fix / scratch / translate
 function viewCode(work, item, ctx) {
   const r = rec(item.id);
-  const blank = item.type === "scratch" ? (item.lang === "ts" ? "// 从这里开始写\n" : "# 从这里开始写\n") : item.starter || "";
-  if (item.source) { work.append(h("p", { class: "panelLabel" }, "对照的 Python 代码")); work.append(codeBlock(item.source, "py")); }
+  const blank = item.type === "scratch" ? (item.lang === "ts" ? tr("// 从这里开始写\n", "// start writing here\n") : tr("# 从这里开始写\n", "# start writing here\n")) : item.starter || "";
+  if (item.source) { work.append(h("p", { class: "panelLabel" }, tr("对照的 Python 代码", "The Python code to compare with"))); work.append(codeBlock(item.source, "py")); }
   const host = h("div", { class: "editorWrap" + (ctx.exam ? " exam" : "") });
   work.append(host);
   const out = h("div", { class: "results" });
@@ -1438,17 +1471,17 @@ function viewCode(work, item, ctx) {
     value: initial, lang: item.lang, exam: ctx.exam, onRun: () => run(),
     onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(pendingDraft(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }), 800); },
   });
-  const runBtn = h("button", { class: "btn primary", onclick: () => run() }, "运行并判题 ", h("kbd", {}, "Ctrl+Enter"));
+  const runBtn = h("button", { class: "btn primary", onclick: () => run() }, tr("运行并判题 ", "Run & check "), h("kbd", {}, "Ctrl+Enter"));
   const actions = h("div", { class: "actions" }, runBtn,
-    h("button", { class: "btn ghost", onclick: () => { ed.set(blank); out.replaceChildren(); ed.markLines([]); } }, item.type === "scratch" ? "清空" : "还原起始代码"),
-    !ctx.exam ? h("button", { class: "btn ghost", onclick: () => exportLocal(item, ed.get(), out) }, "复制为本机文件") : "");
+    h("button", { class: "btn ghost", onclick: () => { ed.set(blank); out.replaceChildren(); ed.markLines([]); } }, item.type === "scratch" ? tr("清空", "Clear") : tr("还原起始代码", "Reset starter code")),
+    !ctx.exam ? h("button", { class: "btn ghost", onclick: () => exportLocal(item, ed.get(), out) }, tr("复制为本机文件", "Copy as local file")) : "");
   work.append(actions);
   helpers(work, item, { exam: ctx.exam, solution: item.solution, onRedo: () => { SESSION.redo[item.id] = true; r.code = blank; r.u = Date.now(); save(); ed.set(blank); out.replaceChildren(); ed.focus(); } });
   work.append(out);
   if (SESSION.results[item.id]) out.append(...resultView(SESSION.results[item.id], { item, editor: ed, onPassNext: ctx.next }));
   async function run() {
     runBtn.disabled = true;
-    out.replaceChildren(h("p", { class: "note" }, item.lang === "py" && PY.state !== "ready" ? "正在启动 Python（第一次需要下载约 14 MB 的运行环境，之后就快了）…" : item.lang === "ts" && TSR.state !== "ready" ? "正在加载 TypeScript 编译器…" : "运行中…"));
+    out.replaceChildren(h("p", { class: "note" }, item.lang === "py" && PY.state !== "ready" ? tr("正在启动 Python（第一次需要下载约 14 MB 的运行环境，之后就快了）…", "Starting Python (the first time downloads about 14 MB, after that it is quick)…") : item.lang === "ts" && TSR.state !== "ready" ? tr("正在加载 TypeScript 编译器…", "Loading the TypeScript compiler…") : tr("运行中…", "Running…")));
     const code = ed.get();
     r.code = code.slice(0, 8000);
     const res = await runCode(item, code);
@@ -1467,12 +1500,12 @@ function refreshHead(work, item) {
   if (!head) return;
   head.querySelectorAll(".status, .note").forEach((n) => n.remove());
   const r = rec(item.id);
-  const stLabel = { solved: "已通过", review: "需要重做", tried: "尝试中", new: "" }[st];
+  const stLabel = { solved: tr("已通过", "Solved"), review: tr("需要重做", "Redo"), tried: tr("尝试中", "In progress"), new: "" }[st];
   const h2 = head.querySelector("h2");
   if (stLabel) head.insertBefore(h("span", { class: "status " + st }, stLabel), h2);
-  if (r.a) head.insertBefore(h("span", { class: "note" }, `已提交 ${r.a} 次`), h2);
+  if (r.a) head.insertBefore(h("span", { class: "note" }, tr(`已提交 ${r.a} 次`, `${r.a} ${r.a === 1 ? "try" : "tries"}`)), h2);
   const gate = canSeeSolution(item, r);
-  work.querySelectorAll(".actions .btn").forEach((b) => { if (b.textContent === "看答案") { b.disabled = !gate.ok; const n = b.nextElementSibling; if (gate.ok && n && n.classList.contains("note")) n.remove(); } });
+  work.querySelectorAll(".actions .btn").forEach((b) => { if (b.textContent === tr("看答案", "Show answer")) { b.disabled = !gate.ok; const n = b.nextElementSibling; if (gate.ok && n && n.classList.contains("note")) n.remove(); } });
 }
 async function exportLocal(item, code, out) {
   const text = localFile(item, code);
@@ -1480,10 +1513,16 @@ async function exportLocal(item, code, out) {
   const name = `${item.id}.${item.lang === "ts" ? "ts" : "py"}`;
   const area = h("textarea", { class: "copyArea", readonly: true }, text);
   const cmd = item.lang === "ts" ? "npx tsx " + name : item.type === "testwrite" ? "python -m pytest " + name : "python " + name;
-  const what = item.type === "testwrite" ? "文件里是被测函数和你的测试（本机只有正确版本，没有那些坏版本）"
-    : item.lang === "sql" ? "文件里是样例数据和你的查询，运行后打印结果表"
-    : `文件里包含同样的测试${item.mock || item.langchain ? "和模拟服务器" : ""}${item.cloud ? "和模拟的云 SDK" : ""}，结果会逐条打印${item.langchain ? `。第一次先安装真正的 LangChain：\n\n\`${LC_INSTALL}\`` : ""}`;
-  out.replaceChildren(h("div", { class: "explain", html: md(`${ok ? "已复制到剪贴板。" : "浏览器不允许自动复制，请在下面全选（Ctrl+A）后复制。"}在 VS Code 里新建 \`${name}\`，粘贴保存，然后在终端运行：\n\n\`${cmd}\`\n\n${what}。`) }), ok ? "" : area);
+  const what = UI_LANG === "en"
+    ? (item.type === "testwrite" ? "The file has the function under test and your tests (only the correct version, not the broken ones)"
+      : item.lang === "sql" ? "The file has the sample data and your query, and prints the result table"
+      : `The file has the same tests${item.mock || item.langchain ? " and the mock server" : ""}${item.cloud ? " and the simulated cloud SDKs" : ""}, and prints each result${item.langchain ? `. First install the real LangChain:\n\n\`${LC_INSTALL}\`` : ""}`)
+    : (item.type === "testwrite" ? "文件里是被测函数和你的测试（本机只有正确版本，没有那些坏版本）"
+      : item.lang === "sql" ? "文件里是样例数据和你的查询，运行后打印结果表"
+      : `文件里包含同样的测试${item.mock || item.langchain ? "和模拟服务器" : ""}${item.cloud ? "和模拟的云 SDK" : ""}，结果会逐条打印${item.langchain ? `。第一次先安装真正的 LangChain：\n\n\`${LC_INSTALL}\`` : ""}`);
+  out.replaceChildren(h("div", { class: "explain", html: md(UI_LANG === "en"
+    ? `${ok ? "Copied to the clipboard." : "The browser does not allow automatic copying: select all below (Ctrl+A) and copy."} In VS Code create \`${name}\`, paste and save, then run in a terminal:\n\n\`${cmd}\`\n\n${what}.`
+    : `${ok ? "已复制到剪贴板。" : "浏览器不允许自动复制，请在下面全选（Ctrl+A）后复制。"}在 VS Code 里新建 \`${name}\`，粘贴保存，然后在终端运行：\n\n\`${cmd}\`\n\n${what}。`) }), ok ? "" : area);
   if (!ok) { area.focus(); area.select(); }
 }
 
@@ -1505,16 +1544,16 @@ function viewChoice(work, item, ctx) {
     box.append(b);
     return b;
   });
-  work.append(box, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: submit }, "提交"), multi ? h("span", { class: "note" }, "多选题：选出所有正确项") : ""), out);
+  work.append(box, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: submit }, tr("提交", "Submit")), multi ? h("span", { class: "note" }, tr("多选题：选出所有正确项", "More than one answer: pick every correct option")) : ""), out);
   let wrongs = 0;
   function submit() {
-    if (!picked.size) { toast("先选一个"); return; }
+    if (!picked.size) { toast(tr("先选一个", "Pick one first")); return; }
     const correct = item.answer.length === picked.size && item.answer.every((a) => picked.has(a));
     if (!correct) wrongs++;
     markAttempt(item, correct, { wrongChoices: wrongs });
     opts.forEach((x, j) => { x.classList.toggle("right", correct && picked.has(j)); x.classList.toggle("wrong", !correct && picked.has(j)); });
     const reveal = correct || wrongs >= 2;
-    out.replaceChildren(h("div", { class: "verdict " + (correct ? "pass" : "fail") }, correct ? "回答正确" : wrongs >= 2 ? "还是不对，看看解析" : "不对，再想想", correct && ctx.next ? h("button", { class: "btn next", onclick: ctx.next }, "下一题 →") : ""));
+    out.replaceChildren(h("div", { class: "verdict " + (correct ? "pass" : "fail") }, correct ? tr("回答正确", "Correct") : wrongs >= 2 ? tr("还是不对，看看解析", "Still not right: read the explanation") : tr("不对，再想想", "Not right, think again"), correct && ctx.next ? h("button", { class: "btn next", onclick: ctx.next }, tr("下一题 →", "Next →")) : ""));
     if (reveal) {
       if (!correct) opts.forEach((x, j) => x.classList.toggle("right", item.answer.includes(j)));
       const ex = h("div", { class: "explain md", html: md(item.explain) });
@@ -1529,14 +1568,14 @@ function viewChoice(work, item, ctx) {
 function normOut(s) { return String(s).replace(/\r/g, "").split("\n").map((l) => l.replace(/\s+$/, "")).join("\n").replace(/\n+$/, "").replace(/^\n+/, ""); }
 function viewPredict(work, item, ctx) {
   work.append(codeBlock(item.code, item.lang));
-  const ta = h("textarea", { class: "answer", placeholder: "在这里写出输出，每个 print / console.log 一行", spellcheck: "false", id: "ans-" + item.id });
+  const ta = h("textarea", { class: "answer", placeholder: tr("在这里写出输出，每个 print / console.log 一行", "Write the output here, one line per print / console.log"), spellcheck: "false", id: "ans-" + item.id });
   ta.value = rec(item.id).code || "";
   ta.addEventListener("input", () => { const r = rec(item.id); r.code = ta.value.slice(0, 4000); r.u = Date.now(); save(); });
   const out = h("div", { class: "results" });
   let wrongs = 0;
-  work.append(h("p", { class: "panelLabel" }, "你的答案"), ta, h("div", { class: "actions" },
-    h("button", { class: "btn primary", onclick: submit }, "提交"),
-    h("button", { class: "btn ghost", onclick: runIt }, "运行看看（交卷后再用）")), out);
+  work.append(h("p", { class: "panelLabel" }, tr("你的答案", "Your answer")), ta, h("div", { class: "actions" },
+    h("button", { class: "btn primary", onclick: submit }, tr("提交", "Submit")),
+    h("button", { class: "btn ghost", onclick: runIt }, tr("运行看看（交卷后再用）", "Run it (after you submit)"))), out);
   function submit() {
     const want = normOut(item.expected), got = normOut(ta.value);
     const correct = want === got;
@@ -1545,14 +1584,14 @@ function viewPredict(work, item, ctx) {
     const wl = want.split("\n"), gl = got.split("\n");
     let firstBad = wl.findIndex((l, i) => l !== gl[i]);
     if (firstBad === -1 && gl.length !== wl.length) firstBad = Math.min(gl.length, wl.length);
-    out.replaceChildren(h("div", { class: "verdict " + (correct ? "pass" : "fail") }, correct ? "完全正确" : `第 ${firstBad + 1} 行不对` + (gl.length !== wl.length ? `（应该一共 ${wl.length} 行，你写了 ${gl.length} 行）` : ""), correct && ctx.next ? h("button", { class: "btn next", onclick: ctx.next }, "下一题 →") : ""));
-    if (correct || wrongs >= 2) out.append(h("p", { class: "panelLabel" }, "正确输出"), h("pre", { class: "outBox" }, item.expected), item.explain ? h("div", { class: "explain md", html: md(item.explain) }) : "");
+    out.replaceChildren(h("div", { class: "verdict " + (correct ? "pass" : "fail") }, correct ? tr("完全正确", "Exactly right") : tr(`第 ${firstBad + 1} 行不对`, `Line ${firstBad + 1} is wrong`) + (gl.length !== wl.length ? tr(`（应该一共 ${wl.length} 行，你写了 ${gl.length} 行）`, ` (it should be ${wl.length} lines; you wrote ${gl.length})`) : ""), correct && ctx.next ? h("button", { class: "btn next", onclick: ctx.next }, tr("下一题 →", "Next →")) : ""));
+    if (correct || wrongs >= 2) out.append(h("p", { class: "panelLabel" }, tr("正确输出", "The correct output")), h("pre", { class: "outBox" }, item.expected), item.explain ? h("div", { class: "explain md", html: md(item.explain) }) : "");
     refreshHead(work, item);
   }
   async function runIt() {
     const r = rec(item.id);
-    if (r.s !== "solved" && (r.a || 0) < 2) { toast("先自己写答案并提交；提交正确或错两次后可以运行"); return; }
-    out.append(h("p", { class: "note" }, "运行中…"));
+    if (r.s !== "solved" && (r.a || 0) < 2) { toast(tr("先自己写答案并提交；提交正确或错两次后可以运行", "Write and submit your own answer first; you can run it once you are right or have tried twice")); return; }
+    out.append(h("p", { class: "note" }, tr("运行中…", "Running…")));
     const res = item.lang === "ts" ? await runTypeScript(item.code, "") : await runPython(item.code, "", pySetup(item));
     out.lastElementChild.remove();
     out.append(...resultView(res, { item, noTests: true }));
@@ -1569,7 +1608,7 @@ function viewFill(work, item, ctx) {
     if (i % 2 === 0) box.append(p);
     else {
       const k = inputs.length;
-      const inp = h("input", { type: "text", spellcheck: "false", autocomplete: "off", "aria-label": `第 ${k + 1} 个空`, style: `width:${Math.max(p.length, 3) + 2}ch`, id: `fill-${item.id}-${k}` });
+      const inp = h("input", { type: "text", spellcheck: "false", autocomplete: "off", "aria-label": tr(`第 ${k + 1} 个空`, `Blank ${k + 1}`), style: `width:${Math.max(p.length, 3) + 2}ch`, id: `fill-${item.id}-${k}` });
       inp.value = (r.fills || [])[k] || "";
       inp.addEventListener("input", () => { r.fills = inputs.map((x) => x.value); r.u = Date.now(); save(); });
       inp.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
@@ -1578,7 +1617,7 @@ function viewFill(work, item, ctx) {
     }
   });
   const out = h("div", { class: "results" });
-  const runBtn = h("button", { class: "btn primary", onclick: run }, "运行并判题");
+  const runBtn = h("button", { class: "btn primary", onclick: run }, tr("运行并判题", "Run & check"));
   work.append(box, h("div", { class: "actions" }, runBtn));
   helpers(work, item, { exam: ctx.exam, solution: item.solution, onRedo: () => { SESSION.redo[item.id] = true; inputs.forEach((x) => (x.value = "")); out.replaceChildren(); inputs[0]?.focus(); } });
   work.append(out);
@@ -1586,7 +1625,7 @@ function viewFill(work, item, ctx) {
     let k = 0;
     const code = parts.map((p, i) => (i % 2 === 0 ? p : inputs[k++].value)).join("");
     runBtn.disabled = true;
-    out.replaceChildren(h("p", { class: "note" }, "运行中…"));
+    out.replaceChildren(h("p", { class: "note" }, tr("运行中…", "Running…")));
     const res = await runCode(item, code);
     runBtn.disabled = false;
     if (!res.runtimeError) markAttempt(item, isPass(res));
@@ -1603,18 +1642,18 @@ function viewOrder(work, item, ctx) {
   const rnd = seeded(item.id);
   const pool0 = all.map((x) => [rnd(), x]).sort((a, b) => a[0] - b[0]).map((x) => x[1]);
   let chosen = (r.order || []).map((k) => all[k]).filter(Boolean);
-  const poolBox = h("div", { class: "lineBox", "aria-label": "可用的代码行" });
-  const ansBox = h("div", { class: "lineBox", "aria-label": "你的程序" });
+  const poolBox = h("div", { class: "lineBox", "aria-label": tr("可用的代码行", "Available lines") });
+  const ansBox = h("div", { class: "lineBox", "aria-label": tr("你的程序", "Your program") });
   const out = h("div", { class: "results" });
   function draw() {
     poolBox.replaceChildren(...pool0.filter((x) => !chosen.includes(x)).map((x) => h("button", { class: "pline", onclick: () => { chosen.push(x); persist(); draw(); } }, x.text)));
-    ansBox.replaceChildren(...(chosen.length ? chosen.map((x) => h("button", { class: "pline", title: "点击移回", onclick: () => { chosen = chosen.filter((y) => y !== x); persist(); draw(); } }, x.text)) : [h("p", { class: "note", style: "margin:6px" }, "点左边的代码行，按顺序放到这里")]));
+    ansBox.replaceChildren(...(chosen.length ? chosen.map((x) => h("button", { class: "pline", title: tr("点击移回", "Click to move back"), onclick: () => { chosen = chosen.filter((y) => y !== x); persist(); draw(); } }, x.text)) : [h("p", { class: "note", style: "margin:6px" }, tr("点左边的代码行，按顺序放到这里", "Click the lines on the left to place them here in order"))]));
   }
   function persist() { r.order = chosen.map((x) => x.key); r.u = Date.now(); save(); }
   draw();
-  work.append(h("div", { class: "parsons" }, h("div", {}, h("h5", {}, "代码行"), poolBox), h("div", {}, h("h5", {}, "你的程序（点击可移回）"), ansBox)));
-  const runBtn = h("button", { class: "btn primary", onclick: check }, "检查");
-  work.append(h("div", { class: "actions" }, runBtn, h("button", { class: "btn ghost", onclick: () => { chosen = []; persist(); draw(); out.replaceChildren(); } }, "清空")));
+  work.append(h("div", { class: "parsons" }, h("div", {}, h("h5", {}, tr("代码行", "Lines")), poolBox), h("div", {}, h("h5", {}, tr("你的程序（点击可移回）", "Your program (click to move back)")), ansBox)));
+  const runBtn = h("button", { class: "btn primary", onclick: check }, tr("检查", "Check"));
+  work.append(h("div", { class: "actions" }, runBtn, h("button", { class: "btn ghost", onclick: () => { chosen = []; persist(); draw(); out.replaceChildren(); } }, tr("清空", "Clear"))));
   helpers(work, item, { exam: ctx.exam, solution: item.solution, onRedo: () => { SESSION.redo[item.id] = true; chosen = []; persist(); draw(); out.replaceChildren(); } });
   work.append(out);
   async function check() {
@@ -1622,16 +1661,16 @@ function viewOrder(work, item, ctx) {
     if (!item.tests) {
       const ok = code === item.lines.join("\n");
       markAttempt(item, ok);
-      out.replaceChildren(h("div", { class: "verdict " + (ok ? "pass" : "fail") }, ok ? "顺序正确" : "顺序不对", ok && ctx.next ? h("button", { class: "btn next", onclick: ctx.next }, "下一题 →") : ""));
+      out.replaceChildren(h("div", { class: "verdict " + (ok ? "pass" : "fail") }, ok ? tr("顺序正确", "Right order") : tr("顺序不对", "Wrong order"), ok && ctx.next ? h("button", { class: "btn next", onclick: ctx.next }, tr("下一题 →", "Next →")) : ""));
       refreshHead(work, item);
       return;
     }
     runBtn.disabled = true;
-    out.replaceChildren(h("p", { class: "note" }, "运行中…"));
+    out.replaceChildren(h("p", { class: "note" }, tr("运行中…", "Running…")));
     const res = await runCode(item, code);
     runBtn.disabled = false;
     if (!res.runtimeError) markAttempt(item, isPass(res));
-    out.replaceChildren(h("p", { class: "panelLabel" }, "拼出来的程序"), codeBlock(code, item.lang), ...resultView(res, { item, onPassNext: ctx.next }));
+    out.replaceChildren(h("p", { class: "panelLabel" }, tr("拼出来的程序", "The program you built")), codeBlock(code, item.lang), ...resultView(res, { item, onPassNext: ctx.next }));
     refreshHead(work, item);
   }
 }
@@ -1640,19 +1679,19 @@ function viewOrder(work, item, ctx) {
 function viewLocal(work, item, ctx) {
   const r = rec(item.id);
   work.querySelectorAll("pre.codeBlock").forEach((pre) => {
-    const btn = h("button", { class: "btn ghost", style: "align-self:flex-start", onclick: async () => { if (!(await copyText(pre.textContent))) toast("请手动选中复制"); } }, "复制");
+    const btn = h("button", { class: "btn ghost", style: "align-self:flex-start", onclick: async () => { if (!(await copyText(pre.textContent))) toast(tr("请手动选中复制", "Select it and copy by hand")); } }, tr("复制", "Copy"));
     pre.after(btn);
   });
-  const ta = h("textarea", { class: "answer", placeholder: item.placeholder || "把终端里的输出粘贴到这里", spellcheck: "false", id: "local-" + item.id });
+  const ta = h("textarea", { class: "answer", placeholder: item.placeholder || tr("把终端里的输出粘贴到这里", "Paste the terminal output here"), spellcheck: "false", id: "local-" + item.id });
   ta.value = r.code || "";
   ta.addEventListener("input", () => { r.code = ta.value.slice(0, 8000); r.u = Date.now(); save(); });
   const out = h("div", { class: "results" });
-  work.append(h("p", { class: "panelLabel" }, "粘贴你的运行结果"), ta, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: () => {
+  work.append(h("p", { class: "panelLabel" }, tr("粘贴你的运行结果", "Paste what you got")), ta, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: () => {
     const ok = new RegExp(item.verify, "i").test(ta.value);
     markAttempt(item, ok);
-    out.replaceChildren(h("div", { class: "verdict " + (ok ? "pass" : "fail") }, ok ? "完成" : "还没看到预期的结果：按步骤运行后，把完整输出粘贴进来", ok && ctx.next ? h("button", { class: "btn next", onclick: ctx.next }, "下一题 →") : ""));
+    out.replaceChildren(h("div", { class: "verdict " + (ok ? "pass" : "fail") }, ok ? tr("完成", "Done") : tr("还没看到预期的结果：按步骤运行后，把完整输出粘贴进来", "The expected result is not there yet: run the steps, then paste the complete output"), ok && ctx.next ? h("button", { class: "btn next", onclick: ctx.next }, tr("下一题 →", "Next →")) : ""));
     refreshHead(work, item);
-  } }, "检查")), out);
+  } }, tr("检查", "Check"))), out);
   helpers(work, item, { exam: false, solution: item.solution, onRedo: null });
 }
 
@@ -1661,9 +1700,9 @@ function viewSql(work, item, ctx) {
   const r = rec(item.id);
   const exam = ctx.exam;
   if (item.tables) work.append(schemaPanel(item.tables, true));
-  if (!exam && item.expected_table && !item.check) work.append(h("details", { class: "schema" }, h("summary", {}, "看看期望的结果长什么样"), sqlTableEl(item.expected_table, 10)));
-  if (item.bq) work.append(h("p", { class: "note" }, "这道题可以用 BigQuery 的写法：`project.dataset.table` 反引号表名、SAFE_DIVIDE、COUNTIF、DATE_TRUNC(x, MONTH)、TIMESTAMP_DIFF(a, b, HOUR)。本页在 SQLite 上模拟这几个，其余 BigQuery 独有语法这里跑不了。"));
-  const blank = item.exam ? "-- 从这里开始写\n" : item.starter || "";
+  if (!exam && item.expected_table && !item.check) work.append(h("details", { class: "schema" }, h("summary", {}, tr("看看期望的结果长什么样", "What the expected result looks like")), sqlTableEl(item.expected_table, 10)));
+  if (item.bq) work.append(h("p", { class: "note" }, tr("这道题可以用 BigQuery 的写法：`project.dataset.table` 反引号表名、SAFE_DIVIDE、COUNTIF、DATE_TRUNC(x, MONTH)、TIMESTAMP_DIFF(a, b, HOUR)。本页在 SQLite 上模拟这几个，其余 BigQuery 独有语法这里跑不了。", "You can use BigQuery forms here: `project.dataset.table` backtick table names, SAFE_DIVIDE, COUNTIF, DATE_TRUNC(x, MONTH), TIMESTAMP_DIFF(a, b, HOUR). The page simulates these on SQLite; other BigQuery-only syntax does not run here.")));
+  const blank = item.exam ? tr("-- 从这里开始写\n", "-- start writing here\n") : item.starter || "";
   const host = h("div", { class: "editorWrap" + (exam ? " exam" : "") });
   work.append(host);
   const out = h("div", { class: "results" });
@@ -1672,17 +1711,17 @@ function viewSql(work, item, ctx) {
     value: r.code !== undefined ? r.code : blank, lang: "sql", exam, onRun: () => run(true),
     onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(pendingDraft(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }), 800); },
   });
-  const runBtn = h("button", { class: "btn primary", onclick: () => run(true) }, "运行并判题 ", h("kbd", {}, "Ctrl+Enter"));
+  const runBtn = h("button", { class: "btn primary", onclick: () => run(true) }, tr("运行并判题 ", "Run & check "), h("kbd", {}, "Ctrl+Enter"));
   work.append(h("div", { class: "actions" }, runBtn,
-    h("button", { class: "btn", onclick: () => run(false) }, "只运行看看"),
-    h("button", { class: "btn ghost", onclick: () => { ed.set(blank); out.replaceChildren(); } }, item.exam ? "清空" : "还原起始代码"),
-    !exam ? h("button", { class: "btn ghost", onclick: () => exportLocal(item, ed.get(), out) }, "复制为本机文件") : ""));
+    h("button", { class: "btn", onclick: () => run(false) }, tr("只运行看看", "Just run")),
+    h("button", { class: "btn ghost", onclick: () => { ed.set(blank); out.replaceChildren(); } }, item.exam ? tr("清空", "Clear") : tr("还原起始代码", "Reset starter code")),
+    !exam ? h("button", { class: "btn ghost", onclick: () => exportLocal(item, ed.get(), out) }, tr("复制为本机文件", "Copy as local file")) : ""));
   helpers(work, item, { exam, solution: item.solution, onRedo: () => { SESSION.redo[item.id] = true; r.code = blank; r.u = Date.now(); save(); ed.set(blank); out.replaceChildren(); ed.focus(); } });
   work.append(out);
   if (SESSION.results[item.id]) out.append(...resultView(SESSION.results[item.id], { item, onPassNext: ctx.next }));
   async function run(judge) {
     runBtn.disabled = true;
-    out.replaceChildren(h("p", { class: "note" }, PY.state !== "ready" ? "正在启动 SQL 运行环境（第一次需要下载约 14 MB）…" : "运行中…"));
+    out.replaceChildren(h("p", { class: "note" }, PY.state !== "ready" ? tr("正在启动 SQL 运行环境（第一次需要下载约 14 MB）…", "Starting the SQL runtime (the first time downloads about 14 MB)…") : tr("运行中…", "Running…")));
     const code = ed.get();
     r.code = code.slice(0, 8000);
     const res = await runSql(item, code, judge);
@@ -1717,27 +1756,27 @@ function testwriteView(res, item, next) {
   const implOk = isPass(onImpl);
   const caught = mutants.filter((m) => m.caught).length;
   const v = h("div", { class: "verdict " + (res.pass ? "pass" : "fail") },
-    res.pass ? `全部抓住：${caught}/${mutants.length} 个坏版本` : !implOk ? "你的测试在正确版本上没通过" : `抓住了 ${caught}/${mutants.length} 个坏版本`);
-  if (res.pass && next) v.append(h("button", { class: "btn next", onclick: next }, "下一题 →"));
+    res.pass ? tr(`全部抓住：${caught}/${mutants.length} 个坏版本`, `All caught: ${caught}/${mutants.length} broken versions`) : !implOk ? tr("你的测试在正确版本上没通过", "Your tests fail on the correct version") : tr(`抓住了 ${caught}/${mutants.length} 个坏版本`, `Caught ${caught}/${mutants.length} broken versions`));
+  if (res.pass && next) v.append(h("button", { class: "btn next", onclick: next }, tr("下一题 →", "Next →")));
   els.push(v);
-  if (!implOk) els.push(h("p", { class: "note" }, "正确的函数必须让你的每个测试都通过。先看下面哪个测试失败了：是期望值写错了，还是函数名 / 参数不对？"));
-  els.push(h("p", { class: "panelLabel" }, "在正确版本上"));
+  if (!implOk) els.push(h("p", { class: "note" }, tr("正确的函数必须让你的每个测试都通过。先看下面哪个测试失败了：是期望值写错了，还是函数名 / 参数不对？", "The correct function must pass every one of your tests. See which test fails below: is the expected value wrong, or the function name / arguments?")));
+  els.push(h("p", { class: "panelLabel" }, tr("在正确版本上", "On the correct version")));
   els.push(...resultView(onImpl, { item, noTests: false }).slice(1));
   if (implOk) {
-    els.push(h("p", { class: "panelLabel" }, "在坏版本上"));
+    els.push(h("p", { class: "panelLabel" }, tr("在坏版本上", "On the broken versions")));
     els.push(h("ul", { class: "tests" }, mutants.map((m, i) => h("li", { class: m.caught ? "ok" : "no" },
       h("span", { class: "m" }, m.caught ? "✓" : "✗"),
-      h("div", {}, h("div", {}, `坏版本 ${i + 1}：${m.caught ? "抓住了" : "没抓住"}`),
-        m.caught ? h("div", { class: "detail" }, m.by.length ? `失败的测试：${m.by.join("、")}` : "代码直接报错了")
-          : h("div", { class: "detail" }, `线索：${m.note}。想一个能区分正确版本和它的输入，再写一个测试。`))))));
+      h("div", {}, h("div", {}, tr(`坏版本 ${i + 1}：${m.caught ? "抓住了" : "没抓住"}`, `Broken version ${i + 1}: ${m.caught ? "caught" : "not caught"}`)),
+        m.caught ? h("div", { class: "detail" }, m.by.length ? tr(`失败的测试：${m.by.join("、")}`, `Failing tests: ${m.by.join(", ")}`) : tr("代码直接报错了", "The code raised an error"))
+          : h("div", { class: "detail" }, tr(`线索：${m.note}。想一个能区分正确版本和它的输入，再写一个测试。`, `Clue: ${m.note}. Think of an input that tells the correct version apart from this one, and write a test for it.`)))))));
   }
   return els;
 }
 function viewTestwrite(work, item, ctx) {
   const r = rec(item.id);
-  work.append(h("p", { class: "panelLabel" }, "被测函数（正确版本）"), codeBlock(item.impl, "py"),
-    h("p", { class: "note" }, `另外还有 ${item.mutants.length} 个悄悄改坏的版本，你看不到。好的测试要在正确版本上全部通过，并且每个坏版本都至少让一个测试失败。`),
-    h("p", { class: "panelLabel" }, "你的测试（每个 test_ 开头的函数是一个测试，用 assert 检查）"));
+  work.append(h("p", { class: "panelLabel" }, tr("被测函数（正确版本）", "The function under test (correct version)")), codeBlock(item.impl, "py"),
+    h("p", { class: "note" }, tr(`另外还有 ${item.mutants.length} 个悄悄改坏的版本，你看不到。好的测试要在正确版本上全部通过，并且每个坏版本都至少让一个测试失败。`, `There are also ${item.mutants.length} quietly broken versions you can't see. Good tests all pass on the correct version, and every broken version makes at least one test fail.`)),
+    h("p", { class: "panelLabel" }, tr("你的测试（每个 test_ 开头的函数是一个测试，用 assert 检查）", "Your tests (each function starting with test_ is a test; check with assert)")));
   const host = h("div", { class: "editorWrap" });
   work.append(host);
   const out = h("div", { class: "results" });
@@ -1747,16 +1786,16 @@ function viewTestwrite(work, item, ctx) {
     value: r.code !== undefined ? r.code : blank, lang: "py", onRun: () => run(),
     onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(pendingDraft(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }), 800); },
   });
-  const runBtn = h("button", { class: "btn primary", onclick: () => run() }, "运行我的测试 ", h("kbd", {}, "Ctrl+Enter"));
+  const runBtn = h("button", { class: "btn primary", onclick: () => run() }, tr("运行我的测试 ", "Run my tests "), h("kbd", {}, "Ctrl+Enter"));
   work.append(h("div", { class: "actions" }, runBtn,
-    h("button", { class: "btn ghost", onclick: () => { ed.set(blank); out.replaceChildren(); ed.markLines([]); } }, "还原起始代码"),
-    h("button", { class: "btn ghost", onclick: () => exportLocal(item, ed.get(), out) }, "复制为本机文件")));
+    h("button", { class: "btn ghost", onclick: () => { ed.set(blank); out.replaceChildren(); ed.markLines([]); } }, tr("还原起始代码", "Reset starter code")),
+    h("button", { class: "btn ghost", onclick: () => exportLocal(item, ed.get(), out) }, tr("复制为本机文件", "Copy as local file"))));
   helpers(work, item, { exam: false, solution: item.solution, onRedo: () => { SESSION.redo[item.id] = true; r.code = blank; r.u = Date.now(); save(); ed.set(blank); out.replaceChildren(); ed.focus(); } });
   work.append(out);
   if (SESSION.results[item.id]) out.append(...testwriteView(SESSION.results[item.id], item, ctx.next));
   async function run() {
     runBtn.disabled = true;
-    out.replaceChildren(h("p", { class: "note" }, PY.state !== "ready" ? "正在启动 Python（第一次需要下载约 14 MB 的运行环境，之后就快了）…" : `运行中：正确版本 + ${item.mutants.length} 个坏版本…`));
+    out.replaceChildren(h("p", { class: "note" }, PY.state !== "ready" ? tr("正在启动 Python（第一次需要下载约 14 MB 的运行环境，之后就快了）…", "Starting Python (the first time downloads about 14 MB, after that it is quick)…") : tr(`运行中：正确版本 + ${item.mutants.length} 个坏版本…`, `Running: the correct version + ${item.mutants.length} broken versions…`)));
     const code = ed.get();
     r.code = code.slice(0, 8000);
     const res = await runTestwrite(item, code);
@@ -1772,8 +1811,8 @@ function viewTestwrite(work, item, ctx) {
 // ---------------------------------------------------------------- exam
 function examTitle(day) {
   const w = weekOf(day.id);
-  if (Number(day.id) % 7 !== 0) return `第 ${day.id} 天闭卷挑战`;
-  return w === 3 ? "毕业大考" : `第 ${w} 周周考`;
+  if (Number(day.id) % 7 !== 0) return tr(`第 ${day.id} 天闭卷挑战`, `Day ${day.id} closed-book challenge`);
+  return w === 3 ? tr("毕业大考", "Final exam") : tr(`第 ${w} 周周考`, `Week ${w} exam`);
 }
 function renderExam(main, day) {
   const items = examItems(day);
@@ -1782,25 +1821,27 @@ function renderExam(main, day) {
   if (!e || !e.active) {
     const panel = h("section", { class: "panel" },
       h("h2", {}, examTitle(day)),
-      h("div", { class: "md", html: md(`${items.length} 道「从零手写」题，限时 **${Math.round((items.length * EXAM_MS_PER_ITEM) / 60000)} 分钟**。\n\n- 没有提示、不能看答案、**不能粘贴**\n- 写完一题可以先运行判题，全部通过或时间到就交卷\n- 建议：先把今天的练习做完再来。考不过不丢人，会告诉你明天该复习哪题。`) }),
-      best ? h("p", { class: "note" }, `历史最好：${best.best}/${items.length}，上次：${best.last}/${items.length}（${new Date(best.at).toLocaleString()}）`) : "",
+      h("div", { class: "md", html: md(UI_LANG === "en"
+        ? `${items.length} "From scratch" exercises, **${Math.round((items.length * EXAM_MS_PER_ITEM) / 60000)} minutes**.\n\n- No hints, no answers, **no pasting**\n- You can run and check each one when you finish it; the exam ends when all pass or time is up\n- Tip: finish today's practice first. Failing is fine: it tells you what to review tomorrow.`
+        : `${items.length} 道「从零手写」题，限时 **${Math.round((items.length * EXAM_MS_PER_ITEM) / 60000)} 分钟**。\n\n- 没有提示、不能看答案、**不能粘贴**\n- 写完一题可以先运行判题，全部通过或时间到就交卷\n- 建议：先把今天的练习做完再来。考不过不丢人，会告诉你明天该复习哪题。`) }),
+      best ? h("p", { class: "note" }, tr(`历史最好：${best.best}/${items.length}，上次：${best.last}/${items.length}（${new Date(best.at).toLocaleString()}）`, `Best: ${best.best}/${items.length}, last: ${best.last}/${items.length} (${new Date(best.at).toLocaleString()})`)) : "",
       h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: () => {
         STATE.exam = { day: Number(day.id), active: true, startedAt: Date.now(), ms: items.length * EXAM_MS_PER_ITEM };
         for (const it of items) { SESSION.redo[it.id] = true; const r = rec(it.id); delete r.code; delete SESSION.results[it.id]; }
         save(); render();
-      } }, best ? "再考一次" : "开始闭卷")));
+      } }, best ? tr("再考一次", "Take it again") : tr("开始闭卷", "Start the exam"))));
     main.append(panel);
     if (best) renderPractice(main, day, items, "exam");
     return;
   }
   const clock = h("span", { class: "clock" }, "--:--");
-  const bar = h("div", { class: "examBar" }, h("strong", {}, "闭卷进行中"), clock, h("span", { class: "note" }, "提示、答案、粘贴都已关闭"), h("div", { class: "spacer" }), h("button", { class: "btn", onclick: () => finishExam("交卷") }, "交卷"));
+  const bar = h("div", { class: "examBar" }, h("strong", {}, tr("闭卷进行中", "Closed-book exam in progress")), clock, h("span", { class: "note" }, tr("提示、答案、粘贴都已关闭", "Hints, answers and pasting are off")), h("div", { class: "spacer" }), h("button", { class: "btn", onclick: () => finishExam(tr("交卷", "Handed in")) }, tr("交卷", "Hand in")));
   main.append(bar);
   renderPractice(main, day, items, "exam");
   const tick = () => {
     if (!STATE.exam || !STATE.exam.active) return;
     const left = STATE.exam.startedAt + STATE.exam.ms - Date.now();
-    if (left <= 0) { finishExam("时间到"); return; }
+    if (left <= 0) { finishExam(tr("时间到", "Time is up")); return; }
     clock.textContent = `${String(Math.floor(left / 60000)).padStart(2, "0")}:${String(Math.floor((left % 60000) / 1000)).padStart(2, "0")}`;
     examTick = setTimeout(tick, 1000);
   };
@@ -1811,7 +1852,7 @@ let examTick = null;
 function examCheck() {
   if (!STATE.exam || !STATE.exam.active) return;
   const items = examItems(dayOf(STATE.exam.day));
-  if (items.every((it) => SESSION.results[it.id] && isPass(SESSION.results[it.id]))) finishExam("全部通过");
+  if (items.every((it) => SESSION.results[it.id] && isPass(SESSION.results[it.id]))) finishExam(tr("全部通过", "All passed"));
 }
 function finishExam(reason) {
   if (!STATE.exam || !STATE.exam.active) return;
@@ -1824,7 +1865,7 @@ function finishExam(reason) {
   STATE.exam = null;
   clearTimeout(examTick);
   save();
-  toast(`${reason}：${score}/${items.length}`);
+  toast(`${reason}${tr("：", ": ")}${score}/${items.length}`);
   render();
 }
 
@@ -1832,9 +1873,9 @@ function finishExam(reason) {
 function renderReview(main) {
   const items = ALL_ITEMS.filter((it) => STATE.items[it.id]?.review);
   main.append(h("section", { class: "panel" },
-    h("h2", {}, "复习区"),
-    h("div", { class: "md", html: md("这里是需要**独立重做一次**的题：看过答案的、用了 2 个以上提示的、提交很多次才过的、闭卷没做出来的。\n\n点开题目 →「从空白重做」→ 不看答案写对，它就会离开这里。每天开始新内容之前，先把这里清空。") })));
-  if (!items.length) { main.append(h("div", { class: "panel" }, h("p", { class: "emptyNote" }, "复习区是空的。保持住：做完一题后，隔一天再从空白写一遍，最能检验是不是真会了。"))); return; }
+    h("h2", {}, tr("复习区", "Review")),
+    h("div", { class: "md", html: md(tr("这里是需要**独立重做一次**的题：看过答案的、用了 2 个以上提示的、提交很多次才过的、闭卷没做出来的。\n\n点开题目 →「从空白重做」→ 不看答案写对，它就会离开这里。每天开始新内容之前，先把这里清空。", "These exercises need **one more solve on your own**: ones where you saw the answer, used more than 2 hints, needed many tries, or missed in a closed-book exam.\n\nOpen the exercise → Redo from blank → get it right without the answer, and it leaves this list. Empty this list before you start anything new each day.")) })));
+  if (!items.length) { main.append(h("div", { class: "panel" }, h("p", { class: "emptyNote" }, tr("复习区是空的。保持住：做完一题后，隔一天再从空白写一遍，最能检验是不是真会了。", "Review is empty. Keep it that way: rewriting an exercise from blank a day later is the best test of whether you really know it.")))); return; }
   renderPractice(main, null, items, "review");
 }
 function renderStats(main) {
@@ -1844,30 +1885,31 @@ function renderStats(main) {
   const sols = Object.values(STATE.items).filter((r) => r.sol).length;
   const stuck = ALL_ITEMS.filter((it) => { const r = STATE.items[it.id]; return r && r.s !== "solved" && r.a >= 3; });
   main.append(h("section", { class: "panel" },
-    h("h2", {}, "我的进度"),
+    h("h2", {}, tr("我的进度", "My progress")),
     h("div", { class: "statGrid" },
-      h("div", { class: "stat" }, h("b", {}, mastered.length), h("span", {}, "已掌握（通过且不在复习区）")),
-      h("div", { class: "stat" }, h("b", {}, `${solved.length}/${ALL_ITEMS.length}`), h("span", {}, "已通过")),
-      h("div", { class: "stat" }, h("b", {}, ALL_ITEMS.filter((it) => STATE.items[it.id]?.review).length), h("span", {}, "复习区")),
-      h("div", { class: "stat" }, h("b", {}, hints), h("span", {}, "用过的提示")),
-      h("div", { class: "stat" }, h("b", {}, sols), h("span", {}, "看过答案的题"))),
+      h("div", { class: "stat" }, h("b", {}, mastered.length), h("span", {}, tr("已掌握（通过且不在复习区）", "Mastered (solved, not in Review)"))),
+      h("div", { class: "stat" }, h("b", {}, `${solved.length}/${ALL_ITEMS.length}`), h("span", {}, tr("已通过", "Solved"))),
+      h("div", { class: "stat" }, h("b", {}, ALL_ITEMS.filter((it) => STATE.items[it.id]?.review).length), h("span", {}, tr("复习区", "In Review"))),
+      h("div", { class: "stat" }, h("b", {}, hints), h("span", {}, tr("用过的提示", "Hints used"))),
+      h("div", { class: "stat" }, h("b", {}, sols), h("span", {}, tr("看过答案的题", "Answers seen")))),
     h("div", { class: "tableWrap" }, h("table", { class: "dayTable" },
-      h("thead", {}, h("tr", {}, h("th", {}, "天"), h("th", {}, "主题"), h("th", {}, "通过"), h("th", {}, "掌握"), h("th", {}, "闭卷最好"))),
+      h("thead", {}, h("tr", {}, h("th", {}, tr("天", "Day")), h("th", {}, tr("主题", "Topic")), h("th", {}, tr("通过", "Solved")), h("th", {}, tr("掌握", "Mastered")), h("th", {}, tr("闭卷最好", "Best exam")))),
       h("tbody", {}, COURSE.days.map((d) => {
         const p = dayProgress(d);
         const m = d.items.filter((it) => STATE.items[it.id]?.s === "solved" && !STATE.items[it.id].review).length;
         const e = STATE.exams[d.id];
         return h("tr", {}, h("td", {}, d.id), h("td", {}, d.title), h("td", {}, `${p.done}/${p.total}`), h("td", {}, `${m}/${p.total}`), h("td", {}, e ? `${e.best}/${examItems(d).length}` : "—"));
       })))),
-    stuck.length ? h("div", { class: "md", html: md("**卡住的题**（提交 3 次以上还没通过）：" + stuck.map((it) => `第 ${it.day} 天「${it.title}」`).join("、") + "。先休息一下，读一遍相关的知识卡片再回来。") }) : "",
-    h("p", { class: "note" }, CLOUD.ready ? "进度已同步到这个页面的数据库：回到和 Claude 的对话里说「看看我的进度」，它能读到你每道题的情况。" : "进度保存在这个浏览器里。")));
+    stuck.length ? h("div", { class: "md", html: md(tr("**卡住的题**（提交 3 次以上还没通过）：", "**Stuck** (more than 3 tries, not solved yet): ") + stuck.map((it) => tr(`第 ${it.day} 天「${it.title}」`, `Day ${it.day} "${it.title}"`)).join(tr("、", ", ")) + tr("。先休息一下，读一遍相关的知识卡片再回来。", ". Take a break, reread the matching knowledge cards, then come back.")) }) : "",
+    h("p", { class: "note" }, CLOUD.ready ? tr("进度已同步到这个页面的数据库：回到和 Claude 的对话里说「看看我的进度」，它能读到你每道题的情况。", "Progress is synced to this page's database: tell Claude \"look at my progress\" in your conversation and it can read how every exercise went.") : tr("进度保存在这个浏览器里。", "Progress is kept in this browser."))));
 }
 
 // ---------------------------------------------------------------- boot
 load();
 $("#allowPaste").checked = !!STATE.settings.allowPaste;
-$("#allowPaste").addEventListener("change", (e) => { STATE.settings.allowPaste = e.target.checked; save(); toast(e.target.checked ? "已允许粘贴" : "已关闭粘贴：手敲记得更牢"); });
+$("#allowPaste").addEventListener("change", (e) => { STATE.settings.allowPaste = e.target.checked; save(); toast(e.target.checked ? tr("已允许粘贴", "Pasting allowed") : tr("已关闭粘贴：手敲记得更牢", "Pasting off: typing it sticks better")); });
 if (STATE.exam && STATE.exam.active) for (const it of examItems(dayOf(STATE.exam.day) || { items: [] })) SESSION.redo[it.id] = false;
+applyChrome();
 pySetChip(); tsSetChip();
 render();
 initCloud();

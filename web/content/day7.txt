@@ -433,7 +433,7 @@ cards: 读 Clause Check 的路线图
 - 把 temperature 调成 0
 answer: 3
 --- explain
-这是**检索 / 输入问题**：模型拿到的是页脚，它没法判对。改 prompt 或换模型永远修不好。排错顺序：先看送进模型的是什么，再看模型怎么推理。对应学习课 01 和 Clause Check 的 `parse.py`（先拼页、去页眉页脚，再切分）。
+这是**检索 / 输入问题**：模型拿到的是页脚，它没法判对。改 prompt 或换模型永远修不好。排错顺序：先看送进模型的是什么，再看模型怎么推理。对应训练营的上手课 01（`lessons/01_parse.md`）和 Clause Check 的 `parse.py`（先拼页、去页眉页脚，再切分）。
 
 @@ item d7-08
 type: choice

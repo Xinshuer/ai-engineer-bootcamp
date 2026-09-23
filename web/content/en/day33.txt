@@ -1,0 +1,1850 @@
+@@ day 33
+title: Agent graphs: tool loop, memory, checkpoints
+lang: py
+langchain: yes
+hours: 4–5 hours
+--- goal
+Use LangGraph to build the agent loop as a graph (model ⇄ ToolNode), give it a cap (recursion_limit) and a memory (checkpointer + thread_id), inspect and change the state at every step (get_state, history, update_state, time travel), use SqliteSaver so checkpoints are still there after the process exits, and use a Store to remember customer preferences across conversations. This is the loop you wrote by hand on Day 17 and the checkpoints you wrote by hand on Day 19, and it is what `SqliteSaver` and `thread_id` do in `clausecheck/graph.py`.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, change the examples and run them
+- Pass every practice exercise (the local task is optional)
+- The 3 closed-book challenges
+- Be able to explain: what a `thread_id` is, which checkpoints a thread holds, and what the checkpointer (short-term memory) and the Store (long-term memory) are each for
+
+@@ concept
+title: The agent graph: model ⇄ tools
+--- body
+On Day 17 you wrote the agent loop by hand, on Day 30 you wrote it again with LangChain messages, and on Day 31 `create_agent` did it for you. Today you build it yourself as a LangGraph graph: two nodes, three edges.
+
+- The `model` node: calls the model once with `model.bind_tools(tools)` and returns `{"messages": [reply]}`
+- The `tools` node: `ToolNode(tools)` runs **all** the tool_calls in the last AIMessage and returns one ToolMessage per call
+- `add_conditional_edges("model", tools_condition)`: the last message has tool_calls → `"tools"`; no tool_calls → END
+- `add_edge("tools", "model")`: sends the tool results back to the model. This edge is the "loop"
+
+The graph that `create_agent` returns also calls its nodes `model` and `tools`. When all you need is a standard tool loop, that is enough; the benefit of building it yourself is that you can insert your own nodes in the middle (approval, logging, a budget check).
+
+The model must have thinking turned off: `extra_body={"thinking": {"type": "disabled"}}`. Day 30 explained why: in thinking mode, a request with `tools` must send back the `reasoning_content` of every earlier assistant message, or DeepSeek returns 400. ChatDeepSeek does not send it back, so with thinking on, this graph breaks the rule on its second model call (this page's mock server answers 400). Turning it off is also faster, and you pay for fewer output tokens.
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+PLAYBOOK = {"liability_cap": "PB-01: cap at 12 months of fees", "payment": "PB-04: net 30 days is fine"}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return PLAYBOOK.get(topic, "no rule for this topic")
+
+tools = [lookup_playbook]
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).bind_tools(tools)
+
+def call_model(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("model", call_model)
+g.add_node("tools", ToolNode(tools))
+g.add_edge(START, "model")
+g.add_conditional_edges("model", tools_condition)   # tool_calls → "tools", none → END
+g.add_edge("tools", "model")                        # tool results go back to the model
+app = g.compile()
+
+out = app.invoke({"messages": [("user", "Review clause 8.1: Liability is unlimited.")]})
+for m in out["messages"]:
+    print(f"{type(m).__name__:<13}", m.content[:60])
+print("tool call:", out["messages"][1].tool_calls[0]["args"])
+print("model calls:", len(MOCK.calls), "| nodes:", list(app.get_graph().nodes))
+
+@@ concept
+title: ToolNode: errors are messages too
+--- body
+`ToolNode` does Day 30's `run_tools` for you: it runs each call and pairs each ToolMessage with its `tool_call_id`. When something goes wrong, there are two cases:
+
+- **The model's mistake** (a tool name that doesn't exist, wrong arguments): it automatically becomes a ToolMessage with `status="error"`, which the model sees in the next round and can correct. This is what Day 17 meant by "errors are messages for the model"
+- **Your own tool raises an exception** (for example the playbook has no such topic): by default it is **raised straight through**, the whole graph crashes, and all the review work already done on this contract is wasted. This is different from the `run_tools` you wrote on Day 30, which also returned a message on errors
+- Add `handle_tool_errors=True`: the exception also becomes an error message, `"Error: KeyError('payment')\n Please fix your mistakes."`; you can also pass a string or a function and decide yourself what the model sees
+
+Also, `ToolNode` only runs inside a graph: calling its `invoke` on its own raises an error.
+--- code
+from langchain_core.messages import AIMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode
+
+PLAYBOOK = {"liability_cap": "PB-01: cap at 12 months of fees"}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return PLAYBOOK[topic]          # raises KeyError when the topic is missing
+
+def run_tools(node, call):
+    g = StateGraph(MessagesState)
+    g.add_node("tools", node)
+    g.add_edge(START, "tools")
+    g.add_edge("tools", END)
+    out = g.compile().invoke({"messages": [AIMessage(content="", tool_calls=[call])]})
+    return out["messages"][-1]
+
+calls = {
+    "ok": {"name": "lookup_playbook", "args": {"topic": "liability_cap"}, "id": "c1"},
+    "wrong tool name": {"name": "lookup_rules", "args": {"topic": "liability_cap"}, "id": "c2"},
+    "wrong argument name": {"name": "lookup_playbook", "args": {"topik": "payment"}, "id": "c3"},
+}
+for label, call in calls.items():
+    msg = run_tools(ToolNode([lookup_playbook]), call)
+    print(label, msg.status, "|", msg.content.splitlines()[0])
+
+boom = {"name": "lookup_playbook", "args": {"topic": "payment"}, "id": "c4"}
+try:
+    run_tools(ToolNode([lookup_playbook]), boom)
+except KeyError as e:
+    print("the tool itself raised: the whole graph crashed", repr(e))
+msg = run_tools(ToolNode([lookup_playbook], handle_tool_errors=True), boom)
+print("handle_tool_errors=True:", msg.status, "|", msg.content.splitlines()[0])
+
+@@ concept
+title: recursion_limit: a cap on the loop
+--- body
+The model may keep calling tools and never give a final answer (in the mock, write `[loop]` in the question to simulate this). LangGraph uses `recursion_limit` to cap the number of **supersteps** (a superstep: the nodes that run together in one round count as one step).
+
+- In LangGraph 1.2, the version on this page, the default is **10007**! Older versions and many tutorials say 25. If you don't set it, an endless loop calls the model thousands of times before it stops
+- So pass it every time: `app.invoke(inputs, {"recursion_limit": 10})`
+- Going over raises `GraphRecursionError` (`from langgraph.errors import GraphRecursionError`). Catch it and tell the user "no answer within the step limit", instead of letting the whole request fail with a 500
+- The first step, which writes the input into the state (`__start__`), counts too: model → tools → model really takes 4 steps, so a limit of 3 raises an error and 4 passes (the example below, measured with this page's version). Don't set it right at the edge; leave some room
+
+Compare with Day 17: the `max_steps` you wrote by hand is exactly this.
+--- code
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import StateGraph, START, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees"
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).bind_tools([lookup_playbook])
+g = StateGraph(MessagesState)
+g.add_node("model", lambda state: {"messages": [model.invoke(state["messages"])]})
+g.add_node("tools", ToolNode([lookup_playbook]))
+g.add_edge(START, "model")
+g.add_conditional_edges("model", tools_condition)
+g.add_edge("tools", "model")
+app = g.compile()
+
+def run(question, limit):
+    MOCK.reset()
+    try:
+        out = app.invoke({"messages": [("user", question)]}, {"recursion_limit": limit})
+        return f"limit {limit}: ok after {len(MOCK.calls)} model call(s)"
+    except GraphRecursionError:
+        return f"limit {limit}: GraphRecursionError after {len(MOCK.calls)} model call(s)"
+
+print(run("Review clause 8.1: Liability is unlimited.", 3))
+print(run("Review clause 8.1: Liability is unlimited.", 4))
+print(run("[loop] Review clause 8.1: Liability is unlimited.", 10))
+
+@@ concept
+title: Checkpointer and thread_id
+--- body
+Until now, every `invoke` started from nothing. Add a **checkpointer** when you compile, and the graph saves the state after every step, kept separately per `thread_id`:
+
+```python
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {"configurable": {"thread_id": "acme-msa"}}
+app.invoke({"messages": [("user", "Review clause 8.1")]}, cfg)
+app.invoke({"messages": [("user", "And clause 9.2?")]}, cfg)   # continues from the previous round
+```
+
+- Invoke again with the same `thread_id`: it first reads the last state, the new message is appended through `add_messages`, and the model sees the whole conversation
+- A different `thread_id`: a fresh start
+- A checkpointer but no thread_id (or a misspelled `threadId`): `ValueError`. Put it inside `"configurable"`, the way the docs and `graph.py` do
+- `InMemorySaver` keeps everything in the process's memory, which is gone as soon as the process exits, so it is only for development and tests. It is your `run_id` + JSON file from Day 19
+--- code
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def chat(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+app = g.compile(checkpointer=InMemorySaver())
+
+acme = {"configurable": {"thread_id": "acme-msa"}}
+globex = {"configurable": {"thread_id": "globex-msa"}}
+app.invoke({"messages": [("user", "Review clause 8.1")]}, acme)
+app.invoke({"messages": [("user", "And clause 9.2?")]}, acme)
+app.invoke({"messages": [("user", "And clause 9.2?")]}, globex)
+for call in MOCK.calls:
+    print("model saw:", [m["role"] for m in call["body"]["messages"]])
+try:
+    app.invoke({"messages": [("user", "hi")]})
+except ValueError as e:
+    print("ValueError:", str(e)[:70])
+
+@@ concept
+title: Inspecting state: get_state and history
+--- body
+With checkpoints you can see the graph's state at every step. Debugging "what exactly did the agent see at step 2" depends on this:
+
+- `snap = app.get_state(cfg)`: the latest checkpoint. `snap.values` is the state; `snap.next` is the nodes that run next (a tuple), and `()` means it has finished
+- `app.get_state_history(cfg)`: all the checkpoints of this thread, **newest first**, one per superstep: `metadata["step"]` starts at -1 (input just received), then 0, 1, 2…
+- A thread that doesn't exist: `values` is `{}`, `next` is `()`
+- `snap.config` contains a `checkpoint_id` that is different on every run: don't print it or compare with it
+
+The UI uses this to show progress, and the backend uses it to answer "which contracts are waiting for a person's approval" (the threads whose `next` is not empty).
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    return {"verdict": "redline"}
+
+def export(state: State):
+    return {"report": f"{state['clause']}: {state['verdict']}"}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("export", export)
+g.add_edge(START, "review")
+g.add_edge("review", "export")
+g.add_edge("export", END)
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {"configurable": {"thread_id": "t1"}}
+app.invoke({"clause": "8.1"}, cfg)
+
+snap = app.get_state(cfg)
+print("next:", snap.next, "| values:", snap.values)
+for s in app.get_state_history(cfg):          # newest first
+    print("step", s.metadata["step"], "next", s.next, "keys", sorted(s.values))
+print(app.get_state({"configurable": {"thread_id": "nobody"}}).values)
+
+@@ concept
+title: Changing state: update_state and time travel
+--- body
+On Day 19 you made the runner stop before a node and wait for a person's approval. Here is LangGraph's static way to do it, and how to change the state:
+
+- `compile(..., interrupt_before=["export"])`: stops every time before reaching `export`. `invoke` returns the state so far, **without** an `__interrupt__` key; look at `get_state(cfg).next` instead
+- A person makes a change: `app.update_state(cfg, {"verdict": "flag"})`. It works as if a node had returned this update (it still goes through the reducer), and it adds a new checkpoint
+- Continue: `app.invoke(None, cfg)`. `None` means "no new input, carry on from where it stopped"
+- **Time travel**: pick an old snapshot from the history, and `app.invoke(None, old_snapshot.config)` reruns from there; to change a value first, use `update_state(old_snapshot.config, {...})`, which returns a new config
+
+The benefit: only the later steps rerun, the earlier review doesn't have to be redone, and you don't pay for the model a second time.
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+g = StateGraph(State)
+g.add_node("review", lambda state: {"verdict": "redline"})
+g.add_node("export", lambda state: {"report": f"{state['clause']}: {state['verdict']}"})
+g.add_edge(START, "review")
+g.add_edge("review", "export")
+g.add_edge("export", END)
+app = g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+cfg = {"configurable": {"thread_id": "t2"}}
+
+print(app.invoke({"clause": "8.1"}, cfg))          # stops before export
+print("next:", app.get_state(cfg).next)
+app.update_state(cfg, {"verdict": "flag"})          # the lawyer changes the verdict
+print(app.invoke(None, cfg))                        # None = no new input, carry on
+
+# Time travel: go back to the checkpoint "before export, before the verdict was changed" and rerun from there
+old = [s for s in app.get_state_history(cfg) if s.next == ("export",)][-1]
+print("old:", old.values)
+print(app.invoke(None, old.config))
+
+@@ concept
+title: SqliteSaver: survives a process exit
+--- body
+`InMemorySaver` is gone as soon as the process exits. `clausecheck/graph.py` uses **SqliteSaver**: checkpoints are written to `data/checkpoints.sqlite`, and when the lawyer approves the next day, another process continues with the same `thread_id`.
+
+```python
+with SqliteSaver.from_conn_string("work/d33/cp.sqlite") as saver:
+    app = build_graph(checkpointer=saver)
+```
+
+- The connection closes automatically when the `with` ends. Two `with` blocks are like two processes: in between, the graph in memory is completely gone, and only the file is left
+- Another way to write it: `SqliteSaver(sqlite3.connect(path, check_same_thread=False))`. You **must** add `check_same_thread=False`: LangGraph writes checkpoints in a background thread, and without it, on your own computer you get `ProgrammingError: SQLite objects created in a thread can only be used in that same thread`. This page has only one thread, so you don't get the error here, which is all the more reason to remember it
+- Production usually uses the Postgres checkpointer (a separate package). Same idea: the graph stays the same, only the checkpointer changes
+--- code
+import os
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def build(checkpointer):
+    g = StateGraph(State)
+    g.add_node("review", lambda state: {"verdict": "redline"})
+    g.add_node("export", lambda state: {"report": f"{state['clause']}: {state['verdict']}"})
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=checkpointer, interrupt_before=["export"])
+
+os.makedirs("work/d33", exist_ok=True)
+path = "work/d33/demo.sqlite"
+if os.path.exists(path):
+    os.remove(path)                                   # start from an empty file on every run
+cfg = {"configurable": {"thread_id": "contract-42"}}
+
+with SqliteSaver.from_conn_string(path) as saver:     # "process 1": review, stop before export
+    print(build(saver).invoke({"clause": "8.1"}, cfg))
+
+with SqliteSaver.from_conn_string(path) as saver:     # "process 2": the lawyer approves the next day
+    app = build(saver)
+    print("next:", app.get_state(cfg).next)
+    print(app.invoke(None, cfg))
+print("file kept:", os.path.exists(path))
+
+@@ concept
+title: Long-term memory: Store
+--- body
+The checkpointer is **short-term memory**: the state inside one thread (one conversation, one contract). Some things must be remembered across threads, for example "Acme accepts a 24-month liability cap", which is still needed next week when you review another Acme contract. That is **long-term memory**: the Store.
+
+- `store.put(("prefs", "acme"), "liability_cap", {"cap": "24 months"})`: the namespace is a tuple, the key is a string, the value is a dict; putting the same key again overwrites it
+- `store.get(ns, key)` returns an Item (use `.value`) or `None`; `store.search(("prefs",))` lists items by prefix, **at most 10 by default**; pass `limit=` for more
+- Add a parameter `runtime: Runtime[Ctx]` to the node and use `runtime.store`; compile with `compile(store=store)`
+- "Which customer is this" doesn't go in the state: declare it with `StateGraph(State, context_schema=Ctx)`, pass it in with `invoke(..., context=Ctx(customer="acme"))`, and read `runtime.context.customer` in the node
+
+Also, a thread keeps growing, and every round sends the whole history to the model. Before calling the model, use `trim_messages(..., strategy="last", include_system=True, start_on="human")` to keep only the last few messages (the exercises use `token_counter=len`, which counts messages).
+--- code
+from dataclasses import dataclass
+from typing import TypedDict
+from langchain_core.messages import trim_messages
+from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
+from langgraph.store.memory import InMemoryStore
+
+@dataclass
+class Ctx:
+    customer: str
+
+class State(TypedDict, total=False):
+    clause: str
+    rule: str
+
+def load_rule(state: State, runtime: Runtime[Ctx]):
+    item = runtime.store.get(("prefs", runtime.context.customer), "liability_cap")
+    return {"rule": item.value["cap"] if item else "12 months (default)"}
+
+store = InMemoryStore()
+store.put(("prefs", "acme"), "liability_cap", {"cap": "24 months"})
+
+g = StateGraph(State, context_schema=Ctx)
+g.add_node("load_rule", load_rule)
+g.add_edge(START, "load_rule")
+g.add_edge("load_rule", END)
+app = g.compile(store=store)
+print(app.invoke({"clause": "8.1"}, context=Ctx(customer="acme")))
+print(app.invoke({"clause": "8.1"}, context=Ctx(customer="globex")))
+print([(item.namespace, item.key) for item in store.search(("prefs",))])
+
+history = [("system", "You review contracts."), ("user", "Review clause 1"), ("assistant", "accept"),
+           ("user", "Review clause 2"), ("assistant", "flag"), ("user", "Review clause 3")]
+kept = trim_messages(history, max_tokens=4, token_counter=len, strategy="last", include_system=True, start_on="human")
+print([m.content for m in kept])
+
+@@ item d33-01
+type: predict
+title: Recap: reducers and messages
+level: 1
+cards: d32:MessagesState and add_messages; d32:State and reducers
+--- context
+A review graph often has both a chat history and keys of its own: a log of which nodes a record went through, a final verdict. First review how each of these keys is merged.
+--- prompt
+A review of Day 32. Write the output. `State` adds two keys to `MessagesState`: `log` is merged with `operator.add`, and `verdict` has no reducer. Notice that the nodes return tuples: what does `add_messages` turn them into?
+--- code
+import operator
+from typing import Annotated
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+class State(MessagesState):
+    log: Annotated[list, operator.add]
+    verdict: str
+
+def review(state: State):
+    return {"messages": [("assistant", "8.1 looks risky")], "log": ["review"], "verdict": "flag"}
+
+def decide(state: State):
+    n = len(state["messages"])
+    return {"messages": [("assistant", f"final: redline after {n} messages")], "log": ["decide"], "verdict": "redline"}
+
+g = StateGraph(State)
+g.add_node("review", review)
+g.add_node("decide", decide)
+g.add_edge(START, "review")
+g.add_edge("review", "decide")
+g.add_edge("decide", END)
+out = g.compile().invoke({"messages": [("user", "Review clause 8.1")], "log": ["start"], "verdict": ""})
+for m in out["messages"]:
+    print(type(m).__name__, "|", m.content)
+print(out["log"], out["verdict"])
+--- explain
+The reducer of `messages` is `add_messages`: it appends, and it turns tuples like `("assistant", ...)` into AIMessages. `log` uses `operator.add`, so the three lists are joined together. `verdict` has no reducer, so the later write overwrites the earlier one. Today's agent graph is built on this: each node returns only its new messages, and `add_messages` takes care of appending them at the end.
+
+@@ item d33-02
+type: predict
+title: Which message tools_condition looks at
+level: 1
+cards: The agent graph: model ⇄ tools; ToolNode: errors are messages too
+--- context
+In the review agent, every time the model finishes a reply, the program has to decide where to go next; the model may also want to look up two rules at once (say, payment and the liability cap). This code takes these two parts out and looks at each on its own.
+--- prompt
+Write the output. The first two lines are return values of the routing function `tools_condition`; after that, an AIMessage with **two** tool_calls is handed to a ToolNode.
+--- code
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return f"rule for {topic}"
+
+call = {"name": "lookup_playbook", "args": {"topic": "payment"}, "id": "call_1"}
+print(tools_condition({"messages": [HumanMessage("hi"), AIMessage("", tool_calls=[call])]}))
+print(tools_condition({"messages": [AIMessage("", tool_calls=[call]), AIMessage("Done.")]}))
+
+g = StateGraph(MessagesState)
+g.add_node("tools", ToolNode([lookup_playbook]))
+g.add_edge(START, "tools")
+g.add_edge("tools", END)
+two = [call, {"name": "lookup_playbook", "args": {"topic": "liability_cap"}, "id": "call_2"}]
+out = g.compile().invoke({"messages": [AIMessage("", tool_calls=two)]})
+print(len(out["messages"]))
+for m in out["messages"][1:]:
+    print(type(m).__name__, m.tool_call_id, m.content)
+--- explain
+`tools_condition` only looks at the **last** message: if it has tool_calls, go to `"tools"`; if not, it returns `"__end__"` (which is `END`). In the second call, the earlier message with tool_calls doesn't count. ToolNode runs every call in the last AIMessage, one ToolMessage per call, with matching `tool_call_id`s. That is exactly what your hand-written `run_tools` did on Day 30.
+
+@@ item d33-03
+type: fill
+title: Fill in: build the agent graph
+level: 1
+cards: The agent graph: model ⇄ tools
+--- context
+This is the skeleton of the review agent: the model reads the clause, calls tools like `lookup_playbook` when it needs to look up the company's review rules, and continues its judgment with the results until it reaches a conclusion. On Day 17 you wrote the same loop by hand.
+--- prompt
+Complete `build_agent(model, tools)`: the `model` node calls the model with the tools bound, the `tools` node runs the tools, after the model the graph branches on whether there are tool_calls, and after the tools it goes back to the model.
+--- template
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+def build_agent(model, tools):
+    bound = model.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        return {"messages": [bound.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", [[ToolNode(tools)]])
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", [[tools_condition]])
+    g.add_edge([["tools"]], [["model"]])
+    return g.compile()
+--- tests
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return {"liability_cap": "PB-01: cap at 12 months of fees"}.get(topic, "no rule")
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+def _run():
+    MOCK.reset()
+    return build_agent(MODEL, [lookup_playbook]).invoke({"messages": [("user", "Review clause 8.1: Liability is unlimited.")]})["messages"]
+expect("message order: question → tool call → tool result → answer", lambda: [type(m).__name__ for m in _run()], ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"])
+expect("the final answer uses the tool result", lambda: _run()[-1].content, "Based on the playbook: PB-01: cap at 12 months of fees")
+expect("the model was called 2 times", lambda: (_run(), len(MOCK.calls))[1], 2)
+--- hints
+- The tool node is just `ToolNode(...)`: pass the list of tools into it.
+- You don't write the routing function yourself: it is `tools_condition`. The edge back to the model goes from `"tools"` to `"model"`.
+
+@@ item d33-04
+type: code
+title: An agent with a system prompt
+level: 2
+cards: The agent graph: model ⇄ tools; d32:MessagesState and add_messages
+--- context
+A system prompt tells the model its "identity and rules", for example "You are a contract reviewer; judge by the company's review rules". The review agent must include it on every model call, and the same conversation may go on for many rounds.
+--- prompt
+Write `build_agent(model, tools, system_prompt)`: the same agent graph as in the previous exercise, plus:
+
+- Every time you call the model, put `SystemMessage(system_prompt)` at the front of the messages: `[SystemMessage(system_prompt)] + state["messages"]`
+- The system prompt is **not stored in the state**: the `model` node returns only the model's reply. If you store it, the same thread gets one more system message every round
+- The `ToolNode` must have all the tools
+
+Example: for the question `"Use get_clause to read clause 12."`, the model calls `get_clause` with the arguments `{"clause_id": "12"}`.
+--- starter
+from langchain_core.messages import SystemMessage
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+def build_agent(model, tools, system_prompt):
+    pass
+--- solution
+from langchain_core.messages import SystemMessage
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+def build_agent(model, tools, system_prompt):
+    bound = model.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        messages = [SystemMessage(system_prompt)] + state["messages"]
+        return {"messages": [bound.invoke(messages)]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", ToolNode(tools))
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", tools_condition)
+    g.add_edge("tools", "model")
+    return g.compile()
+--- tests
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+
+CLAUSES = {"12": "Notwithstanding Section 8, Customer's liability shall be unlimited."}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return {"liability_cap": "PB-01: cap at 12 months of fees"}.get(topic, "no rule")
+
+@tool
+def get_clause(clause_id: str) -> str:
+    """Return the full text of another clause of the same contract, e.g. 12."""
+    return CLAUSES.get(clause_id, "no such clause")
+
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+SYSTEM = "You review SaaS contracts for Acme. Check cross-references."
+def _run(question):
+    MOCK.reset()
+    app = build_agent(MODEL, [lookup_playbook, get_clause], SYSTEM)
+    return app.invoke({"messages": [("user", question)]})["messages"]
+Q = "Review clause 8.1: Liability is unlimited."
+expect("first request: system comes first", lambda: (_run(Q), [m["role"] for m in MOCK.calls[0]["body"]["messages"]])[1], ["system", "user"])
+expect("the system content", lambda: (_run(Q), MOCK.calls[0]["body"]["messages"][0]["content"])[1], SYSTEM)
+expect("the second request has system too", lambda: (_run(Q), [m["role"] for m in MOCK.calls[1]["body"]["messages"]])[1], ["system", "user", "assistant", "tool"])
+expect("no SystemMessage in the state", lambda: [type(m).__name__ for m in _run(Q)], ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"])
+expect("the tool asked for by name is in the ToolNode too", lambda: _run("Use get_clause to read clause 12.")[-1].content, "Based on the playbook: " + CLAUSES["12"])
+expect("the arguments of get_clause", lambda: _run("Use get_clause to read clause 12.")[1].tool_calls[0]["args"], {"clause_id": "12"})
+--- hints
+- The structure is the same as in the previous exercise; only `call_model` is different: first build `messages = [SystemMessage(system_prompt)] + state["messages"]`, then `bound.invoke(messages)`.
+- Put only the model's reply in the return value: `{"messages": [reply]}`. If you put the SystemMessage in the return value too, `add_messages` stores it in the state.
+
+@@ item d33-05
+type: fix
+title: Fix the bug: one tool error crashes the whole review
+level: 2
+cards: ToolNode: errors are messages too
+--- context
+The real project's `tools.py` has a rule: when a tool's arguments are wrong, write the error as a message and hand it back to the model to correct, instead of letting the program crash. Today the same idea is applied to LangGraph's tool node.
+--- prompt
+The review agent uses `lookup_playbook` to look up rules. A topic that isn't in the playbook (for example governing law) makes the tool raise `KeyError`, the whole graph crashes with it, and all the review work already done on this contract is wasted.
+
+Run the tests to see the error, then change the code so that a tool error becomes an error ToolMessage for the model, and the model deals with it itself. **Don't change `lookup_playbook`**: in the real project the playbook may be a remote service, and any tool can fail. Change only one place.
+--- starter
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+PLAYBOOK = {
+    "liability_cap": "PB-01: cap at 12 months of fees",
+    "payment": "PB-04: net 30 days is acceptable",
+}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return PLAYBOOK[topic]
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def build_agent(tools):
+    bound = model.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        return {"messages": [bound.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", ToolNode(tools))
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", tools_condition)
+    g.add_edge("tools", "model")
+    return g.compile()
+
+app = build_agent([lookup_playbook])
+
+def review(text):
+    out = app.invoke({"messages": [("user", text)]}, {"recursion_limit": 10})
+    return out["messages"]
+--- solution
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+PLAYBOOK = {
+    "liability_cap": "PB-01: cap at 12 months of fees",
+    "payment": "PB-04: net 30 days is acceptable",
+}
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return PLAYBOOK[topic]
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def build_agent(tools):
+    bound = model.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        return {"messages": [bound.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", tools_condition)
+    g.add_edge("tools", "model")
+    return g.compile()
+
+app = build_agent([lookup_playbook])
+
+def review(text):
+    out = app.invoke({"messages": [("user", text)]}, {"recursion_limit": 10})
+    return out["messages"]
+--- tests
+LAW = "Review clause 14: governed by the laws of Sweden."
+expect("a topic with a rule: a normal answer", lambda: review("Review clause 8.1: Liability is unlimited.")[-1].content, "Based on the playbook: PB-01: cap at 12 months of fees")
+expect("a topic without a rule: the graph doesn't crash and runs to the end", lambda: [type(m).__name__ for m in review(LAW)], ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"])
+expect("the tool's error becomes a ToolMessage with status=error", lambda: review(LAW)[2].status, "error")
+expect_true("the model saw this error message in the next round", lambda: (lambda ms: ms[-1].content == "Based on the playbook: " + ms[2].content[:80])(review(LAW)))
+expect_raises("lookup_playbook itself is unchanged: it still raises KeyError when there is no rule", lambda: lookup_playbook.invoke({"topic": "other"}), KeyError)
+--- hints
+- The error comes from inside the tool, and by default ToolNode raises this kind of exception straight through.
+- ToolNode has a parameter that turns exceptions into error messages: `handle_tool_errors`.
+- `ToolNode(tools, handle_tool_errors=True)`.
+
+@@ item d33-06
+type: choice
+title: No recursion_limit set
+level: 2
+cards: recursion_limit: a cap on the loop
+--- context
+Once an agent is live, the biggest fear is a model that keeps asking for tools and never stops, with one model call every round. You need to know in advance whether the framework will catch this for you.
+--- prompt
+You wrote an agent graph with this page's LangGraph version (1.2) and didn't pass `recursion_limit` when calling it. One time, the model keeps calling tools and won't give a final answer. What happens?
+--- options
+- It raises `GraphRecursionError` at step 25, as the tutorials online all say
+- This version's default cap is 10007 steps: it takes thousands of model calls before the error comes, and the money is spent first. So pass a small `recursion_limit` yourself on every call
+- LangGraph notices that the same tool is called over and over and stops automatically
+- It never stops: LangGraph has no step limit
+answer: 2
+--- explain
+There has always been a cap, but the default has changed: older versions used 25, and version 1.2 on this page uses 10007 (`DEFAULT_RECURSION_LIMIT` in the source code). Defaults like this change quietly when a framework is upgraded; only passing the value explicitly yourself is reliable. LangGraph doesn't check "is it calling the same tool again and again"; to stop by your own rule, write your own routing function (the `should_continue` in the exercises stops after a number of tool rounds). In an interview, saying "I pass recursion_limit explicitly on every call and turn GraphRecursionError into a result the user can understand" is more useful than reciting the default.
+
+@@ item d33-07
+type: code
+title: Give the agent a cap
+level: 2
+cards: recursion_limit: a cap on the loop
+--- context
+The review agent will run inside a service: users submit a question and wait for the result. When the model goes around in circles and can't stop, the user should get a clear explanation instead of the whole request failing. In the exercise, a question containing `[loop]` simulates this circling.
+--- prompt
+Write `ask(app, question, limit=10)`:
+
+- Call `app` (an agent graph, already built in the tests) with `{"recursion_limit": limit}`
+- Normally: return the `content` of the last message
+- If it raises `GraphRecursionError`: return `f"stopped: no answer within {limit} steps"`
+
+Example: `ask(app, "[loop] Review clause 8.1", limit=6)` → `"stopped: no answer within 6 steps"`
+
+Note: when the mock sees `[loop]` in the question, it calls tools forever. The tests give the graph a 30-step safety net, but when you try things elsewhere yourself, don't run `[loop]` without passing a cap.
+--- starter
+from langgraph.errors import GraphRecursionError
+
+def ask(app, question, limit=10):
+    pass
+--- solution
+from langgraph.errors import GraphRecursionError
+
+def ask(app, question, limit=10):
+    try:
+        out = app.invoke({"messages": [("user", question)]}, {"recursion_limit": limit})
+    except GraphRecursionError:
+        return f"stopped: no answer within {limit} steps"
+    return out["messages"][-1].content
+--- tests
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    return "PB-01: cap at 12 months of fees"
+
+_bound = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).bind_tools([lookup_playbook])
+_g = StateGraph(MessagesState)
+_g.add_node("model", lambda state: {"messages": [_bound.invoke(state["messages"])]})
+_g.add_node("tools", ToolNode([lookup_playbook]))
+_g.add_edge(START, "model")
+_g.add_conditional_edges("model", tools_condition)
+_g.add_edge("tools", "model")
+APP = _g.compile().with_config(recursion_limit=30)   # safety net: even if limit is forgotten, it won't run ten thousand steps
+def _calls(fn):
+    MOCK.reset()
+    fn()
+    return len(MOCK.calls)
+expect("a normal answer", lambda: ask(APP, "Review clause 8.1: Liability is unlimited."), "Based on the playbook: PB-01: cap at 12 months of fees")
+expect("endless loop: over the cap", lambda: ask(APP, "[loop] Review clause 8.1: Liability is unlimited.", limit=6), "stopped: no answer within 6 steps")
+expect("the cap really is passed in: 6 steps make only 3 model calls", lambda: _calls(lambda: ask(APP, "[loop] liability", limit=6)), 3)
+expect("the default cap is 10: 5 model calls", lambda: _calls(lambda: ask(APP, "[loop] liability")), 5)
+--- hints
+- The second argument is the config dict: `app.invoke(inputs, {"recursion_limit": limit})`. It is not inside `"configurable"`.
+- Wrap the invoke in `try: ... except GraphRecursionError: return ...`.
+
+@@ item d33-08
+type: code
+title: Remember the conversation per thread
+level: 2
+cards: Checkpointer and thread_id
+--- context
+When a lawyer reviews a contract, they ask one follow-up question after another: first about 8.1, then about 9.2, and the second question can only be answered correctly together with the previous round. Each contract (or each customer) has its own separate conversation, and they don't get mixed up.
+--- prompt
+Complete two places:
+
+1. `build_chat(model)`: add `InMemorySaver()` as the checkpointer when compiling
+2. `say(app, thread_id, text)`: send one user message on this thread and return the `content` of the model's reply
+
+Example: on the same thread, first `say(app, "acme", "Review clause 8.1")`, then `say(app, "acme", "And clause 9.2?")`; the second time, the roles of the messages the model receives are `["user", "assistant", "user"]`.
+--- starter
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+def build_chat(model):
+    def chat(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("chat", chat)
+    g.add_edge(START, "chat")
+    g.add_edge("chat", END)
+    return g.compile()
+
+def say(app, thread_id, text):
+    pass
+--- solution
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+def build_chat(model):
+    def chat(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("chat", chat)
+    g.add_edge(START, "chat")
+    g.add_edge("chat", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+def say(app, thread_id, text):
+    cfg = {"configurable": {"thread_id": thread_id}}
+    out = app.invoke({"messages": [("user", text)]}, cfg)
+    return out["messages"][-1].content
+--- tests
+from langchain_deepseek import ChatDeepSeek
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+def _roles():
+    return [m["role"] for m in MOCK.calls[-1]["body"]["messages"]]
+def _two_turns():
+    MOCK.reset()
+    app = build_chat(MODEL)
+    a = say(app, "acme", "Review clause 8.1")
+    b = say(app, "acme", "And clause 9.2?")
+    return [a, b, _roles()]
+expect("same thread: the second round includes the first", _two_turns, ["Mock reply: Review clause 8.1", "Mock reply: And clause 9.2?", ["user", "assistant", "user"]])
+def _other_thread():
+    MOCK.reset()
+    app = build_chat(MODEL)
+    say(app, "acme", "Review clause 8.1")
+    say(app, "globex", "And clause 9.2?")
+    return _roles()
+expect("another thread: starts from scratch", _other_thread, ["user"])
+def _stored():
+    app = build_chat(MODEL)
+    say(app, "acme", "a")
+    say(app, "acme", "b")
+    return len(app.get_state({"configurable": {"thread_id": "acme"}}).values["messages"])
+expect("the thread stores 4 messages", _stored, 4)
+def _new_app():
+    MOCK.reset()
+    say(build_chat(MODEL), "acme", "Review clause 8.1")
+    say(build_chat(MODEL), "acme", "And clause 9.2?")
+    return _roles()
+expect("InMemorySaver belongs to the graph object: a newly built graph doesn't remember", _new_app, ["user"])
+--- hints
+- The compile line: `g.compile(checkpointer=InMemorySaver())`.
+- The shape of the config: `{"configurable": {"thread_id": thread_id}}`, as the second argument of `invoke`.
+- The input holds only this round's new message, `{"messages": [("user", text)]}`; the checkpointer reads the earlier ones, and `add_messages` appends the new one after them.
+
+@@ item d33-09
+type: fix
+title: Fix the bug: thread_id in the wrong place
+level: 1
+cards: Checkpointer and thread_id
+--- context
+Each customer has a separate chat, and Acme's conversation must not leak into another customer's. This time the program fails with an error right away, and the error message is the best clue.
+--- prompt
+One thread per customer: `ask(customer, text)` chats on the customer's own thread. This code was adapted from a TypeScript project. Run the tests, read the error message, and fix `ask`.
+--- starter
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def chat(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+app = g.compile(checkpointer=InMemorySaver())
+
+def ask(customer, text):
+    cfg = {"configurable": {"threadId": customer}}
+    out = app.invoke({"messages": [("user", text)]}, cfg)
+    return out["messages"][-1].content
+--- solution
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def chat(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("chat", chat)
+g.add_edge(START, "chat")
+g.add_edge("chat", END)
+app = g.compile(checkpointer=InMemorySaver())
+
+def ask(customer, text):
+    cfg = {"configurable": {"thread_id": customer}}
+    out = app.invoke({"messages": [("user", text)]}, cfg)
+    return out["messages"][-1].content
+--- tests
+expect("it answers", lambda: ask("acme-1", "Review clause 8.1"), "Mock reply: Review clause 8.1")
+def _memory():
+    ask("acme-2", "Review clause 8.1")
+    MOCK.reset()
+    ask("acme-2", "And clause 9.2?")
+    return len(MOCK.calls[-1]["body"]["messages"])
+expect("same customer: the model sees 3 messages", _memory, 3)
+def _separate():
+    ask("globex-2", "Review clause 8.1")
+    MOCK.reset()
+    ask("initech-2", "And clause 9.2?")
+    return len(MOCK.calls[-1]["body"]["messages"])
+expect("different customers don't affect each other", _separate, 1)
+--- hints
+- The error lists the key names the checkpointer recognizes; compare them letter by letter.
+- TypeScript usually uses camelCase, `threadId`, but LangGraph's key uses an underscore, `thread_id` (it is `thread_id` in LangGraph.js too): `{"configurable": {"thread_id": customer}}`.
+
+@@ item d33-10
+type: predict
+title: The state when it stops before export
+level: 2
+cards: Changing state: update_state and time travel; Inspecting state: get_state and history
+--- context
+Before the review result is exported, the program stops and waits for a lawyer to confirm (the real `graph.py` also stops before export to wait for approval, only it uses a different method that you'll learn tomorrow). This code looks at the state and the history at the stop.
+--- prompt
+Write the output. The graph is compiled with `interrupt_before=["export"]`. Watch whether the return value of the first `invoke` contains `__interrupt__`, and the order of the history.
+--- code
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+g = StateGraph(State)
+g.add_node("review", lambda state: {"verdict": "redline"})
+g.add_node("export", lambda state: {"report": f"{state['clause']}: {state['verdict']}"})
+g.add_edge(START, "review")
+g.add_edge("review", "export")
+g.add_edge("export", END)
+app = g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+cfg = {"configurable": {"thread_id": "8.1"}}
+
+out = app.invoke({"clause": "8.1"}, cfg)
+print(out)
+print(app.get_state(cfg).next, "__interrupt__" in out)
+for s in app.get_state_history(cfg):
+    print(s.metadata["step"], s.next)
+out = app.invoke(None, cfg)
+print(out["report"], app.get_state(cfg).next)
+print(len(list(app.get_state_history(cfg))))
+--- explain
+`interrupt_before` is a "static" interrupt: the graph stops before export, and `invoke` only returns the current state, with no `__interrupt__` key (tomorrow's `interrupt()` has one), so you use `get_state(cfg).next` to see where it stopped. The history is newest first, one checkpoint per superstep, starting from step -1 (input received). `invoke(None, cfg)` carries on and finishes export, which adds one more checkpoint, and `next` becomes an empty tuple.
+
+@@ item d33-11
+type: code
+title: Change the verdict, then export
+level: 2
+cards: Changing state: update_state and time travel; Inspecting state: get_state and history
+--- context
+The model judged a clause as redline, and the lawyer thinks marking it flag (a warning to look at it) is enough. The system must let the lawyer change the conclusion and then export, without redoing the earlier review.
+--- prompt
+The graph (`build()` is already written) reviews a clause and then stops before `export` to wait for the lawyer's confirmation. Write `correct_and_export(app, cfg, verdict=None)`:
+
+1. The thread is not stopped before export (`app.get_state(cfg).next != ("export",)`): `raise ValueError`
+2. `verdict` is not None: use `app.update_state` to change `"verdict"`; if it is None, **don't** call update_state (the lawyer agrees with the model's conclusion)
+3. Run to the end: `return app.invoke(None, cfg)`
+
+Example: the model says redline, the lawyer changes it to flag → in the returned state, `report` is `"8.1 ... -> flag"`.
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": f"{state['clause']} -> {state['verdict']}"}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+
+def correct_and_export(app, cfg, verdict=None):
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": f"{state['clause']} -> {state['verdict']}"}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+
+def correct_and_export(app, cfg, verdict=None):
+    if app.get_state(cfg).next != ("export",):
+        raise ValueError("this thread is not waiting before export")
+    if verdict is not None:
+        app.update_state(cfg, {"verdict": verdict})
+    return app.invoke(None, cfg)
+--- tests
+def _paused(tid, clause="8.1 Liability is unlimited."):
+    app = build()
+    cfg = {"configurable": {"thread_id": tid}}
+    app.invoke({"clause": clause}, cfg)
+    return app, cfg
+expect("the lawyer changes it to flag", lambda: correct_and_export(*_paused("a"), "flag")["report"], "8.1 Liability is unlimited. -> flag")
+expect("no change: the model's verdict is kept", lambda: correct_and_export(*_paused("b"))["report"], "8.1 Liability is unlimited. -> redline")
+def _twice():
+    app, cfg = _paused("c")
+    correct_and_export(app, cfg, "flag")
+    return correct_and_export(app, cfg, "accept")
+expect_raises("already exported: can't be changed again", _twice, ValueError)
+expect_raises("no such thread", lambda: correct_and_export(build(), {"configurable": {"thread_id": "nope"}}, "flag"), ValueError)
+def _sources(verdict):
+    app, cfg = _paused("d-" + str(verdict))
+    correct_and_export(app, cfg, verdict)
+    return [s.metadata["source"] for s in app.get_state_history(cfg)]
+expect("a change leaves an update checkpoint", lambda: _sources("flag"), ["loop", "update", "loop", "loop", "input"])
+expect("no change: update_state is not called", lambda: _sources(None), ["loop", "loop", "loop", "input"])
+--- hints
+- The first step only looks at `app.get_state(cfg).next`. It is a tuple, and when the graph is stopped before export it equals `("export",)` (note the comma).
+- Change the verdict: `app.update_state(cfg, {"verdict": verdict})`.
+- Keep running: `app.invoke(None, cfg)`; `None` means there is no new input.
+
+@@ item d33-12
+type: code
+title: Time travel: rerun only the export
+level: 3
+cards: Changing state: update_state and time travel; Inspecting state: get_state and history
+--- context
+The report's format often has to change (for example, the customer wants a different layout), while the review conclusions stay the same. Reviewing again means calling the model again and paying again, so you want only the export step to rerun.
+--- prompt
+The report template has changed (`TEMPLATE["text"]`) and the report must be exported again, but **without reviewing again**: in the real project, `review` calls the model and costs money (here `CALLS` counts the calls).
+
+Write `rerun_from(app, cfg, node)`:
+
+1. In `app.get_state_history(cfg)`, find the **newest** snapshot with `next == (node,)` (the history is newest first, so stop at the first one you find)
+2. None found: `raise ValueError`
+3. Rerun from that snapshot: `return app.invoke(None, snapshot.config)`
+
+Example: after the template is changed to `"[{verdict}] clause {clause}"`, `rerun_from(app, cfg, "export")` → a new report, and `CALLS["review"]` is still 1.
+--- starter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+CALLS = {"review": 0}
+TEMPLATE = {"text": "{clause}: {verdict}"}
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    CALLS["review"] += 1          # the real project calls the model here
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": TEMPLATE["text"].format(clause=state["clause"], verdict=state["verdict"])}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+def rerun_from(app, cfg, node):
+    pass
+--- solution
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+CALLS = {"review": 0}
+TEMPLATE = {"text": "{clause}: {verdict}"}
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def review(state: State):
+    CALLS["review"] += 1          # the real project calls the model here
+    return {"verdict": "redline" if "unlimited" in state["clause"] else "accept"}
+
+def export(state: State):
+    return {"report": TEMPLATE["text"].format(clause=state["clause"], verdict=state["verdict"])}
+
+def build():
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+def rerun_from(app, cfg, node):
+    for snap in app.get_state_history(cfg):
+        if snap.next == (node,):
+            return app.invoke(None, snap.config)
+    raise ValueError(f"no checkpoint before {node!r}")
+--- tests
+def _setup(tid):
+    CALLS["review"] = 0
+    TEMPLATE["text"] = "{clause}: {verdict}"
+    app = build()
+    cfg = {"configurable": {"thread_id": tid}}
+    app.invoke({"clause": "8.1 unlimited liability"}, cfg)
+    return app, cfg
+def _export_only():
+    app, cfg = _setup("r1")
+    TEMPLATE["text"] = "[{verdict}] clause {clause}"
+    out = rerun_from(app, cfg, "export")
+    return [out["report"], CALLS["review"]]
+expect("rerun only export: review is not called again", _export_only, ["[redline] clause 8.1 unlimited liability", 1])
+def _from_review():
+    app, cfg = _setup("r2")
+    rerun_from(app, cfg, "review")
+    return CALLS["review"]
+expect("rerun from review: review is called once more", _from_review, 2)
+def _twice():
+    app, cfg = _setup("r3")
+    TEMPLATE["text"] = "v2 {verdict}"
+    rerun_from(app, cfg, "export")
+    TEMPLATE["text"] = "v3 {verdict}"
+    out = rerun_from(app, cfg, "export")
+    return [out["report"], app.get_state(cfg).values["report"], CALLS["review"]]
+expect("rerun twice: the thread's latest state is the result of the last run", _twice, ["v3 redline", "v3 redline", 1])
+def _latest_wins():
+    app, cfg = _setup("r5")
+    old = [s for s in app.get_state_history(cfg) if s.next == ("export",)][0]
+    app.update_state(old.config, {"verdict": "flag"})   # the lawyer changes the verdict on the old snapshot: now there is a newer snapshot before export
+    TEMPLATE["text"] = "[{verdict}] clause {clause}"
+    return [rerun_from(app, cfg, "export")["report"], CALLS["review"]]
+expect("several snapshots stopped before export: use the newest one (after the change)", _latest_wins, ["[flag] clause 8.1 unlimited liability", 1])
+expect_raises("no such node", lambda: rerun_from(*_setup("r4"), "approve"), ValueError)
+--- hints
+- `for snap in app.get_state_history(cfg):` walks from the newest; the one with `snap.next == (node,)` is the one you want.
+- To continue from an old snapshot, use the snapshot's own config: `app.invoke(None, snap.config)`, which carries that checkpoint's id.
+- If the loop ends without a return, nothing was found: `raise ValueError(...)` after the loop.
+
+@@ item d33-13
+type: order
+title: Put the code in order: two "processes"
+level: 2
+cards: SqliteSaver: survives a process exit
+--- context
+The program reviews a contract and stops to wait for approval, and the lawyer may only click "approve" the next day, long after the original program has exited. The real `graph.py` saves checkpoints in `data/checkpoints.sqlite`, and another process continues with the same `thread_id`.
+--- prompt
+Put `pause_then_resume(build, path, thread_id, clause)` in order: delete the old checkpoint file; in the first `with`, review and stop before export; in the second `with` (like another process), continue from the file and finish. Return `(first, final)`. `build(saver)` returns a compiled graph with `interrupt_before=["export"]`. Two lines are distractors.
+--- lines
+import os
+from langgraph.checkpoint.sqlite import SqliteSaver
+def pause_then_resume(build, path, thread_id, clause):
+    if os.path.exists(path):
+        os.remove(path)
+    cfg = {"configurable": {"thread_id": thread_id}}
+    with SqliteSaver.from_conn_string(path) as saver:
+        first = build(saver).invoke({"clause": clause}, cfg)
+    with SqliteSaver.from_conn_string(path) as saver:
+        final = build(saver).invoke(None, cfg)
+    return first, final
+--- distractors
+        final = build(saver).invoke({"clause": clause}, cfg)
+    with SqliteSaver.from_conn_string(":memory:") as saver:
+--- tests
+import os
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def build(saver):
+    g = StateGraph(State)
+    g.add_node("review", lambda s: {"verdict": "redline" if "unlimited" in s["clause"] else "accept"})
+    g.add_node("export", lambda s: {"report": f"{s['clause']}: {s['verdict']}"})
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    return g.compile(checkpointer=saver, interrupt_before=["export"])
+
+os.makedirs("work/d33", exist_ok=True)
+P = "work/d33/order.sqlite"
+expect("the first 'process' stops before export", lambda: pause_then_resume(build, P, "t1", "8.1 unlimited")[0], {"clause": "8.1 unlimited", "verdict": "redline"})
+expect("the second 'process' continues from the file and finishes", lambda: pause_then_resume(build, P, "t1", "8.1 unlimited")[1]["report"], "8.1 unlimited: redline")
+expect("every run starts from an empty file: the previous report doesn't sneak in", lambda: pause_then_resume(build, P, "t1", "3.1 net 30")[0], {"clause": "3.1 net 30", "verdict": "accept"})
+--- hints
+- Delete the file first, then prepare the config, then the two `with` blocks.
+- The second time "continues", so the input is `None`, not a new clause.
+- Both "processes" must open the same file; a `":memory:"` database is gone as soon as its connection closes.
+
+@@ item d33-14
+type: code
+title: Which contracts are waiting for a lawyer
+level: 3
+cards: SqliteSaver: survives a process exit; Inspecting state: get_state and history
+--- context
+The law firm's backend needs a "waiting for approval" list, so that as soon as a lawyer opens it they know which contracts to deal with today. The real `graph.py` also has a function that looks at a stopped thread from another process.
+--- prompt
+The checkpoints of all contracts are in the same SQLite file, one thread per contract. The backend page must list "which contracts are stopped before export, waiting for a lawyer's approval".
+
+Write `waiting_threads(path, build)`:
+
+1. Open the file with `with SqliteSaver.from_conn_string(path) as saver:`
+2. `saver.list(None)` goes through all checkpoints of **all** threads in the file; each element's `.config["configurable"]["thread_id"]` is the thread it belongs to
+3. For each distinct thread_id, look at `next` with `build(saver).get_state({"configurable": {"thread_id": ...}})`
+4. Return the list of thread_ids whose `next` is not empty, sorted alphabetically; when the file has no threads yet, return `[]`
+
+Example: `msa-1` is already exported, `msa-2` and `msa-3` are stopped before export → `["msa-2", "msa-3"]`
+--- starter
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+def waiting_threads(path, build):
+    pass
+--- solution
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+def waiting_threads(path, build):
+    with SqliteSaver.from_conn_string(path) as saver:
+        thread_ids = {t.config["configurable"]["thread_id"] for t in saver.list(None)}
+        app = build(saver)
+        waiting = []
+        for tid in thread_ids:
+            if app.get_state({"configurable": {"thread_id": tid}}).next:
+                waiting.append(tid)
+    return sorted(waiting)
+--- tests
+import os
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clause: str
+    verdict: str
+    report: str
+
+def build(saver):
+    g = StateGraph(State)
+    g.add_node("review", lambda s: {"verdict": "redline" if "unlimited" in s["clause"] else "accept"})
+    g.add_node("export", lambda s: {"report": f"{s['clause']}: {s['verdict']}"})
+    g.add_edge(START, "review")
+    g.add_conditional_edges("review", lambda s: "export" if s["verdict"] == "redline" else END, ["export", END])
+    g.add_edge("export", END)
+    return g.compile(checkpointer=saver, interrupt_before=["export"])
+
+os.makedirs("work/d33", exist_ok=True)
+P = "work/d33/waiting.sqlite"
+def _fresh():
+    if os.path.exists(P):
+        os.remove(P)
+    with SqliteSaver.from_conn_string(P) as saver:
+        app = build(saver)
+        app.invoke({"clause": "8.1 unlimited liability"}, {"configurable": {"thread_id": "msa-2"}})
+        app.invoke({"clause": "3.1 net 30"}, {"configurable": {"thread_id": "msa-1"}})
+        app.invoke({"clause": "12 unlimited damages"}, {"configurable": {"thread_id": "msa-3"}})
+expect("two are waiting", lambda: (_fresh(), waiting_threads(P, build))[1], ["msa-2", "msa-3"])
+def _after_approval():
+    _fresh()
+    with SqliteSaver.from_conn_string(P) as saver:
+        build(saver).invoke(None, {"configurable": {"thread_id": "msa-2"}})
+    return waiting_threads(P, build)
+expect("after msa-2 is approved and exported, only msa-3 is left", _after_approval, ["msa-3"])
+def _empty():
+    if os.path.exists(P):
+        os.remove(P)
+    return waiting_threads(P, build)
+expect("empty file", _empty, [])
+--- hints
+- First collect the thread_ids in a set: `{t.config["configurable"]["thread_id"] for t in saver.list(None)}`. One thread has many checkpoints, and a set removes the duplicates automatically.
+- `get_state(...).next` is a tuple, and an empty tuple is false, so `if ... .next:` means "there is a next step".
+- Do all the reading inside the `with` block; once you leave the `with`, the connection is closed.
+
+@@ item d33-15
+type: choice
+title: Where to remember it
+level: 2
+cards: Long-term memory: Store; Checkpointer and thread_id
+--- context
+What a lawyer says during one review may still be useful in the next one. Which layer it is stored in decides whether the agent can recall it next time.
+--- prompt
+In one review, Acme's lawyer says: "We accept a 24-month liability cap." Next week, when the agent reviews **another** Acme contract (a new thread), it should know this too. Where is the best place to store it?
+--- options
+- Just leave it in this conversation's messages; the checkpointer will remember it
+- In the Store: namespace `("prefs", "acme")`, key `"liability_cap"`; when reviewing any Acme contract, a node reads it through `runtime.store`
+- Use the same `thread_id` for all Acme contracts, so the whole history is in one place
+- Write it into a constant in the system prompt
+answer: 2
+--- explain
+The checkpointer stores per thread: a new contract is a new thread and can't see the previous conversation. If all contracts share one thread, the history keeps growing, every call sends the conversations about other contracts to the model, and you can't tell which message belongs to which contract. Hard-coding it in the system prompt applies it to every customer, and every change needs a new deploy. The Store is designed for exactly this: long-term memory that works "across threads, organized by user or customer". In Clause Check, preferences like this should be managed as data anyway, just like `data/playbook.json`.
+
+@@ item d33-16
+type: code
+title: Read preferences per customer
+level: 2
+cards: Long-term memory: Store
+--- context
+Each customer draws the line in a different place: Acme can accept a 24-month liability cap, other customers may not. A review should use what the current customer said, instead of judging everything by the general rules.
+--- prompt
+Write two things:
+
+- `save_preference(store, customer, topic, rule)`: store it in the namespace `("prefs", customer)`, with key `topic` and value `{"rule": rule}`
+- The `load_rule` node: from `runtime.store`, read the preference of **this customer** (`runtime.context.customer`) for `state["topic"]`, and return `{"rule": that rule}`; if there is none, return `{"rule": DEFAULT}`
+
+Example: after `save_preference(store, "acme", "liability_cap", "24 months is acceptable")`, calling the graph with `Ctx(customer="acme")` and `topic` set to `"liability_cap"` → `rule` is `"24 months is acceptable"`; with globex instead → `DEFAULT`.
+--- starter
+from dataclasses import dataclass
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
+from langgraph.store.memory import InMemoryStore
+
+DEFAULT = "standard playbook"
+
+@dataclass
+class Ctx:
+    customer: str
+
+class State(TypedDict, total=False):
+    topic: str
+    rule: str
+
+def save_preference(store, customer, topic, rule):
+    pass
+
+def load_rule(state: State, runtime: Runtime[Ctx]):
+    return {"rule": DEFAULT}
+
+def build(store):
+    g = StateGraph(State, context_schema=Ctx)
+    g.add_node("load_rule", load_rule)
+    g.add_edge(START, "load_rule")
+    g.add_edge("load_rule", END)
+    return g.compile(store=store)
+--- solution
+from dataclasses import dataclass
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
+from langgraph.store.memory import InMemoryStore
+
+DEFAULT = "standard playbook"
+
+@dataclass
+class Ctx:
+    customer: str
+
+class State(TypedDict, total=False):
+    topic: str
+    rule: str
+
+def save_preference(store, customer, topic, rule):
+    store.put(("prefs", customer), topic, {"rule": rule})
+
+def load_rule(state: State, runtime: Runtime[Ctx]):
+    item = runtime.store.get(("prefs", runtime.context.customer), state["topic"])
+    if item is None:
+        return {"rule": DEFAULT}
+    return {"rule": item.value["rule"]}
+
+def build(store):
+    g = StateGraph(State, context_schema=Ctx)
+    g.add_node("load_rule", load_rule)
+    g.add_edge(START, "load_rule")
+    g.add_edge("load_rule", END)
+    return g.compile(store=store)
+--- tests
+def _rule(store, customer, topic):
+    return build(store).invoke({"topic": topic}, context=Ctx(customer=customer))["rule"]
+def _saved():
+    st = InMemoryStore()
+    save_preference(st, "acme", "liability_cap", "24 months is acceptable")
+    return st.get(("prefs", "acme"), "liability_cap").value
+expect("where and in what shape save_preference stores it", _saved, {"rule": "24 months is acceptable"})
+def _lookup():
+    st = InMemoryStore()
+    save_preference(st, "acme", "liability_cap", "24 months is acceptable")
+    return [_rule(st, "acme", "liability_cap"), _rule(st, "acme", "payment"), _rule(st, "globex", "liability_cap")]
+expect("read by customer and by topic; the default when there is none", _lookup, ["24 months is acceptable", DEFAULT, DEFAULT])
+def _overwrite():
+    st = InMemoryStore()
+    save_preference(st, "acme", "payment", "net 45")
+    save_preference(st, "acme", "payment", "net 60")
+    return [_rule(st, "acme", "payment"), len(st.search(("prefs", "acme")))]
+expect("saving the same key again overwrites it", _overwrite, ["net 60", 1])
+--- hints
+- Save: `store.put(namespace, key, value)`, where the namespace is the tuple `("prefs", customer)`.
+- Read: `runtime.store.get(("prefs", runtime.context.customer), state["topic"])` returns `None` when there is nothing.
+- When there is something, the value is in `item.value["rule"]`.
+
+@@ item d33-17
+type: fix
+title: Fix the bug: the API returns 400 after trimming
+level: 3
+cards: Long-term memory: Store; d32:MessagesState and add_messages
+--- context
+A chat history keeps getting longer, and every request is charged by the token (the unit the model bills by), so sending only the last few messages to the model is a common practice. Trimming only affects what is sent; the full history in the state is still there.
+--- prompt
+To save tokens, `call_model` sends only the last few messages to the model. Short conversations are fine, but once a long conversation that used tools is trimmed, DeepSeek (here the mock) returns 400.
+
+Run the tests, read the 400 error message, and see what the first non-system message is after trimming. Fix `call_model`: the part that is kept must start with a **user message**. Change only the arguments of `trim_messages`.
+--- starter
+from langchain_core.messages import trim_messages
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def call_model(state: MessagesState):
+    recent = trim_messages(state["messages"], max_tokens=4, token_counter=len,
+                           strategy="last", include_system=True)
+    return {"messages": [model.invoke(recent)]}
+
+g = StateGraph(MessagesState)
+g.add_node("model", call_model)
+g.add_edge(START, "model")
+g.add_edge("model", END)
+app = g.compile()
+--- solution
+from langchain_core.messages import trim_messages
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import StateGraph, START, END, MessagesState
+
+model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+
+def call_model(state: MessagesState):
+    recent = trim_messages(state["messages"], max_tokens=4, token_counter=len,
+                           strategy="last", include_system=True, start_on="human")
+    return {"messages": [model.invoke(recent)]}
+
+g = StateGraph(MessagesState)
+g.add_node("model", call_model)
+g.add_edge(START, "model")
+g.add_edge("model", END)
+app = g.compile()
+--- tests
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+TOOL_CHAT = [
+    SystemMessage("You review contracts for Acme."),
+    HumanMessage("Review clause 8.1"),
+    AIMessage("", tool_calls=[{"name": "lookup_playbook", "args": {"topic": "liability_cap"}, "id": "call_1"}]),
+    ToolMessage("PB-01: cap at 12 months of fees", tool_call_id="call_1"),
+    AIMessage("8.1 needs a redline."),
+    HumanMessage("Review clause 9.2"),
+]
+PLAIN_CHAT = [
+    SystemMessage("You review contracts for Acme."),
+    HumanMessage("Review clause 1"), AIMessage("accept"),
+    HumanMessage("Review clause 2"), AIMessage("flag"),
+    HumanMessage("Review clause 3"),
+]
+def _sent(messages):
+    MOCK.reset()
+    out = app.invoke({"messages": messages})
+    return [[m["role"] for m in MOCK.calls[-1]["body"]["messages"]], out["messages"][-1].content]
+expect("long conversation with tool calls: the kept part starts at a user message", lambda: _sent(TOOL_CHAT), [["system", "user"], "Mock reply: Review clause 9.2"])
+expect("plain long conversation: keep the last 3", lambda: _sent(PLAIN_CHAT), [["system", "user", "assistant", "user"], "Mock reply: Review clause 3"])
+expect("short conversation: sent as it is", lambda: _sent(TOOL_CHAT[:2]), [["system", "user"], "Mock reply: Review clause 8.1"])
+expect("only what is sent to the model is trimmed; no message is missing from the history in the state", lambda: len(app.invoke({"messages": TOOL_CHAT})["messages"]), 7)
+--- hints
+- The 400 message says the tool message at index 1 can't find the tool call it answers: its AIMessage was trimmed away, and only half of the pair is left.
+- `trim_messages` has a parameter that sets "which kind of message the kept part starts with".
+- Add `start_on="human"`.
+
+@@ item d33-18
+type: testwrite
+title: Write tests: continue or stop
+level: 2
+cards: The agent graph: model ⇄ tools; recursion_limit: a cap on the loop
+--- context
+When the model looks up rules round after round and still won't reach a conclusion, it is better to switch early to a wrap-up node than to wait until the total step count runs out and raises an error. A routing function like this doesn't need a graph to be tested: just build a few messages directly.
+--- prompt
+The function under test, `should_continue(state, max_rounds=3)`, is a hand-written routing function that replaces `tools_condition` and adds a cap on the number of "tool rounds":
+
+- No messages, or the last one is not an AIMessage with tool_calls → `END`
+- There are already **more than** `max_rounds` AIMessages with tool_calls → `"give_up"`
+- Otherwise → `"tools"`
+
+Write test functions (`assert` inside `def test_...():`) that all pass on the correct function and catch the hidden buggy versions. You can build messages directly: `AIMessage("", tool_calls=[{"name": "lookup_playbook", "args": {}, "id": "c1"}])`.
+--- impl
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    if not messages:
+        return END
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
+    if rounds > max_rounds:
+        return "give_up"
+    return "tools"
+--- mutants
+===== Edge case: at exactly max_rounds rounds it should still go to tools
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    if not messages:
+        return END
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
+    if rounds >= max_rounds:
+        return "give_up"
+    return "tools"
+===== Final answer: when tool_calls is an empty list [], it should end
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    if not messages:
+        return END
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or last.tool_calls is None:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
+    if rounds > max_rounds:
+        return "give_up"
+    return "tools"
+===== An empty message list
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
+    if rounds > max_rounds:
+        return "give_up"
+    return "tools"
+===== Rounds: count only AIMessages with tool_calls, not every AIMessage
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+def should_continue(state, max_rounds=3):
+    messages = state["messages"]
+    if not messages:
+        return END
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return END
+    rounds = sum(1 for m in messages if isinstance(m, AIMessage))
+    if rounds > max_rounds:
+        return "give_up"
+    return "tools"
+--- starter
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.graph import END
+
+def call(i):
+    return AIMessage("", tool_calls=[{"name": "lookup_playbook", "args": {}, "id": f"c{i}"}])
+
+def test_first_round_goes_to_tools():
+    state = {"messages": [HumanMessage("Review clause 8.1"), call(1)]}
+    assert should_continue(state) == "tools"
+--- solution
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.graph import END
+
+def call(i):
+    return AIMessage("", tool_calls=[{"name": "lookup_playbook", "args": {}, "id": f"c{i}"}])
+
+def rounds(n):
+    msgs = [HumanMessage("Review clause 8.1")]
+    for i in range(1, n + 1):
+        msgs.append(call(i))
+        if i < n:
+            msgs.append(ToolMessage("PB-01", tool_call_id=f"c{i}"))
+    return msgs
+
+def test_first_round_goes_to_tools():
+    assert should_continue({"messages": rounds(1)}) == "tools"
+
+def test_exactly_max_rounds_still_goes_to_tools():
+    assert should_continue({"messages": rounds(3)}) == "tools"
+
+def test_more_than_max_rounds_gives_up():
+    assert should_continue({"messages": rounds(4)}) == "give_up"
+
+def test_final_answer_ends():
+    msgs = [HumanMessage("Review clause 8.1"), AIMessage("8.1 needs a redline.")]
+    assert should_continue({"messages": msgs}) == END
+
+def test_empty_messages_end():
+    assert should_continue({"messages": []}) == END
+
+def test_earlier_plain_answers_are_not_rounds():
+    msgs = [HumanMessage("a"), AIMessage("ok"), HumanMessage("b"), AIMessage("ok"), HumanMessage("c"), AIMessage("ok"), HumanMessage("d"), call(1)]
+    assert should_continue({"messages": msgs}) == "tools"
+--- hints
+- Edge case: exactly 3 rounds should still give `"tools"`; only 4 rounds give `"give_up"`. Write a small function that builds a message list with n rounds.
+- The model's final answer is an AIMessage whose `tool_calls` is `[]`, not `None`; there is also the empty list `{"messages": []}`.
+- In a conversation with several rounds, earlier plain answers (AIMessages without tool_calls) don't count as tool rounds.
+
+@@ item d33-19
+type: local
+title: Local task (optional): look at the real checkpoint file
+level: 2
+cards: SqliteSaver: survives a process exit; Checkpointer and thread_id
+--- context
+The real project's graph mode writes checkpoints to `data/checkpoints.sqlite`. Look at this file with your own eyes, and you'll understand how the program is able to continue when the lawyer approves the next day. `--mode mock` doesn't call the model and costs nothing.
+--- prompt
+Run the LangGraph version of the review once in the real project, then query the SQLite file directly to see how many checkpoints each thread has stored (free: `--mode mock` doesn't call the model). In PowerShell:
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck review data/sample_contract.txt --mode mock --graph --approve yes --thread day33-1 --out data/day33.report.json
+python -c "import sqlite3; c = sqlite3.connect('data/checkpoints.sqlite'); print(c.execute('SELECT thread_id, COUNT(*) FROM checkpoints GROUP BY thread_id').fetchall())"
+```
+
+Then **run the first command again** (with the same `--thread day33-1`), and then the second one. Did the number for `day33-1` change? Think about it: is a thread "one run" or "one history"?
+
+Paste the output of the two commands from the first time below (the first command's output is long; you can start pasting from `Interrupted before export`).
+placeholder: Paste the output; it should contain approved=True and ('day33-1', a number)
+verify: approved=True[\s\S]*\('day33-1', \d+\)
+--- hints
+- `No module named 'langgraph'`: first run `python -m pip install langgraph langgraph-checkpoint-sqlite`.
+- When you run the same thread again, the new checkpoints come after the old ones: a thread is a history, and `get_state` only returns the newest one.
+- `data/checkpoints.sqlite` and the report file are both in `.gitignore`, so running this as often as you like won't clutter the repository.
+
+@@ item d33-e1
+type: scratch
+title: Closed book: an agent with a cap that survives tool errors
+exam: yes
+level: 3
+cards: The agent graph: model ⇄ tools; ToolNode: errors are messages too; recursion_limit: a cap on the loop
+--- context
+Put today's pieces together into a review agent that is ready to ship: it looks up rules, doesn't crash when a tool fails, stops at the cap when it goes around in circles, and reports which tools it called, so a person can take over.
+--- prompt
+Write `review_agent(question, tools, limit=10)`, which builds a review agent and runs it once:
+
+- Model: `ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})` (`from langchain_deepseek import ChatDeepSeek`), with `tools` bound
+- Graph: `MessagesState`; nodes `"model"` (calls the model, returns `{"messages": [reply]}`) and `"tools"` (`ToolNode(tools, handle_tool_errors=True)`); START → model; `tools_condition` after model; tools → model
+- Compile with `InMemorySaver()`; when calling it, the thread_id is `"exam"` and `recursion_limit` is `limit`
+- Normal finish: return `{"answer": content of the last message, "tools_used": [...], "stopped": False}`, where `tools_used` is the tool names in the tool_calls of all AIMessages, in the order they appear
+- Over the cap (`GraphRecursionError`, in `langgraph.errors`): don't raise. Use `get_state` to get the messages so far, and return `{"answer": None, "tools_used": [...], "stopped": True}`
+
+The tool in the tests aborts the whole run if it is called more than 20 times (a safety net: if the cap is not passed in, it won't run tens of thousands of steps).
+--- solution
+from langchain_core.messages import AIMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import StateGraph, START, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+def review_agent(question, tools, limit=10):
+    model = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}}).bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", call_model)
+    g.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", tools_condition)
+    g.add_edge("tools", "model")
+    app = g.compile(checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "exam"}}
+    stopped = False
+    try:
+        app.invoke({"messages": [("user", question)]}, {**cfg, "recursion_limit": limit})
+    except GraphRecursionError:
+        stopped = True
+    messages = app.get_state(cfg).values["messages"]
+    used = [c["name"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls]
+    answer = None if stopped else messages[-1].content
+    return {"answer": answer, "tools_used": used, "stopped": stopped}
+--- tests
+from langchain_core.tools import tool
+PLAYBOOK = {"liability_cap": "PB-01: cap at 12 months of fees"}
+class _SafetyNet(BaseException):   # not an Exception: handle_tool_errors can't catch it
+    pass
+_USED = {"n": 0}
+@tool
+def lookup_playbook(topic: str) -> str:
+    """Look up the customer's playbook rule for a contract topic."""
+    _USED["n"] += 1
+    if _USED["n"] > 20:   # safety net: if the cap is not passed in, don't let [loop] run tens of thousands of steps
+        raise _SafetyNet("the tool was called more than 20 times: did recursion_limit reach invoke?")
+    return PLAYBOOK[topic]
+def _agent(question, **kw):
+    _USED["n"] = 0
+    return review_agent(question, [lookup_playbook], **kw)
+expect("normal", lambda: _agent("Review clause 8.1: Liability is unlimited."), {"answer": "Based on the playbook: PB-01: cap at 12 months of fees", "tools_used": ["lookup_playbook"], "stopped": False})
+expect_true("a tool error doesn't crash it", lambda: _agent("Review clause 14: governed by Swedish law.")["answer"].startswith("Based on the playbook: Error"))
+expect("endless loop: stop and report the tools called", lambda: _agent("[loop] Review clause 8.1 liability", limit=6), {"answer": None, "tools_used": ["lookup_playbook"] * 3, "stopped": True})
+
+@@ item d33-e2
+type: scratch
+title: Closed book: the lawyer changes verdicts before export
+exam: yes
+level: 3
+cards: Changing state: update_state and time travel; Checkpointer and thread_id
+--- context
+After a contract is reviewed, the graph stops before export; the lawyer goes through the model's conclusions one by one, changes the ones they disagree with, and then exports. The clause numbers the lawyer gives may be wrong, and that must not add clauses that don't exist to the result.
+--- prompt
+Write `review_and_correct(clauses, corrections)`:
+
+- `clauses`: `[{"id": "8.1", "text": "..."}, ...]`; `corrections`: the lawyer's changes, `{"8.1": "flag"}`, which may be empty or may contain clause numbers that don't exist (ignore those)
+- Build the graph with LangGraph: the state has `clauses`, `verdicts` (a dict: clause number → verdict) and `report` (a list)
+- Node `review`: text that contains `unlimited` (ignoring case) gets `"redline"`, otherwise `"accept"`; write the results into `verdicts`
+- Node `export`: `report` is a list of `"number: verdict"` strings in the order of `clauses`
+- START → review → export → END; compile with `InMemorySaver()` and `interrupt_before=["export"]`; any thread_id will do
+- Flow: run until it stops → read the `verdicts` at the stop → if there are valid changes, write the **merged, complete dict** with `update_state` → finish with `invoke(None, ...)`
+- Return `{"before": the verdicts at the stop, "after": the verdicts in the final state, "report": the final report}`
+--- solution
+from typing import TypedDict
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict, total=False):
+    clauses: list
+    verdicts: dict
+    report: list
+
+def review(state: State):
+    return {"verdicts": {c["id"]: ("redline" if "unlimited" in c["text"].lower() else "accept") for c in state["clauses"]}}
+
+def export(state: State):
+    return {"report": [f"{c['id']}: {state['verdicts'][c['id']]}" for c in state["clauses"]]}
+
+def review_and_correct(clauses, corrections):
+    g = StateGraph(State)
+    g.add_node("review", review)
+    g.add_node("export", export)
+    g.add_edge(START, "review")
+    g.add_edge("review", "export")
+    g.add_edge("export", END)
+    app = g.compile(checkpointer=InMemorySaver(), interrupt_before=["export"])
+    cfg = {"configurable": {"thread_id": "review"}}
+    app.invoke({"clauses": clauses}, cfg)
+    before = app.get_state(cfg).values["verdicts"]
+    valid = {k: v for k, v in corrections.items() if k in before}
+    if valid:
+        app.update_state(cfg, {"verdicts": {**before, **valid}})
+    final = app.invoke(None, cfg)
+    return {"before": before, "after": final["verdicts"], "report": final["report"]}
+--- tests
+CL = [{"id": "8.1", "text": "Liability is UNLIMITED."}, {"id": "3.1", "text": "Net 30."}, {"id": "12", "text": "Unlimited damages."}]
+V0 = {"8.1": "redline", "3.1": "accept", "12": "redline"}
+expect("no changes", lambda: review_and_correct(CL, {}), {"before": V0, "after": V0, "report": ["8.1: redline", "3.1: accept", "12: redline"]})
+expect("one change, the others stay the same", lambda: review_and_correct(CL, {"12": "flag"})["report"], ["8.1: redline", "3.1: accept", "12: flag"])
+expect("a number that doesn't exist is ignored and not written into verdicts", lambda: (lambda r: [r["after"], r["report"]])(review_and_correct(CL, {"99": "flag", "3.1": "flag"})), [{"8.1": "redline", "3.1": "flag", "12": "redline"}, ["8.1: redline", "3.1: flag", "12: redline"]])
+
+@@ item d33-e3
+type: scratch
+title: Closed book: an assistant that remembers the customer
+exam: yes
+level: 3
+cards: Long-term memory: Store; Checkpointer and thread_id
+--- context
+A Q&A assistant for lawyers: within one conversation it remembers what was said earlier (short-term memory), and in a new conversation it still remembers this customer's long-term notes (long-term memory).
+--- prompt
+Write two functions:
+
+- `save_note(store, customer, key, text)`: store it in the Store under the namespace `("notes", customer)`, with key `key` and value `{"text": text}`
+- `build_assistant(model, store)`: returns the compiled graph
+  - The state is `MessagesState`; the `context_schema` is the `Ctx` below (`from dataclasses import dataclass`):
+    ```python
+    @dataclass
+    class Ctx:
+        customer: str
+    ```
+  - Only one node, `"answer"` (START → answer → END). It uses `runtime.store.search(("notes", customer), limit=100)` to get all of this customer's notes (`search` returns at most 10 by default), **sorts them by key**, joins their `text` with `"; "`, and makes the system message `"Customer notes: ..."`; with no notes it is `"Customer notes: none"`
+  - When calling the model, send `[SystemMessage(that text)] + state["messages"]`, and store only the model's reply in the state
+  - Compile with both `checkpointer=InMemorySaver()` and `store=store`
+
+How to call it: `app.invoke({"messages": [("user", "...")]}, {"configurable": {"thread_id": "t1"}}, context=Ctx(customer="acme"))`
+--- solution
+from dataclasses import dataclass
+from langchain_core.messages import SystemMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.runtime import Runtime
+
+@dataclass
+class Ctx:
+    customer: str
+
+def save_note(store, customer, key, text):
+    store.put(("notes", customer), key, {"text": text})
+
+def build_assistant(model, store):
+    def answer(state: MessagesState, runtime: Runtime[Ctx]):
+        items = sorted(runtime.store.search(("notes", runtime.context.customer), limit=100), key=lambda item: item.key)
+        notes = "; ".join(item.value["text"] for item in items) or "none"
+        reply = model.invoke([SystemMessage(f"Customer notes: {notes}")] + state["messages"])
+        return {"messages": [reply]}
+
+    g = StateGraph(MessagesState, context_schema=Ctx)
+    g.add_node("answer", answer)
+    g.add_edge(START, "answer")
+    g.add_edge("answer", END)
+    return g.compile(checkpointer=InMemorySaver(), store=store)
+--- tests
+from langchain_deepseek import ChatDeepSeek
+from langgraph.store.memory import InMemoryStore
+MODEL = ChatDeepSeek(model="deepseek-flash", extra_body={"thinking": {"type": "disabled"}})
+def _run():
+    MOCK.reset()
+    st = InMemoryStore()
+    save_note(st, "acme", "b-renewal", "max 12 month renewals")
+    save_note(st, "acme", "a-liability", "24 month cap is fine")
+    app = build_assistant(MODEL, st)
+    t1 = {"configurable": {"thread_id": "t1"}}
+    app.invoke({"messages": [("user", "Review clause 8.1")]}, t1, context=Ctx(customer="acme"))
+    app.invoke({"messages": [("user", "And clause 9.2?")]}, t1, context=Ctx(customer="acme"))
+    second = MOCK.calls[-1]["body"]["messages"]
+    app.invoke({"messages": [("user", "Review clause 8.1")]}, {"configurable": {"thread_id": "t2"}}, context=Ctx(customer="globex"))
+    other = MOCK.calls[-1]["body"]["messages"]
+    state = app.get_state(t1).values["messages"]
+    return {"second": second, "other": other, "state": state}
+expect("notes sorted by key go into the system message", lambda: _run()["second"][0]["content"], "Customer notes: 24 month cap is fine; max 12 month renewals")
+expect("the same thread remembers the previous round; no system message is stored in the state", lambda: (lambda r: [[m["role"] for m in r["second"]], [type(m).__name__ for m in r["state"]]])(_run()), [["system", "user", "assistant", "user"], ["HumanMessage", "AIMessage", "HumanMessage", "AIMessage"]])
+expect("another customer has no notes and no history", lambda: [(m["role"], m["content"]) for m in _run()["other"]], [("system", "Customer notes: none"), ("user", "Review clause 8.1")])
+def _many():
+    MOCK.reset()
+    st = InMemoryStore()
+    for i in range(12):
+        save_note(st, "initech", f"n{i:02d}", f"note {i}")
+    build_assistant(MODEL, st).invoke({"messages": [("user", "hi")]}, {"configurable": {"thread_id": "t3"}}, context=Ctx(customer="initech"))
+    return MOCK.calls[-1]["body"]["messages"][0]["content"].count("note ")
+expect("all 12 notes, none missing", _many, 12)

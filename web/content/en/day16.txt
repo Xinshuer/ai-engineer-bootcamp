@@ -1,0 +1,1645 @@
+@@ day 16
+title: TS classes and errors: class, Result, dependency injection, modules
+lang: ts
+hours: 4–5 hours
+--- goal
+Write small, clear classes: private state, getters, static factory methods. Design errors: custom Error subclasses, handling each kind separately with `instanceof`, returning a Result value instead of throwing. Pass dependencies such as `fetch` and the clock in through the constructor, so the code can be tested with fake objects. TypeScript API clients (the OpenAI SDK, Mastra) and tool registries are written this way; on the Python side, the matching code is `clausecheck/playbook.py` (the Playbook class) and `review.py` (two Backend classes, catching SDK errors by type).
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, change the examples and run them
+- Pass every practice exercise
+- Local task: split a client into three files (types.ts / client.ts / main.ts) and get it working with the real DeepSeek
+- The 3 closed-book challenges
+
+@@ concept
+title: class basics
+--- body
+You wrote classes in Python on Day 3. TypeScript maps onto them almost one to one:
+
+- `__init__` → `constructor`, `self` → `this`. Inside a method you **must** write `this.xxx` to read a field
+- Fields need a declared type: `counts: Record<string, number> = {};`
+- Creating an object needs `new`: `const c = new VerdictCounter();`
+
+Put `private readonly` or `readonly` in front of a constructor parameter and it automatically becomes a field (a **parameter property**). You'll see this a lot in SDK source code:
+
+```ts
+class Client {
+  constructor(private readonly apiKey: string, readonly model = "deepseek-flash") {}
+}
+```
+
+The classic mistake: forgetting `this.` inside a method. TypeScript reports `Cannot find name 'counts'`.
+--- code
+class VerdictCounter {
+  counts: Record<string, number> = {};
+
+  add(verdict: string): void {
+    this.counts[verdict] = (this.counts[verdict] ?? 0) + 1;
+  }
+
+  total(): number {
+    return Object.values(this.counts).reduce((sum, n) => sum + n, 0);
+  }
+}
+
+class Client {
+  constructor(private readonly apiKey: string, readonly model = "deepseek-flash") {}
+
+  describe(): string {
+    return `${this.model} with key ${this.apiKey.slice(0, 3)}...`;
+  }
+}
+
+const counter = new VerdictCounter();
+for (const v of ["flag", "accept", "flag"]) {
+  counter.add(v);
+}
+console.log(counter.counts, counter.total());
+console.log(new Client("sk-123456").describe());
+
+@@ concept
+title: Private state and getters
+--- body
+A class earns its keep by **guarding a rule**, for example "the tokens used must not go over the budget". If anyone can change `used` directly, the rule can't be kept.
+
+- `#used = 0`: a truly private field. Code outside the class can neither read nor write it, and it isn't visible at runtime either (it's not in `Object.keys` or `JSON.stringify`)
+- `private used = 0`: only blocked at **compile time**; at runtime it is still an ordinary field
+- getter: `get remaining(): number { ... }`. Outside code uses it like a field, `budget.remaining` (no parentheses), and can read it but not change it
+
+Use `#` in new code; in SDK source code you'll see both. Change state only through methods: the method checks first, then changes.
+--- code
+class TokenBudget {
+  #used = 0;
+  constructor(readonly limit: number) {}
+
+  get used(): number {
+    return this.#used;
+  }
+  get remaining(): number {
+    return this.limit - this.#used;
+  }
+  spend(n: number): boolean {
+    if (n > this.remaining) {
+      return false;
+    }
+    this.#used += n;
+    return true;
+  }
+}
+
+const budget = new TokenBudget(1000);
+console.log(budget.spend(600), budget.spend(600), budget.remaining);
+console.log(Object.keys(budget), JSON.stringify(budget));
+// budget.remaining = 5; // uncomment to try it: there is only a getter, so you can't assign
+
+@@ concept
+title: static and factory methods
+--- body
+A `static` method belongs to **the class itself**. You call it as `ClassName.method()`, without creating an object with new first. Its most common use is a **factory method**: it creates an object from outside data, and validates the data before creating it.
+
+```ts
+const pb = Playbook.fromJSON(JSON.parse(text)); // throws if the data is bad
+```
+
+The benefit: the constructor only ever receives data that has already passed, so bad data is stopped at the door, with a clear error. In Clause Check, `Playbook.load(path)` in `clausecheck/playbook.py` is the Python version of a factory method (`@classmethod`): it first validates every rule with Pydantic, then creates the Playbook.
+
+`static` can also be a constant: `static readonly VERSION = "2026-09";`
+--- code
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+class Playbook {
+  static readonly VERSION = "2026-09";
+
+  constructor(readonly rules: Rule[]) {}
+
+  static fromJSON(raw: unknown): Playbook {
+    if (typeof raw !== "object" || raw === null || !("rules" in raw) || !Array.isArray(raw.rules)) {
+      throw new Error("playbook JSON needs a 'rules' array");
+    }
+    return new Playbook(raw.rules);
+  }
+
+  topics(): string[] {
+    return this.rules.map((r) => r.topic);
+  }
+}
+
+const pb = Playbook.fromJSON(JSON.parse('{"rules": [{"id": "PB-01", "topic": "liability_cap"}]}'));
+console.log(pb.topics(), Playbook.VERSION);
+try {
+  Playbook.fromJSON({ items: [] });
+} catch (e) {
+  console.log(e instanceof Error ? e.message : e);
+}
+
+@@ concept
+title: Custom errors and instanceof
+--- body
+A call to an API can fail in many ways: 429 rate limit (wait and try again), 401 wrong key (retrying won't help), 500 server error. The caller has to **handle each one differently**, so give each kind of failure its own error class:
+
+```ts
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);          // must call the parent class's constructor first
+    this.name = "ApiError";  // the name shown in the error
+  }
+}
+```
+
+Tell them apart with `instanceof`, and **check the subclass first** (a RateLimitError is also an ApiError). An error you don't recognize must be passed on with `throw e`; don't swallow it. In TypeScript the e in `catch (e)` is `unknown`, and an `instanceof` check narrows it at the same time.
+
+Clause Check's `review.py` catches the Anthropic SDK's `RateLimitError` and `APIStatusError` by type in exactly this way.
+--- code
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+class RateLimitError extends ApiError {
+  constructor(message = "rate limited") {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+
+function handle(e: unknown): string {
+  if (e instanceof RateLimitError) {
+    return `wait and retry (${e.status})`;
+  }
+  if (e instanceof ApiError) {
+    return `give up: ${e.name} ${e.status} ${e.message}`;
+  }
+  throw e;
+}
+
+console.log(handle(new RateLimitError()));
+console.log(handle(new ApiError("bad key", 401)));
+const err = new RateLimitError();
+console.log(err instanceof RateLimitError, err instanceof ApiError, err instanceof Error);
+try {
+  handle(new TypeError("x is undefined"));
+} catch (e) {
+  console.log("re-thrown:", e instanceof TypeError);
+}
+
+@@ concept
+title: Result: failure is a return value too
+--- body
+throw is for the **unexpected**: a bug in the program, missing configuration, situations where the program can't go on. But some failures are **expected**: the model now and then returns bad JSON, and 3 out of 200 clauses fail to parse. Then it's better to treat the failure as an ordinary return value:
+
+```ts
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+```
+
+It's the discriminated union you learned yesterday: you can read `r.value` only after `if (r.ok)`. The benefits: the function signature tells the caller directly "this can fail", so the caller **can't forget** to handle it; and in a batch, one failure doesn't stop the whole batch.
+
+Zod's `safeParse` returns `{ success: true, data } | { success: false, error }`: the same design. Clause Check's `review.py` catches the errors the SDK throws and returns them as `Step(stop="error", error=...)`: the same idea.
+--- code
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseScore(raw: string): Result<number> {
+  const n = Number(raw);
+  if (raw.trim() === "" || Number.isNaN(n)) {
+    return { ok: false, error: `not a number: ${JSON.stringify(raw)}` };
+  }
+  return { ok: true, value: n };
+}
+
+for (const raw of ["0.8", "high", ""]) {
+  const r = parseScore(raw);
+  if (r.ok) {
+    console.log("score", r.value * 100);
+  } else {
+    console.log("skip:", r.error);
+  }
+}
+
+@@ concept
+title: Dependency injection: pass the outside world in
+--- body
+If a class calls `fetch` or `Date.now()` directly, its tests have to really go online and really wait. **Dependency injection** means: pass these dependencies in as constructor parameters, with a real default value; in tests, pass in a fake one:
+
+```ts
+new DeepSeekClient(key);                  // production: uses the real fetch
+new DeepSeekClient("sk-test", fakeFetch); // test: no network, fixed result
+```
+
+This is also "composition over inheritance": the client **has** a fetch function instead of **inheriting from** some HTTP base class, so swapping it out doesn't affect any other code. On Day 13 you gave `measure` a fake clock, `clock=fake_clock(...)`: the same idea. In Clause Check's `review.py`, the review loop `model_review(backend, ...)` only calls a few methods such as `backend.step(...)`, so the backend passed in can be the Anthropic backend or the DeepSeek backend.
+--- code
+type Clock = () => number;
+
+class Stopwatch {
+  #start: number;
+  constructor(private readonly now: Clock = () => Date.now()) {
+    this.#start = now();
+  }
+  elapsedMs(): number {
+    return this.now() - this.#start;
+  }
+}
+
+// a fake clock for tests: every call moves it 250 milliseconds forward
+let fakeTime = 1000;
+const fakeClock: Clock = () => {
+  fakeTime += 250;
+  return fakeTime;
+};
+const sw = new Stopwatch(fakeClock);
+console.log(sw.elapsedMs(), sw.elapsedMs());
+
+const real = new Stopwatch();
+console.log(real.elapsedMs() >= 0);
+
+@@ concept
+title: Modules: one file, one job
+--- body
+Real projects split files by responsibility, and each file does one job:
+
+- `types.ts`: types and error classes (`Verdict`, `Result`, `ApiError`)
+- `client.ts`: `DeepSeekClient`, which only handles HTTP
+- `review.ts`: the review logic, which depends only on types and the "client interface"
+- `main.ts`: puts them together
+
+How to write it: `export class DeepSeekClient { ... }`, and in another file `import { DeepSeekClient } from "./client";`; to import only types, write `import type { Verdict } from "./types";`. `class X implements ModelClient` makes the compiler check that the class really has the methods the interface requires.
+
+The rule: dependencies point in one direction only (main → review → client → types); **files must not import each other**. A circular dependency causes strange bugs such as "it's still undefined when you use it". Each exercise on this page has only one file; today's local task splits one up for real.
+--- code
+// ---- types.ts ----
+type Verdict = "accept" | "flag" | "redline";
+interface ClauseReview {
+  id: string;
+  verdict: Verdict;
+}
+
+// ---- client.ts ---- (only handles "how to ask the model")
+interface ModelClient {
+  judge(text: string): Verdict;
+}
+class KeywordClient implements ModelClient {
+  judge(text: string): Verdict {
+    return text.includes("unlimited") ? "redline" : "accept";
+  }
+}
+
+// ---- review.ts ---- (depends only on the ModelClient interface, doesn't care which class it is)
+function reviewAll(client: ModelClient, clauses: { id: string; text: string }[]): ClauseReview[] {
+  return clauses.map((c) => ({ id: c.id, verdict: client.judge(c.text) }));
+}
+
+// ---- main.ts ---- (puts it together)
+const reviews = reviewAll(new KeywordClient(), [
+  { id: "3.1", text: "Fees are due in 30 days." },
+  { id: "8.1", text: "Liability is unlimited." },
+]);
+console.log(reviews.map((r) => `${r.id}: ${r.verdict}`).join(", "));
+
+@@ concept
+title: Map and Set
+--- body
+On Day 5 you used `Record<string, T>` as a dictionary. `Map` is a container made for "key → value", and it fits better when:
+
+- keys are added and removed often, and you need `.size`
+- keys are not strings (numbers, objects)
+- keys come from outside data: on a plain object, keys such as `"constructor"` collide with built-in properties; on a Map they don't
+
+```ts
+const byId = new Map<string, Rule>();
+byId.set("PB-01", rule);
+byId.get("PB-01"); // Rule | undefined: remember it may not be there
+byId.has("PB-02");
+for (const [id, rule] of byId) { ... }
+const seen = new Map([["8.1", "redline"]]); // you can also build it in one go from an array of [key, value] pairs
+```
+
+`Set` is "a collection without duplicates": `new Set(ids)` removes duplicates, `.has(x)` checks very fast, `.add(x)` adds, and `[...set]` turns it back into an array. Map and Set both loop in **insertion order**.
+--- code
+interface Rule {
+  id: string;
+  topic: string;
+}
+const rules: Rule[] = [
+  { id: "PB-01", topic: "liability_cap" },
+  { id: "PB-02", topic: "auto_renewal" },
+  { id: "PB-07", topic: "liability_cap" },
+];
+const byId = new Map<string, Rule>();
+for (const r of rules) {
+  byId.set(r.id, r);
+}
+console.log(byId.size, byId.has("PB-02"), byId.get("PB-99"));
+console.log(byId.get("PB-07")?.topic);
+
+const topics = new Set(rules.map((r) => r.topic));
+console.log(topics.size, [...topics]);
+
+const verdicts = new Map([["8.1", "redline"], ["3.1", "accept"]]);
+console.log(verdicts.get("8.1"), [...verdicts.keys()]);
+
+const plain: Record<string, number> = {};
+console.log("constructor" in plain, new Map<string, number>().has("constructor"));
+
+@@ item d16-01
+type: code
+title: Recap: discriminated unions
+level: 2
+cards: d15:Discriminated unions and exhaustiveness checks
+--- context
+When a clause is reviewed, the model may call tools a few times before it gives its answer, and something may also go wrong along the way. Clause Check's `review.py` handles each `Step` one by one exactly like this; at the end it has to pull a result it can write into the report out of this series of steps.
+--- prompt
+A review of Day 15. `Step` is the three possible kinds of one model reply (the same as `Step.stop` in `review.py`). Write `finalText(steps)`, which looks at each step in order:
+
+- on an `error`: return `"failed: " + error` right away
+- on an `end`: remember its `text` (a later end overwrites an earlier one)
+- when all steps are done: return the last text remembered; if there was no end at all, return `"(no answer)"`
+
+Example: `[{ stop: "tool_use", tool: "lookup_playbook" }, { stop: "end", text: "flag" }]` → `"flag"`.
+--- starter
+type Step =
+  | { stop: "end"; text: string }
+  | { stop: "tool_use"; tool: string }
+  | { stop: "error"; error: string };
+
+function finalText(steps: Step[]): string {
+  return "(no answer)";
+}
+--- solution
+type Step =
+  | { stop: "end"; text: string }
+  | { stop: "tool_use"; tool: string }
+  | { stop: "error"; error: string };
+
+function finalText(steps: Step[]): string {
+  let answer = "(no answer)";
+  for (const s of steps) {
+    if (s.stop === "error") {
+      return `failed: ${s.error}`;
+    }
+    if (s.stop === "end") {
+      answer = s.text;
+    }
+  }
+  return answer;
+}
+--- tests
+expect("answer after a tool call", () => finalText([{ stop: "tool_use", tool: "lookup_playbook" }, { stop: "end", text: "flag" }]), "flag");
+expect("error along the way", () => finalText([{ stop: "tool_use", tool: "get_clause" }, { stop: "error", error: "http 429" }, { stop: "end", text: "accept" }]), "failed: http 429");
+expect("a later end overwrites an earlier one", () => finalText([{ stop: "end", text: "a" }, { stop: "end", text: "b" }]), "b");
+expect("empty", () => finalText([]), "(no answer)");
+--- hints
+- Only after narrowing with `if (s.stop === "error")` can you read `s.error`.
+- Use a variable `let answer = "(no answer)";` to remember the text of the last end, and return it after the loop.
+
+@@ item d16-02
+type: code
+title: A Counter class
+level: 1
+cards: class basics
+--- context
+The report summary counts how many clauses got each verdict, and evals count which failure is most common. Python has a ready-made `Counter`; TypeScript doesn't, so write a small class yourself.
+--- prompt
+Write `class Counter`:
+
+- `add(key)`: add 1 to this key's count
+- `get(key)`: return the count; a key never seen returns 0
+- `top(n)`: return the n keys with the highest counts; on a tie, the key that appeared first comes first
+
+Example: after adding `flag, accept, flag, redline, flag, accept` in that order, `top(2)` → `["flag", "accept"]`.
+--- starter
+class Counter {
+  counts: Record<string, number> = {};
+
+  add(key: string): void {}
+
+  get(key: string): number {
+    return 0;
+  }
+
+  top(n: number): string[] {
+    return [];
+  }
+}
+--- solution
+class Counter {
+  counts: Record<string, number> = {};
+
+  add(key: string): void {
+    this.counts[key] = (this.counts[key] ?? 0) + 1;
+  }
+
+  get(key: string): number {
+    return this.counts[key] ?? 0;
+  }
+
+  top(n: number): string[] {
+    return Object.keys(this.counts)
+      .sort((a, b) => this.counts[b] - this.counts[a])
+      .slice(0, n);
+  }
+}
+--- tests
+const c = new Counter();
+for (const v of ["flag", "accept", "flag", "redline", "flag", "accept"]) {
+  c.add(v);
+}
+expect("get", () => c.get("flag"), 3);
+expect("a key never seen", () => c.get("maybe"), 0);
+expect("top 2", () => c.top(2), ["flag", "accept"]);
+expect("n larger than the number of keys", () => c.top(10), ["flag", "accept", "redline"]);
+expect("each object counts on its own", () => { const a = new Counter(); a.add("x"); return new Counter().get("x"); }, 0);
+--- hints
+- Inside a method, reading or writing the field always means `this.counts`.
+- `top`: sort `Object.keys(this.counts)` by count from high to low (sort is stable, so keys with the same count keep the order they first appeared in), then `slice(0, n)`.
+
+@@ item d16-03
+type: translate
+title: Translate: the Playbook class
+level: 2
+cards: Private state and getters; class basics
+--- context
+The `Playbook` class in `playbook.py` groups the customer's review rules by topic, and the `lookup_playbook` tool relies on it to look rules up by topic. Translate it into TypeScript; you'll need it later when you write agents in TypeScript.
+--- prompt
+Translate `Playbook` from `clausecheck/playbook.py` (with `load` removed) into TypeScript. How things map:
+
+- `__init__` → `constructor`
+- `self._by_topic` (the underscore means "for internal use") → the private field `#byTopic`, of type `Record<string, Rule[]>`
+- `@property def topics` → the getter `get topics()`
+- Method names become camelCase: `for_topic` → `forTopic`; `None` → `undefined`
+- `next((r for r in ...), None)` means "find the first one, or None if there isn't one", which is `find`
+
+`forTopic` must return a **copy** (the `list(...)` in the Python), so a caller that changes it doesn't affect the Playbook.
+--- source
+class Playbook:
+    def __init__(self, rules: list[Rule]):
+        self.rules = rules
+        self._by_topic: dict[str, list[Rule]] = {}
+        for r in rules:
+            self._by_topic.setdefault(r.topic, []).append(r)
+
+    @property
+    def topics(self) -> list[str]:
+        return sorted(self._by_topic)
+
+    def for_topic(self, topic: str) -> list[Rule]:
+        return list(self._by_topic.get(topic, []))
+
+    def get(self, rule_id: str) -> Rule | None:
+        return next((r for r in self.rules if r.id == rule_id), None)
+--- starter
+interface Rule {
+  id: string;
+  topic: string;
+  severity: "low" | "medium" | "high";
+}
+
+class Playbook {
+  constructor(rules: Rule[]) {}
+}
+--- solution
+interface Rule {
+  id: string;
+  topic: string;
+  severity: "low" | "medium" | "high";
+}
+
+class Playbook {
+  readonly rules: Rule[];
+  #byTopic: Record<string, Rule[]> = {};
+
+  constructor(rules: Rule[]) {
+    this.rules = rules;
+    for (const r of rules) {
+      if (this.#byTopic[r.topic] === undefined) {
+        this.#byTopic[r.topic] = [];
+      }
+      this.#byTopic[r.topic].push(r);
+    }
+  }
+
+  get topics(): string[] {
+    return Object.keys(this.#byTopic).sort();
+  }
+
+  forTopic(topic: string): Rule[] {
+    return [...(this.#byTopic[topic] ?? [])];
+  }
+
+  get(ruleId: string): Rule | undefined {
+    return this.rules.find((r) => r.id === ruleId);
+  }
+}
+--- tests
+const RULES: Rule[] = [
+  { id: "PB-01", topic: "liability_cap", severity: "high" },
+  { id: "PB-02", topic: "auto_renewal", severity: "medium" },
+  { id: "PB-07", topic: "liability_cap", severity: "medium" },
+];
+const pb = new Playbook(RULES);
+expect("topics are sorted", () => pb.topics, ["auto_renewal", "liability_cap"]);
+expect("forTopic", () => pb.forTopic("liability_cap").map((r) => r.id), ["PB-01", "PB-07"]);
+expect("a topic that doesn't exist", () => pb.forTopic("payment"), []);
+expect("get", () => [pb.get("PB-02")?.severity, pb.get("PB-99")], ["medium", undefined]);
+expect("returns a copy", () => { pb.forTopic("liability_cap").push(RULES[1]); return pb.forTopic("liability_cap").length; }, 2);
+--- hints
+- `setdefault(k, []).append(r)`: first check `this.#byTopic[r.topic] === undefined` and put in an empty array if so, then `push`.
+- `sorted(dict)` sorts the keys: `Object.keys(this.#byTopic).sort()`. A copy can be written `[...(this.#byTopic[topic] ?? [])]`.
+
+@@ item d16-04
+type: predict
+title: Getters and private fields
+level: 2
+cards: Private state and getters; static and factory methods
+--- context
+Calling the model costs money, so tokens get a budget; the client also stores the API key. Neither of these should be freely read or written by code outside the class.
+--- prompt
+Write the output. Notice how a `#` field and a `private` field differ at runtime.
+--- code
+class Budget {
+  static created = 0;
+  #used = 0;
+
+  constructor(readonly limit: number) {
+    Budget.created += 1;
+  }
+  get remaining(): number {
+    return this.limit - this.#used;
+  }
+  spend(n: number): void {
+    this.#used += n;
+  }
+}
+
+class Client {
+  private apiKey = "sk-123";
+  model = "deepseek-flash";
+}
+
+const a = new Budget(100);
+const b = new Budget(50);
+a.spend(30);
+a.spend(30);
+console.log(a.remaining, b.remaining, Budget.created);
+console.log(JSON.stringify(a));
+console.log(JSON.stringify(new Client()));
+--- explain
+`static created` belongs to the class itself, so both objects share one count. `#used` really is hidden at runtime, so it isn't in the JSON; `private apiKey` only stops you from writing `client.apiKey` outside the class at compile time, and at runtime it's an ordinary field. Write a client object like this into a log and the key leaks, so fields such as keys use `#`.
+
+@@ item d16-05
+type: code
+title: TokenBudget
+level: 2
+cards: Private state and getters; Custom errors and instanceof
+--- context
+Reviewing a very long contract can take dozens of model calls. Give each contract a token limit, so one strange contract can't burn through a month's budget; and the amount already used must not be quietly changed by code somewhere else.
+--- prompt
+Write `class TokenBudget` (the error class `BudgetExceededError` is already written; the card "Custom errors and instanceof" explains it in detail):
+
+- The constructor takes `limit`
+- The amount used lives in the private field `#used`; outside code can only read it through the getters `used` and `remaining`
+- `spend(n)`: when `n` is more than what's left, throw `new BudgetExceededError(...)` and **don't deduct** anything; otherwise add n to the amount used
+- When `n` is negative, throw a plain `Error` (no "refunds")
+
+Example: `new TokenBudget(1000)`, then `spend(600)` twice: the second call throws BudgetExceededError, and `remaining` is still 400.
+--- starter
+class BudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BudgetExceededError";
+  }
+}
+
+class TokenBudget {
+  constructor(readonly limit: number) {}
+
+  get used(): number {
+    return 0;
+  }
+
+  get remaining(): number {
+    return this.limit;
+  }
+
+  spend(n: number): void {}
+}
+--- solution
+class BudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BudgetExceededError";
+  }
+}
+
+class TokenBudget {
+  #used = 0;
+
+  constructor(readonly limit: number) {}
+
+  get used(): number {
+    return this.#used;
+  }
+
+  get remaining(): number {
+    return this.limit - this.#used;
+  }
+
+  spend(n: number): void {
+    if (n < 0) {
+      throw new Error(`cannot spend a negative amount: ${n}`);
+    }
+    if (n > this.remaining) {
+      throw new BudgetExceededError(`need ${n} tokens, only ${this.remaining} left`);
+    }
+    this.#used += n;
+  }
+}
+--- tests
+expect("normal spend", () => { const b = new TokenBudget(1000); b.spend(600); return [b.used, b.remaining]; }, [600, 400]);
+expect("uses up exactly all of it", () => { const b = new TokenBudget(100); b.spend(100); return b.remaining; }, 0);
+expect("going over throws BudgetExceededError", () => {
+  const b = new TokenBudget(1000);
+  b.spend(600);
+  try { b.spend(600); return "no error thrown"; } catch (e) { return e instanceof BudgetExceededError; }
+}, true);
+expect("going over deducts nothing", () => { const b = new TokenBudget(1000); b.spend(600); try { b.spend(600); } catch {} return b.remaining; }, 400);
+expectThrows("negative amount", () => new TokenBudget(10).spend(-5));
+expect("the internal field stays hidden", () => JSON.stringify(new TokenBudget(5)), '{"limit":5}');
+--- hints
+- Write the field as `#used = 0;`, and in the getter `return this.#used;`.
+- In `spend`, check first (negative, over the limit), and only when every check passes do `this.#used += n`. That way an error never leaves the state broken.
+
+@@ item d16-06
+type: fix
+title: The lost this
+level: 2
+cards: class basics
+--- context
+`Counter` can add keys one at a time, but a report summary more often hands over a whole batch of verdicts at once, so a colleague added a method that adds a batch.
+--- prompt
+Run the tests: `addAll` throws a TypeError, while the type check says nothing. Read the error, think about why `this` is undefined, then fix `addAll` (you only need to change one line).
+--- starter
+class Counter {
+  counts: Record<string, number> = {};
+
+  add(key: string): void {
+    this.counts[key] = (this.counts[key] ?? 0) + 1;
+  }
+
+  addAll(keys: string[]): void {
+    keys.forEach(this.add);
+  }
+}
+--- solution
+class Counter {
+  counts: Record<string, number> = {};
+
+  add(key: string): void {
+    this.counts[key] = (this.counts[key] ?? 0) + 1;
+  }
+
+  addAll(keys: string[]): void {
+    keys.forEach((k) => this.add(k));
+  }
+}
+--- tests
+expect("addAll", () => { const c = new Counter(); c.addAll(["flag", "accept", "flag"]); return c.counts; }, { flag: 2, accept: 1 });
+expect("add still works after addAll", () => { const c = new Counter(); c.addAll(["x"]); c.add("x"); return c.counts.x; }, 2);
+--- hints
+- `keys.forEach(this.add)` "takes the method out" and hands it to forEach on its own. When forEach calls it, there's no `object.` in front of it, so the `this` inside the method is lost.
+- An arrow function has no `this` of its own; it uses the `this` from outside: `keys.forEach((k) => this.add(k));`
+
+@@ item d16-07
+type: code
+title: static fromJSON
+level: 3
+cards: static and factory methods; d15:unknown and type guards; Custom errors and instanceof
+--- context
+The playbook is a JSON file written by hand, so mistakes are bound to happen. Stopping bad data at the door and saying exactly which rule is wrong is much easier to debug than a strange error halfway through a review. The real project's `Playbook.load` also validates first, then creates the object.
+--- prompt
+Write the factory method `static fromJSON(raw: unknown): Playbook` for `Playbook` (`PlaybookError` is already written):
+
+- `raw` must be an object with a `rules` array, otherwise throw `PlaybookError("missing rules array")`
+- Every rule must have a string `id` and a string `topic`, otherwise throw `PlaybookError("bad rule at index 2")` (indexes start at 0)
+- ids must not repeat, otherwise throw `PlaybookError("duplicate rule id PB-01")`
+- If everything passes, `return new Playbook(rules)`
+
+Then write the instance method `rulesFor(topic)`: return the ids of this topic's rules, in their original order.
+--- starter
+class PlaybookError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlaybookError";
+  }
+}
+
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+class Playbook {
+  constructor(readonly rules: Rule[]) {}
+
+  static fromJSON(raw: unknown): Playbook {
+    return new Playbook([]);
+  }
+
+  rulesFor(topic: string): string[] {
+    return [];
+  }
+}
+--- solution
+class PlaybookError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlaybookError";
+  }
+}
+
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+function isRule(x: unknown): x is Rule {
+  return typeof x === "object" && x !== null && "id" in x && typeof x.id === "string" && "topic" in x && typeof x.topic === "string";
+}
+
+class Playbook {
+  constructor(readonly rules: Rule[]) {}
+
+  static fromJSON(raw: unknown): Playbook {
+    if (typeof raw !== "object" || raw === null || !("rules" in raw) || !Array.isArray(raw.rules)) {
+      throw new PlaybookError("missing rules array");
+    }
+    const items: unknown[] = raw.rules;
+    const rules: Rule[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!isRule(item)) {
+        throw new PlaybookError(`bad rule at index ${i}`);
+      }
+      if (rules.some((r) => r.id === item.id)) {
+        throw new PlaybookError(`duplicate rule id ${item.id}`);
+      }
+      rules.push(item);
+    }
+    return new Playbook(rules);
+  }
+
+  rulesFor(topic: string): string[] {
+    return this.rules.filter((r) => r.topic === topic).map((r) => r.id);
+  }
+}
+--- tests
+const GOOD = { rules: [{ id: "PB-01", topic: "liability_cap" }, { id: "PB-02", topic: "auto_renewal" }, { id: "PB-07", topic: "liability_cap" }] };
+const errorOf = (raw: unknown): string => {
+  try {
+    Playbook.fromJSON(raw);
+    return "no error thrown";
+  } catch (e) {
+    return e instanceof PlaybookError ? e.message : `not a PlaybookError: ${String(e)}`;
+  }
+};
+expect("valid", () => Playbook.fromJSON(GOOD).rulesFor("liability_cap"), ["PB-01", "PB-07"]);
+expect("a topic that doesn't exist", () => Playbook.fromJSON(GOOD).rulesFor("payment"), []);
+expect("no rules, or not an object", () => [errorOf({ items: [] }), errorOf(null)], ["missing rules array", "missing rules array"]);
+expect("index of the bad rule", () => errorOf({ rules: [{ id: "PB-01", topic: "x" }, { id: "PB-02", topic: "y" }, { id: 3, topic: "z" }] }), "bad rule at index 2");
+expect("duplicate id", () => errorOf({ rules: [{ id: "PB-01", topic: "x" }, { id: "PB-01", topic: "y" }] }), "duplicate rule id PB-01");
+--- hints
+- The first step is the same as in the knowledge card: if `typeof raw !== "object" || raw === null || !("rules" in raw) || !Array.isArray(raw.rules)`, throw.
+- Write the check for each rule as a type guard like on Day 15, `isRule(x: unknown): x is Rule`, and loop with an index, `for (let i = 0; ...)`, so the error message can include the index.
+- Duplicates: `rules.some((r) => r.id === item.id)`.
+
+@@ item d16-08
+type: code
+title: An error class hierarchy
+level: 2
+cards: Custom errors and instanceof
+--- context
+Calls to the model API fail for different reasons, and each one needs a different response: when you're rate limited, wait a little and try again; when the key is wrong, no number of retries helps, and a person has to fix the configuration. The caller has to be able to tell which one it is.
+--- prompt
+Design error classes for failures of the DeepSeek API (each one must set `name`). `ApiError` is already written; you write:
+
+- `AuthError extends ApiError`: for 401 / 403
+- `RateLimitError extends ApiError`: for 429
+
+Then rewrite `errorFor(status, message)`: **return** (not throw) an instance of the matching subclass; any other status code returns a plain `ApiError`. Example: `errorFor(429, "slow down")` is a `RateLimitError` whose `.status` is 429 and whose `.name` is `"RateLimitError"`.
+--- starter
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+// write AuthError and RateLimitError here
+
+function errorFor(status: number, message: string): ApiError {
+  return new ApiError(message, status);
+}
+--- solution
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+class AuthError extends ApiError {
+  constructor(message: string, status: number) {
+    super(message, status);
+    this.name = "AuthError";
+  }
+}
+
+class RateLimitError extends ApiError {
+  constructor(message: string) {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+
+function errorFor(status: number, message: string): ApiError {
+  if (status === 401 || status === 403) {
+    return new AuthError(message, status);
+  }
+  if (status === 429) {
+    return new RateLimitError(message);
+  }
+  return new ApiError(message, status);
+}
+--- tests
+expect("429 → RateLimitError", () => { const e = errorFor(429, "slow down"); return [e instanceof RateLimitError, e instanceof ApiError, e.name, e.status, e.message]; }, [true, true, "RateLimitError", 429, "slow down"]);
+expect("401 → AuthError", () => { const e = errorFor(401, "bad key"); return [e instanceof AuthError, e.name, e.status]; }, [true, "AuthError", 401]);
+expect("403 is an AuthError too", () => errorFor(403, "forbidden") instanceof AuthError, true);
+expect("500 → plain ApiError", () => { const e = errorFor(500, "boom"); return [e instanceof RateLimitError, e instanceof AuthError, e.name]; }, [false, false, "ApiError"]);
+--- hints
+- The first thing in a subclass's constructor is `super(message, statusCode)`, then `this.name = "RateLimitError";`.
+- In `errorFor`, check the status code with if, and return an instance like `return new RateLimitError(message);`.
+
+@@ item d16-09
+type: fix
+title: Forgot super
+level: 2
+cards: Custom errors and instanceof; class basics
+--- context
+When you're rate limited, the server often tells you how many seconds to wait before trying again. Store that number of seconds in the error object, and the code in charge of retries knows how long to wait.
+--- prompt
+Run it: the type check reports two errors. Understand them, then fix `RateLimitError`: its message looks like `"rate limited, retry after 5 s"` (5 is `retryAfterSeconds`), and its status is always 429.
+--- starter
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+class RateLimitError extends ApiError {
+  constructor(readonly retryAfterSeconds: number) {
+    this.name = "RateLimitError";
+  }
+}
+--- solution
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+class RateLimitError extends ApiError {
+  constructor(readonly retryAfterSeconds: number) {
+    super(`rate limited, retry after ${retryAfterSeconds} s`, 429);
+    this.name = "RateLimitError";
+  }
+}
+--- tests
+expect("fields", () => { const e = new RateLimitError(5); return [e.message, e.status, e.retryAfterSeconds, e.name]; }, ["rate limited, retry after 5 s", 429, 5, "RateLimitError"]);
+expect("still an ApiError", () => new RateLimitError(30) instanceof ApiError, true);
+--- hints
+- A subclass's constructor must call `super(...)` first and hand it what the parent class needs (message and status); you can't use `this` before that.
+- `super(\`rate limited, retry after ${retryAfterSeconds} s\`, 429);`, written before `this.name = ...`.
+
+@@ item d16-10
+type: predict
+title: The order of instanceof checks
+level: 2
+cards: Custom errors and instanceof
+--- context
+An error-handling function turns each kind of failure into one sentence people can read, to write into the log or to show to the lawyer.
+--- prompt
+Write the output. Notice the order of the ifs in `label`.
+--- code
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+class RateLimitError extends ApiError {
+  constructor() {
+    super("slow down", 429);
+    this.name = "RateLimitError";
+  }
+}
+
+function label(e: unknown): string {
+  if (e instanceof ApiError) {
+    return `api ${e.status}`;
+  }
+  if (e instanceof RateLimitError) {
+    return "rate limit";
+  }
+  if (e instanceof Error) {
+    return `error ${e.name}`;
+  }
+  return `other ${String(e)}`;
+}
+
+const err = new RateLimitError();
+console.log(err instanceof RateLimitError, err instanceof ApiError, err instanceof Error);
+console.log(err.name, err.message);
+console.log(label(err));
+console.log(label(new TypeError("x")), label("oops"));
+--- explain
+A RateLimitError is also an ApiError (and also an Error), so the first if already matches, and the `"rate limit"` line can never be reached. When you write the checks in a catch, put **subclasses first and parent classes after them**, with `Error` and everything else last.
+
+@@ item d16-11
+type: code
+title: Retry only rate limits
+level: 3
+cards: Custom errors and instanceof; d15:Generics: parameters for types
+--- context
+Reviewing a contract makes many model calls in a row; letting the whole contract fail because of one rate limit along the way would be a waste. But not every failure is worth another try.
+--- prompt
+Write `withRetry(fn, tries)`: call the async function `fn`, and return its result if it succeeds.
+
+- If it throws a `RateLimitError`: retry, calling it at most `tries` times **in total**; if every call fails, throw the error from the **last** call
+- Any other error (for example `AuthError`): throw it **right away**, no retry
+
+The error classes and the generic signature are already written. (Real code waits a little between two tries; that's left out here.)
+--- starter
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+class RateLimitError extends ApiError {
+  constructor(message = "rate limited") {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+class AuthError extends ApiError {
+  constructor(message = "bad key") {
+    super(message, 401);
+    this.name = "AuthError";
+  }
+}
+
+async function withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T> {
+  return fn();
+}
+--- solution
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+class RateLimitError extends ApiError {
+  constructor(message = "rate limited") {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+class AuthError extends ApiError {
+  constructor(message = "bad key") {
+    super(message, 401);
+    this.name = "AuthError";
+  }
+}
+
+async function withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T> {
+  let lastError: unknown = new Error("tries must be at least 1");
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (!(e instanceof RateLimitError)) {
+        throw e;
+      }
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+--- tests
+function flaky(failures: Error[], value: string) {
+  let calls = 0;
+  const fn = async (): Promise<string> => {
+    calls += 1;
+    const e = failures.shift();
+    if (e) {
+      throw e;
+    }
+    return value;
+  };
+  return { fn, calls: () => calls };
+}
+expectAsync("succeeds after two rate limits", async () => {
+  const f = flaky([new RateLimitError(), new RateLimitError()], "ok");
+  const r = await withRetry(f.fn, 3);
+  return [r, f.calls()];
+}, ["ok", 3]);
+expectAsync("out of tries: throws the last error", async () => {
+  const f = flaky([new RateLimitError("1"), new RateLimitError("2"), new RateLimitError("3")], "ok");
+  try { await withRetry(f.fn, 3); return "no error thrown"; } catch (e) { return [e instanceof RateLimitError ? e.message : String(e), f.calls()]; }
+}, ["3", 3]);
+expectAsync("AuthError is not retried", async () => {
+  const f = flaky([new AuthError()], "ok");
+  try { await withRetry(f.fn, 3); return "no error thrown"; } catch (e) { return [e instanceof AuthError, f.calls()]; }
+}, [true, 1]);
+expectAsync("succeeds on the first try", async () => {
+  const f = flaky([], "ok");
+  return [await withRetry(f.fn, 3), f.calls()];
+}, ["ok", 1]);
+--- hints
+- Loop `tries` times, and each time call fn inside a try; in the catch, use `e instanceof RateLimitError` to decide whether to go on.
+- Be sure to write `return await fn();`. With only `return fn();`, the Promise fails outside the try, and the catch never catches it.
+- Remember the last error in a variable `lastError`, and after the loop `throw lastError;`.
+
+@@ item d16-12
+type: choice
+title: throw or Result
+level: 2
+cards: Result: failure is a return value too
+--- context
+From startup until a contract is fully reviewed, Clause Check runs into all kinds of failures. The team has to agree on which failures are thrown and which come back as an ordinary return value.
+--- prompt
+Which of these situations is best suited to returning a `Result` (`{ ok: false, error }`) rather than throwing?
+--- options
+- At startup the program finds that `DEEPSEEK_API_KEY` isn't set
+- In a batch review of 200 clauses, the model returns invalid JSON for a few of them
+- The code uses `undefined` as an array (a bug in the program)
+- The file `playbook.json` doesn't exist, so the program can't start
+answer: 2
+--- explain
+Use Result for failures that are expected and where the rest of the data still has to be processed: one bad JSON shouldn't make all 200 fail, and a caller that gets a Result can record it, retry, or hand it to a person. Missing configuration, a missing file and a bug in the program are all "can't go on" situations: throw right away, so the program fails early and loudly. Being able to explain this distinction in an interview is a sign that you "know how to design errors".
+
+@@ item d16-13
+type: code
+title: safeParseVerdict
+level: 2
+cards: Result: failure is a return value too; d6:Zod: the Pydantic of TypeScript
+--- context
+The model hands back a verdict as JSON, which may be broken JSON, or may have a field that isn't valid. Pass the reason for the failure to the caller as it is; the caller then decides whether to have the model answer again or to hand it to a person.
+--- prompt
+Write `safeParseVerdict(raw): Result<Verdict>`, which never throws, whatever happens:
+
+- broken JSON → `{ ok: false, error: "bad json" }`
+- an invalid field → `{ ok: false, error: "bad field: verdict" }`; after the colon comes the `path` of Zod's first issue, joined with `"."`
+- valid → `{ ok: true, value: <the parsed object> }`
+
+The schema is already written; use its `safeParse`.
+--- starter
+import { z } from "zod";
+
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  risk_level: z.enum(["low", "medium", "high"]),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function safeParseVerdict(raw: string): Result<Verdict> {
+  return { ok: false, error: "not implemented" };
+}
+--- solution
+import { z } from "zod";
+
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  risk_level: z.enum(["low", "medium", "high"]),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function safeParseVerdict(raw: string): Result<Verdict> {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { ok: false, error: "bad json" };
+  }
+  const parsed = VerdictSchema.safeParse(data);
+  if (!parsed.success) {
+    return { ok: false, error: `bad field: ${parsed.error.issues[0].path.join(".")}` };
+  }
+  return { ok: true, value: parsed.data };
+}
+--- tests
+expect("valid", () => safeParseVerdict('{"clause_id": "8.1", "verdict": "flag", "risk_level": "high"}'), { ok: true, value: { clause_id: "8.1", verdict: "flag", risk_level: "high" } });
+expect("broken JSON", () => safeParseVerdict("Sure! {"), { ok: false, error: "bad json" });
+expect("invalid verdict", () => safeParseVerdict('{"clause_id": "8.1", "verdict": "maybe", "risk_level": "high"}'), { ok: false, error: "bad field: verdict" });
+expect("missing field", () => safeParseVerdict('{"clause_id": "8.1", "verdict": "flag"}'), { ok: false, error: "bad field: risk_level" });
+expect("read value after narrowing with ok", () => { const r = safeParseVerdict('{"clause_id": "3.1", "verdict": "accept", "risk_level": "low"}'); return r.ok ? r.value.clause_id : r.error; }, "3.1");
+--- hints
+- It has the same structure as `parseVerdict` from Day 6; only the return value is now a Result.
+- `parsed.error.issues[0].path` is an array, for example `["verdict"]`; turn it into text with `.join(".")`.
+
+@@ item d16-14
+type: order
+title: Put the code in order: sort out Results
+level: 2
+cards: Result: failure is a return value too; d15:Discriminated unions and exhaustiveness checks
+--- context
+After reviewing a batch of clauses one by one, you're holding a list of results: some succeeded, some failed. The report puts the successful verdicts in the main text and lists the reasons for the failures separately for a person to look at.
+--- prompt
+Put `collectResults` in order: it splits a list of Results into two piles, the successful values and the error messages, each keeping its original order. There are two distractor lines; think about why they don't pass the type check.
+--- lines
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+function collectResults<T>(results: Result<T>[]): { values: T[]; errors: string[] } {
+  const values: T[] = [];
+  const errors: string[] = [];
+  for (const r of results) {
+    if (r.ok) {
+      values.push(r.value);
+    } else {
+      errors.push(r.error);
+    }
+  }
+  return { values, errors };
+}
+--- distractors
+    if (r.value) {
+      values.push(r.error);
+--- tests
+const RESULTS: Result<number>[] = [{ ok: true, value: 0.8 }, { ok: false, error: "bad json" }, { ok: true, value: 0.4 }, { ok: false, error: "bad field: verdict" }];
+expect("split into two piles", () => collectResults(RESULTS), { values: [0.8, 0.4], errors: ["bad json", "bad field: verdict"] });
+expect("empty", () => collectResults([]), { values: [], errors: [] });
+--- hints
+- You can read `r.value` or `r.error` only after narrowing with `r.ok`: the failure kind has no `value` field at all.
+- Successful values go into `values`, error messages into `errors`.
+
+@@ item d16-15
+type: code
+title: A client with fetch injected
+level: 3
+cards: Dependency injection: pass the outside world in; Result: failure is a return value too; d6:fetch: the requests.post of TypeScript
+--- context
+This is the TypeScript version of the model client: it only sends requests and receives answers. Real requests cost money and their results vary, so the part that goes online has to be replaceable with a fake. In the real project, the review loop in `review.py` also only knows the one backend object passed in to it.
+--- prompt
+Write the `review(clauseText)` method of `DeepSeekClient`, which returns `Promise<Result<string>>`:
+
+- POST to `API_URL`: header `Authorization: Bearer <apiKey>`, model `deepseek-flash`, one user message, `response_format: { type: "json_object" }`, `thinking: { type: "disabled" }` (this turns off thinking mode, which is on by default: you only need one verdict, with no long reasoning, and turning it off is faster and cheaper)
+- status code not 200 → something like `{ ok: false, error: "http 429" }`
+- success → `JSON.parse` the answer's content and return `{ ok: true, value: <its verdict field> }`
+
+The constructor is already written: `fetchFn` defaults to the global `fetch`. The tests pass in a **fake** fetchFn, so you must call `this.fetchFn(...)`, not `fetch` directly.
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+type FetchFn = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body: string },
+) => Promise<{ status: number; json(): Promise<any> }>;
+
+class DeepSeekClient {
+  constructor(private readonly apiKey: string, private readonly fetchFn: FetchFn = fetch) {}
+
+  async review(clauseText: string): Promise<Result<string>> {
+    return { ok: false, error: "not implemented" };
+  }
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+type FetchFn = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body: string },
+) => Promise<{ status: number; json(): Promise<any> }>;
+
+class DeepSeekClient {
+  constructor(private readonly apiKey: string, private readonly fetchFn: FetchFn = fetch) {}
+
+  async review(clauseText: string): Promise<Result<string>> {
+    const res = await this.fetchFn(API_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-flash",
+        messages: [{ role: "user", content: clauseText }],
+        response_format: { type: "json_object" },
+        thinking: { type: "disabled" },
+      }),
+    });
+    if (res.status !== 200) {
+      return { ok: false, error: `http ${res.status}` };
+    }
+    const data = await res.json();
+    return { ok: true, value: JSON.parse(data.choices[0].message.content).verdict };
+  }
+}
+--- tests
+function fakeFetch(status: number, content: string) {
+  const seen: { url: string; body: any; auth: string }[] = [];
+  const fn: FetchFn = async (url, init) => {
+    seen.push({ url, body: JSON.parse(init.body), auth: init.headers.Authorization });
+    return { status, json: async () => ({ choices: [{ message: { content } }] }) };
+  };
+  return { fn, seen };
+}
+expectAsync("fake fetch: success", async () => {
+  const f = fakeFetch(200, '{"verdict": "flag"}');
+  return new DeepSeekClient("sk-test", f.fn).review("Review clause 3.2: late fees");
+}, { ok: true, value: "flag" });
+expectAsync("fake fetch: what the request contains", async () => {
+  const f = fakeFetch(200, '{"verdict": "accept"}');
+  await new DeepSeekClient("sk-test", f.fn).review("hello");
+  const s = f.seen[0];
+  return [s.url, s.auth, s.body.model, s.body.messages[0].content, s.body.response_format.type, s.body.thinking?.type];
+}, ["https://api.deepseek.com/v1/chat/completions", "Bearer sk-test", "deepseek-flash", "hello", "json_object", "disabled"]);
+expectAsync("fake fetch: 429", async () => {
+  const f = fakeFetch(429, "");
+  return new DeepSeekClient("sk-test", f.fn).review("x");
+}, { ok: false, error: "http 429" });
+expectAsync("no fetchFn: uses the global fetch (on this page, a mock server)", async () => {
+  const client = new DeepSeekClient(process.env.DEEPSEEK_API_KEY ?? "");
+  return client.review("Review clause 8.1: liability is unlimited");
+}, { ok: true, value: "redline" });
+--- hints
+- The request is written the same way as on Day 6; just replace `fetch(...)` with `this.fetchFn(...)`, and use `this.apiKey` for the key.
+- First check `res.status !== 200` and return a failure Result; on success, `JSON.parse(data.choices[0].message.content).verdict`.
+
+@@ item d16-16
+type: fill
+title: Fill in: a cache with an injected clock
+level: 2
+cards: Dependency injection: pass the outside world in; Private state and getters
+--- context
+On the web page, lawyers often open the same clause again and again, and calling the model again every time is slow and costly. So keep review results for a while, and review again once they expire, so an old result isn't used forever after the rules change.
+--- prompt
+Complete a cache with an expiry time: for the same clause text, the review result is reused, without calling the model again, for `ttlMs` milliseconds. The clock is injected through the constructor, and the tests control time with a fake clock. An entry counts as expired when the current time is **greater than or equal to** `expires`.
+--- template
+type Clock = () => number;
+
+class TtlCache {
+  #store: Record<string, { value: string; expires: number }> = {};
+
+  constructor(private readonly ttlMs: number, [[private readonly]] now: Clock = () => Date.now()) {}
+
+  set(key: string, value: string): void {
+    this.#store[key] = { value, expires: [[this.now()]] + this.ttlMs };
+  }
+
+  get(key: string): string | undefined {
+    const hit = this.#store[key];
+    if (hit === undefined || this.now() [[>=]] hit.expires) {
+      return undefined;
+    }
+    return hit.value;
+  }
+}
+--- tests
+let t = 500;
+const cache = new TtlCache(1000, () => t);
+cache.set("Liability is unlimited.", "redline");
+expect("not expired yet", () => { t = 1499; return cache.get("Liability is unlimited."); }, "redline");
+expect("gone exactly at the expiry time", () => { t = 1500; return cache.get("Liability is unlimited."); }, undefined);
+expect("a key that doesn't exist", () => cache.get("Fees are due in 30 days."), undefined);
+--- hints
+- First blank: how do you make the constructor parameter `now` automatically become a field, so that later you can write `this.now()`?
+- Second blank: when storing, ask the injected clock what time it is "now", not `Date.now()`, or the fake clock has no effect.
+
+@@ item d16-17
+type: choice
+title: Which way module dependencies point
+level: 2
+cards: Modules: one file, one job
+--- context
+The code is already split into several files, each doing one job. Now you're adding a new function and have to decide which file it goes in.
+--- prompt
+You've split the code into `types.ts` (types and error classes), `client.ts` (DeepSeekClient, which imports types.ts) and `main.ts` (puts things together). Now you want to add a function `defaultClient()` that does `new DeepSeekClient(process.env.DEEPSEEK_API_KEY ?? "")`. Where is the best place for it?
+--- options
+- In types.ts, with `import { DeepSeekClient } from "./client"` in types.ts
+- In client.ts or main.ts, so that types.ts still depends on no project file
+- Merge the three files into one, and the question goes away
+- Delete client.ts's import of types.ts
+answer: 2
+--- explain
+client.ts already imports types.ts. If types.ts also imports client.ts, that's a circular dependency; a common symptom is that some import is still `undefined` when it's used. Keep it one-way: types ← client ← main. Assembly work such as "creating the concrete objects" goes in the outermost layer, which is also the idea behind dependency injection. In Clause Check, `models.py` imports no project module: the same principle.
+
+@@ item d16-18
+type: code
+title: RuleIndex (Map)
+level: 2
+cards: Map and Set; Private state and getters
+--- context
+`lookup_playbook` looks up rules by topic, and the report also needs to find a single rule again by its id. Once the rule table is built, lookups have to be fast; and if two rules used the same id, nobody could say which one the report refers to.
+--- prompt
+Write `class RuleIndex`, which stores the rules by id in a `Map` inside:
+
+- `add(rule)`: when the id already exists, throw `Error("duplicate rule id PB-01")`, and **don't overwrite** it
+- `find(id)`: return the rule, or `undefined` if there isn't one
+- `size`: a getter, the number of rules
+- `topics()`: all topics, without duplicates, sorted alphabetically (use a `Set` to remove duplicates)
+
+Example: after adding PB-01 (liability_cap), PB-07 (liability_cap) and PB-02 (auto_renewal), `topics()` → `["auto_renewal", "liability_cap"]`.
+--- starter
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+class RuleIndex {
+  #byId = new Map<string, Rule>();
+
+  add(rule: Rule): void {}
+
+  find(id: string): Rule | undefined {
+    return undefined;
+  }
+
+  get size(): number {
+    return 0;
+  }
+
+  topics(): string[] {
+    return [];
+  }
+}
+--- solution
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+class RuleIndex {
+  #byId = new Map<string, Rule>();
+
+  add(rule: Rule): void {
+    if (this.#byId.has(rule.id)) {
+      throw new Error(`duplicate rule id ${rule.id}`);
+    }
+    this.#byId.set(rule.id, rule);
+  }
+
+  find(id: string): Rule | undefined {
+    return this.#byId.get(id);
+  }
+
+  get size(): number {
+    return this.#byId.size;
+  }
+
+  topics(): string[] {
+    const unique = new Set<string>();
+    for (const rule of this.#byId.values()) {
+      unique.add(rule.topic);
+    }
+    return [...unique].sort();
+  }
+}
+--- tests
+const idx = new RuleIndex();
+idx.add({ id: "PB-01", topic: "liability_cap" });
+idx.add({ id: "PB-07", topic: "liability_cap" });
+idx.add({ id: "PB-02", topic: "auto_renewal" });
+expect("size", () => idx.size, 3);
+expect("find", () => [idx.find("PB-07")?.topic, idx.find("PB-99")], ["liability_cap", undefined]);
+expect("topics without duplicates, sorted", () => idx.topics(), ["auto_renewal", "liability_cap"]);
+expectThrows("duplicate id", () => idx.add({ id: "PB-01", topic: "payment" }));
+expect("a duplicate doesn't overwrite", () => { try { idx.add({ id: "PB-01", topic: "payment" }); } catch {} return [idx.find("PB-01")?.topic, idx.size]; }, ["liability_cap", 3]);
+expect("'constructor' is just an ordinary key too", () => new RuleIndex().find("constructor"), undefined);
+--- hints
+- `add`: first check with `this.#byId.has(rule.id)` and throw if it's a duplicate; otherwise `this.#byId.set(rule.id, rule)`.
+- You can loop over `this.#byId.values()` directly with `for...of`; turn a Set into an array with `[...unique]`, then `.sort()`.
+
+@@ item d16-19
+type: local
+title: Local task: split into three modules
+level: 2
+cards: Modules: one file, one job; Dependency injection: pass the outside world in
+--- context
+On the web page each exercise has only one file. In this step you split the model client into several modules for real on your own computer and get it working once with the real DeepSeek, so you get used to how several files work together in a real project.
+--- prompt
+Each exercise on this page has only one file. Today you split code into modules for real on your own computer, and get it working with the real DeepSeek.
+
+1. Under `G:\Contract Clause Reviewer\work`, create a folder `ts16` with three files:
+   - `types.ts`: `export type Result<T> = ...`
+   - `client.ts`: first line `import type { Result } from "./types";`, then `export class DeepSeekClient` (write it like d16-15, without looking at the answer; use the global `fetch` by default; model `deepseek-flash`, thinking mode off)
+   - `main.ts`: start with `import { DeepSeekClient } from "./client";`, then `process.loadEnvFile();` (it reads the `.env` in the current directory). Then write an async `main()`: create the client (key `process.env.DEEPSEEK_API_KEY ?? ""`), review one clause, and `console.log` the result; the last line calls `main();` (same as on Day 6: don't write await at the top level)
+2. DeepSeek's JSON mode requires the word json to appear in the prompt, and it's best to give a JSON example too, so write the clause text like this: `Reply in JSON like {"verdict": "flag"} (verdict is accept, flag or redline). Clause 8.1: The Customer's liability under this Agreement shall be unlimited.`
+3. Run it from the project root:
+
+```
+cd "G:\Contract Clause Reviewer"
+npx tsx work/ts16/main.ts
+```
+
+4. Paste the output below. You should see `ok: true` and a verdict.
+
+Cost: with thinking mode off, this one request has only a few dozen input tokens and a dozen or so output tokens, less than 0.0001 US dollars. If you forget to turn it off, the thinking tokens are billed at the output price (`deepseek-flash` costs 1.20 US dollars per million output tokens at peak times and half that off-peak; the official pricing page has the final word (2026-09)). That's still very little, but the answer is a lot slower.
+placeholder: Paste the terminal output, for example { ok: true, value: 'redline' }
+verify: ok\W{0,4}true[\s\S]{0,60}(accept|flag|redline)
+--- hints
+- `Cannot find module './client'`: check the file names and the path; the three files must be in the same folder. `TransformError`: most likely you wrote await at the top level; move it into the async `main()`.
+- If you see `http 401`: the key in `.env` is wrong, or you didn't run it from the project root (`loadEnvFile` reads the `.env` in the current directory).
+- If you see `http 400`: most likely the prompt doesn't contain the word json, or the model name is misspelled (it should be `deepseek-flash`).
+
+@@ item d16-e1
+type: scratch
+title: Closed book: rate limiter
+exam: yes
+level: 3
+cards: Private state and getters; Dependency injection: pass the outside world in
+--- context
+A model service limits how many calls you can make in a period of time, and returns a rate limit error when you go over. Rather than waiting for the server to refuse, control how fast you send requests on your own side first.
+--- prompt
+Write `class RateLimiter`: allow at most `max` calls in any `windowMs` consecutive milliseconds.
+
+- Constructor: `constructor(max: number, windowMs: number, now: () => number = () => Date.now())`
+- `tryAcquire(): boolean`: if the recent window (the timestamps `s` with `now() - s < windowMs`) already holds `max` successful calls, return `false` (and don't record this one); otherwise record the time of this call and return `true`
+- getter `remaining`: how many more calls the current window allows (used as `limiter.remaining`, no parentheses)
+--- solution
+class RateLimiter {
+  #stamps: number[] = [];
+
+  constructor(
+    private readonly max: number,
+    private readonly windowMs: number,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  private prune(): void {
+    const t = this.now();
+    this.#stamps = this.#stamps.filter((s) => t - s < this.windowMs);
+  }
+
+  tryAcquire(): boolean {
+    this.prune();
+    if (this.#stamps.length >= this.max) {
+      return false;
+    }
+    this.#stamps.push(this.now());
+    return true;
+  }
+
+  get remaining(): number {
+    this.prune();
+    return this.max - this.#stamps.length;
+  }
+}
+--- tests
+function make(): { lim: RateLimiter; set: (ms: number) => void } {
+  let t = 0;
+  return { lim: new RateLimiter(2, 1000, () => t), set: (ms) => { t = ms; } };
+}
+expect("the first two are allowed, the third is refused", () => { const { lim } = make(); return [lim.tryAcquire(), lim.tryAcquire(), lim.tryAcquire()]; }, [true, true, false]);
+expect("remaining", () => { const { lim } = make(); lim.tryAcquire(); return lim.remaining; }, 1);
+expect("still inside the window at 999 ms", () => { const { lim, set } = make(); lim.tryAcquire(); lim.tryAcquire(); set(999); return lim.tryAcquire(); }, false);
+expect("recovers after 1000 ms", () => { const { lim, set } = make(); lim.tryAcquire(); lim.tryAcquire(); set(1000); return [lim.remaining, lim.tryAcquire()]; }, [2, true]);
+
+@@ item d16-e2
+type: scratch
+title: Closed book: error hierarchy
+exam: yes
+level: 3
+cards: Custom errors and instanceof
+--- context
+When the program fails, the lawyer shouldn't see a long error dump, but one sentence they can act on: wait a few seconds and try again, go check the key, or there's a bug in the program and a developer is needed.
+--- prompt
+Design the error classes and write a function that handles them:
+
+- `ApiError extends Error`: constructor `(message: string, status: number)`, read-only field `status`, `name` is `"ApiError"`
+- `AuthError extends ApiError`: constructor `(message: string)`, status always 401, `name` is `"AuthError"`
+- `RateLimitError extends ApiError`: constructor `(retryAfter: number)`, read-only field `retryAfter`, status always 429, message `"rate limited"`, `name` is `"RateLimitError"`
+- `handle(e: unknown): string`:
+  - RateLimitError → `"retry in 5s"` (5 is retryAfter)
+  - AuthError → `"check DEEPSEEK_API_KEY"`
+  - any other ApiError → `"api error 500: boom"` (status and message)
+  - any other Error → `"bug: " + message`
+  - any other value → `"unknown: " + String(e)`
+--- solution
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+class AuthError extends ApiError {
+  constructor(message: string) {
+    super(message, 401);
+    this.name = "AuthError";
+  }
+}
+
+class RateLimitError extends ApiError {
+  constructor(readonly retryAfter: number) {
+    super("rate limited", 429);
+    this.name = "RateLimitError";
+  }
+}
+
+function handle(e: unknown): string {
+  if (e instanceof RateLimitError) {
+    return `retry in ${e.retryAfter}s`;
+  }
+  if (e instanceof AuthError) {
+    return "check DEEPSEEK_API_KEY";
+  }
+  if (e instanceof ApiError) {
+    return `api error ${e.status}: ${e.message}`;
+  }
+  if (e instanceof Error) {
+    return `bug: ${e.message}`;
+  }
+  return `unknown: ${String(e)}`;
+}
+--- tests
+expect("RateLimitError fields", () => { const e = new RateLimitError(5); return [e.name, e.status, e.message, e.retryAfter, e instanceof ApiError]; }, ["RateLimitError", 429, "rate limited", 5, true]);
+expect("rate limit and bad key", () => [handle(new RateLimitError(5)), handle(new AuthError("bad key"))], ["retry in 5s", "check DEEPSEEK_API_KEY"]);
+expect("other API errors", () => handle(new ApiError("boom", 500)), "api error 500: boom");
+expect("a program bug and anything else", () => [handle(new TypeError("x is undefined")), handle("oops")], ["bug: x is undefined", "unknown: oops"]);
+
+@@ item d16-e3
+type: scratch
+title: Closed book: batch parsing
+exam: yes
+level: 3
+cards: Result: failure is a return value too; d15:unknown and type guards
+--- context
+Once a batch of clauses is reviewed, each clause hands back a piece of JSON text, and a few of them may be broken. One bad one shouldn't bring down the whole batch: the good ones go into the report as usual, and for the bad ones, record which one it was and what was wrong, and hand them to a person.
+--- prompt
+The model returned a piece of JSON text for each clause in a batch. Without Zod, write:
+
+- `type Result<T> = { ok: true; value: T } | { ok: false; error: string }`
+- `interface Verdict { clause_id: string; verdict: "accept" | "flag" | "redline" }`
+- `parseOne(raw: string): Result<Verdict>`: broken JSON → error `"bad json"`; parses but isn't a valid Verdict → error `"bad shape"`; otherwise ok
+- `parseAll(raws: string[]): { verdicts: Verdict[]; errors: string[] }`: each item in errors is written `"#<index>: <error>"`, for example `"#1: bad json"`; both keep the original order
+--- solution
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+interface Verdict {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+}
+
+const VERDICTS = ["accept", "flag", "redline"];
+
+function isVerdict(x: unknown): x is Verdict {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "clause_id" in x &&
+    typeof x.clause_id === "string" &&
+    "verdict" in x &&
+    typeof x.verdict === "string" &&
+    VERDICTS.includes(x.verdict)
+  );
+}
+
+function parseOne(raw: string): Result<Verdict> {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { ok: false, error: "bad json" };
+  }
+  if (!isVerdict(data)) {
+    return { ok: false, error: "bad shape" };
+  }
+  return { ok: true, value: data };
+}
+
+function parseAll(raws: string[]): { verdicts: Verdict[]; errors: string[] } {
+  const verdicts: Verdict[] = [];
+  const errors: string[] = [];
+  raws.forEach((raw, i) => {
+    const r = parseOne(raw);
+    if (r.ok) {
+      verdicts.push(r.value);
+    } else {
+      errors.push(`#${i}: ${r.error}`);
+    }
+  });
+  return { verdicts, errors };
+}
+--- tests
+const RAWS = ['{"clause_id": "3.1", "verdict": "accept"}', "Sure! {", '{"clause_id": "8.1", "verdict": "maybe"}', '{"clause_id": "10.1", "verdict": "redline"}'];
+expect("parseOne success", () => parseOne(RAWS[0]), { ok: true, value: { clause_id: "3.1", verdict: "accept" } });
+expect("parseOne: three failures", () => [parseOne(RAWS[1]), parseOne(RAWS[2]), parseOne("null")], [{ ok: false, error: "bad json" }, { ok: false, error: "bad shape" }, { ok: false, error: "bad shape" }]);
+expect("parseAll", () => parseAll(RAWS), { verdicts: [{ clause_id: "3.1", verdict: "accept" }, { clause_id: "10.1", verdict: "redline" }], errors: ["#1: bad json", "#2: bad shape"] });
+expect("empty", () => parseAll([]), { verdicts: [], errors: [] });

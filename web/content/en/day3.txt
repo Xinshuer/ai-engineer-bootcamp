@@ -1,0 +1,741 @@
+@@ day 3
+title: Intermediate Python: JSON, exceptions, regex, classes
+lang: py
+hours: 4–5 hours
+--- goal
+Turn the JSON text a model returns into a dictionary and handle format errors safely; use try/except and raise; use a regular expression to find references like "Section 12"; write a simple class. This is what you need before you can read `split.py`, `tools.py` and `models.py` in Clause Check.
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change and run every example
+- Pass every practice exercise
+- The 3 closed-book challenges
+- Open `clausecheck/split.py` in the project, find the regex `XREF`, and say what it matches
+
+@@ concept
+title: import: use code someone else wrote
+--- body
+Python comes with many "standard library" modules. You `import` a module before you use it:
+
+- `import json`, then write `json.loads(...)`
+- `from pathlib import Path` takes just one name from the module; after that, write `Path(...)` directly
+- `import re` for regular expressions
+
+Third-party libraries (for example `pydantic` or `requests`) need a `pip install` first; after that you use them the same way. Imports usually go at the very top of the file.
+--- code
+import json
+import math
+from pathlib import Path
+
+print(json.dumps({"verdict": "accept"}))
+print(math.ceil(2.1))
+print(Path("data/playbook.json").name)
+
+@@ concept
+title: JSON: the bridge between text and dictionaries
+--- body
+The model returns **text**; the program needs a **dictionary**. JSON is the format between the two.
+
+- `json.loads(text)` → a dictionary or list (the s stands for string)
+- `json.dumps(obj)` → text; add `ensure_ascii=False` to keep characters like é as they are instead of escaping them, and `indent=2` for tidy indentation
+
+Remember the pairs: JSON's `true` / `false` / `null` are Python's `True` / `False` / `None`; JSON strings **must use double quotes**.
+--- code
+import json
+
+raw = '{"clause_id": "8.1", "verdict": "flag", "ok": true, "note": null}'
+data = json.loads(raw)
+print(type(data), data["verdict"], data["ok"], data["note"])
+
+back = json.dumps({"verdict": "accept", "high": False}, indent=2)
+print(back)
+
+@@ concept
+title: try / except: catch the errors you expect
+--- body
+Some errors are not bugs: they come from **unreliable outside input**. The JSON the model returned is broken, or a field is missing from the dictionary. In those cases, catch the error with try/except and give a sensible result instead of letting the whole program crash.
+
+```python
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    data = None
+```
+
+- Name only the error types you **expect**. Don't write a bare `except:`: it hides real bugs too
+- `except SomeError as e:` gives you the error object; `str(e)` is the error message
+--- code
+import json
+
+for raw in ['{"verdict": "flag"}', "Sure! {bad json"]:
+    try:
+        data = json.loads(raw)
+        print("ok:", data["verdict"])
+    except json.JSONDecodeError as e:
+        print("bad json:", e)
+
+@@ concept
+title: raise: report an error on purpose
+--- body
+When a function gets input it can't handle, don't quietly return a wrong value. It is better to **raise an error on purpose**:
+
+```python
+if risk not in ("low", "medium", "high"):
+    raise ValueError(f"unknown risk: {risk}")
+```
+
+The caller can catch it with try/except. "Fail early and loudly" is much easier to debug than "quietly compute the wrong answer".
+--- code
+def parse_risk(text):
+    risk = text.strip().lower()
+    if risk not in ("low", "medium", "high"):
+        raise ValueError(f"unknown risk: {text}")
+    return risk
+
+print(parse_risk(" HIGH "))
+try:
+    parse_risk("urgent")
+except ValueError as e:
+    print("caught:", e)
+
+@@ concept
+title: Reading a multi-level traceback
+error_demo: yes
+--- body
+When a function calls another function, the error lists the **whole chain of calls**, from the outside in: the entry point is at the top, and **the line that actually failed is at the bottom**.
+
+You read it the same way as before: first the error type on the last line, then the `File "main.py", line N, in function_name` right above it. That is where it happened. The levels further up tell you who called it.
+
+Run the code below and find which line of which function fails.
+--- code
+def summarise(clauses):
+    counts = {}
+    for c in clauses:
+        counts[c["verdict"]] += 1
+    return counts
+
+clauses = [{"verdict": "flag"}]
+print(summarise(clauses))
+
+@@ concept
+title: Regex basics: find patterns in text
+--- body
+A regular expression (regex) describes what a piece of text looks like. The most common symbols:
+
+- `\d` one digit, `\d+` one or more digits
+- `\.` a literal dot (a `.` on its own means "any character")
+- `( )` a group: take out only the part inside the parentheses
+- `?` the thing before it is optional
+
+`re.findall(pattern, text)` returns every match; `re.search` returns the first match (`None` if there is none), and `.group(1)` gives what the first pair of parentheses matched. Put `r` in front of the pattern string so backslashes stay as they are.
+--- code
+import re
+
+text = "Subject to Section 12, see also Section 4.2. Pay within 30 days."
+print(re.findall(r"\d+", text))
+print(re.findall(r"Section (\d+(?:\.\d+)?)", text))
+m = re.search(r"(\d+) days", text)
+print(m.group(1) if m else None)
+
+@@ concept
+title: Classes: keep data and operations together
+--- body
+A class is a "type" you define yourself. A clause has a number, a heading and a text, plus a few operations that go with them. You can write it like this:
+
+```python
+class Clause:
+    def __init__(self, clause_id, heading, text):
+        self.clause_id = clause_id
+        self.heading = heading
+        self.text = text
+
+    def is_title(self):
+        return self.text.strip() == ""
+```
+
+- `__init__` runs automatically when an object is created and stores the data; `self` means "this object itself"
+- `Clause("8.1", "Cap", "...")` creates an object; `c.heading` reads an attribute; `c.is_title()` calls a method
+- The first parameter of a method is always `self`
+--- code
+class Clause:
+    def __init__(self, clause_id, heading, text):
+        self.clause_id = clause_id
+        self.heading = heading
+        self.text = text
+
+    def is_title(self):
+        return self.text.strip() == ""
+
+    def label(self):
+        return f"{self.clause_id} {self.heading}"
+
+c = Clause("8.1", "Cap on Liability", "Each party's liability ...")
+t = Clause("8", "Limitation of Liability", "")
+print(c.label(), c.is_title())
+print(t.label(), t.is_title())
+
+@@ concept
+title: Type hints: notes for people and tools
+--- body
+```python
+def risk_score(risk: str) -> int:
+```
+
+This means "the parameter risk should be a string, and the function returns a whole number". Common forms: `list[str]`, `dict[str, int]`, `str | None` (may be None).
+
+**Python does not check these hints when it runs**: pass the wrong type and it runs anyway. What they are good for: people reading the code see at a glance what to pass; the editor can give hints; and **Pydantic reads these hints to validate data** (tomorrow's topic). TypeScript, on the other hand, really checks them before the code runs (Day 5).
+--- code
+def risk_score(risk: str) -> int:
+    scores: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
+    return scores.get(risk, 0)
+
+def first_id(ids: list[str]) -> str | None:
+    return ids[0] if ids else None
+
+print(risk_score("high"), risk_score("urgent"))
+print(first_id(["3.1", "8.1"]), first_id([]))
+
+@@ item d3-01
+type: predict
+title: json.loads
+level: 1
+cards: JSON: the bridge between text and dictionaries
+--- context
+The model sends its verdict back to the program as a piece of text in JSON format (JSON is the most common way for programs to pass data to each other). Before the program can take out the verdict, it has to turn that text into something Python can use.
+--- prompt
+Write the output. Notice what JSON's `true` / `null` become.
+--- code
+import json
+
+raw = '{"clause_id": "8.1", "verdict": "flag", "ok": true, "note": null}'
+data = json.loads(raw)
+print(type(data))
+print(data["verdict"])
+print(data["ok"], data["note"])
+print(sorted(data.keys()))
+
+@@ item d3-02
+type: predict
+title: json.dumps
+level: 1
+cards: JSON: the bridge between text and dictionaries
+--- context
+The other way around, the program often has to write Python data as JSON text: for example to save the review report to a file, or to send a tool's result back to the model.
+--- prompt
+Write the output. Notice what Python's `False` / `None` become, and look at the quotes.
+--- code
+import json
+
+v = {"verdict": "accept", "high": False, "refs": ["12"], "note": None}
+print(json.dumps(v))
+print(json.dumps(v["refs"]))
+
+@@ item d3-03
+type: code
+title: Get the verdict out of JSON
+level: 1
+cards: JSON: the bridge between text and dictionaries; import: use code someone else wrote
+--- context
+The program asks the model to answer in JSON, so it can take out the verdict exactly instead of guessing what a sentence in plain language means. This is the first step in handling the model's answer.
+--- prompt
+The model returned some JSON text, for example `'{"clause_id": "8.1", "verdict": "flag"}'`.
+
+Write `verdict_of(raw)` that returns the value of its `verdict` field.
+--- starter
+import json
+
+def verdict_of(raw):
+    pass
+--- solution
+import json
+
+def verdict_of(raw):
+    data = json.loads(raw)
+    return data["verdict"]
+--- tests
+expect("flag", lambda: verdict_of('{"clause_id": "8.1", "verdict": "flag"}'), "flag")
+expect("accept", lambda: verdict_of('{"verdict": "accept", "risk_level": "low"}'), "accept")
+--- hints
+- First `json.loads(raw)` to get a dictionary, then look up the key.
+
+@@ item d3-04
+type: code
+title: Parse safely
+level: 2
+cards: try / except: catch the errors you expect; JSON: the bridge between text and dictionaries
+--- context
+Sometimes the model leaves out a bracket or adds an extra sentence, and the JSON is broken. A contract has dozens of clauses; the whole review can't stop just because the answer for one of them is broken.
+--- prompt
+Now and then the model returns broken JSON. Write `safe_parse(raw)`: if it can be parsed, return the dictionary; if the format is wrong, return `None`. **Don't let the program crash**.
+--- starter
+import json
+
+def safe_parse(raw):
+    pass
+--- solution
+import json
+
+def safe_parse(raw):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+--- tests
+expect("valid JSON", lambda: safe_parse('{"verdict": "flag"}'), {"verdict": "flag"})
+expect("broken JSON returns None", lambda: safe_parse("Sure! Here you go: {verdict"), None)
+expect("empty string returns None", lambda: safe_parse(""), None)
+--- hints
+- Put `json.loads` inside the `try:`.
+- The exception for a format error is called `json.JSONDecodeError`.
+
+@@ item d3-05
+type: fix
+title: Fix the bug: catching the wrong exception
+level: 2
+cards: try / except: catch the errors you expect; Reading a multi-level traceback
+--- context
+Halfway through a review, one answer is broken and the whole batch stops: that is one of the most frustrating things that can happen. This code was written precisely to prevent it.
+--- prompt
+This function should return `None` when the JSON is broken, but it still crashes on broken JSON. Run it, look at the type of the error, and fix it.
+--- starter
+import json
+
+def parse_or_none(raw):
+    try:
+        return json.loads(raw)
+    except KeyError:
+        return None
+--- solution
+import json
+
+def parse_or_none(raw):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+--- tests
+expect("valid", lambda: parse_or_none('{"a": 1}'), {"a": 1})
+expect("broken JSON", lambda: parse_or_none("{oops"), None)
+--- hints
+- except only catches the kind of error you name. What type does the last line of the error show?
+- Replace `KeyError` with `json.JSONDecodeError`.
+
+@@ item d3-06
+type: code
+title: A default value for a missing field
+level: 2
+cards: try / except: catch the errors you expect; d2:Dictionaries: look up values by name
+--- context
+In the model's JSON answer, fields that don't matter much (like a note) are sometimes left out. If one is missing, fill in a default and let the review carry on; there is no need to raise an error for it.
+--- prompt
+Write `field(data, key, default)`: if `data` has the key, return its value; if not, return `default`.
+
+Write it with try/except (to practice exceptions); when you're done, think about a shorter way to write it.
+--- starter
+def field(data, key, default):
+    pass
+--- solution
+def field(data, key, default):
+    try:
+        return data[key]
+    except KeyError:
+        return default
+--- tests
+expect("key is there", lambda: field({"verdict": "flag"}, "verdict", "accept"), "flag")
+expect("key is missing", lambda: field({"verdict": "flag"}, "risk", "low"), "low")
+expect("a value of None is still returned as is", lambda: field({"note": None}, "note", "x"), None)
+--- hints
+- Looking up a key that doesn't exist in a dictionary raises `KeyError`.
+- The shorter way is `data.get(key, default)`.
+
+@@ item d3-07
+type: choice
+title: Reading a multi-level error
+level: 2
+cards: Reading a multi-level traceback
+--- context
+In a real project, functions call each other layer by layer: the main program calls the summary, and the summary does the counting. When something fails, the error lists every layer. It looks scary, but there is a fixed way to read it.
+--- prompt
+Going by the error below, which line should you change?
+--- code
+Traceback (most recent call last):
+  File "main.py", line 9, in <module>
+    print(summarise(clauses))
+  File "main.py", line 5, in summarise
+    counts[c["verdict"]] += 1
+KeyError: 'flag'
+--- options
+- Line 9: summarise is called the wrong way
+- Line 5: counts has no 'flag' key yet; it should use counts.get(..., 0) + 1
+- The data should not contain flag
+- The print on line 9 should be deleted
+answer: 2
+--- explain
+The **bottom level** of a multi-level error is where it actually went wrong: line 5, in the `summarise` function. `KeyError: 'flag'` says the dictionary doesn't have that key yet. Line 9 only tells you who called it; there is nothing wrong with it.
+
+@@ item d3-08
+type: code
+title: Find cross-references
+level: 2
+cards: Regex basics: find patterns in text; import: use code someone else wrote
+--- context
+"Subject to Section 12" means this clause is bound by Section 12: judge it without reading Section 12 and the verdict can easily be wrong. When the contract is cut up, these references are found first; the real project puts them into the message it sends the model, to remind it which other clauses to read.
+--- prompt
+Clauses often say "Subject to Section 12". Write `find_refs(text)`: return every section number the text refers to (as strings), in the order they appear. A section number may contain a dot, like `4.2`.
+
+```python
+find_refs("Subject to Section 12 and Section 4.2")
+# → ["12", "4.2"]
+```
+
+This is exactly what `XREF` does in the project's `split.py`.
+--- starter
+import re
+
+def find_refs(text):
+    pass
+--- solution
+import re
+
+def find_refs(text):
+    return re.findall(r"Section (\d+(?:\.\d+)?)", text)
+--- tests
+expect("two references", lambda: find_refs("Subject to Section 12 and Section 4.2"), ["12", "4.2"])
+expect("no references", lambda: find_refs("Fees are payable within 30 days"), [])
+expect("one reference", lambda: find_refs("as set out in Section 9.1."), ["9.1"])
+--- hints
+- You can start the pattern like this: `r"Section (\d+)"`, and get 12 to match first.
+- The optional "dot plus digits" is written `(?:\.\d+)?`: `(?:...)` is a group that isn't captured on its own, and `?` makes it optional. The full pattern: `r"Section (\d+(?:\.\d+)?)"`.
+
+@@ item d3-09
+type: predict
+title: re.findall and re.search
+level: 2
+cards: Regex basics: find patterns in text
+--- context
+The numbers in a contract are often the key conditions: how many days to pay, how much interest, which section it refers to. First see clearly what each of the two ways of finding numbers hands back.
+--- prompt
+Write the output. Into how many numbers does `\d+` split `4.2`?
+--- code
+import re
+
+text = "Pay within 30 days; interest 3 percent; see Section 4.2"
+print(re.findall(r"\d+", text))
+m = re.search(r"(\d+) days", text)
+print(m.group(1))
+print(re.search(r"\d+ weeks", text))
+
+@@ item d3-10
+type: code
+title: The first number
+level: 2
+cards: Regex basics: find patterns in text; d1:Variables and types
+--- context
+The payment clause says "Pay within 30 days". Suppose the company's rule is that the payment period must be at least 30 days. In this exercise, the number of days has to be taken out first, so it can be compared with the number the rule sets.
+--- prompt
+Write `first_number(text)`: return the first whole number that appears in the text (type `int`); if there are no digits, return `None`.
+
+`first_number("Pay within 30 days")` → `30`
+--- starter
+import re
+
+def first_number(text):
+    pass
+--- solution
+import re
+
+def first_number(text):
+    m = re.search(r"\d+", text)
+    if m is None:
+        return None
+    return int(m.group())
+--- tests
+expect("30", lambda: first_number("Pay within 30 days"), 30)
+expect("returns an int", lambda: type(first_number("a 7 b")).__name__, "int")
+expect("no digits", lambda: first_number("no digits here"), None)
+--- hints
+- `re.search` returns `None` when it finds nothing, so check first, then take the value.
+- `m.group()` is the matched text (a string); turn it into a number with `int(...)`.
+
+@@ item d3-11
+type: code
+title: Write a Clause class
+level: 2
+cards: Classes: keep data and operations together
+--- context
+A clause has three things that always go together: a number, a heading and a text. A contract also has section heading lines with a heading but no text (like "8 Liability"); they don't need to be reviewed. The real project's `models.py` has a `Clause` class too.
+--- prompt
+Write the class `Clause`:
+
+- when created, it takes the three parameters `clause_id`, `heading` and `text` and stores them as attributes with the same names
+- method `is_title()`: returns `True` if the text is empty once whitespace is removed (then it's a section heading, not a clause)
+- method `label()`: returns a string like `"8.1 Cap on Liability"`
+--- starter
+class Clause:
+    def __init__(self, clause_id, heading, text):
+        pass
+--- solution
+class Clause:
+    def __init__(self, clause_id, heading, text):
+        self.clause_id = clause_id
+        self.heading = heading
+        self.text = text
+
+    def is_title(self):
+        return self.text.strip() == ""
+
+    def label(self):
+        return f"{self.clause_id} {self.heading}"
+--- tests
+c = Clause("8.1", "Cap on Liability", "Each party's liability shall not exceed ...")
+t = Clause("8", "Limitation of Liability", "   ")
+expect("attribute heading", lambda: c.heading, "Cap on Liability")
+expect("text is not empty", lambda: c.is_title(), False)
+expect("only whitespace counts as a section heading", lambda: t.is_title(), True)
+expect("label", lambda: c.label(), "8.1 Cap on Liability")
+--- hints
+- In `__init__`, write `self.clause_id = clause_id`; store all three attributes.
+- Methods go inside the class (indented 4 spaces), their first parameter is `self`, and you read an attribute with `self.text`.
+
+@@ item d3-12
+type: code
+title: A verdict tally class
+level: 3
+cards: Classes: keep data and operations together; d2:The standard way to count
+--- context
+The review goes one clause at a time. Suppose the screen must always show how many clauses have got each verdict so far. In this exercise, you make that counter an object that keeps count as the review goes.
+--- prompt
+Write the class `VerdictTally`:
+
+- it takes no parameters when created, and keeps the counts in a dictionary inside
+- `add(verdict)`: count it once
+- `count(verdict)`: return how many times this verdict was counted; 0 if never
+- `most_common()`: return the verdict with the highest count; on a tie, return the one that appeared **first**; if nothing has been counted yet, return `None`
+--- starter
+class VerdictTally:
+    def __init__(self):
+        self.counts = {}
+--- solution
+class VerdictTally:
+    def __init__(self):
+        self.counts = {}
+
+    def add(self, verdict):
+        self.counts[verdict] = self.counts.get(verdict, 0) + 1
+
+    def count(self, verdict):
+        return self.counts.get(verdict, 0)
+
+    def most_common(self):
+        best = None
+        for v, n in self.counts.items():
+            if best is None or n > self.counts[best]:
+                best = v
+        return best
+--- tests
+def _make(*vs):
+    t = VerdictTally()
+    for v in vs:
+        t.add(v)
+    return t
+expect("count", lambda: _make("flag", "accept", "flag").count("flag"), 2)
+expect("never counted is 0", lambda: _make("flag").count("redline"), 0)
+expect("the most common one", lambda: _make("accept", "flag", "flag").most_common(), "flag")
+expect("a tie gives the one that came first", lambda: _make("redline", "accept").most_common(), "redline")
+expect("empty returns None", lambda: VerdictTally().most_common(), None)
+--- hints
+- `add` and `count` are just the counting pattern; the dictionary is now `self.counts`.
+- `most_common`: loop over `self.counts.items()` and remember the biggest one so far; replace it only when a count is "strictly greater", so a tie keeps the one that appeared first.
+
+@@ item d3-13
+type: choice
+title: Are type hints checked?
+level: 1
+cards: Type hints: notes for people and tools
+--- context
+In the real project almost every function has type hints, for example `def summarise(reviews: list[ClauseReview], settings: Settings) -> dict`. Before you read them, get clear on what they actually do.
+--- prompt
+With `def risk_score(risk: str) -> int:` defined like this, what happens when you call `risk_score(123)`?
+--- options
+- Python reports a type error before it runs
+- It runs anyway; hints are only notes, and Python itself doesn't check them
+- 123 is automatically turned into a string
+- A syntax error
+answer: 2
+--- explain
+Python doesn't check type hints at runtime, so the function runs as usual (it may still fail inside with some other error because the type is wrong). Hints are there for people and tools: editor hints, type checkers, and **Pydantic, which validates data based on the hints**. TypeScript is different: it checks types before the code runs.
+
+@@ item d3-14
+type: order
+title: Put the code in order: get the verdict safely
+level: 2
+cards: try / except: catch the errors you expect; JSON: the bridge between text and dictionaries
+--- context
+For every clause it reviews, the program has to take the verdict out of the model's answer. The model's answer is not always reliable, so this step must survive all kinds of broken answers, or the full report never comes out.
+--- prompt
+Put `load_verdict(raw)` in order: if the JSON is broken, return `None`; otherwise return its `verdict` (also `None` if that field is missing). One line is a distractor.
+--- lines
+import json
+def load_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data.get("verdict")
+--- distractors
+    catch json.JSONDecodeError:
+--- tests
+expect("valid", lambda: load_verdict('{"verdict": "flag"}'), "flag")
+expect("broken JSON", lambda: load_verdict("{oops"), None)
+expect("field missing", lambda: load_verdict("{}"), None)
+--- hints
+- Python uses `except`, not `catch` (`catch` is how JavaScript/TypeScript write it; you'll learn that on Day 6).
+
+@@ item d3-15
+type: code
+title: Write a validator by hand
+level: 3
+cards: d2:Dictionaries: look up values by name; d1:if / elif / else
+--- context
+JSON that parses is not necessarily correct: the model may leave out the clause number, or invent a verdict of its own, like `maybe`. When the program finds a problem, it can tell the model what is wrong and have it answer again.
+--- prompt
+The dictionary the model returns isn't always reliable. Write `validate_verdict(data)` that returns a list of problems (strings), or `[]` if there are none:
+
+- `clause_id` missing → `"missing clause_id"`
+- `verdict` missing → `"missing verdict"`
+- `verdict` is there but isn't one of `accept` / `flag` / `redline` → `"bad verdict: X"` (X is the actual value)
+
+Check in the order above and list every problem. Once you've written it, you'll find it tedious: tomorrow's Pydantic is there to replace exactly this.
+--- starter
+ALLOWED = ("accept", "flag", "redline")
+
+def validate_verdict(data):
+    problems = []
+    return problems
+--- solution
+ALLOWED = ("accept", "flag", "redline")
+
+def validate_verdict(data):
+    problems = []
+    if "clause_id" not in data:
+        problems.append("missing clause_id")
+    if "verdict" not in data:
+        problems.append("missing verdict")
+    elif data["verdict"] not in ALLOWED:
+        problems.append(f"bad verdict: {data['verdict']}")
+    return problems
+--- tests
+expect("no problems", lambda: validate_verdict({"clause_id": "8.1", "verdict": "flag"}), [])
+expect("two fields missing", lambda: validate_verdict({}), ["missing clause_id", "missing verdict"])
+expect("invalid verdict", lambda: validate_verdict({"clause_id": "1", "verdict": "HIGH"}), ["bad verdict: HIGH"])
+expect("clause number missing and verdict invalid", lambda: validate_verdict({"verdict": "maybe"}), ["missing clause_id", "bad verdict: maybe"])
+--- hints
+- Each check is its own `if` (not elif), so that every problem gets listed.
+- "verdict is there but invalid" is only checked when "verdict is there": you can use `elif` for it.
+
+@@ item d3-16
+type: code
+title: Raise an error on purpose
+level: 2
+cards: raise: report an error on purpose; d1:Strings
+--- context
+The risk level decides where a clause sits in the report and whether a person looks at it first. If an unknown value is quietly treated as `low`, a high-risk clause ends up in the "no need to look" pile.
+--- prompt
+Write `parse_risk(text)`: remove the whitespace at both ends and convert to lowercase; if the result is one of `low` / `medium` / `high`, return it; otherwise `raise ValueError` (with the message `"unknown risk: <original input>"`).
+--- starter
+def parse_risk(text):
+    pass
+--- solution
+def parse_risk(text):
+    risk = text.strip().lower()
+    if risk not in ("low", "medium", "high"):
+        raise ValueError(f"unknown risk: {text}")
+    return risk
+--- tests
+expect("valid", lambda: parse_risk(" HIGH "), "high")
+expect_raises("an unknown value raises ValueError", lambda: parse_risk("urgent"), ValueError)
+def _message():
+    try:
+        parse_risk("x")
+    except ValueError as e:
+        return str(e)
+expect("error message", _message, "unknown risk: x")
+--- hints
+- `raise ValueError("...")` ends the function right away with an error.
+- First check "invalid, so raise", then return the valid value at the end.
+
+@@ item d3-e1
+type: scratch
+title: Closed book: all the rule IDs
+exam: yes
+level: 2
+cards: JSON: the bridge between text and dictionaries; d2:List comprehensions: filter and transform in one line
+--- context
+The company's review rules (the playbook) are stored in a JSON file; each rule has an ID (like `PB-01`) and a topic. The program reads this file when it starts, and the model's verdict also names the rules it is based on.
+--- prompt
+Write `rule_ids(raw)`. `raw` is JSON text like this:
+
+`'{"rules": [{"id": "PB-01", "topic": "payment"}, {"id": "PB-02", "topic": "renewal"}]}'`
+
+Return a list of the `id` of every rule.
+--- solution
+import json
+
+def rule_ids(raw):
+    data = json.loads(raw)
+    return [r["id"] for r in data["rules"]]
+--- tests
+expect("two rules", lambda: rule_ids('{"rules": [{"id": "PB-01", "topic": "payment"}, {"id": "PB-02", "topic": "renewal"}]}'), ["PB-01", "PB-02"])
+expect("no rules", lambda: rule_ids('{"rules": []}'), [])
+
+@@ item d3-e2
+type: scratch
+title: Closed book: a parse result
+exam: yes
+level: 2
+cards: try / except: catch the errors you expect; JSON: the bridge between text and dictionaries
+--- context
+A function that handles the model's answer should let the code calling it see at a glance whether it worked or failed. On failure, that code then decides whether to ask the model again or to log an error.
+--- prompt
+Write `parse_result(raw)`:
+
+- valid JSON: return `{"ok": True, "data": <the parsed object>}`
+- a JSON format error: return `{"ok": False, "error": "invalid json"}`
+--- solution
+import json
+
+def parse_result(raw):
+    try:
+        return {"ok": True, "data": json.loads(raw)}
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "invalid json"}
+--- tests
+expect("valid", lambda: parse_result('{"a": 1}'), {"ok": True, "data": {"a": 1}})
+expect("broken", lambda: parse_result("nope"), {"ok": False, "error": "invalid json"})
+
+@@ item d3-e3
+type: scratch
+title: Closed book: a Rule class
+exam: yes
+level: 2
+cards: Classes: keep data and operations together
+--- context
+Every rule in the playbook has an ID, a topic and a severity. When a high-severity rule is broken, that usually means a high-risk clause.
+--- prompt
+Write the class `Rule`: when created, it takes `rule_id`, `topic` and `severity` and stores them as attributes with the same names; the method `is_high()` returns `True` when `severity` is `"high"`; the method `summary()` returns a string like `"PB-01 (payment, high)"`.
+--- solution
+class Rule:
+    def __init__(self, rule_id, topic, severity):
+        self.rule_id = rule_id
+        self.topic = topic
+        self.severity = severity
+
+    def is_high(self):
+        return self.severity == "high"
+
+    def summary(self):
+        return f"{self.rule_id} ({self.topic}, {self.severity})"
+--- tests
+r = Rule("PB-01", "payment", "high")
+expect("is_high", lambda: r.is_high(), True)
+expect("summary", lambda: r.summary(), "PB-01 (payment, high)")
+expect("attribute", lambda: Rule("PB-02", "renewal", "low").topic, "renewal")

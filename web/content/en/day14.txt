@@ -1,0 +1,1938 @@
+@@ day 14
+title: Week 2 project: a mini Clause Check command-line tool + weekly exam
+lang: py
+hours: 6 hours
+--- goal
+Put this week's lessons together into a small program that really runs: read a contract file → split it into clauses → call the model for each clause (structured output + validation + retry) → summarize → write a JSON report → command-line entry point. Each piece matches the Clause Check file with the same name (`models.py`, `split.py`, `review.py`, `pipeline.py`, `cli.py`), and at the end you run it on your own computer with the real DeepSeek. Then comes the Week 2 weekly exam: 5 problems in 60 minutes.
+--- checklist
+- Clear your Review list first
+- Pass all of project parts P1–P7: one piece at a time; run each piece and look at the result before you submit
+- Local task: put the mini tool into files, run it once with the real DeepSeek, and compare its counts with the real project's
+- Pass at least 3 of the 5 weekly exam problems
+- With the "Weekly review" card in front of you, say which Clause Check file uses each concept from this week
+
+@@ concept
+title: Splitting up the project: five files, three kinds of data
+--- body
+A real project doesn't put all its code in one function. It splits the code by the rule "one file does one job". The mini version uses the same file names as Clause Check:
+
+- `models.py`: what the data looks like (`Clause`, `Verdict`, `ClauseReview`)
+- `split.py`: read the file and split it into clauses. Plain code, no model calls
+- `review.py`: the **only** place that calls the model: send the request, validate, retry
+- `pipeline.py`: connect the pieces above, summarize, write the report
+- `cli.py`: parse the command-line arguments, call the pipeline, return the exit code
+
+Data flows between the files like this: the full contract text `str` → `list[Clause]` → `list[ClauseReview]` → report `dict` → JSON file. **Use a dataclass for data you produce yourself** (light, no validation); **use Pydantic for data that comes from outside** (the model's answer can break the rules at any time, so it must be validated).
+--- code
+from dataclasses import dataclass, asdict
+from typing import Literal
+from pydantic import BaseModel
+
+@dataclass
+class Clause:              # produced by split.py: our own data, no validation needed
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):  # the model's answer: outside data, must be validated
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:        # produced by review.py, summarized by pipeline.py
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+c = Clause("8.1", "Cap on Liability", "Customer's liability shall be unlimited.")
+raw = '{"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "topic": "liability_cap", "rationale": "no cap"}'
+v = Verdict.model_validate_json(raw)
+r = ClauseReview(c.id, v.verdict, v.risk_level, 180)
+print(c)
+print(v.verdict, v.risk_level)
+print(asdict(r))
+
+@@ concept
+title: Start small: get one clause working first
+mock: yes
+--- body
+The approach most likely to fail: write all five files in one go, then run them and stare at a screen full of errors with no idea where to start.
+
+The right order:
+
+1. Hard-code **one** clause and take it all the way through "call the model → validate → print", and see the correct result with your own eyes
+2. Once that works, switch to a loop and run three clauses
+3. Then add one piece at a time: retry, summary, writing the report, command-line arguments
+
+Run the code after every piece you add. Then, when something breaks, you only need to look at **the few lines you just added**. Today's P1–P7 follow exactly this order.
+
+Every review request today carries Day 12's `"thinking": {"type": "disabled"}`: reviewing one clause at a time doesn't need long reasoning, so turning thinking mode off makes it faster and cheaper, and `temperature` works again.
+--- code
+import os
+import requests
+from typing import Literal
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+def review_one(clause_id, text):
+    body = {
+        "model": "deepseek-flash",
+        "messages": [{"role": "user", "content": f"Review clause {clause_id}: {text}"}],
+        "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
+    }
+    data = requests.post(API_URL, headers=HEADERS, json=body, timeout=60).json()
+    return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
+
+# Step 1: hard-code one clause and see a result first
+print(review_one("8.1", "Customer's liability shall be unlimited."))
+
+# Step 2: once one clause works, switch to a loop
+for cid, text in [("3.1", "Fees are payable within thirty days."), ("4.2", "Renews for twenty-four (24) months.")]:
+    v = review_one(cid, text)
+    print(cid, v.verdict, v.risk_level)
+
+@@ concept
+title: Validate at the door
+--- body
+Data enters the program through three doors: **files** (may not exist, may be empty), **the model's answer** (may not be JSON, may have invalid values) and **command-line arguments** (may be misspelled).
+
+Check once at the door: if something is wrong, immediately raise an error that says clearly what (or have the model answer again). Data that made it through the door can be trusted, so the functions inside don't need `if` checks everywhere.
+
+- Files: checked in `read_contract`, which raises `FileNotFoundError` / `ValueError`
+- The model: `review_clause` validates with Pydantic; on failure it tells the model the error and has it answer again
+- Arguments: argparse's `choices` checks them for you
+
+A common mistake: passing the model's answer along without validating it, until `summarise` sorts and hits a `KeyError` on a `"HIGH"`. By then you are far away from where things actually went wrong.
+--- code
+import argparse
+import json
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Verdict(BaseModel):
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+raw = '{"verdict": "flag", "risk_level": "HIGH"}'   # the model wrote it in uppercase
+
+# No check at the door: the error shows up only when sorting, far from the cause
+try:
+    RISK_RANK[json.loads(raw)["risk_level"]]
+except KeyError as e:
+    print("found only in summarise:", repr(e))
+
+# Check at the door: you know what's wrong as soon as the answer arrives
+try:
+    Verdict.model_validate_json(raw)
+except ValidationError as e:
+    print("found right away in review:", e.errors()[0]["loc"], e.errors()[0]["msg"])
+
+# Command-line arguments: choices is the check at the door
+parser = argparse.ArgumentParser(prog="minicheck")
+parser.add_argument("--only-risk", choices=["low", "medium", "high"])
+try:
+    parser.parse_args(["--only-risk", "urgent"])
+except SystemExit as e:
+    print("argparse refused it, exit code", e.code)
+
+@@ concept
+title: On your own computer: package, entry point, and README
+--- body
+On the web page, each exercise is one file. On your own computer, split it into a **package** (a folder with an `__init__.py` inside):
+
+```
+work/minicheck/
+  __init__.py     empty file; it says "this is a package"
+  __main__.py     from .cli import main  and  raise SystemExit(main())
+  models.py  split.py  review.py  pipeline.py  cli.py
+  README.md
+```
+
+- Imports inside the same package start with a dot: `from .split import read_contract`
+- `python -m minicheck ...` runs `__main__.py`, exactly like `clausecheck/__main__.py`
+- The real `cli.py` has one more layer, "subcommands" (`review`, `clauses`, built with `add_subparsers`); the mini version leaves them out for now
+
+**Write the README's run instructions for yourself three months from now**: what to install, where to put the API key, which command to run, what the output looks like, how to run the tests. Every command must work when you copy and paste it.
+--- code
+steps = [
+    ("Install the dependencies", "python -m pip install requests pydantic python-dotenv"),
+    ("Add the API key", "write DEEPSEEK_API_KEY=sk-... in the .env at the repository root (.env stays out of git)"),
+    ("Run", "cd work  then  python -m minicheck ..\\data\\sample_contract.txt --out ..\\data\\mini.report.json"),
+    ("Export only high risk", "python -m minicheck ..\\data\\sample_contract.txt --only-risk high"),
+]
+lines = ["# minicheck", "", "Reviews a contract clause by clause and writes a JSON report.", "", "## How to run"]
+for i, (what, cmd) in enumerate(steps, 1):
+    lines.append(f"{i}. {what}: `{cmd}`")
+lines += ["", "## What the output looks like", "counts={'accept': …, 'flag': …, 'redline': …} needs_attention=[…]"]
+print("\n".join(lines))
+
+@@ concept
+title: Weekly review: which file uses each concept
+--- body
+Whatever concept an interviewer asks about, you should be able to follow up with "I used that in this file of my project":
+
+- Day 8 dataclass, sorting by several keys → `models.py`, `summarise` in `pipeline.py`
+- Day 9 writing tests, debugging → `tests/*.py`, `evals/test_review.py`
+- Day 10 files, command line, environment variables → `cli.py`, `split.load_contract`, `config.py`
+- Day 11 chunking, retrieval → `split.py` (chunks by clause number: each clause is one chunk), `lookup_playbook` in `tools.py`
+- Day 12 structured output, prompts → `review.py` (two prompt versions, asks again when the JSON is invalid), `strict_schema` in `models.py`
+- Day 13 evals, tracing → `evals/run_evals.py` (`high-risk recall`), `evals/harness.py`, `tracing.py` (`@observe`)
+
+Before the weekly exam, go through this list with the project files: open the file, find those lines, and say in one sentence what they do.
+--- code
+week2 = [
+    ("Day 8", "dataclass, sorting by several keys", "models.py, pipeline.summarise"),
+    ("Day 9", "writing tests, debugging", "tests/*.py, evals/test_review.py"),
+    ("Day 10", "files, command line, environment variables", "cli.py, split.load_contract, config.py"),
+    ("Day 11", "chunking, retrieval", "split.py, tools.py (lookup_playbook)"),
+    ("Day 12", "structured output, prompts", "review.py, models.strict_schema"),
+    ("Day 13", "evals, tracing", "evals/run_evals.py, evals/harness.py, tracing.py"),
+]
+for day, topic, files in week2:
+    print(f"{day}  {topic}  ->  {files}")
+
+@@ item d14-01
+type: predict
+title: Recap: how to sort clause numbers
+level: 1
+cards: d8:Sorting by several keys; d8:dataclass: classes that only hold data
+--- context
+Today you put the week's lessons together into a small tool, and its report sorts clauses by number and by urgency. Clause numbers are text like `10.1`, and how to sort them correctly is the first thing to think through today.
+--- prompt
+Recap of Day 8 (dataclass, sorting by several keys): write the output. Notice the difference between sorting strings and sorting by number.
+--- code
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+
+reviews = [
+    ClauseReview("10.1", "redline", "high"),
+    ClauseReview("3.2", "flag", "medium"),
+    ClauseReview("8.1", "redline", "high"),
+    ClauseReview("3.1", "accept", "low"),
+]
+print(sorted(r.clause_id for r in reviews))
+by_number = sorted(reviews, key=lambda r: tuple(int(x) for x in r.clause_id.split(".")))
+print([r.clause_id for r in by_number])
+urgent = sorted(reviews, key=lambda r: (RISK_RANK[r.risk], r.clause_id))
+print([r.clause_id for r in urgent])
+print(reviews[0])
+--- explain
+Strings are compared one character at a time, and `"1"` is smaller than `"8"`, so `"10.1"` comes before `"8.1"`. In the third line's sort key the clause number is still a string, so it falls into the same trap. Today's `summarise` compares clause numbers as integer tuples like `(10, 1)`. The last line is the `__repr__` that dataclass generates for you.
+
+@@ item d14-02
+type: choice
+title: Which change is in the wrong place?
+level: 1
+cards: Splitting up the project: five files, three kinds of data
+--- context
+The mini Clause Check is split into five files, like the real project, and each file is in charge of one job. Whenever you add a feature later, first decide which file the code belongs in.
+--- prompt
+You are adding features to the mini Clause Check. Which of these **breaks** "one file does one job"?
+--- options
+- In `split.py`, call the model to decide which lines are clause headings
+- In `pipeline.py`, add a function that picks the high-risk clauses out of the report
+- In `cli.py`, add an `--only-risk` argument and pass its value to the pipeline
+- In `review.py`, add retries on 429 to the model request
+answer: 1
+--- explain
+Splitting clauses is deterministic work, and one regex is enough: fast, free, the same result every time, easy to test. Handing it to the model makes it slow, costly and sometimes wrong, and from then on `split.py` can't work without the network. The first comment line of Clause Check's `split.py` says so: "No model involved - this is a regex". The code that calls the model lives in one place only, `review.py`; the other three options each do their work in the file where it belongs.
+
+@@ item d14-03
+type: code
+title: P1 Read the contract file
+level: 1
+cards: Validate at the door; d10:pathlib: paths are objects
+--- context
+The first step of the whole tool: read a contract from disk. It matches `load_contract` in the real project's `split.py`. The file path comes from the user and may have a typo, and the file may be empty. Saying clearly what went wrong right here is much easier to debug than a puzzling error further on.
+--- prompt
+**Project part 1 (split.py).** Write `read_contract(path)`: read the contract text file (UTF-8) and return the full text.
+
+- The file does not exist: `raise FileNotFoundError(f"contract not found: {path}")`
+- The file holds only whitespace (an empty file, or only spaces and line breaks): `raise ValueError(f"contract is empty: {path}")`
+
+`path` may be a string or a `Path`. Example: `read_contract("work/d14/p1/c.txt")` → the full text of the file.
+--- starter
+from pathlib import Path
+
+def read_contract(path):
+    return ""
+--- solution
+from pathlib import Path
+
+def read_contract(path):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"contract not found: {path}")
+    text = p.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"contract is empty: {path}")
+    return text
+--- tests
+import shutil
+from pathlib import Path
+DIR = Path("work/d14/p1")
+shutil.rmtree(DIR, ignore_errors=True)
+DIR.mkdir(parents=True)
+(DIR / "c.txt").write_text("1 Scope\nThe Service is a note-taking tool.\n", encoding="utf-8")
+(DIR / "blank.txt").write_text("  \n\n ", encoding="utf-8")
+expect("reads a normal file", lambda: read_contract("work/d14/p1/c.txt"), "1 Scope\nThe Service is a note-taking tool.\n")
+expect("also accepts a Path", lambda: read_contract(DIR / "c.txt").startswith("1 Scope"), True)
+def _missing():
+    try:
+        read_contract("work/d14/p1/missing.txt")
+    except FileNotFoundError as e:
+        return str(e)
+    return "no FileNotFoundError raised"
+expect("missing file: FileNotFoundError, and the message has the path", _missing, "contract not found: work/d14/p1/missing.txt")
+expect_raises("only whitespace: ValueError", lambda: read_contract("work/d14/p1/blank.txt"), ValueError)
+--- hints
+- `p = Path(path)` turns a string into a path object; `p.exists()` checks whether the file is there, and `p.read_text(encoding="utf-8")` reads the whole text.
+- Check for "only whitespace" with `text.strip()`: if nothing is left after removing the whitespace at both ends, the file is empty.
+- Check that the file exists before reading it: `if not p.exists(): raise FileNotFoundError(f"contract not found: {path}")`.
+
+@@ item d14-04
+type: code
+title: P2 Split into Clause objects
+level: 2
+cards: Splitting up the project: five files, three kinds of data; d8:dataclass: classes that only hold data
+--- context
+The full contract text you read in must be cut into single clauses, so each one can go to the model for review. On Day 7 the clauses came out as dictionaries; today they become dataclasses, and the code gets closer to the real `split.py`.
+--- prompt
+**Project part 2 (split.py).** Change Day 7's clause splitter so it returns dataclasses, and bring it closer to the real project:
+
+- Heading line: after removing the whitespace at both ends, it matches `HEAD` (given; the same regex as in `clausecheck/split.py`: one dot is allowed after the number, as in `1. Definitions`)
+- The lines below a heading and before the next heading are the body: join them with `"\n"`, then remove the whitespace at both ends
+- **Don't return headings with an empty body** (for example `8. Limitation of Liability` directly followed by `8.1`): they are only section names and need no review. In the real project this is `Contract.reviewable`
+- Ignore everything before the first heading
+
+Return `list[Clause]`. Example: `split_clauses("2. Fees\n2.1 Invoicing\nPay in 30 days.")` → `[Clause(id='2.1', heading='Invoicing', text='Pay in 30 days.')]`
+--- starter
+import re
+from dataclasses import dataclass
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+def split_clauses(text):
+    clauses = []
+    return clauses
+--- solution
+import re
+from dataclasses import dataclass
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+--- tests
+DOC = """CLOUDNOTES AGREEMENT
+Preamble, ignored.
+1. Fees
+1.1 Invoicing
+Fees are payable within thirty (30) days.
+1.2 Suspension
+Provider may suspend the Service
+without notice.
+10. Data
+10.1 Location
+Customer Data may be processed in any country."""
+expect("section headings with an empty body are not returned", lambda: [c.id for c in split_clauses(DOC)], ["1.1", "1.2", "10.1"])
+expect("returns Clause objects", lambda: split_clauses(DOC)[0], Clause("1.1", "Invoicing", "Fees are payable within thirty (30) days."))
+expect("a multi-line body is joined with line breaks", lambda: split_clauses(DOC)[1].text, "Provider may suspend the Service\nwithout notice.")
+expect("a dot after the number is recognized too", lambda: [c.heading for c in split_clauses("3. Term\nOne year.")], ["Term"])
+expect("no headings", lambda: split_clauses("just text\nmore text"), [])
+--- hints
+- Scan line by line, as on Day 7. The difference: "the current clause" is now a `Clause` object, and you can change a dataclass's fields directly: `current.text += line + "\n"`.
+- After the scan, run `c.text = c.text.strip()` on every clause, then use a list comprehension to keep only the ones whose `text` is not empty.
+
+@@ item d14-05
+type: fill
+title: P3 first half: send the request
+level: 2
+mock: yes
+cards: d4:Status codes and retries; Start small: get one clause working first
+--- context
+This is the only place in the mini tool that makes a network request; it matches the real project's `review.py`. One contract means dozens of model calls in a row, and letting the whole contract fail because the server was busy once along the way is a bad deal.
+--- prompt
+**Project part 3 (review.py), first half.** `call_model(messages)` sends the messages to the model, asks for JSON, and returns the **whole** response dictionary (later code reads both `content` and `usage`):
+
+- 200: return `resp.json()`
+- 429 / 500 / 503: retry, with at most `max_attempts` attempts in total
+- any other status code (400, 401): don't retry, just `raise RuntimeError`
+- attempts used up: `raise RuntimeError`
+
+Fill in the blanks. This is Day 4's retry, now one piece of the project.
+--- template
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
+    for _ in range([[max_attempts]]):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return [[resp.json()]]
+        if resp.status_code [[not in]] RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    [[raise]] RuntimeError(f"gave up after {max_attempts} attempts")
+--- tests
+MSGS = [{"role": "user", "content": "Review clause 8.1: liability is unlimited."}]
+def _ok():
+    MOCK.reset()
+    data = call_model(MSGS)
+    return [data["choices"][0]["finish_reason"], "usage" in data, len(MOCK.calls)]
+expect("success: returns the whole dictionary after only 1 request", _ok, ["stop", True, 1])
+def _retry():
+    MOCK.reset()
+    MOCK.fail_next(429, 2)
+    call_model(MSGS)
+    return len(MOCK.calls)
+expect("429 twice, then success (3 requests in total)", _retry, 3)
+def _down():
+    MOCK.reset()
+    MOCK.fail_next(503, 5)
+    try:
+        call_model(MSGS)
+    except RuntimeError:
+        return len(MOCK.calls)
+    return "no error raised"
+expect("503 every time: RuntimeError after only 3 requests", _down, 3)
+def _auth():
+    MOCK.reset()
+    MOCK.fail_next(401)
+    try:
+        call_model(MSGS)
+    except RuntimeError:
+        return len(MOCK.calls)
+    return "no error raised"
+expect("401 is not retried (only 1 request)", _auth, 1)
+--- hints
+- `range(number of attempts)` sets how many tries there can be; on success, return the whole dictionary, not just the content.
+- "Not in the tuple" is written `not in`; if the loop runs all the way to the end, the attempts are used up, and then you raise an error.
+
+@@ item d14-06
+type: code
+title: P3 second half: validate and correct
+level: 3
+mock: yes
+cards: Validate at the door; d12:Validation failed: tell the model what went wrong, then retry
+--- context
+The model's answer is data from outside, so it gets checked at this door. A verdict that passes becomes a `ClauseReview`, and the code that summarizes and writes the report can trust it without adding its own checks everywhere.
+--- prompt
+**Project part 3, second half.** Write `review_clause(clause, call=call_model)` that returns a `ClauseReview` (the start of `messages` and `tokens` is already written):
+
+1. `data = call(messages)`, and add `data["usage"]["total_tokens"]` to `tokens`
+2. Validate the answer text with `Verdict.model_validate_json(content)` (`content` is at `data["choices"][0]["message"]["content"]`)
+3. Validation fails (`ValidationError`): first add the model's own words `{"role": "assistant", "content": content}` to messages, then add a user message that gives the reason `e.errors()[0]["msg"]` and asks for JSON only, then call again. **At most 2 calls in total**; if the answer is still invalid, `raise RuntimeError`
+4. Valid: return `ClauseReview(clause.id, v.verdict, v.risk_level, tokens)`. For the clause number use **our own** `clause.id`, not the one the model wrote (the real `review.py` has a line like this too: `verdict.clause_id = clause.clause_id`)
+
+`call` defaults to `call_model`; the tests pass in a fake `call` that pretends the model talks nonsense twice in a row. This is Day 13's "dependency injection". The real project goes one step further: when both answers are invalid, it doesn't raise an error; it marks the clause `flag` for a person and records the error in the trace.
+--- starter
+import os
+from dataclasses import dataclass
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+# ===== models.py =====
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+# ===== review.py =====
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+SYSTEM = ("You review one contract clause for the customer. Reply with a JSON object only, with the keys "
+          "clause_id, verdict (accept|flag|redline), risk_level (low|medium|high), topic, rationale.")
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
+    for _ in range(max_attempts):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+
+def review_clause(clause, call=call_model):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Review clause {clause.id}: {clause.text}"},
+    ]
+    tokens = 0
+    pass
+--- solution
+import os
+from dataclasses import dataclass
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+# ===== models.py =====
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+# ===== review.py =====
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+SYSTEM = ("You review one contract clause for the customer. Reply with a JSON object only, with the keys "
+          "clause_id, verdict (accept|flag|redline), risk_level (low|medium|high), topic, rationale.")
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
+    for _ in range(max_attempts):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+
+def review_clause(clause, call=call_model):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Review clause {clause.id}: {clause.text}"},
+    ]
+    tokens = 0
+    for _ in range(2):
+        data = call(messages)
+        tokens += data["usage"]["total_tokens"]
+        content = data["choices"][0]["message"]["content"]
+        try:
+            v = Verdict.model_validate_json(content)
+        except ValidationError as e:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Invalid reply: {e.errors()[0]['msg']}. Reply with the JSON object only."})
+            continue
+        return ClauseReview(clause.id, v.verdict, v.risk_level, tokens)
+    raise RuntimeError(f"clause {clause.id}: no valid JSON after 2 attempts")
+--- tests
+C81 = Clause("8.1", "Cap", "Customer's liability shall be unlimited.")
+GOOD = '{"clause_id": "unknown", "verdict": "flag", "risk_level": "medium", "topic": "payment", "rationale": "late fees"}'
+def fake(replies):
+    seen = []
+    def call(messages):
+        seen.append([m["role"] for m in messages])
+        return {"choices": [{"message": {"content": replies[len(seen) - 1]}}], "usage": {"total_tokens": 100}}
+    return call, seen
+def _normal():
+    MOCK.reset()
+    r = review_clause(C81)
+    return [r.clause_id, r.verdict, r.risk, r.tokens > 0, len(MOCK.calls)]
+expect("normal: one request, unlimited → redline / high", _normal, ["8.1", "redline", "high", True, 1])
+def _bad_json():
+    MOCK.reset()
+    r = review_clause(Clause("3.2", "Late Payment", "Late fees apply without notice. [bad-json]"))
+    return [r.clause_id, len(MOCK.calls), [m["role"] for m in MOCK.calls[-1]["body"]["messages"]]]
+expect("first answer has chatter around the JSON: succeeds after one correction", _bad_json, ["3.2", 2, ["system", "user", "assistant", "user"]])
+def _fake_once():
+    call, seen = fake(["Sure! Here you go: {", GOOD])
+    r = review_clause(C81, call=call)
+    return [r, seen]
+expect("uses our own clause.id; tokens of both calls are added up", _fake_once, [ClauseReview("8.1", "flag", "medium", 200), [["system", "user"], ["system", "user", "assistant", "user"]]])
+def _fake_twice():
+    call, seen = fake(["oops", "still not json"])
+    return review_clause(C81, call=call)
+expect_raises("invalid both times: RuntimeError", _fake_twice, RuntimeError)
+--- hints
+- Structure: inside `for _ in range(2):` do "call → add up tokens → get content → try to validate"; on success `return`, on failure add two messages to messages and `continue`. If the loop ends without a return, `raise RuntimeError(...)`.
+- Put the model's own words back unchanged (role `"assistant"`) so it knows what it said last time; the reason for the error is in `e.errors()[0]["msg"]`.
+- On success: `return ClauseReview(clause.id, v.verdict, v.risk_level, tokens)`.
+
+@@ item d14-07
+type: choice
+title: Where should validation go?
+level: 2
+cards: Validate at the door
+--- context
+A value that breaks the rules comes in with the model's answer and travels through several steps: review, summary, writing the report. The team is discussing at which step to stop it.
+--- prompt
+Now and then the model writes `risk_level` as `"HIGH"`. Where should this check go?
+--- options
+- In `summarise`, when sorting: treat any value it doesn't recognize as `low`
+- In `review_clause`: validate with Pydantic as soon as the answer arrives, and have the model answer again if it's invalid; the code after that only handles valid `ClauseReview` objects
+- In `write_report`: check all fields once before writing the file
+- No check needed: the prompt already says to use lowercase only
+answer: 2
+--- explain
+Validate where the data **comes in**: that's closest to the cause of the error, and you can have the model answer again on the spot. "Treat it as low" is the most dangerous: a high-risk clause quietly becomes low risk and nobody notices. `write_report` is too late, and the bad data has already gone into the summary. However clearly the prompt is written, the model sometimes ignores it, so the code must have this gate. Clause Check's `review.py` does exactly this.
+
+@@ item d14-08
+type: code
+title: P4 Summary
+level: 2
+cards: d8:Sorting by several keys; Splitting up the project: five files, three kinds of data
+--- context
+When lawyers get the report, they read the summary first: how many clauses, how many of each verdict, which ones to read first. That is what `summarise` in the real project's `pipeline.py` does, and its `needs_attention` also puts the highest risk first.
+--- prompt
+**Project part 4 (pipeline.py).** Write two functions:
+
+- `id_key(clause_id)`: turn `"10.1"` into `(10, 1)`, used to sort clause numbers as numbers
+- `summarise(reviews)`: `reviews` is a list of `ClauseReview`; return this dictionary
+
+```python
+{
+    "clauses": number of clauses,
+    "counts": {"accept": n, "flag": n, "redline": n},  # all three keys, 0 for any that doesn't appear
+    "needs_attention": [...],  # numbers of the non-accept clauses: high → medium → low, same level in numeric order
+    "tokens": sum of all tokens,
+}
+```
+
+Example: when `8.1` and `10.1` are both high-risk redlines, `needs_attention` is `["8.1", "10.1"]` (sorting as strings puts `"10.1"` first: the trap from exercise 1).
+--- starter
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    pass
+
+def summarise(reviews):
+    pass
+--- solution
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+--- tests
+R = [
+    ClauseReview("10.1", "redline", "high", 300),
+    ClauseReview("3.1", "accept", "low", 120),
+    ClauseReview("3.2", "flag", "medium", 150),
+    ClauseReview("8.1", "redline", "high", 280),
+]
+expect("id_key", lambda: id_key("10.1"), (10, 1))
+expect("id_key with three levels", lambda: id_key("2.10.3"), (2, 10, 3))
+expect("full summary", lambda: summarise(R), {"clauses": 4, "counts": {"accept": 1, "flag": 1, "redline": 2}, "needs_attention": ["8.1", "10.1", "3.2"], "tokens": 850})
+expect("a verdict that doesn't appear is 0 too", lambda: summarise(R[1:2])["counts"], {"accept": 1, "flag": 0, "redline": 0})
+expect("empty list", lambda: summarise([]), {"clauses": 0, "counts": {"accept": 0, "flag": 0, "redline": 0}, "needs_attention": [], "tokens": 0})
+--- hints
+- `id_key`: `tuple(int(x) for x in clause_id.split("."))`.
+- The sort key is a tuple: `key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id))`. Both parts go from small to large, so you don't need `reverse`.
+- Start `counts` as `{"accept": 0, "flag": 0, "redline": 0}`, then add 1 inside the loop.
+
+@@ item d14-09
+type: testwrite
+title: Write tests for summarise
+level: 3
+cards: d9:How to come up with test cases; d9:Test functions and pytest
+--- context
+The result of `summarise` decides which clause a lawyer reads first. Get the order even slightly wrong and the most dangerous clause may end up buried at the bottom of the list. Tests make sure this kind of error gets caught the moment it appears.
+--- prompt
+The "function under test" below is a correct `summarise`. Write tests for it: all your tests must pass on it, and they must also catch the hidden broken versions (each broken version must make at least one test fail).
+
+Each `test_` function tests one thing only: build a few `ClauseReview`s, call `summarise`, then `assert`. Think about it: what input exposes "clause numbers in the wrong order", "risk order reversed", "a verdict left out", "counts missing a key"?
+--- impl
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+--- mutants
+===== Sorting: which comes first, 10.1 or 8.1?
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], r.clause_id))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+===== Counts: a verdict that doesn't appear still needs its 0
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {}
+    for r in reviews:
+        counts[r.verdict] = counts.get(r.verdict, 0) + 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+===== Needs a person: flag counts too
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict == "redline"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+===== Risk order: high must come first
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)), reverse=True)
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+--- starter
+def test_counts():
+    reviews = [
+        ClauseReview("1.1", "accept", "low", 10),
+        ClauseReview("1.2", "flag", "medium", 10),
+        ClauseReview("2.1", "redline", "high", 10),
+    ]
+    assert summarise(reviews)["counts"] == {"accept": 1, "flag": 1, "redline": 1}
+--- solution
+def test_counts_include_zero():
+    s = summarise([ClauseReview("1.1", "accept", "low", 10)])
+    assert s["counts"] == {"accept": 1, "flag": 0, "redline": 0}
+
+def test_number_order_not_text_order():
+    reviews = [ClauseReview("10.1", "redline", "high", 10), ClauseReview("8.1", "redline", "high", 10)]
+    assert summarise(reviews)["needs_attention"] == ["8.1", "10.1"]
+
+def test_high_first_and_flag_included():
+    reviews = [
+        ClauseReview("1.2", "flag", "medium", 10),
+        ClauseReview("2.1", "redline", "high", 10),
+        ClauseReview("1.1", "accept", "low", 10),
+    ]
+    assert summarise(reviews)["needs_attention"] == ["2.1", "1.2"]
+
+def test_tokens_and_clauses():
+    s = summarise([ClauseReview("1.1", "accept", "low", 100), ClauseReview("1.2", "flag", "medium", 50)])
+    assert s["tokens"] == 150
+    assert s["clauses"] == 2
+--- hints
+- One test tests one thing, and its name says what, for example `test_number_order_not_text_order`.
+- The sorting test needs clause numbers whose text order and number order differ (`"10.1"` and `"8.1"`); the risk-order test needs both high and medium, with medium deliberately placed first.
+- The counting test uses only one verdict and checks that the other two keys are 0; then add a `flag` and check whether it shows up in `needs_attention`.
+
+@@ item d14-10
+type: code
+title: P5 Write the report file
+level: 2
+cards: d10:JSON files: load and dump; d10:Folders: mkdir, glob, and the current directory
+--- context
+The finished report is saved as a JSON file to hand over: lawyers can open it and read it, and other programs can load it and keep working with it. This is the last piece of the mini tool's `pipeline.py`.
+--- prompt
+**Project part 5 (pipeline.py).** Write `write_report(report, path)`: write the dictionary `report` to a JSON file and return the `Path` of that file.
+
+- Create the parent folder if it doesn't exist
+- `indent=2`, `ensure_ascii=False` (Chinese characters and Swedish letters like å are saved as they are, so a lawyer who opens the file can read it directly), UTF-8 encoding
+
+Example: `write_report({"contract": "cloudnotes"}, "work/out/r.json")` → `Path("work/out/r.json")`, and the file holds JSON indented by 2 spaces.
+--- starter
+import json
+from pathlib import Path
+
+def write_report(report, path):
+    pass
+--- solution
+import json
+from pathlib import Path
+
+def write_report(report, path):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+--- tests
+import json
+import shutil
+from pathlib import Path
+REPORT = {"contract": "Molnavtal för Kund AB", "summary": {"counts": {"accept": 2, "flag": 1, "redline": 0}}, "note": "需要律师确认"}  # keep-zh
+OUT = "work/d14/p5/2026/09/report.json"
+def _write():
+    shutil.rmtree("work/d14/p5", ignore_errors=True)
+    return write_report(REPORT, OUT)
+expect("returns a Path", _write, Path(OUT))
+expect("the file reads back as the original dictionary", lambda: (_write(), json.loads(Path(OUT).read_text(encoding="utf-8")))[1], REPORT)
+expect("indented by 2 spaces", lambda: (_write(), Path(OUT).read_text(encoding="utf-8").split("\n")[1])[1], '  "contract": "Molnavtal för Kund AB",')
+expect("Chinese text saved as is, not as \\u escapes", lambda: (_write(), "需要律师确认" in Path(OUT).read_text(encoding="utf-8"))[1], True)  # keep-zh
+--- hints
+- `p = Path(path)`; the parent folder is `p.parent`, and you create it with `p.parent.mkdir(parents=True, exist_ok=True)`.
+- Write the file in one line: `p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")`, and finish with `return p`.
+
+@@ item d14-11
+type: order
+title: Put the code in order: connect the pipeline
+level: 2
+cards: Splitting up the project: five files, three kinds of data
+--- context
+Each of the earlier pieces works on its own; now connect them into one pipeline: a contract file goes in, a report comes out. In the real project, `review_contract` in `pipeline.py` does this.
+--- prompt
+**Connect the earlier pieces (pipeline.py).** Put `review_contract(path, review)` in order: read the file → split into clauses → review each clause → summarize → build the report dictionary.
+
+The `review` parameter is "a function that reviews one clause": a real run passes `review_clause`, and the tests pass a fake function that doesn't call the model. The functions from the earlier exercises are all already there. One line is a distractor.
+--- lines
+from dataclasses import asdict
+from pathlib import Path
+def review_contract(path, review):
+    text = read_contract(path)
+    clauses = split_clauses(text)
+    reviews = [review(c) for c in clauses]
+    summary = summarise(reviews)
+    return {"contract": Path(path).stem, "summary": summary, "reviews": [asdict(r) for r in reviews]}
+--- distractors
+    clauses = split_clauses(path)
+--- tests
+import re
+import shutil
+from dataclasses import dataclass
+from pathlib import Path as _P
+_HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+def read_contract(path):
+    return _P(path).read_text(encoding="utf-8")
+def split_clauses(text):
+    clauses = []
+    for line in text.split("\n"):
+        m = _HEAD.match(line.strip())
+        if m:
+            clauses.append(Clause(m.group(1), m.group(2), ""))
+        elif clauses:
+            clauses[-1].text = (clauses[-1].text + "\n" + line).strip()
+    return [c for c in clauses if c.text]
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    return {"clauses": len(reviews), "counts": counts}
+def keyword_review(clause):
+    if "unlimited" in clause.text:
+        return ClauseReview(clause.id, "redline", "high", 100)
+    return ClauseReview(clause.id, "accept", "low", 50)
+shutil.rmtree("work/d14/order", ignore_errors=True)
+_P("work/d14/order").mkdir(parents=True)
+_P("work/d14/order/cloudnotes.txt").write_text("1. Fees\n1.1 Invoicing\nPay within 30 days.\n2. Liability\n2.1 Cap\nLiability is unlimited.\n", encoding="utf-8")
+_R = lambda: review_contract("work/d14/order/cloudnotes.txt", keyword_review)
+expect("the contract name comes from the file name", lambda: _R()["contract"], "cloudnotes")
+expect("summary", lambda: _R()["summary"], {"clauses": 2, "counts": {"accept": 1, "flag": 0, "redline": 1}})
+expect("reviews is a list of dictionaries", lambda: _R()["reviews"], [{"clause_id": "1.1", "verdict": "accept", "risk": "low", "tokens": 50}, {"clause_id": "2.1", "verdict": "redline", "risk": "high", "tokens": 100}])
+--- hints
+- The shape of the data keeps changing along the way: path → full text → `list[Clause]` → `list[ClauseReview]` → report dictionary. Each line's input is the previous line's output.
+- The distractor passes the "path" to `split_clauses` as if it were the "full text".
+
+@@ item d14-12
+type: fix
+title: Fix the bug: the second contract gets the first one's clauses
+level: 2
+cards: d9:Debugging: reproduce, then guess, change one thing at a time; d9:Common bug patterns
+--- context
+Clause Check's `api.py` turns the review into a web service: someone uploads a contract, and it reviews it and returns the report. A law firm reviews many contracts through it every day, and each report must contain only that contract's own content.
+--- prompt
+A colleague wrote `review_text`, which takes the full contract text directly, for the web service (a process that keeps running, like `clausecheck/api.py`). After launch, lawyers complain: **the second contract's report contains clauses from the first contract**.
+
+Run the code below, look at the two printed results, find the cause and fix it. (To avoid calling the model, this uses `keyword_review`, which decides by keyword.)
+
+Why doesn't this show up on the command line? Because every time you run a command, it's a new process; the web service keeps running, and the same function is called many times.
+--- starter
+import re
+from dataclasses import dataclass, asdict
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+
+def keyword_review(clause):
+    if "unlimited" in clause.text:
+        return ClauseReview(clause.id, "redline", "high", 100)
+    return ClauseReview(clause.id, "accept", "low", 50)
+
+def review_text(text, review, reviews=[]):
+    for clause in split_clauses(text):
+        reviews.append(review(clause))
+    return {"clauses": len(reviews), "reviews": [asdict(r) for r in reviews]}
+
+first = review_text("1 Fees\nPay within 30 days.\n2 Cap\nLiability is unlimited.", keyword_review)
+second = review_text("1 Term\nOne year.", keyword_review)
+print(first["clauses"], [r["clause_id"] for r in first["reviews"]])
+print(second["clauses"], [r["clause_id"] for r in second["reviews"]])
+--- solution
+import re
+from dataclasses import dataclass, asdict
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+
+def keyword_review(clause):
+    if "unlimited" in clause.text:
+        return ClauseReview(clause.id, "redline", "high", 100)
+    return ClauseReview(clause.id, "accept", "low", 50)
+
+def review_text(text, review):
+    reviews = []
+    for clause in split_clauses(text):
+        reviews.append(review(clause))
+    return {"clauses": len(reviews), "reviews": [asdict(r) for r in reviews]}
+
+first = review_text("1 Fees\nPay within 30 days.\n2 Cap\nLiability is unlimited.", keyword_review)
+second = review_text("1 Term\nOne year.", keyword_review)
+print(first["clauses"], [r["clause_id"] for r in first["reviews"]])
+print(second["clauses"], [r["clause_id"] for r in second["reviews"]])
+--- tests
+A = "1 Fees\nPay within 30 days.\n2 Cap\nLiability is unlimited."
+B = "1 Term\nOne year."
+def _twice():
+    review_text(A, keyword_review)
+    return [r["clause_id"] for r in review_text(B, keyword_review)["reviews"]]
+expect("the second contract has only its own clauses", _twice, ["1"])
+expect("the first contract has 2 clauses", lambda: review_text(A, keyword_review)["clauses"], 2)
+expect("three runs in a row give the same result every time", lambda: [review_text(B, keyword_review)["clauses"] for _ in range(3)], [1, 1, 1])
+--- hints
+- A default argument's value is created **once**, at the moment `def` runs, and every later call uses that same list (it's on Day 9's list of common bugs).
+- The simplest fix: remove this parameter and write `reviews = []` inside the function. If you must keep the parameter, use `reviews=None`, then `if reviews is None: reviews = []` inside the function.
+
+@@ item d14-13
+type: code
+title: P6 Command-line arguments
+level: 2
+cards: d10:Command-line arguments: argparse; Validate at the door
+--- context
+Once it's a command-line tool, a lawyer or a colleague can review a contract by typing one command in the terminal, without touching the code. The real project's `cli.py` takes its arguments the same way.
+--- prompt
+**Project part 6 (cli.py), first half.** Write `build_parser()` that returns an `argparse.ArgumentParser` (`prog="minicheck"`) with these arguments:
+
+- positional argument `path`: the contract file
+- `--out`: the report path, default `"report.json"`
+- `--only-risk`: can only be `low` / `medium` / `high`, default `None`
+
+Note: a `-` in an argument name becomes `_` in the result, so you read it as `args.only_risk`. Example: `build_parser().parse_args(["c.txt", "--only-risk", "high"]).only_risk` → `"high"`
+--- starter
+import argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicheck")
+    return parser
+--- solution
+import argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicheck", description="Review every clause of a contract.")
+    parser.add_argument("path", help="contract .txt file")
+    parser.add_argument("--out", default="report.json", help="report JSON path")
+    parser.add_argument("--only-risk", choices=["low", "medium", "high"], help="keep only reviews with this risk")
+    return parser
+--- tests
+_P = lambda argv: build_parser().parse_args(argv)
+expect("path only: the rest use their defaults", lambda: vars(_P(["contract.txt"])), {"path": "contract.txt", "out": "report.json", "only_risk": None})
+expect("all arguments", lambda: vars(_P(["c.txt", "--out", "work/r.json", "--only-risk", "high"])), {"path": "c.txt", "out": "work/r.json", "only_risk": "high"})
+expect_raises("misspelled risk level: argparse exits", lambda: _P(["c.txt", "--only-risk", "urgent"]), SystemExit)
+expect_raises("missing path: argparse exits", lambda: _P([]), SystemExit)
+--- hints
+- Positional argument: `parser.add_argument("path")`; optional argument: `parser.add_argument("--out", default="report.json")`.
+- Limit the allowed values with `choices=["low", "medium", "high"]`; without a `default`, an argument that isn't given is `None`.
+
+@@ item d14-14
+type: predict
+title: After asdict, it's a dictionary
+level: 2
+cards: d8:dataclass: classes that only hold data; Splitting up the project: five files, three kinds of data
+--- context
+The report ends up as JSON, and JSON only understands plain data like dictionaries and lists, so every review result turns from a dataclass into a dictionary before it goes into the report. That changes how the code that reads it afterward is written.
+--- prompt
+Write the output. After `asdict`, each review is a plain dictionary: you read values with `r["risk"]`, not `r.risk` any more. The `--only-risk` filter in the next exercise works on dictionaries like these.
+--- code
+from dataclasses import dataclass, asdict
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+reviews = [
+    ClauseReview("2.1", "redline", "high", 180),
+    ClauseReview("1.1", "accept", "low", 120),
+    ClauseReview("10.1", "redline", "high", 200),
+]
+report = {"reviews": [asdict(r) for r in reviews]}
+print(report["reviews"][1])
+kept = [r for r in report["reviews"] if r["risk"] == "high"]
+print([r["clause_id"] for r in kept], sum(r["tokens"] for r in kept))
+try:
+    print(report["reviews"][0].risk)
+except AttributeError as e:
+    print("AttributeError:", e)
+--- explain
+`asdict` turns a dataclass into a dictionary so that `json.dumps` can handle it. The price: from then on you can only read values with `["key"]`, and writing `.risk` gives an `AttributeError`. When you see "'dict' object has no attribute", your first thought should be "this is already a dictionary".
+
+@@ item d14-15
+type: code
+title: P7 End to end: main
+level: 3
+mock: yes
+cards: On your own computer: package, entry point, and README; d10:main(argv), exit codes, and __name__; Validate at the door
+--- context
+This is the last step, the one that connects all the parts: type one command in the terminal and go all the way from a contract file to a report file. The real project's `cli.py` also has a `main(argv)`, and the exit code it returns is how other scripts know whether the run succeeded or failed.
+--- prompt
+**Project part 7 (cli.py): connect the whole tool.** All the earlier functions are below, split into sections by file. Write `main(argv=None)`:
+
+1. `args = build_parser().parse_args(argv)`
+2. `report = review_contract(args.path, review_clause)`; if this raises `FileNotFoundError` or `ValueError`: print `error: <error message>` and return `1`
+3. If `--only-risk` is given: keep only the entries of `report["reviews"]` whose `risk` equals it (leave `summary` alone; it still counts all clauses)
+4. `out = write_report(report, args.out)`
+5. Print two lines: `counts=<counts> needs_attention=<list>`, then `report written to <out>`
+6. Return `0`
+
+The tests first write a contract file, then call `main(["work/d14/p7/contract.txt", "--out", "...", "--only-risk", "high"])` the way a terminal would, and finally read the JSON it produced. This is an **end-to-end test**: in from a file, out to a file, and every piece in between really runs.
+--- starter
+import argparse
+import json
+import os
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+# ===== models.py =====
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+# ===== split.py =====
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+def read_contract(path):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"contract not found: {path}")
+    text = p.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"contract is empty: {path}")
+    return text
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+
+# ===== review.py =====
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+SYSTEM = ("You review one contract clause for the customer. Reply with a JSON object only, with the keys "
+          "clause_id, verdict (accept|flag|redline), risk_level (low|medium|high), topic, rationale.")
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
+    for _ in range(max_attempts):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+
+def review_clause(clause, call=call_model):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Review clause {clause.id}: {clause.text}"},
+    ]
+    tokens = 0
+    for _ in range(2):
+        data = call(messages)
+        tokens += data["usage"]["total_tokens"]
+        content = data["choices"][0]["message"]["content"]
+        try:
+            v = Verdict.model_validate_json(content)
+        except ValidationError as e:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Invalid reply: {e.errors()[0]['msg']}. Reply with the JSON object only."})
+            continue
+        return ClauseReview(clause.id, v.verdict, v.risk_level, tokens)
+    raise RuntimeError(f"clause {clause.id}: no valid JSON after 2 attempts")
+
+# ===== pipeline.py =====
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+
+def write_report(report, path):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+
+def review_contract(path, review):
+    text = read_contract(path)
+    clauses = split_clauses(text)
+    reviews = [review(c) for c in clauses]
+    summary = summarise(reviews)
+    return {"contract": Path(path).stem, "summary": summary, "reviews": [asdict(r) for r in reviews]}
+
+# ===== cli.py =====
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicheck", description="Review every clause of a contract.")
+    parser.add_argument("path", help="contract .txt file")
+    parser.add_argument("--out", default="report.json", help="report JSON path")
+    parser.add_argument("--only-risk", choices=["low", "medium", "high"], help="keep only reviews with this risk")
+    return parser
+
+def main(argv=None):
+    pass
+--- solution
+import argparse
+import json
+import os
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+# ===== models.py =====
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+# ===== split.py =====
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+def read_contract(path):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"contract not found: {path}")
+    text = p.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"contract is empty: {path}")
+    return text
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+
+# ===== review.py =====
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+SYSTEM = ("You review one contract clause for the customer. Reply with a JSON object only, with the keys "
+          "clause_id, verdict (accept|flag|redline), risk_level (low|medium|high), topic, rationale.")
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"}}
+    for _ in range(max_attempts):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+
+def review_clause(clause, call=call_model):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Review clause {clause.id}: {clause.text}"},
+    ]
+    tokens = 0
+    for _ in range(2):
+        data = call(messages)
+        tokens += data["usage"]["total_tokens"]
+        content = data["choices"][0]["message"]["content"]
+        try:
+            v = Verdict.model_validate_json(content)
+        except ValidationError as e:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Invalid reply: {e.errors()[0]['msg']}. Reply with the JSON object only."})
+            continue
+        return ClauseReview(clause.id, v.verdict, v.risk_level, tokens)
+    raise RuntimeError(f"clause {clause.id}: no valid JSON after 2 attempts")
+
+# ===== pipeline.py =====
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+
+def write_report(report, path):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+
+def review_contract(path, review):
+    text = read_contract(path)
+    clauses = split_clauses(text)
+    reviews = [review(c) for c in clauses]
+    summary = summarise(reviews)
+    return {"contract": Path(path).stem, "summary": summary, "reviews": [asdict(r) for r in reviews]}
+
+# ===== cli.py =====
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicheck", description="Review every clause of a contract.")
+    parser.add_argument("path", help="contract .txt file")
+    parser.add_argument("--out", default="report.json", help="report JSON path")
+    parser.add_argument("--only-risk", choices=["low", "medium", "high"], help="keep only reviews with this risk")
+    return parser
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        report = review_contract(args.path, review_clause)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"error: {e}")
+        return 1
+    if args.only_risk:
+        report["reviews"] = [r for r in report["reviews"] if r["risk"] == args.only_risk]
+    out = write_report(report, args.out)
+    s = report["summary"]
+    print(f"counts={s['counts']} needs_attention={s['needs_attention']}")
+    print(f"report written to {out}")
+    return 0
+--- tests
+import json
+import shutil
+from pathlib import Path
+DIR = Path("work/d14/p7")
+OUT = "work/d14/p7/out/report.json"
+CONTRACT = """MINI SAAS AGREEMENT
+1. Fees
+1.1 Invoicing
+Fees are payable within thirty (30) days of the invoice date.
+1.2 Suspension
+Provider may suspend the Service without notice if any amount is overdue.
+2. Liability
+2.1 Cap
+Customer's liability shall be unlimited.
+10. Data
+10.1 Location
+Customer Data may be processed in any country.
+"""
+def _setup():
+    shutil.rmtree(DIR, ignore_errors=True)
+    DIR.mkdir(parents=True)
+    (DIR / "contract.txt").write_text(CONTRACT, encoding="utf-8")
+    (DIR / "empty.txt").write_text("\n", encoding="utf-8")
+_setup()
+expect_output("terminal output", lambda: main(["work/d14/p7/contract.txt", "--out", OUT]),
+              "counts={'accept': 1, 'flag': 1, 'redline': 2} needs_attention=['2.1', '10.1', '1.2']\nreport written to work/d14/p7/out/report.json")
+def _run(extra):
+    _setup()
+    code = main(["work/d14/p7/contract.txt", "--out", OUT] + extra)
+    return code, json.loads(Path(OUT).read_text(encoding="utf-8"))
+def _full():
+    code, data = _run([])
+    return [code, data["contract"], data["summary"]["clauses"], len(data["reviews"])]
+expect("returns 0; all 4 clauses are in the report", _full, [0, "contract", 4, 4])
+def _only_high():
+    code, data = _run(["--only-risk", "high"])
+    return [[r["clause_id"] for r in data["reviews"]], data["summary"]["counts"]]
+expect("--only-risk high: reviews keeps only high risk, summary still counts everything", _only_high, [["2.1", "10.1"], {"accept": 1, "flag": 1, "redline": 2}])
+expect_output("missing file: prints error", lambda: main(["work/d14/p7/nope.txt"]), "error: contract not found: work/d14/p7/nope.txt")
+expect("missing file: returns 1", lambda: main(["work/d14/p7/nope.txt"]), 1)
+expect("empty file: returns 1", lambda: main(["work/d14/p7/empty.txt", "--out", OUT]), 1)
+--- hints
+- Follow the 6 steps in the prompt, one or two lines each. Error handling: `try: report = review_contract(args.path, review_clause)`, and inside `except (FileNotFoundError, ValueError) as e:` do `print(f"error: {e}")`, then `return 1`.
+- After `asdict` the reviews are dictionaries (the trap from the previous exercise), so filter with `[r for r in report["reviews"] if r["risk"] == args.only_risk]`.
+- Printing: `s = report["summary"]`, `print(f"counts={s['counts']} needs_attention={s['needs_attention']}")`.
+
+@@ item d14-16
+type: local
+title: Local task: make it a real command-line tool
+level: 3
+cards: On your own computer: package, entry point, and README; Splitting up the project: five files, three kinds of data; Start small: get one clause working first
+--- context
+The mini tool on the web page only talks to a mock server. This step moves it onto your own computer as a command-line tool that really runs in the terminal, reviews the sample contract with the real DeepSeek, and compares the result with the real project's: how much difference do the parts you haven't built yet, like the playbook and tool calls, actually make?
+--- prompt
+Move today's mini tool onto your computer, run it on the sample contract with the real DeepSeek, then compare with the real project's result.
+
+1. Create the folder `G:\Contract Clause Reviewer\work\minicheck\` and set up the files as in the "On your own computer" card: `__init__.py` (empty), `__main__.py`, `models.py`, `split.py`, `review.py`, `pipeline.py`, `cli.py`
+2. Put the code under each `# ===== xxx.py =====` section of exercise 15 into the matching file (ideally retype it, making sure you understand each line), and use your own version of `main`
+3. At the top of each file, add the `import`s that file uses. Imports inside the package start with a dot, for example in `cli.py`: `from .pipeline import review_contract, write_report` and `from .review import review_clause`
+4. Add three more lines at the top of `review.py` to read the `.env` at the repository root (only needed on your own computer; the mock server on the web page doesn't need it): `from pathlib import Path`, `from dotenv import load_dotenv`, `load_dotenv(Path(__file__).resolve().parents[2] / ".env")`
+5. Run your tool in the terminal, then run the real project (both reports are written to `data/`, and `.gitignore` already ignores `*.report.json`):
+
+```
+cd "G:\Contract Clause Reviewer\work"
+python -m minicheck ..\data\sample_contract.txt --out ..\data\mini.report.json
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck review data/sample_contract.txt --mode deepseek --out data/ds.report.json
+```
+
+Both sides use `deepseek-flash` with thinking mode off (the real project turns it off in `_post` in `clausecheck/review.py`, which you read on Day 7). At `deepseek-flash`'s current prices (peak hours: input 0.30 and output 1.20 US dollars per million tokens, half price off-peak; the official pricing page is what counts (2026-09)), the two runs together usually cost less than 0.2 dollars. The `est_cost` in the real project's output is estimated from `PRICES` in `config.py`.
+
+6. Paste the line starting with `counts=` from each of the two outputs below
+
+It's normal for the two sets of numbers to differ: the real project has a playbook, tool calls and a much longer prompt. Compare the two `needs_attention` lists: which clauses did only one side mark? Why do you think that is?
+placeholder: Paste the two counts=… lines (one from your minicheck, one from the real project)
+verify: counts=\{[\s\S]*counts=\{
+--- hints
+- `ModuleNotFoundError: No module named 'minicheck'`: make sure you run it from inside the `work` folder (the first `cd`), and that the `minicheck` folder has an `__init__.py`.
+- `ImportError: attempted relative import with no known parent package`: don't run `python cli.py` directly; use `python -m minicheck`.
+- 401: the key in `.env` is wrong, or the path in the `load_dotenv` line is wrong. Add `print(Path(__file__).resolve().parents[2])` below that line and check that it prints the repository root.
+- The real project's output ends with `errors on clauses: [...]`: open `data/ds.report.json` and read the errors in those clauses' `rationale`. If you see `The supported API model names are ...`, the model name is wrong: check whether `.env` sets a different `CLAUSECHECK_DEEPSEEK_MODEL`.
+
+@@ item d14-17
+type: local
+title: Local task (optional): add a test for split
+level: 2
+cards: d9:Test functions and pytest; d9:How to come up with test cases; Weekly review: which file uses each concept
+--- context
+The real project's `tests/test_split.py` already has a few tests guarding the "cut the contract into clauses" step. If this step cuts wrongly, the whole pipeline after it reviews the wrong content. This is the first time you add a test to the real project.
+--- prompt
+At the end of the real project's `tests/test_split.py`, add one test function **yourself** that tests something the existing tests don't test yet. Three ideas to choose from:
+
+- A heading with a dot after the number (`"1. Scope"`) is recognized too
+- Cross-references: a clause whose body says `See Section 2.` has `"2"` in its `refs`
+- A section title (empty body) has `is_section_title` equal to `True`
+
+Then run only this one file (no model calls, a few seconds). Note: **don't add `-q`**: the project's `pyproject.toml` already sets `-q`, and adding it again also hides the final "N passed" line.
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m pytest tests/test_split.py
+```
+
+First write the assertion wrong on purpose and watch it turn red (to confirm the test really checks something), then fix it and paste the green output below.
+placeholder: Paste the pytest output (you should see 6 passed)
+verify: \d+ passed
+--- hints
+- Copy the shape of the last test in the file: `clauses = split_clauses("1. Scope\nShort.\n2. Payment\nPay.\n")`, then `assert [c.clause_id for c in clauses] == ["1", "2"]`.
+- The real project's `Clause` is a Pydantic model, and its number field is called `clause_id` (the mini version calls it `id`).
+
+@@ item d14-e1
+type: scratch
+title: Weekly exam 1: merge findings by clause
+exam: yes
+level: 3
+cards: d8:dataclass: classes that only hold data; d8:Sorting by several keys
+--- context
+When clauses are checked against the playbook, one clause may break several rules, and each rule reports its own finding. A lawyer doesn't want to read the same clause several times: they want one line per clause, starting with the most urgent.
+--- prompt
+One clause may break several rules. Define `Finding` with `@dataclass`: `clause_id: str`, `rule_id: str`, `severity: str` (`low` / `medium` / `high`).
+
+Write `triage(findings)`: merge the findings by clause and return a list of tuples `[(clause_id, the most severe severity of this clause, [its rule_ids, without duplicates, sorted alphabetically]), ...]`. Order: higher severity first (high → medium → low), and within the same level by clause number in numeric order (`"9.1"` before `"10.1"`).
+
+Example: `triage([Finding("8.1", "PB-08", "medium"), Finding("3.2", "PB-04", "medium"), Finding("8.1", "PB-01", "high")])` → `[("8.1", "high", ["PB-01", "PB-08"]), ("3.2", "medium", ["PB-04"])]`
+--- solution
+from collections import defaultdict
+from dataclasses import dataclass
+
+RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class Finding:
+    clause_id: str
+    rule_id: str
+    severity: str
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def triage(findings):
+    by_clause = defaultdict(list)
+    for f in findings:
+        by_clause[f.clause_id].append(f)
+    rows = []
+    for cid, fs in by_clause.items():
+        worst = min((f.severity for f in fs), key=lambda s: RANK[s])
+        rows.append((cid, worst, sorted({f.rule_id for f in fs})))
+    rows.sort(key=lambda r: (RANK[r[1]], id_key(r[0])))
+    return rows
+--- tests
+F = [
+    Finding("10.1", "PB-03", "high"),
+    Finding("8.1", "PB-08", "medium"),
+    Finding("3.2", "PB-04", "medium"),
+    Finding("8.1", "PB-01", "high"),
+    Finding("9.1", "PB-08", "high"),
+    Finding("8.1", "PB-01", "high"),
+    Finding("2.1", "PB-00", "low"),
+]
+expect("merge, take the most severe, sort", lambda: triage(F), [("8.1", "high", ["PB-01", "PB-08"]), ("9.1", "high", ["PB-08"]), ("10.1", "high", ["PB-03"]), ("3.2", "medium", ["PB-04"]), ("2.1", "low", ["PB-00"])])
+expect("empty list", lambda: triage([]), [])
+expect("dataclass objects can be compared with ==", lambda: Finding("8.1", "PB-01", "high") == Finding("8.1", "PB-01", "high"), True)
+
+@@ item d14-e2
+type: scratch
+title: Weekly exam 2: append to the eval history
+exam: yes
+level: 3
+cards: d10:JSON files: load and dump; d10:Folders: mkdir, glob, and the current directory; d3:try / except: catch the errors you expect
+--- context
+The project's `evals/results.json` is completely overwritten on every eval run, so you can't see whether the pass rate went up or down this week. That's why you keep a separate history, and that file must not keep growing forever.
+--- prompt
+After every eval run, append the result to a history file (like `evals/results.json`, but keeping several runs). Write `append_run(history_path, run, keep=5)`:
+
+- `history_path` is a JSON file that holds `{"runs": [...]}`; if the file doesn't exist, treat it as `{"runs": []}`, and create the parent folder if it doesn't exist
+- Add the dictionary `run` to the end of `runs` and keep only the **last** `keep` entries
+- Write it back to the file (`indent=2`, UTF-8) and return the dictionary you wrote
+- The file exists but isn't valid JSON: **don't just overwrite it** (it may hold data someone edited by hand). First rename it to the original file name plus `.bak` (`history.json` → `history.json.bak`; rename with `p.rename(new_path)`), then start from `{"runs": []}`
+--- solution
+import json
+from pathlib import Path
+
+def append_run(history_path, run, keep=5):
+    p = Path(history_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    history = {"runs": []}
+    if p.exists():
+        try:
+            history = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            p.rename(p.with_name(p.name + ".bak"))
+            history = {"runs": []}
+    history["runs"] = (history["runs"] + [run])[-keep:]
+    p.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+    return history
+--- tests
+import json
+import shutil
+from pathlib import Path
+D = Path("work/d14/e2")
+H = "work/d14/e2/evals/history.json"
+def _fresh():
+    shutil.rmtree(D, ignore_errors=True)
+    return append_run(H, {"prompt": "v1", "recall": 1.0})
+expect("first time: creates the folder and the file", lambda: (_fresh(), json.loads(Path(H).read_text(encoding="utf-8")))[1], {"runs": [{"prompt": "v1", "recall": 1.0}]})
+def _trim():
+    shutil.rmtree(D, ignore_errors=True)
+    for i in range(4):
+        append_run(H, {"n": i}, keep=3)
+    return json.loads(Path(H).read_text(encoding="utf-8"))["runs"]
+expect("keeps only the last keep entries", _trim, [{"n": 1}, {"n": 2}, {"n": 3}])
+def _broken():
+    shutil.rmtree(D, ignore_errors=True)
+    Path(H).parent.mkdir(parents=True)
+    Path(H).write_text("{hand-edited, broken", encoding="utf-8")
+    result = append_run(H, {"n": 1})
+    return [result, Path(H + ".bak").read_text(encoding="utf-8")]
+expect("a broken file is first renamed to .bak, then it starts over", _broken, [{"runs": [{"n": 1}]}, "{hand-edited, broken"])
+expect("indented by 2 spaces", lambda: (_fresh(), Path(H).read_text(encoding="utf-8").split("\n")[1])[1], '  "runs": [')
+
+@@ item d14-e3
+type: scratch
+title: Weekly exam 3: search by clause, with extra weight for headings
+exam: yes
+level: 3
+cards: d11:Keyword search; d11:Chunking: by structure, by length, with overlap
+--- context
+A lawyer asks "what happens to the data after the contract ends?" The program first finds the few most relevant clauses among dozens, then hands them to the model for a close read. Narrowing it down first means the model reads less text: faster and cheaper.
+--- prompt
+A contract already comes cut into chunks: its clauses. Write `find_clauses(text, query, k)`:
+
+1. **Chunking**: a line that matches `r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$"` after removing the whitespace at both ends is a clause heading; the lines below it, up to the next heading, are its body; skip headings with an empty body
+2. **Words**: lowercase the text, then `re.findall(r"[a-z0-9]+", ...)`
+3. **Score** = the number of **distinct** query words that appear in the body + 2 × the number that appear in the heading (the heading says best what the clause is about)
+4. Keep only scores > 0; sort by score from high to low, and ties by clause number in numeric order; return a list of `(clause number, score)` tuples for the top `k`
+
+Example: with the query `"effect of termination"`, the clause with the heading `11.2 Effect of Termination` and the body `Data is deleted after termination.` scores 1 + 2 × 3 = 7.
+--- solution
+import re
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+def words(text):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+def find_clauses(text, query, k):
+    clauses = []
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            clauses.append([m.group(1), m.group(2), []])
+        elif clauses:
+            clauses[-1][2].append(line)
+    q = words(query)
+    scored = []
+    for cid, heading, lines in clauses:
+        body = "\n".join(lines).strip()
+        if not body:
+            continue
+        score = len(q & words(body)) + 2 * len(q & words(heading))
+        if score > 0:
+            scored.append((cid, score))
+    scored.sort(key=lambda s: (-s[1], tuple(int(x) for x in s[0].split("."))))
+    return scored[:k]
+--- tests
+DOC = """CLOUDNOTES AGREEMENT
+3. Fees and Payment
+3.1 Invoicing
+Fees are invoiced annually and payable within thirty days.
+3.2 Late Payment
+Overdue amounts accrue interest. Provider may suspend the Service.
+11. Termination
+11.1 Termination for Convenience
+Provider may terminate this Agreement at any time on notice.
+11.2 Effect of Termination
+Customer Data is deleted thirty days after termination."""
+expect("extra weight for headings, scores from high to low", lambda: find_clauses(DOC, "termination of the agreement", 5), [("11.2", 5), ("11.1", 3), ("3.2", 1)])
+expect("k limits how many come back", lambda: find_clauses(DOC, "termination of the agreement", 2), [("11.2", 5), ("11.1", 3)])
+expect("ties in numeric clause order", lambda: find_clauses(DOC, "provider", 5), [("3.2", 1), ("11.1", 1)])
+expect("no matches", lambda: find_clauses(DOC, "warranty", 3), [])
+
+@@ item d14-e4
+type: scratch
+title: Weekly exam 4: a structured call with correction
+exam: yes
+level: 3
+mock: yes
+cards: d12:Validation failed: tell the model what went wrong, then retry; d4:Status codes and retries; Validate at the door
+--- context
+This is the whole job of `review.py` in the mini tool, squeezed into one function: hand over a clause, get back a verdict you can safely use. The network will have problems and the model will get the format wrong, and both cases have to be handled.
+--- prompt
+Define `Verdict` with Pydantic: `clause_id: str`; `verdict` can only be `accept` / `flag` / `redline`; `risk_level` can only be `low` / `medium` / `high`.
+
+Write `review(clause_text)`:
+
+- POST to `https://api.deepseek.com/v1/chat/completions` with the header `Authorization: Bearer <environment variable DEEPSEEK_API_KEY>`, model `deepseek-flash`, `response_format` set to `{"type": "json_object"}`, and thinking mode off (`"thinking": {"type": "disabled"}`); messages starts with just one user message whose content is `clause_text`
+- Status code 429: send the request again; any other status code that isn't 200: `raise RuntimeError`
+- 200: validate the answer text with `Verdict.model_validate_json`; if it's valid, return the `Verdict` object; if not, append the model's answer (role `assistant`) and a user message that states the error and asks for JSON only to messages, then send the request again
+- At most 3 requests in total (a 429 and a failed validation each count as one); if it still hasn't succeeded, `raise RuntimeError`
+--- solution
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+def review(clause_text):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    messages = [{"role": "user", "content": clause_text}]
+    for _ in range(3):
+        body = {"model": "deepseek-flash", "messages": messages, "response_format": {"type": "json_object"},
+                "thinking": {"type": "disabled"}}
+        resp = requests.post(URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 429:
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(f"API error {resp.status_code}")
+        content = resp.json()["choices"][0]["message"]["content"]
+        try:
+            return Verdict.model_validate_json(content)
+        except ValidationError as e:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Invalid: {e.errors()[0]['msg']}. Reply with the JSON object only."})
+    raise RuntimeError("no valid verdict after 3 attempts")
+--- tests
+def _normal():
+    MOCK.reset()
+    v = review("Review clause 8.1: Customer's liability shall be unlimited.")
+    return [type(v).__name__, v.clause_id, v.verdict, v.risk_level, len(MOCK.calls), MOCK.calls[-1]["body"].get("thinking")]
+expect("normal: one request, with thinking mode off", _normal, ["Verdict", "8.1", "redline", "high", 1, {"type": "disabled"}])
+def _bad():
+    MOCK.reset()
+    v = review("Review clause 3.2: Late fees apply without notice. [bad-json]")
+    return [type(v).__name__, len(MOCK.calls), [m["role"] for m in MOCK.calls[-1]["body"]["messages"]]]
+expect("answer has chatter around the JSON: one correction", _bad, ["Verdict", 2, ["user", "assistant", "user"]])
+def _429():
+    MOCK.reset()
+    MOCK.fail_next(429, 1)
+    return [review("Review clause 4.2: renews for twenty-four (24) months").verdict, len(MOCK.calls)]
+expect("one 429, then success", _429, ["redline", 2])
+def _give_up():
+    MOCK.reset()
+    MOCK.fail_next(429, 3)
+    try:
+        review("Review clause 1.1: hello")
+    except RuntimeError:
+        return len(MOCK.calls)
+    return "no error raised"
+expect("429 every time: RuntimeError after 3 requests", _give_up, 3)
+
+
+@@ item d14-e5
+type: scratch
+title: Weekly exam 5: the last line of the eval results
+exam: yes
+level: 3
+cards: d13:Confusion matrix, precision, recall; d13:Run N times, look at the pass rate; Weekly review: which file uses each concept
+--- context
+The project's `run_evals.py` runs the whole eval suite and prints a one-line summary at the end, so after changing the prompt you can see at a glance whether the results still hold up. Watch out especially for test cases that pass on some runs and fail on others: whether they pass is pure luck.
+--- prompt
+Imitate the line that `evals/run_evals.py` prints at the end. `cases` is `[{"id": ..., "kind": ...}]`, where `kind` may be `must_flag`, `trap`, `must_accept` or something else; `runs` is `{case id: [the verdict of each run, ...]}`. Write `eval_line(cases, runs)` that returns one line of text in this format (two spaces between the parts):
+
+`high-risk recall 0.75  false flags 1/4  flaky: payment-net-30`
+
+- **high-risk recall**: over all runs of the `must_flag` and `trap` cases, the share whose verdict is **not** `accept`, with two decimals; `1.00` when there are no such runs (the same as `high_risk_recall` in `evals/harness.py`)
+- **false flags**: over all runs of the `must_accept` cases, the number of runs whose verdict is not `accept`, then `/`, then the total number of such runs
+- **flaky**: the ids of the cases whose runs did not all give the same verdict (any kind counts), in the order of `cases`, joined with `", "`; write `-` if there are none
+- A case that is missing from `runs`: treat it as never run; it counts toward nothing
+--- solution
+def eval_line(cases, runs):
+    hit = total = false_flags = accept_runs = 0
+    flaky = []
+    for case in cases:
+        verdicts = runs.get(case["id"], [])
+        if len(set(verdicts)) > 1:
+            flaky.append(case["id"])
+        for v in verdicts:
+            if case["kind"] in ("must_flag", "trap"):
+                total += 1
+                if v != "accept":
+                    hit += 1
+            elif case["kind"] == "must_accept":
+                accept_runs += 1
+                if v != "accept":
+                    false_flags += 1
+    recall = hit / total if total else 1.0
+    return f"high-risk recall {recall:.2f}  false flags {false_flags}/{accept_runs}  flaky: {', '.join(flaky) or '-'}"
+--- tests
+CASES = [
+    {"id": "unlimited-liability", "kind": "must_flag"},
+    {"id": "cross-reference-trap", "kind": "trap"},
+    {"id": "payment-net-30", "kind": "must_accept"},
+    {"id": "as-is", "kind": "must_accept"},
+    {"id": "injection", "kind": "injection"},
+]
+RUNS = {
+    "unlimited-liability": ["redline", "redline", "redline"],
+    "cross-reference-trap": ["flag", "accept", "flag"],
+    "payment-net-30": ["accept", "flag"],
+    "as-is": ["accept", "accept"],
+    "injection": ["flag", "redline"],
+}
+expect("the full line", lambda: eval_line(CASES, RUNS), "high-risk recall 0.83  false flags 1/4  flaky: cross-reference-trap, payment-net-30, injection")
+expect("all stable; cases that didn't run don't count", lambda: eval_line(CASES, {"unlimited-liability": ["flag", "flag"], "as-is": ["accept", "accept"]}), "high-risk recall 1.00  false flags 0/2  flaky: -")
+expect("no runs of high-risk cases: recall is 1.00", lambda: eval_line(CASES, {"payment-net-30": ["flag"]}), "high-risk recall 1.00  false flags 1/1  flaky: -")

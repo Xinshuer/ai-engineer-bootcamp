@@ -1,0 +1,703 @@
+@@ day 22
+title: SQL basics: querying, filtering, sorting, grouping
+lang: sql
+dataset: clausecheck
+hours: 4–5 hours
+--- goal
+Read a table the way you read a "list of dictionaries", answer questions with SELECT / WHERE / ORDER BY / GROUP BY / HAVING, and handle NULL correctly. Almost every data / AI engineer interview tests SQL; once Clause Check is live, review records, eval results and costs sit in tables like these (this week's sample database `clausecheck`).
+--- checklist
+- Clear your Review list first
+- Read all 8 knowledge cards, and change every example before you run it
+- Pass every practice exercise
+- The 3 closed-book challenges
+- Explain in your own words: the difference between WHERE and HAVING; why `= NULL` never finds a single row
+
+@@ concept
+title: Why AI engineers need SQL
+--- body
+Once an LLM app is live, the most useful data sits in a database: a record of every model call (a trace), eval results, costs, customers. When someone asks "Which customer costs us the most?" or "Is the v2 prompt really better than v1?", the answer is one SQL query.
+
+A **table** is like the "list of dictionaries" from Day 2: each **row** is a dictionary, each **column** is a fixed key, and every column has a set type.
+
+This week's sample database, `clausecheck`, holds the tables Clause Check might have once it is live:
+
+- `customers`: 6 customers, the companies that use Clause Check to review contracts (a few of them are law firms themselves), each with a country and a plan (`plan`)
+- `contracts`: 10 contracts; `customer_id` points to the customer
+- `reviews`: 65 review records, one row per clause: verdict, risk, model, tokens, latency, cost (`deepseek-v4-flash` in the `model` column is the old name of the flash model, which DeepSeek still accepts; new code writes `deepseek-flash`)
+- `evals`: eval results, 8 test cases × two prompt versions (v1 and v2) × 3 runs each
+- `tool_calls`: which tools each review called
+
+This page runs SQL in your browser with **SQLite**. What you write today works almost the same way in Postgres and BigQuery; where it differs, the cards say so (for example, BigQuery table names include the dataset: `clausecheck.reviews`, more on Day 25). Click Run to see the result; Table schema below expands to show the column names of each table.
+--- code
+-- One row per customer. Run it, then try replacing * with name, country
+SELECT * FROM customers;
+
+@@ concept
+title: SELECT, AS, LIMIT, DISTINCT
+--- body
+A query starts with `SELECT`: **which columns** you want, `FROM` **which table**.
+
+- Separate column names with commas; `AS` gives a result column a name (an alias)
+- A column can be computed: `prompt_tokens + completion_tokens AS total_tokens`, just like Python's `r["prompt_tokens"] + r["completion_tokens"]`
+- `LIMIT 5`: return at most 5 rows
+- `SELECT DISTINCT model`: remove duplicate rows, like the `set` from Day 8. With two columns, it removes duplicate "combinations"
+- `SELECT *` takes every column; use it only while exploring data. Real queries list the columns they need (on Day 25 you'll see that in BigQuery `SELECT *` also costs more money)
+
+SQL keywords are not case-sensitive; by convention they are written in capitals. The semicolon at the end is optional.
+--- code
+SELECT id,
+       clause_id,
+       prompt_tokens + completion_tokens AS total_tokens,
+       latency_ms / 1000.0 AS latency_s
+FROM reviews
+LIMIT 5;
+-- Then try this one (replace the whole query above): SELECT DISTINCT model, prompt_version FROM reviews;
+
+@@ concept
+title: WHERE: pick the rows you need
+--- body
+After `WHERE` comes a condition; only the rows where it is **true** stay. It is the `if` of a list comprehension:
+
+- Comparison: `=` (just one equals sign), `<>` (not equal; `!=` works too), `<`, `>=`
+- Combining: `AND`, `OR`, `NOT`. **`AND` is evaluated before `OR`**, so always add parentheses when you mix them
+- `topic IN ('payment', 'termination')`: equal to any one of them
+- `pages BETWEEN 5 AND 12`: includes both ends, 5 and 12
+- `heading LIKE '%Renewal%'`: `%` stands for any number of characters, `_` for exactly one character
+- Text goes in **single quotes**. In Postgres, double quotes mean a column name, so don't mix them up
+
+Dialect differences: in SQLite, `LIKE` ignores the case of English letters; in Postgres and BigQuery, `LIKE` is case-sensitive (Postgres also has `ILIKE`). Times in this database are text like `'2026-09-05 13:17:04'`, and comparing that text happens to put them in time order.
+--- code
+SELECT id, contract_id, clause_id, heading, risk
+FROM reviews
+WHERE (topic = 'payment' OR topic = 'termination')
+  AND risk <> 'low';
+
+@@ concept
+title: NULL: unknown
+--- body
+The two failed reviews (`id` 1047 and 1061) have **NULL** in `verdict`, `risk` and `rule_ids`: not an empty string, not 0, but "no value / unknown".
+
+- Comparing any value with NULL gives "unknown" again, and WHERE keeps only the rows where the condition is **true**. So `verdict = NULL` never finds a single row; write `verdict IS NULL` or `IS NOT NULL`
+- In the same way, `verdict <> 'accept'` does **not** return the two failed rows either; the same goes for `NOT IN (...)`
+- `COALESCE(verdict, 'failed')` returns the first value that is not NULL; use it to give a default. SQLite and BigQuery also have `IFNULL`, Postgres doesn't; `COALESCE` works everywhere
+
+In Python, `None == None` is True, but in SQL, `NULL = NULL` is not true. This is interviewers' favorite point.
+--- code
+SELECT id,
+       clause_id,
+       verdict,
+       COALESCE(verdict, 'failed') AS verdict_or_failed,
+       error
+FROM reviews
+WHERE verdict IS NULL;
+
+@@ concept
+title: ORDER BY: sorting and top N
+--- body
+- `ORDER BY cost_usd DESC`: largest first; leave it out or write `ASC` for smallest first
+- Several columns: `ORDER BY contract_id, cost_usd DESC`: sort by the first column first; rows with the same first column are then sorted by the second
+- Top N = `ORDER BY ... LIMIT N`. **Without ORDER BY, the order of the result is not guaranteed at all**, so don't rely on it
+- Where NULL goes differs between databases (SQLite and BigQuery put NULL first when sorting smallest first; Postgres puts it last)
+
+The classic trap: `clause_id` is **text**, and text is compared one character at a time, so `'10.1' < '8.1'` (because `'1' < '8'`), the same as Python's `sorted(["8.1", "10.1"])`. To sort by number, convert to a number first: `CAST(clause_id AS REAL)` turns `'10.1'` into 10.1. This only works when every number has a single digit after the dot (`'8.10'` would become 8.1 and sort before `'8.9'`). The safer way is to split it into two integers and sort by each one (`substr` and `instr` are SQLite string functions; in Postgres you can use `split_part`):
+
+```sql
+ORDER BY CAST(substr(clause_id, 1, instr(clause_id, '.') - 1) AS INTEGER),
+         CAST(substr(clause_id, instr(clause_id, '.') + 1) AS INTEGER)
+```
+--- code
+SELECT clause_id,
+       heading,
+       CAST(clause_id AS REAL) AS as_number
+FROM reviews
+WHERE contract_id = 101
+ORDER BY clause_id;
+-- Change ORDER BY clause_id to ORDER BY as_number, run it again and compare the two orders
+
+@@ concept
+title: Aggregates: turn many rows into one number
+--- body
+An aggregate function "folds" many rows into one value, like Python's `len`, `sum` and `max`:
+
+- `COUNT(*)` counts **rows**; `COUNT(verdict)` counts only the rows where verdict is **not NULL**; `COUNT(DISTINCT topic)` counts how many different values there are
+- `SUM`, `AVG`, `MIN` and `MAX` all **skip NULL**
+- `ROUND(x, 2)` keeps 2 decimal places. Do this with averages and money, so the results are easy to read and to compare (in Postgres, `ROUND(x, 2)` only accepts the `numeric` type, and money is usually stored as `NUMERIC` anyway; a floating-point number needs `x::numeric` first)
+
+Trap: **an integer divided by an integer is still an integer**. In SQLite and Postgres, `1 / 2` is 0, so dividing one SUM by another easily gives 0. Multiply by `1.0` first to turn it into a decimal: `ROUND(1.0 * a / b, 3)`. BigQuery is different: its `/` always returns a decimal (`5 / 2 = 2.5`), and for integer division you write `DIV(5, 2)`.
+--- code
+SELECT COUNT(*) AS all_rows,
+       COUNT(verdict) AS with_verdict,
+       COUNT(DISTINCT topic) AS topics,
+       ROUND(AVG(latency_ms), 1) AS avg_latency_ms,
+       MAX(latency_ms) AS max_latency_ms,
+       ROUND(SUM(cost_usd), 4) AS total_cost_usd,
+       SUM(completion_tokens) / SUM(prompt_tokens) AS wrong_ratio,
+       ROUND(1.0 * SUM(completion_tokens) / SUM(prompt_tokens), 3) AS output_input_ratio
+FROM reviews;
+
+@@ concept
+title: GROUP BY and HAVING
+--- body
+`GROUP BY topic`: split the rows into groups by topic, **output one row per group**, and compute the aggregate functions inside each group separately. It is like counting with a dictionary on Day 2: `counts[topic] = counts.get(topic, 0) + 1`.
+
+- Every column in SELECT must either be in GROUP BY or be wrapped in an aggregate function. SQLite lets you write a column that is neither (it quietly takes the value from any one row of the group); Postgres and BigQuery raise an error. **Don't write it that way**
+- `WHERE` filters **rows** **before** grouping; `HAVING` filters **groups** **after** grouping. So `COUNT(*) >= 6` can only go in HAVING
+
+The logical order in which the database runs a query is not the order you write it in:
+
+FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY → LIMIT
+
+So the alias `n` you define in SELECT can be used in ORDER BY (it comes after SELECT) but not in WHERE (it comes before). HAVING also comes before SELECT: in Postgres, HAVING doesn't know aliases, so you write `COUNT(*)` again, and written that way it runs in every database. SQLite is lenient and often accepts aliases in WHERE and HAVING too; don't let it spoil you.
+--- code
+SELECT topic,
+       COUNT(*) AS n,
+       ROUND(AVG(latency_ms)) AS avg_latency_ms
+FROM reviews
+WHERE verdict IS NOT NULL
+GROUP BY topic
+HAVING COUNT(*) >= 6
+ORDER BY n DESC, topic;
+
+@@ concept
+title: CASE WHEN: labels and conditional counts
+--- body
+`CASE` is SQL's if / elif / else: going from top to bottom, the first WHEN that is true wins; if none is true, ELSE is used, and without an ELSE the result is NULL.
+
+```sql
+CASE WHEN latency_ms >= 5000 THEN 'slow'
+     WHEN latency_ms >= 2500 THEN 'ok'
+     ELSE 'fast' END
+```
+
+Two ways to use it:
+
+- **Labels**: put it in SELECT to create a new column; you can even group by it
+- **Conditional counts**: `SUM(CASE WHEN verdict = 'redline' THEN 1 ELSE 0 END)` counts how many redlines each group has. One query can compute several counts at once, instead of running several queries
+
+Postgres and SQLite also have the shorter `COUNT(*) FILTER (WHERE verdict = 'redline')`; in BigQuery you write `COUNTIF(verdict = 'redline')` (Day 25). `SUM(CASE ...)` works everywhere, so it is the safest thing to write in an interview.
+--- code
+SELECT CASE WHEN latency_ms >= 5000 THEN 'slow'
+            WHEN latency_ms >= 2500 THEN 'ok'
+            ELSE 'fast' END AS speed,
+       COUNT(*) AS n,
+       SUM(CASE WHEN model = 'deepseek-v4-pro' THEN 1 ELSE 0 END) AS v4_pro,
+       COUNT(*) FILTER (WHERE verdict = 'redline') AS redlines
+FROM reviews
+GROUP BY speed
+ORDER BY MIN(latency_ms);
+
+@@ item d22-01
+type: choice
+title: Recap: from Python to SQL
+level: 1
+lang: py
+cards: Why AI engineers need SQL; SELECT, AS, LIMIT, DISTINCT; WHERE: pick the rows you need
+--- context
+Once Clause Check is live, review results no longer sit in a Python list; each one is stored as a row of the `reviews` table in the database. Code like Day 2's "pick out the high-risk clauses" has to be written in SQL once the data lives in a database.
+--- prompt
+On Day 2 you used the line below to pick data out of a "list of dictionaries". `reviews` is a list of dictionaries, and each dictionary's keys are the same as the column names of today's `reviews` table. Which SQL query does the same thing?
+--- code
+high = [r["clause_id"] for r in reviews if r["risk"] == "high"]
+--- options
+- `SELECT clause_id FROM reviews WHERE risk = 'high'`
+- `SELECT clause_id FROM reviews IF risk == 'high'`
+- `SELECT * FROM reviews WHERE risk = 'high'`
+- `FROM reviews SELECT clause_id WHERE risk = 'high'`
+answer: 1
+--- explain
+The part of the list comprehension before `for` (`r["clause_id"]`) matches the columns after `SELECT`, and `if` matches `WHERE`. SQL compares with one equals sign and puts text in single quotes. `SELECT *` returns every column of the row, while the Python version takes only `clause_id`. The order of the parts of a SQL query is fixed: SELECT → FROM → WHERE; you can't swap them around.
+
+@@ item d22-02
+type: sql
+title: Pick columns and compute one
+level: 1
+cards: SELECT, AS, LIMIT, DISTINCT
+--- context
+The `contracts` table records every contract customers upload: its title and page count. When the head of legal plans the work, they want to know roughly how long each contract takes to read. The table has no such column, so it has to be computed in the query.
+--- prompt
+A lawyer needs about 2 minutes to read a page. Return every contract in the `contracts` table, three columns: `id`, `title`, and `review_minutes` (= `pages * 2`). Row order doesn't matter.
+--- starter
+-- Still missing two columns: title and review_minutes
+SELECT id
+FROM contracts;
+--- solution
+SELECT id, title, pages * 2 AS review_minutes
+FROM contracts;
+--- hints
+- Separate columns with commas; no comma after the last column.
+- Name a computed column with `AS`: `pages * 2 AS review_minutes`.
+
+@@ item d22-03
+type: sql
+title: High risk and must be rewritten
+level: 1
+cards: WHERE: pick the rows you need
+--- context
+The `reviews` table has one row per clause review, including the model's verdict and risk. Nobody reads 65 rows one by one: the head of legal first wants the most urgent ones picked out.
+--- prompt
+The head of legal wants to see the most serious ones first: reviews where `risk` is `high` **and** `verdict` is `redline`. Return four columns: `id`, `contract_id`, `clause_id`, `heading`. Row order doesn't matter.
+
+When you're done, look at the result: what are these clauses about?
+--- starter
+SELECT id, contract_id, clause_id, heading
+FROM reviews;
+--- solution
+SELECT id, contract_id, clause_id, heading
+FROM reviews
+WHERE risk = 'high' AND verdict = 'redline';
+--- hints
+- Add `WHERE` after FROM; both conditions must be true, so join them with `AND`.
+- Text goes in single quotes, and a comparison uses just one equals sign: `risk = 'high'`.
+
+@@ item d22-04
+type: choice
+title: BETWEEN and times
+level: 2
+cards: WHERE: pick the rows you need
+--- context
+Operations often asks "which reviews were done in these few days?". Filtering by a time range is one of the most common queries on a dashboard (a page of statistics for managers).
+--- prompt
+There are 3 reviews on September 2 and 8 on September 5, and none on September 3 and 4. `created_at` is text like `'2026-09-05 13:17:04'`. How many rows does this query return?
+--- code
+SELECT id, created_at
+FROM reviews
+WHERE created_at BETWEEN '2026-09-02' AND '2026-09-05';
+--- options
+- 11 rows
+- 3 rows
+- 8 rows
+- 0 rows: a date can't be compared with text that includes a time
+answer: 2
+--- explain
+`BETWEEN a AND b` means `>= a AND <= b`. `'2026-09-05 13:17:04'` has the same first 10 characters as `'2026-09-05'`, but it is longer, so it is larger: all 8 reviews from September 5 are left out, and only the 3 from September 2 remain. The safe way to ask for "from one day to another, including the last day" is a **half-open range** (include the start, exclude the end): `created_at >= '2026-09-02' AND created_at < '2026-09-06'`. The real time types in Postgres and BigQuery have the same trap: `'2026-09-05'` is read as midnight at the start of September 5.
+
+@@ item d22-05
+type: sql
+title: Several topics in a time range
+level: 2
+cards: WHERE: pick the rows you need
+--- context
+Suppose a customer reports that in the first few days of September, several kinds of clauses may have been reviewed wrongly, and all of them need to be found and checked again. Filtering by "time range + clause topic" is the most common query when you track down a problem.
+--- prompt
+Among the reviews created from September 2 to September 5 (**including all of September 5**), which ones have `topic` `payment`, `liability_cap` or `data_processing`? Return three columns: `id`, `topic`, `created_at`. Row order doesn't matter.
+--- solution
+SELECT id, topic, created_at
+FROM reviews
+WHERE topic IN ('payment', 'liability_cap', 'data_processing')
+  AND created_at >= '2026-09-02'
+  AND created_at < '2026-09-06';
+--- hints
+- "Equal to any one of three values": `topic IN ('payment', 'liability_cap', 'data_processing')`.
+- The trap from the previous exercise: `<= '2026-09-05'` misses the records from September 5 itself, because they include a time.
+- Include the start, exclude the end: `created_at >= '2026-09-02' AND created_at < '2026-09-06'`.
+
+@@ item d22-06
+type: sql
+title: Fix the bug: missing parentheses
+level: 2
+cards: WHERE: pick the rows you need
+--- context
+A colleague is preparing a list of "termination and renewal clauses" to check again, only the ones the model did not accept. Clauses that were already accepted got mixed into the list, so the lawyer has to read several extra clauses for nothing.
+--- prompt
+Your colleague wants "reviews about termination or renewal that are **not** accept": `heading` contains `Termination` or `Renewal`, and `verdict` is not `accept`. But the query returns several accept rows.
+
+Run it, look at the `verdict` column in the result, and fix it. The returned columns stay the same: `id`, `heading`, `verdict`.
+--- starter
+SELECT id, heading, verdict
+FROM reviews
+WHERE heading LIKE '%Termination%'
+   OR heading LIKE '%Renewal%'
+  AND verdict <> 'accept';
+--- solution
+SELECT id, heading, verdict
+FROM reviews
+WHERE (heading LIKE '%Termination%' OR heading LIKE '%Renewal%')
+  AND verdict <> 'accept';
+--- hints
+- `AND` is evaluated before `OR`. So right now the condition is really: contains Termination, **or** (contains Renewal and is not accept).
+- Put the two LIKEs in parentheses: `WHERE (... OR ...) AND verdict <> 'accept'`.
+
+@@ item d22-07
+type: sql
+title: Fix the bug: the failed ones can't be found
+level: 1
+cards: NULL: unknown
+--- context
+A clause whose review failed (for example, the model's answer didn't pass validation, or it kept being rejected by the rate limit) gets no verdict. The on-call engineer has to find these and run them again; miss one, and that clause has in effect never been reviewed.
+--- prompt
+The on-call engineer wants to find every failed review (`verdict` is NULL) and look at the errors. The query below returns no rows at all, yet the table clearly has failed records. Fix it, and return `id`, `contract_id`, `clause_id`, `error`.
+
+Once it is fixed, read the two `error` values: one is model output that didn't pass validation (Pydantic from Day 4), the other is still a 429 after 3 retries.
+--- starter
+SELECT id, contract_id, clause_id, error
+FROM reviews
+WHERE verdict = NULL;
+--- solution
+SELECT id, contract_id, clause_id, error
+FROM reviews
+WHERE verdict IS NULL;
+--- hints
+- Comparing with NULL using `=` gives "unknown", and WHERE keeps only the rows where the condition is "true".
+- Change it to `verdict IS NULL`.
+
+@@ item d22-08
+type: choice
+title: NULL and not-equal
+level: 2
+cards: NULL: unknown; Aggregates: turn many rows into one number
+--- context
+The dashboard should show "how many reviews the model did not accept". Someone quickly wrote the query below. Before it goes live, work out exactly how many rows it will count.
+--- prompt
+`reviews` has 65 rows in total: 37 accept, 14 flag, 12 redline, and 2 failed reviews (`verdict` is NULL). What number does this query return?
+--- code
+SELECT COUNT(*)
+FROM reviews
+WHERE verdict <> 'accept';
+--- options
+- 28
+- 26
+- 65
+- 0
+answer: 2
+--- explain
+The two failed rows have NULL in `verdict`. `NULL <> 'accept'` gives "unknown", not "true", so WHERE drops them: 14 + 12 = 26. If what you want is "everything a person needs to look at" (including the failed ones), write `verdict <> 'accept' OR verdict IS NULL`. This kind of bug raises no error; the number just quietly gets smaller, which is why interviewers love to ask about it.
+
+@@ item d22-09
+type: sql
+title: Give the failed ones a name
+level: 2
+cards: NULL: unknown
+--- context
+This status table is for the customer, and contracts 106 and 109 both have clauses whose review failed. If the status cell is empty, the customer will think those clauses were skipped, and the row can't be counted together with the other statuses.
+--- prompt
+You need to build a status table for the customer. Return all reviews of contracts 106 and 109, three columns: `id`, `clause_id`, `status`. If there is a verdict, `status` is the verdict; if the review failed (verdict is NULL), `status` is `'failed'`. Row order doesn't matter.
+--- solution
+SELECT id, clause_id, COALESCE(verdict, 'failed') AS status
+FROM reviews
+WHERE contract_id IN (106, 109);
+--- hints
+- Two contracts: `contract_id IN (106, 109)`. Numbers don't get quotes.
+- `COALESCE(verdict, 'failed')` returns the first value that is not NULL; don't forget `AS status`.
+
+@@ item d22-10
+type: sql
+title: The 5 most expensive reviews
+level: 2
+ordered: yes
+cards: ORDER BY: sorting and top N
+--- context
+Every review pays for a model call, and the cost is recorded in the `cost_usd` column. To save money, first find which reviews most of the money went to, then look into the reasons one by one.
+--- prompt
+Return the 5 reviews with the highest `cost_usd`, six columns: `id`, `contract_id`, `clause_id`, `model`, `cache_hit_tokens`, `cost_usd`, from most to least expensive.
+
+When you're done, look at the `model` and `cache_hit_tokens` columns: why are the top 3 the most expensive? And the last 2? (Think of the prefix cache from Day 12.)
+--- solution
+SELECT id, contract_id, clause_id, model, cache_hit_tokens, cost_usd
+FROM reviews
+ORDER BY cost_usd DESC
+LIMIT 5;
+--- hints
+- `ORDER BY cost_usd DESC` for largest first, then `LIMIT 5`.
+- The order you write it in: `SELECT … FROM … ORDER BY … LIMIT …`.
+- The top 3 use the large model `deepseek-v4-pro`: its price is much higher (the sample table uses peak prices: output costs $3.96 per million tokens, versus $1.20 for flash; the official pricing page has the final word (2026-09)), and it also outputs more tokens, so even with cache hits these are the most expensive. The last 2 are flash with `cache_hit_tokens` 0: each is the **first** review of its contract, and the previous request was days earlier. DeepSeek usually clears a cache that is no longer used within a few hours to a few days, so this time the whole input is billed at the "miss" price. The later clauses of the same contract are sent right after it, and their requests start the same way as the one before (Day 12: put what doesn't change first), so they are much cheaper.
+
+@@ item d22-11
+type: sql
+title: Fix the bug: 10.1 comes first
+level: 2
+ordered: yes
+cards: ORDER BY: sorting and top N
+--- context
+The report has to list clauses in the order of the original contract, so the lawyer can read down the original one clause at a time. If the order is scrambled, the lawyer has to flip back and forth through the contract.
+--- prompt
+The report should list the reviews of contract 101: `clause_id`, `heading`, `verdict`, in the **numeric** order of the clause numbers (3.1, 3.5, 4.2 … 9.2, 10.1, 11.2 …). The query below puts 10.1 first. Run it, look at the order, and fix it.
+
+In this contract, every clause number has only one digit after the dot.
+--- starter
+SELECT clause_id, heading, verdict
+FROM reviews
+WHERE contract_id = 101
+ORDER BY clause_id;
+--- solution
+SELECT clause_id, heading, verdict
+FROM reviews
+WHERE contract_id = 101
+ORDER BY CAST(clause_id AS REAL);
+--- hints
+- `clause_id` is text, and text is compared character by character: `'1' < '3'`, so `'10.1'` sorts before `'3.1'`.
+- Sorting by `id` doesn't work either: the review of 9.1 (1008) was written to the table later than the one of 10.1 (1007).
+- Convert to a number when you sort: `ORDER BY CAST(clause_id AS REAL)`.
+
+@@ item d22-12
+type: choice
+title: Three kinds of COUNT
+level: 2
+cards: Aggregates: turn many rows into one number; NULL: unknown
+--- context
+On the dashboard, every contract has a few counts next to it. They are all called COUNT, but what you write inside the parentheses changes what gets counted; mix them up and the numbers on the dashboard won't match reality.
+--- prompt
+Contract 109 has 3 reviews: 3.1 is accept; 8.1 failed the first time (verdict is NULL) and got accept when it was run again. What does this query return?
+--- code
+SELECT COUNT(*), COUNT(verdict), COUNT(DISTINCT verdict)
+FROM reviews
+WHERE contract_id = 109;
+--- options
+- `3, 2, 1`
+- `3, 3, 2`
+- `3, 2, 2`
+- `2, 2, 1`
+answer: 1
+--- explain
+`COUNT(*)` counts rows: 3. `COUNT(verdict)` counts only the rows where verdict is not NULL: 2. `COUNT(DISTINCT verdict)` counts the different non-NULL values: there is only accept, so 1; NULL doesn't count as a value. When you build a report, be clear about which COUNT means "how many were reviewed" and which means "how many succeeded".
+
+@@ item d22-13
+type: sql
+title: How many of each verdict
+level: 2
+ordered: yes
+cards: GROUP BY and HAVING; Aggregates: turn many rows into one number
+--- context
+How many clauses were accepted, flagged and redlined is the most basic summary of the review results, and the report opens with these numbers. On Day 2 you counted the same thing with a dictionary; now let the database do the counting.
+--- prompt
+Return how many reviews each `verdict` has, two columns: `verdict`, `n`, with the largest `n` first. The failed reviews (verdict is NULL) form a group of their own; keep that group.
+--- solution
+SELECT verdict, COUNT(*) AS n
+FROM reviews
+GROUP BY verdict
+ORDER BY n DESC;
+--- hints
+- `GROUP BY verdict`: one row per verdict.
+- Use `COUNT(*)`, not `COUNT(verdict)`: the latter is 0 for the NULL group.
+- `ORDER BY n DESC`: ORDER BY can use an alias defined in SELECT directly.
+
+@@ item d22-14
+type: sql
+title: Fix the bug: the hit ratio is 0
+level: 2
+ordered: yes
+cards: Aggregates: turn many rows into one number; GROUP BY and HAVING
+--- context
+Day 12 covered the prefix cache: input tokens that hit the cache are cheaper (the model bills by token). To decide whether prompt v1 or v2 saves more money, the cache hit ratio is the key number; get it wrong and you can't compare them.
+--- prompt
+You want to compare the **cache hit ratio** of the two prompt versions: input tokens that hit the cache ÷ all input tokens, that is, `SUM(cache_hit_tokens) / SUM(prompt_tokens)`. The query below gives 0 for both versions.
+
+Run it and fix it: two columns, `prompt_version` and `hit_ratio`, with `hit_ratio` rounded to 3 decimal places, sorted by `prompt_version`.
+--- starter
+SELECT prompt_version,
+       SUM(cache_hit_tokens) / SUM(prompt_tokens) AS hit_ratio
+FROM reviews
+GROUP BY prompt_version
+ORDER BY prompt_version;
+--- solution
+SELECT prompt_version,
+       ROUND(1.0 * SUM(cache_hit_tokens) / SUM(prompt_tokens), 3) AS hit_ratio
+FROM reviews
+GROUP BY prompt_version
+ORDER BY prompt_version;
+--- hints
+- When an integer is divided by an integer, SQLite and Postgres simply throw away the decimal part: 37070 / 63146 = 0.
+- Multiply by `1.0` first to make it a decimal, then divide, and `1.0` has to go at the very front: `1.0 * SUM(cache_hit_tokens) / SUM(prompt_tokens)`. At the end (`... / SUM(prompt_tokens) * 1.0`) it comes too late: by then the result is already 0.
+- Wrap it all in `ROUND(..., 3)`.
+
+@@ item d22-15
+type: sql
+title: Find duplicate reviews
+level: 2
+ordered: yes
+cards: GROUP BY and HAVING
+--- context
+Each clause of a contract should be reviewed only once, but running failed clauses again, or reviewing again with a new prompt version, adds extra rows. Duplicate rows make the statistics count too much, so first find out where the duplicates are.
+--- prompt
+The same clause of the same contract should be reviewed only once. Find the "contract + clause" pairs that were reviewed **more than once**: three columns, `contract_id`, `clause_id` and `n` (the number of times), sorted by `contract_id`.
+
+Finding duplicates comes up again and again in SQL interview questions. Tomorrow you'll keep working on them: keep only the latest review of each clause.
+--- solution
+SELECT contract_id, clause_id, COUNT(*) AS n
+FROM reviews
+GROUP BY contract_id, clause_id
+HAVING COUNT(*) > 1
+ORDER BY contract_id;
+--- hints
+- Group by two columns: `GROUP BY contract_id, clause_id`; each "contract + clause" combination is one group.
+- To filter **groups**, use `HAVING`: `HAVING COUNT(*) > 1`.
+
+@@ item d22-16
+type: choice
+title: WHERE or HAVING
+level: 2
+cards: GROUP BY and HAVING; WHERE: pick the rows you need
+--- context
+Legal wants to know which topics (payment, liability cap…) the high-risk reviews are concentrated in, leaving out topics that showed up only once here and there. This kind of statistic is common both on dashboards and in interview questions.
+--- prompt
+You want "the number of high-risk reviews in each topic, listing only topics with at least 2". Which query is correct and also works in SQLite, Postgres and BigQuery?
+--- options
+- `SELECT topic, COUNT(*) AS n FROM reviews WHERE risk = 'high' GROUP BY topic HAVING COUNT(*) >= 2`
+- `SELECT topic, COUNT(*) AS n FROM reviews WHERE risk = 'high' AND COUNT(*) >= 2 GROUP BY topic`
+- `SELECT topic, COUNT(*) AS n FROM reviews GROUP BY topic HAVING risk = 'high' AND COUNT(*) >= 2`
+- `SELECT topic, COUNT(*) AS n FROM reviews WHERE n >= 2 AND risk = 'high' GROUP BY topic`
+answer: 1
+--- explain
+The execution order is FROM → WHERE → GROUP BY → HAVING → SELECT. `risk = 'high'` is a condition on **rows**: put it in WHERE to filter out rows first. `COUNT(*) >= 2` is a condition on **groups**, known only after grouping, so it can only go in HAVING. The correct result is liability_cap with 7 and data_processing with 2.
+
+Options 2 and 4: when WHERE runs, there are no groups yet, so it can't use an aggregate function, and the alias `n` doesn't exist yet either: error. Option 3 is the most dangerous: `risk` is neither grouped nor aggregated. Postgres and BigQuery raise an error, but SQLite quietly takes the risk of any one row in the group to decide, returns liability_cap with 12 (every review of that topic), and raises no error.
+
+@@ item d22-17
+type: fill
+title: Fill in: the topics with the most problems
+level: 2
+ordered: yes
+cards: GROUP BY and HAVING; Aggregates: turn many rows into one number
+--- context
+Both flag and redline are clauses a lawyer has to spend time on. Seeing which topics have the most problems, and how many contracts they are spread across, tells you which kinds of clauses take up most of the lawyers' time.
+--- prompt
+Complete the query: look only at flag and redline reviews, one row per topic. `contracts` is how many **different** contracts the topic appears in, and `problems` is how many reviews there are in total; keep only topics with at least 3.
+--- template
+SELECT topic,
+       COUNT([[DISTINCT]] contract_id) AS contracts,
+       COUNT(*) AS problems
+FROM reviews
+WHERE verdict [[IN]] ('flag', 'redline')
+[[GROUP BY]] topic
+[[HAVING]] COUNT(*) >= 3
+ORDER BY problems DESC, topic;
+--- hints
+- "How many different contracts": `COUNT(DISTINCT contract_id)`.
+- "Equal to any one of them" is `IN`.
+- Group first, then filter the groups: `GROUP BY` comes first, `HAVING` after it.
+
+@@ item d22-18
+type: order
+title: Put a whole query in order
+level: 2
+cards: GROUP BY and HAVING; ORDER BY: sorting and top N
+--- context
+The dashboard needs a small "top three topics by number of reviews" table, so the manager can see at a glance which kind of clause is most common in the contracts. It combines several things you learned today into one complete query.
+--- prompt
+Put this query in order: not counting failed reviews, how many reviews each topic has; only topics with at least 5; the most first, and ties sorted by topic name; only the top 3. Two of the lines are distractors.
+--- lines
+SELECT topic, COUNT(*) AS n
+FROM reviews
+WHERE verdict IS NOT NULL
+GROUP BY topic
+HAVING COUNT(*) >= 5
+ORDER BY n DESC, topic
+LIMIT 3;
+--- distractors
+WHERE COUNT(*) >= 5
+GROUP BY n
+--- hints
+- The order you write it in is fixed: SELECT → FROM → WHERE → GROUP BY → HAVING → ORDER BY → LIMIT.
+- Aggregate functions can't go in WHERE, and you can't group by the aggregated `n`.
+
+@@ item d22-19
+type: sql
+title: Redline share per contract
+level: 3
+ordered: yes
+cards: CASE WHEN: labels and conditional counts; Aggregates: turn many rows into one number
+--- context
+The head of legal wants to give each contract a "how hard to negotiate" score: the share of clauses the model suggests rewriting. Contracts with a high share need more time set aside for negotiation.
+--- prompt
+One row per contract, four columns:
+
+- `contract_id`
+- `reviews`: the number of reviews (including failed ones)
+- `redlines`: how many of them are redline
+- `redline_share`: redlines ÷ reviews, rounded to 2 decimal places
+
+Sort by `redline_share` from highest to lowest, and ties by `contract_id` from smallest to largest.
+
+When you're done, look at the first one: how many reviews does it have in total? With a small sample, a share easily swings up and down, so a report should show the count next to it.
+--- solution
+SELECT contract_id,
+       COUNT(*) AS reviews,
+       SUM(CASE WHEN verdict = 'redline' THEN 1 ELSE 0 END) AS redlines,
+       ROUND(1.0 * SUM(CASE WHEN verdict = 'redline' THEN 1 ELSE 0 END) / COUNT(*), 2) AS redline_share
+FROM reviews
+GROUP BY contract_id
+ORDER BY redline_share DESC, contract_id;
+--- hints
+- Conditional count: `SUM(CASE WHEN verdict = 'redline' THEN 1 ELSE 0 END)`, or `COUNT(*) FILTER (WHERE verdict = 'redline')`.
+- Other columns in the same SELECT can't refer to the alias `redlines`, so write the CASE again to compute the share.
+- Don't forget integer division: `ROUND(1.0 * (number of redlines) / COUNT(*), 2)`; at the end, `ORDER BY redline_share DESC, contract_id`.
+
+@@ item d22-e1
+type: sql
+title: Closed book: usage per model
+exam: yes
+level: 3
+ordered: yes
+cards: Aggregates: turn many rows into one number; GROUP BY and HAVING
+--- context
+In the sample database, most reviews use one model, and a few clauses were switched to another. The manager wants numbers to judge whether switching models was worth it.
+--- prompt
+Using the `reviews` table, return one row per model (`model`), four columns:
+
+- `model`
+- `reviews`: the number of reviews
+- `avg_latency_ms`: the average `latency_ms`, rounded to a whole number (use `ROUND(x)`)
+- `total_cost`: the sum of `cost_usd`, rounded to 6 decimal places
+
+Sort by `avg_latency_ms` from largest to smallest.
+--- solution
+SELECT model,
+       COUNT(*) AS reviews,
+       ROUND(AVG(latency_ms)) AS avg_latency_ms,
+       ROUND(SUM(cost_usd), 6) AS total_cost
+FROM reviews
+GROUP BY model
+ORDER BY avg_latency_ms DESC;
+
+@@ item d22-e2
+type: sql
+title: Closed book: contracts with high-risk clauses
+exam: yes
+level: 3
+ordered: yes
+cards: CASE WHEN: labels and conditional counts; GROUP BY and HAVING
+--- context
+Every week the head of legal sets priorities: contracts with high-risk clauses get a lawyer first, and the more high-risk clauses, the more urgent.
+--- prompt
+Using the `reviews` table, find the contracts that have at least one review with `risk` `'high'`. One row per contract, three columns:
+
+- `contract_id`
+- `reviews`: the number of **all** reviews of this contract
+- `high_risk`: how many of them have `risk` `'high'`
+
+Sort by `high_risk` from largest to smallest, and ties by `contract_id` from smallest to largest.
+--- solution
+SELECT contract_id,
+       COUNT(*) AS reviews,
+       SUM(CASE WHEN risk = 'high' THEN 1 ELSE 0 END) AS high_risk
+FROM reviews
+GROUP BY contract_id
+HAVING SUM(CASE WHEN risk = 'high' THEN 1 ELSE 0 END) >= 1
+ORDER BY high_risk DESC, contract_id;
+
+@@ item d22-e3
+type: sql
+title: Closed book: the queue for human review
+exam: yes
+level: 3
+ordered: yes
+cards: NULL: unknown; ORDER BY: sorting and top N
+--- context
+When lawyers start work each day, the first thing they open is their to-do queue: the newest clauses that need a person to decide sit at the top.
+--- prompt
+Using the `reviews` table, list the reviews a person needs to look at: `verdict` is `'flag'`, or the review failed (`verdict` is NULL). Only the **5 newest**, four columns:
+
+- `id`
+- `clause_id`
+- `status`: `'failed'` for a failed review, otherwise the verdict
+- `created_at`
+
+Sort by `created_at` from newest to oldest.
+--- solution
+SELECT id,
+       clause_id,
+       COALESCE(verdict, 'failed') AS status,
+       created_at
+FROM reviews
+WHERE verdict = 'flag' OR verdict IS NULL
+ORDER BY created_at DESC
+LIMIT 5;
