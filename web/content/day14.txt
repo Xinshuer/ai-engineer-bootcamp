@@ -1,0 +1,1860 @@
+@@ day 14
+title: 第 2 周项目：mini Clause Check 命令行工具 + 周考
+lang: py
+hours: 6 小时
+--- goal
+把这一周学的东西拼成一个真正能跑的小程序：读合同文件 → 拆条款 → 逐条调模型（结构化输出 + 校验 + 重试）→ 汇总 → 写 JSON 报告 → 命令行入口。每一块都和 Clause Check 里同名的文件对应（`models.py`、`split.py`、`review.py`、`pipeline.py`、`cli.py`），最后在本机用真的 DeepSeek 跑一遍。然后是 5 题 60 分钟的第 2 周周考。
+--- checklist
+- 先清空复习区
+- 项目 P1–P7 全部通过：一块一块来，每块先运行、看到结果再提交
+- 本机任务：把 mini 工具放进文件，用真 DeepSeek 跑一遍，和真实项目的 counts 对比
+- 周考 5 题至少过 3 题
+- 对着「周复盘」卡片，说出本周每个概念在 Clause Check 的哪个文件里
+
+@@ concept
+title: 项目怎么拆：五个文件，三种数据
+--- body
+真实项目不会把所有代码写在一个函数里，而是按「一个文件只做一件事」来拆。mini 版和 Clause Check 用同样的文件名：
+
+- `models.py`：数据长什么样（`Clause`、`Verdict`、`ClauseReview`）
+- `split.py`：读文件、拆条款。纯代码，不调模型
+- `review.py`：**唯一**调模型的地方：发请求、校验、重试
+- `pipeline.py`：把前面串起来，汇总，写报告
+- `cli.py`：解析命令行参数，调用 pipeline，返回退出码
+
+数据在文件之间这样流动：合同全文 `str` → `list[Clause]` → `list[ClauseReview]` → 报告 `dict` → JSON 文件。**自己产生的数据用 dataclass**（轻，不校验）；**从外面来的数据用 Pydantic**（模型的回答随时可能不合规矩，必须校验）。
+--- code
+from dataclasses import dataclass, asdict
+from typing import Literal
+from pydantic import BaseModel
+
+@dataclass
+class Clause:              # split.py 产出：自己的数据，不需要校验
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):  # 模型的回答：外来数据，必须校验
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:        # review.py 产出，pipeline.py 汇总
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+c = Clause("8.1", "Cap on Liability", "Customer's liability shall be unlimited.")
+raw = '{"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "topic": "liability_cap", "rationale": "no cap"}'
+v = Verdict.model_validate_json(raw)
+r = ClauseReview(c.id, v.verdict, v.risk_level, 180)
+print(c)
+print(v.verdict, v.risk_level)
+print(asdict(r))
+
+@@ concept
+title: 从小到大：先让一条跑通
+mock: yes
+--- body
+最容易失败的做法：一口气写完五个文件再运行，然后对着一屏报错不知道从哪查起。
+
+正确的顺序：
+
+1. 先写死**一条**条款，走完「调模型 → 校验 → 打印」，亲眼看到正确的结果
+2. 跑通了，再换成循环，跑三条
+3. 再一块一块加：重试、汇总、写报告、命令行参数
+
+每加一块就运行一次。这样出错时，你只需要看**刚加的那几行**。今天的 P1–P7 就是按这个顺序排的。
+--- code
+import os
+import requests
+from typing import Literal
+from pydantic import BaseModel
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+def review_one(clause_id, text):
+    body = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": f"Review clause {clause_id}: {text}"}],
+        "response_format": {"type": "json_object"},
+    }
+    data = requests.post(API_URL, headers=HEADERS, json=body, timeout=60).json()
+    return Verdict.model_validate_json(data["choices"][0]["message"]["content"])
+
+# 第 1 步：写死一条，先看到结果
+print(review_one("8.1", "Customer's liability shall be unlimited."))
+
+# 第 2 步：一条跑通了，再换成循环
+for cid, text in [("3.1", "Fees are payable within thirty days."), ("4.2", "Renews for twenty-four (24) months.")]:
+    v = review_one(cid, text)
+    print(cid, v.verdict, v.risk_level)
+
+@@ concept
+title: 校验放在「门口」
+--- body
+程序的数据从三个门口进来：**文件**（可能不存在、是空的）、**模型的回答**（可能不是 JSON、值不合法）、**命令行参数**（可能拼错）。
+
+在门口检查一次：不合格就立刻报一个说得清楚的错（或者让模型重答）。进了门的数据就是可信的，里面的函数不用再到处写 `if`。
+
+- 文件：`read_contract` 里检查，报 `FileNotFoundError` / `ValueError`
+- 模型：`review_clause` 里用 Pydantic 校验，失败就把错误告诉模型，让它再答一次
+- 参数：argparse 的 `choices` 替你检查
+
+常见错误：模型的回答不校验就往下传，直到 `summarise` 排序时才因为一个 `"HIGH"` 报 `KeyError`，这时离真正出错的地方已经很远了。
+--- code
+import argparse
+import json
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+
+class Verdict(BaseModel):
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+raw = '{"verdict": "flag", "risk_level": "HIGH"}'   # 模型写成了大写
+
+# 不在门口校验：到排序时才出错，离原因很远
+try:
+    RISK_RANK[json.loads(raw)["risk_level"]]
+except KeyError as e:
+    print("summarise 里才发现:", repr(e))
+
+# 在门口校验：一拿到回答就知道哪里不对
+try:
+    Verdict.model_validate_json(raw)
+except ValidationError as e:
+    print("review 里就发现:", e.errors()[0]["loc"], e.errors()[0]["msg"])
+
+# 命令行参数：choices 就是门口的检查
+parser = argparse.ArgumentParser(prog="minicheck")
+parser.add_argument("--only-risk", choices=["low", "medium", "high"])
+try:
+    parser.parse_args(["--only-risk", "urgent"])
+except SystemExit as e:
+    print("argparse 拒绝了，退出码", e.code)
+
+@@ concept
+title: 本机的样子：包、入口和 README
+--- body
+网页里一题一个文件。放到本机时，把它拆成一个**包**（一个文件夹，里面有 `__init__.py`）：
+
+```
+learn/minicheck/
+  __init__.py     空文件，表示「这是一个包」
+  __main__.py     from .cli import main  和  raise SystemExit(main())
+  models.py  split.py  review.py  pipeline.py  cli.py
+  README.md
+```
+
+- 同一个包里互相导入要加点：`from .split import read_contract`
+- `python -m minicheck ...` 运行的就是 `__main__.py`，和 `clausecheck/__main__.py` 一模一样
+- 真实的 `cli.py` 还多一层「子命令」（`review`、`clauses`，用 `add_subparsers` 做的），mini 版先不要
+
+**README 的运行说明写给三个月后的自己**：装什么、在哪放密钥、运行哪条命令、输出长什么样、怎么跑测试。每条命令都要复制过去就能跑。
+--- code
+steps = [
+    ("安装依赖", "python -m pip install requests pydantic python-dotenv"),
+    ("放密钥", "在仓库根目录的 .env 里写 DEEPSEEK_API_KEY=sk-...（.env 不进 git）"),
+    ("运行", "cd learn  然后  python -m minicheck ..\\data\\sample_contract.txt --out ..\\data\\mini.report.json"),
+    ("只导出高风险", "python -m minicheck ..\\data\\sample_contract.txt --only-risk high"),
+]
+lines = ["# minicheck", "", "逐条审查合同条款，输出 JSON 报告。", "", "## 怎么运行"]
+for i, (what, cmd) in enumerate(steps, 1):
+    lines.append(f"{i}. {what}：`{cmd}`")
+lines += ["", "## 输出长什么样", "counts={'accept': …, 'flag': …, 'redline': …} needs_attention=[…]"]
+print("\n".join(lines))
+
+@@ concept
+title: 周复盘：本周每个概念在哪个文件
+--- body
+面试官问任何一个概念，你都要能接一句「我在项目的某某文件里用过」：
+
+- 第 8 天 dataclass、多键排序 → `models.py`、`pipeline.py` 的 `summarise`
+- 第 9 天 写测试、调试 → `tests/*.py`、`evals/test_review.py`
+- 第 10 天 文件、命令行、环境变量 → `cli.py`、`split.load_contract`、`config.py`
+- 第 11 天 切块、检索 → `split.py`（按条款编号切块，每条就是一块）、`tools.py` 的 `lookup_playbook`
+- 第 12 天 结构化输出、提示词 → `review.py`（两版 prompt、JSON 不合格就再要一次）、`models.py` 的 `strict_schema`
+- 第 13 天 评测、追踪 → `evals/run_evals.py`（`high-risk recall`）、`evals/harness.py`、`tracing.py`（`@observe`）
+
+周考前把这张表对着项目文件过一遍：打开文件，找到那几行，用一句话说出它在做什么。
+--- code
+week2 = [
+    ("第 8 天", "dataclass、多键排序", "models.py、pipeline.summarise"),
+    ("第 9 天", "写测试、调试", "tests/*.py、evals/test_review.py"),
+    ("第 10 天", "文件、命令行、环境变量", "cli.py、split.load_contract、config.py"),
+    ("第 11 天", "切块、检索", "split.py、tools.py (lookup_playbook)"),
+    ("第 12 天", "结构化输出、提示词", "review.py、models.strict_schema"),
+    ("第 13 天", "评测、追踪", "evals/run_evals.py、evals/harness.py、tracing.py"),
+]
+for day, topic, files in week2:
+    print(f"{day}  {topic}  ->  {files}")
+
+@@ item d14-01
+type: predict
+title: 复习：编号怎么排序
+level: 1
+--- prompt
+复习第 8 天（dataclass、多键排序）：写出输出。注意字符串排序和按数字排序的区别。
+--- code
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+
+reviews = [
+    ClauseReview("10.1", "redline", "high"),
+    ClauseReview("3.2", "flag", "medium"),
+    ClauseReview("8.1", "redline", "high"),
+    ClauseReview("3.1", "accept", "low"),
+]
+print(sorted(r.clause_id for r in reviews))
+by_number = sorted(reviews, key=lambda r: tuple(int(x) for x in r.clause_id.split(".")))
+print([r.clause_id for r in by_number])
+urgent = sorted(reviews, key=lambda r: (RISK_RANK[r.risk], r.clause_id))
+print([r.clause_id for r in urgent])
+print(reviews[0])
+--- explain
+字符串是一个字符一个字符比的，`"1"` 比 `"8"` 小，所以 `"10.1"` 排在 `"8.1"` 前面。第三行的排序键里编号还是字符串，同样掉进了这个坑。今天的 `summarise` 会用整数元组 `(10, 1)` 来比较编号。最后一行是 dataclass 自动生成的 `__repr__`。
+
+@@ item d14-02
+type: choice
+title: 哪个改动放错了地方
+level: 1
+--- prompt
+你要给 mini Clause Check 加功能。下面哪个做法**破坏**了「一个文件只做一件事」？
+--- options
+- 在 `split.py` 里调用模型，让模型判断哪一行是条款标题
+- 在 `pipeline.py` 里加一个函数，把报告里的高风险条款挑出来
+- 在 `cli.py` 里加一个 `--only-risk` 参数，把它的值传给 pipeline
+- 在 `review.py` 里给模型请求加上 429 重试
+answer: 1
+--- explain
+拆条款是确定性的工作，一个正则就够：快、免费、每次结果一样、好测试。交给模型就变得又慢又花钱、偶尔出错，`split.py` 从此还离不开网络。Clause Check 的 `split.py` 第一行注释就写着「No model involved - this is a regex」。调模型的代码只放在 `review.py` 一个地方，另外三个选项都是在各自该在的文件里做事。
+
+@@ item d14-03
+type: code
+title: P1 读合同文件
+level: 1
+--- prompt
+**项目第 1 块（split.py）。** 写 `read_contract(path)`：读取合同文本文件（UTF-8），返回全文。
+
+- 文件不存在：`raise FileNotFoundError(f"contract not found: {path}")`
+- 文件里只有空白（空文件，或只有空格和换行）：`raise ValueError(f"contract is empty: {path}")`
+
+`path` 可能是字符串，也可能是 `Path`。例：`read_contract("work/d14/p1/c.txt")` → 文件的全部文字。
+--- starter
+from pathlib import Path
+
+def read_contract(path):
+    return ""
+--- solution
+from pathlib import Path
+
+def read_contract(path):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"contract not found: {path}")
+    text = p.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"contract is empty: {path}")
+    return text
+--- tests
+import shutil
+from pathlib import Path
+DIR = Path("work/d14/p1")
+shutil.rmtree(DIR, ignore_errors=True)
+DIR.mkdir(parents=True)
+(DIR / "c.txt").write_text("1 Scope\nThe Service is a note-taking tool.\n", encoding="utf-8")
+(DIR / "blank.txt").write_text("  \n\n ", encoding="utf-8")
+expect("正常读取", lambda: read_contract("work/d14/p1/c.txt"), "1 Scope\nThe Service is a note-taking tool.\n")
+expect("也接受 Path", lambda: read_contract(DIR / "c.txt").startswith("1 Scope"), True)
+def _missing():
+    try:
+        read_contract("work/d14/p1/missing.txt")
+    except FileNotFoundError as e:
+        return str(e)
+    return "没有报 FileNotFoundError"
+expect("文件不存在：FileNotFoundError，信息里有路径", _missing, "contract not found: work/d14/p1/missing.txt")
+expect_raises("只有空白：ValueError", lambda: read_contract("work/d14/p1/blank.txt"), ValueError)
+--- hints
+- `p = Path(path)` 把字符串变成路径对象；`p.exists()` 判断文件在不在，`p.read_text(encoding="utf-8")` 读全文。
+- 「只有空白」用 `text.strip()` 判断：去掉首尾空白后是空字符串，就是空的。
+- 先检查存在再读：`if not p.exists(): raise FileNotFoundError(f"contract not found: {path}")`。
+
+@@ item d14-04
+type: code
+title: P2 拆成 Clause
+level: 2
+--- prompt
+**项目第 2 块（split.py）。** 把第 7 天的拆条款改成返回 dataclass，并且更接近真实项目：
+
+- 标题行：去掉首尾空白后能匹配 `HEAD`（已给出，和 `clausecheck/split.py` 的正则一样：编号后面允许有一个点，比如 `1. Definitions`）
+- 标题下面、下一个标题之前的行是正文，用 `"\n"` 连起来再去掉首尾空白
+- **正文为空的标题不返回**（比如 `8. Limitation of Liability` 下面紧接着就是 `8.1`）：它们只是章节名，不需要审查。真实项目里对应的是 `Contract.reviewable`
+- 第一个标题之前的内容忽略
+
+返回 `list[Clause]`。例：`split_clauses("2. Fees\n2.1 Invoicing\nPay in 30 days.")` → `[Clause(id='2.1', heading='Invoicing', text='Pay in 30 days.')]`
+--- starter
+import re
+from dataclasses import dataclass
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+def split_clauses(text):
+    clauses = []
+    return clauses
+--- solution
+import re
+from dataclasses import dataclass
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+--- tests
+DOC = """CLOUDNOTES AGREEMENT
+Preamble, ignored.
+1. Fees
+1.1 Invoicing
+Fees are payable within thirty (30) days.
+1.2 Suspension
+Provider may suspend the Service
+without notice.
+10. Data
+10.1 Location
+Customer Data may be processed in any country."""
+expect("正文为空的章节标题不返回", lambda: [c.id for c in split_clauses(DOC)], ["1.1", "1.2", "10.1"])
+expect("返回 Clause 对象", lambda: split_clauses(DOC)[0], Clause("1.1", "Invoicing", "Fees are payable within thirty (30) days."))
+expect("多行正文用换行连起来", lambda: split_clauses(DOC)[1].text, "Provider may suspend the Service\nwithout notice.")
+expect("编号后面带点也认", lambda: [c.heading for c in split_clauses("3. Term\nOne year.")], ["Term"])
+expect("没有标题", lambda: split_clauses("just text\nmore text"), [])
+--- hints
+- 和第 7 天一样逐行扫描。不同的是「当前这一条」现在是一个 `Clause` 对象，dataclass 可以直接改字段：`current.text += line + "\n"`。
+- 扫描完再统一 `c.text = c.text.strip()`，最后用列表推导式只留下 `text` 不为空的。
+
+@@ item d14-05
+type: fill
+title: P3 前半：发请求
+level: 2
+mock: yes
+--- prompt
+**项目第 3 块（review.py）的前半。** `call_model(messages)` 把 messages 发给模型、要求 JSON 格式，返回**整个**回答字典（后面既要读 `content`，也要读 `usage`）：
+
+- 200：返回 `resp.json()`
+- 429 / 500 / 503：重试，一共最多 `max_attempts` 次
+- 其他状态码（400、401）：不重试，直接 `raise RuntimeError`
+- 次数用完：`raise RuntimeError`
+
+填空。这是第 4 天的重试，现在成了项目的一块。
+--- template
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    for _ in range([[max_attempts]]):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return [[resp.json()]]
+        if resp.status_code [[not in]] RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    [[raise]] RuntimeError(f"gave up after {max_attempts} attempts")
+--- tests
+MSGS = [{"role": "user", "content": "Review clause 8.1: liability is unlimited."}]
+def _ok():
+    MOCK.reset()
+    data = call_model(MSGS)
+    return [data["choices"][0]["finish_reason"], "usage" in data, len(MOCK.calls)]
+expect("成功：返回整个字典，只请求 1 次", _ok, ["stop", True, 1])
+def _retry():
+    MOCK.reset()
+    MOCK.fail_next(429, 2)
+    call_model(MSGS)
+    return len(MOCK.calls)
+expect("429 两次后成功（一共请求 3 次）", _retry, 3)
+def _down():
+    MOCK.reset()
+    MOCK.fail_next(503, 5)
+    try:
+        call_model(MSGS)
+    except RuntimeError:
+        return len(MOCK.calls)
+    return "没有报错"
+expect("一直 503：RuntimeError，只请求 3 次", _down, 3)
+def _auth():
+    MOCK.reset()
+    MOCK.fail_next(401)
+    try:
+        call_model(MSGS)
+    except RuntimeError:
+        return len(MOCK.calls)
+    return "没有报错"
+expect("401 不重试（只请求 1 次）", _auth, 1)
+--- hints
+- `range(次数)` 控制最多试几次；成功时返回的是整个字典，不只是 content。
+- 「不在元组里」写作 `not in`；循环正常走完说明次数用完了，这时要抛出错误。
+
+@@ item d14-06
+type: code
+title: P3 后半：校验和纠正
+level: 3
+mock: yes
+--- prompt
+**项目第 3 块的后半。** 写 `review_clause(clause, call=call_model)`，返回 `ClauseReview`（messages 和 tokens 的开头已经写好）：
+
+1. `data = call(messages)`，把 `data["usage"]["total_tokens"]` 累加到 `tokens`
+2. 用 `Verdict.model_validate_json(content)` 校验回答文字（`content` 在 `data["choices"][0]["message"]["content"]`）
+3. 校验失败（`ValidationError`）：先把模型的原话 `{"role": "assistant", "content": content}` 加进 messages，再加一条 user 消息，写上错误原因 `e.errors()[0]["msg"]` 并要求只回 JSON，然后再调用一次。**一共最多调用 2 次**，还不合法就 `raise RuntimeError`
+4. 合法：返回 `ClauseReview(clause.id, v.verdict, v.risk_level, tokens)`。编号用**我们自己的** `clause.id`，不用模型写的（真实 `review.py` 里也有这么一行：`verdict.clause_id = clause.clause_id`）
+
+`call` 默认就是 `call_model`；测试会传一个假的 `call` 进来，假装模型连着说两次废话。这就是第 13 天的「依赖注入」。真实项目还多做一步：两次都不合法时不报错，而是判成 `flag` 交给人，并在 trace 里记下 error。
+--- starter
+import os
+from dataclasses import dataclass
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+# ===== models.py =====
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+# ===== review.py =====
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+SYSTEM = ("You review one contract clause for the customer. Reply with a JSON object only, with the keys "
+          "clause_id, verdict (accept|flag|redline), risk_level (low|medium|high), topic, rationale.")
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    for _ in range(max_attempts):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+
+def review_clause(clause, call=call_model):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Review clause {clause.id}: {clause.text}"},
+    ]
+    tokens = 0
+    pass
+--- solution
+import os
+from dataclasses import dataclass
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+# ===== models.py =====
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+# ===== review.py =====
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+SYSTEM = ("You review one contract clause for the customer. Reply with a JSON object only, with the keys "
+          "clause_id, verdict (accept|flag|redline), risk_level (low|medium|high), topic, rationale.")
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    for _ in range(max_attempts):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+
+def review_clause(clause, call=call_model):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Review clause {clause.id}: {clause.text}"},
+    ]
+    tokens = 0
+    for _ in range(2):
+        data = call(messages)
+        tokens += data["usage"]["total_tokens"]
+        content = data["choices"][0]["message"]["content"]
+        try:
+            v = Verdict.model_validate_json(content)
+        except ValidationError as e:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Invalid reply: {e.errors()[0]['msg']}. Reply with the JSON object only."})
+            continue
+        return ClauseReview(clause.id, v.verdict, v.risk_level, tokens)
+    raise RuntimeError(f"clause {clause.id}: no valid JSON after 2 attempts")
+--- tests
+C81 = Clause("8.1", "Cap", "Customer's liability shall be unlimited.")
+GOOD = '{"clause_id": "unknown", "verdict": "flag", "risk_level": "medium", "topic": "payment", "rationale": "late fees"}'
+def fake(replies):
+    seen = []
+    def call(messages):
+        seen.append([m["role"] for m in messages])
+        return {"choices": [{"message": {"content": replies[len(seen) - 1]}}], "usage": {"total_tokens": 100}}
+    return call, seen
+def _normal():
+    MOCK.reset()
+    r = review_clause(C81)
+    return [r.clause_id, r.verdict, r.risk, r.tokens > 0, len(MOCK.calls)]
+expect("正常：一次请求，unlimited → redline / high", _normal, ["8.1", "redline", "high", True, 1])
+def _bad_json():
+    MOCK.reset()
+    r = review_clause(Clause("3.2", "Late Payment", "Late fees apply without notice. [bad-json]"))
+    return [r.clause_id, len(MOCK.calls), [m["role"] for m in MOCK.calls[-1]["body"]["messages"]]]
+expect("第一次回答夹了废话：纠正一次后成功", _bad_json, ["3.2", 2, ["system", "user", "assistant", "user"]])
+def _fake_once():
+    call, seen = fake(["Sure! Here you go: {", GOOD])
+    r = review_clause(C81, call=call)
+    return [r, seen]
+expect("编号用自己的 clause.id，tokens 两次相加", _fake_once, [ClauseReview("8.1", "flag", "medium", 200), [["system", "user"], ["system", "user", "assistant", "user"]]])
+def _fake_twice():
+    call, seen = fake(["oops", "still not json"])
+    return review_clause(C81, call=call)
+expect_raises("两次都不合法：RuntimeError", _fake_twice, RuntimeError)
+--- hints
+- 结构：`for _ in range(2):` 里「调用 → 累加 tokens → 取 content → try 校验」；成功就 `return`，失败就往 messages 里加两条再 `continue`。循环走完还没 return，就 `raise RuntimeError(...)`。
+- 模型的原话要原样放回去（role 是 `"assistant"`），它才知道自己上次说了什么；错误原因在 `e.errors()[0]["msg"]`。
+- 成功时：`return ClauseReview(clause.id, v.verdict, v.risk_level, tokens)`。
+
+@@ item d14-07
+type: choice
+title: 校验应该放在哪
+level: 2
+--- prompt
+模型偶尔会把 `risk_level` 写成 `"HIGH"`。这个检查应该放在哪里？
+--- options
+- 在 `summarise` 排序时，遇到不认识的值就当成 `low`
+- 在 `review_clause` 拿到回答后立刻用 Pydantic 校验，不合法就让模型重答；后面的代码只处理合法的 `ClauseReview`
+- 在 `write_report` 写文件之前，把所有字段统一检查一遍
+- 不用检查，prompt 里已经写了只能用小写
+answer: 2
+--- explain
+在数据**进门**的地方校验：离出错的原因最近，还能当场让模型重答。「当成 low」最危险：一条高风险条款会悄悄变成低风险，谁也发现不了。放到 `write_report` 太晚，而且错误的数据已经参与了汇总。prompt 写得再清楚，模型也会偶尔不听，所以代码里必须有这道关，Clause Check 的 `review.py` 就是这么做的。
+
+@@ item d14-08
+type: code
+title: P4 汇总
+level: 2
+--- prompt
+**项目第 4 块（pipeline.py）。** 写两个函数：
+
+- `id_key(clause_id)`：把 `"10.1"` 变成 `(10, 1)`，用来按数字排序编号
+- `summarise(reviews)`：`reviews` 是 `ClauseReview` 列表，返回下面这个字典
+
+```python
+{
+    "clauses": 条数,
+    "counts": {"accept": n, "flag": n, "redline": n},  # 三个键都要有，没出现的是 0
+    "needs_attention": [...],  # 非 accept 的编号：high → medium → low，同级按编号的数字顺序
+    "tokens": 所有 tokens 之和,
+}
+```
+
+例：`8.1` 和 `10.1` 都是 high 风险的 redline 时，`needs_attention` 是 `["8.1", "10.1"]`（按字符串排会把 `"10.1"` 放在前面，就是第 1 题的坑）。
+--- starter
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    pass
+
+def summarise(reviews):
+    pass
+--- solution
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+--- tests
+R = [
+    ClauseReview("10.1", "redline", "high", 300),
+    ClauseReview("3.1", "accept", "low", 120),
+    ClauseReview("3.2", "flag", "medium", 150),
+    ClauseReview("8.1", "redline", "high", 280),
+]
+expect("id_key", lambda: id_key("10.1"), (10, 1))
+expect("id_key 三层", lambda: id_key("2.10.3"), (2, 10, 3))
+expect("完整汇总", lambda: summarise(R), {"clauses": 4, "counts": {"accept": 1, "flag": 1, "redline": 2}, "needs_attention": ["8.1", "10.1", "3.2"], "tokens": 850})
+expect("没出现的判定也是 0", lambda: summarise(R[1:2])["counts"], {"accept": 1, "flag": 0, "redline": 0})
+expect("空列表", lambda: summarise([]), {"clauses": 0, "counts": {"accept": 0, "flag": 0, "redline": 0}, "needs_attention": [], "tokens": 0})
+--- hints
+- `id_key`：`tuple(int(x) for x in clause_id.split("."))`。
+- 排序键是一个元组：`key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id))`。两个部分都是从小到大，所以不需要 `reverse`。
+- `counts` 先写成 `{"accept": 0, "flag": 0, "redline": 0}`，再在循环里加 1。
+
+@@ item d14-09
+type: testwrite
+title: 给 summarise 写测试
+level: 3
+--- prompt
+下面的「被测函数」是正确的 `summarise`。给它写测试：你的测试在它上面要全部通过，同时要抓住藏起来的几个 bug 版本（每个 bug 版本都要让至少一个测试失败）。
+
+每个 `test_` 函数只测一件事：构造几条 `ClauseReview`，调用 `summarise`，再 `assert`。想一想：什么样的输入能暴露「编号排错了」「风险顺序反了」「漏了某种判定」「计数少了键」？
+--- impl
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+--- mutants
+===== 排序：编号 10.1 和 8.1 谁在前
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], r.clause_id))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+===== 计数：没出现的判定也要有 0
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {}
+    for r in reviews:
+        counts[r.verdict] = counts.get(r.verdict, 0) + 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+===== 需要人看的：flag 也算
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict == "redline"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+===== 风险顺序：high 要在最前面
+from dataclasses import dataclass
+
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)), reverse=True)
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+--- starter
+def test_counts():
+    reviews = [
+        ClauseReview("1.1", "accept", "low", 10),
+        ClauseReview("1.2", "flag", "medium", 10),
+        ClauseReview("2.1", "redline", "high", 10),
+    ]
+    assert summarise(reviews)["counts"] == {"accept": 1, "flag": 1, "redline": 1}
+--- solution
+def test_counts_include_zero():
+    s = summarise([ClauseReview("1.1", "accept", "low", 10)])
+    assert s["counts"] == {"accept": 1, "flag": 0, "redline": 0}
+
+def test_number_order_not_text_order():
+    reviews = [ClauseReview("10.1", "redline", "high", 10), ClauseReview("8.1", "redline", "high", 10)]
+    assert summarise(reviews)["needs_attention"] == ["8.1", "10.1"]
+
+def test_high_first_and_flag_included():
+    reviews = [
+        ClauseReview("1.2", "flag", "medium", 10),
+        ClauseReview("2.1", "redline", "high", 10),
+        ClauseReview("1.1", "accept", "low", 10),
+    ]
+    assert summarise(reviews)["needs_attention"] == ["2.1", "1.2"]
+
+def test_tokens_and_clauses():
+    s = summarise([ClauseReview("1.1", "accept", "low", 100), ClauseReview("1.2", "flag", "medium", 50)])
+    assert s["tokens"] == 150
+    assert s["clauses"] == 2
+--- hints
+- 一个测试只测一件事，名字说清楚测什么，比如 `test_number_order_not_text_order`。
+- 排序的测试要用「字符串顺序和数字顺序不一样」的编号（`"10.1"` 和 `"8.1"`）；风险顺序的测试要同时有 high 和 medium，而且故意把 medium 放在前面。
+- 计数的测试只放一种判定，看另外两个键是不是 0；再放一条 `flag`，看它有没有出现在 `needs_attention` 里。
+
+@@ item d14-10
+type: code
+title: P5 写报告文件
+level: 2
+--- prompt
+**项目第 5 块（pipeline.py）。** 写 `write_report(report, path)`：把字典 `report` 写成 JSON 文件，并返回这个文件的 `Path`。
+
+- 上级文件夹不存在就创建
+- `indent=2`、`ensure_ascii=False`（中文、瑞典语的 å 原样保存，律师打开能直接读），编码 UTF-8
+
+例：`write_report({"contract": "cloudnotes"}, "work/out/r.json")` → `Path("work/out/r.json")`，文件内容是缩进 2 格的 JSON。
+--- starter
+import json
+from pathlib import Path
+
+def write_report(report, path):
+    pass
+--- solution
+import json
+from pathlib import Path
+
+def write_report(report, path):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+--- tests
+import json
+import shutil
+from pathlib import Path
+REPORT = {"contract": "Molnavtal för Kund AB", "summary": {"counts": {"accept": 2, "flag": 1, "redline": 0}}, "note": "需要律师确认"}
+OUT = "work/d14/p5/2026/09/report.json"
+def _write():
+    shutil.rmtree("work/d14/p5", ignore_errors=True)
+    return write_report(REPORT, OUT)
+expect("返回 Path", _write, Path(OUT))
+expect("文件内容能读回原来的字典", lambda: (_write(), json.loads(Path(OUT).read_text(encoding="utf-8")))[1], REPORT)
+expect("缩进 2 格", lambda: (_write(), Path(OUT).read_text(encoding="utf-8").split("\n")[1])[1], '  "contract": "Molnavtal för Kund AB",')
+expect("中文原样保存，不是 \\u 转义", lambda: (_write(), "需要律师确认" in Path(OUT).read_text(encoding="utf-8"))[1], True)
+--- hints
+- `p = Path(path)`；上级文件夹是 `p.parent`，创建它：`p.parent.mkdir(parents=True, exist_ok=True)`。
+- 一行写文件：`p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")`，最后 `return p`。
+
+@@ item d14-11
+type: order
+title: 排代码：串起流水线
+level: 2
+--- prompt
+**把前面几块串起来（pipeline.py）。** 排出 `review_contract(path, review)`：读文件 → 拆条款 → 逐条审查 → 汇总 → 组装报告字典。
+
+`review` 参数是「审查一条条款的函数」：真正运行时传 `review_clause`，测试里传一个不调模型的假函数。前面几题写的函数都已经在了。有一行干扰项。
+--- lines
+from dataclasses import asdict
+from pathlib import Path
+def review_contract(path, review):
+    text = read_contract(path)
+    clauses = split_clauses(text)
+    reviews = [review(c) for c in clauses]
+    summary = summarise(reviews)
+    return {"contract": Path(path).stem, "summary": summary, "reviews": [asdict(r) for r in reviews]}
+--- distractors
+    clauses = split_clauses(path)
+--- tests
+import re
+import shutil
+from dataclasses import dataclass
+from pathlib import Path as _P
+_HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+def read_contract(path):
+    return _P(path).read_text(encoding="utf-8")
+def split_clauses(text):
+    clauses = []
+    for line in text.split("\n"):
+        m = _HEAD.match(line.strip())
+        if m:
+            clauses.append(Clause(m.group(1), m.group(2), ""))
+        elif clauses:
+            clauses[-1].text = (clauses[-1].text + "\n" + line).strip()
+    return [c for c in clauses if c.text]
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    return {"clauses": len(reviews), "counts": counts}
+def keyword_review(clause):
+    if "unlimited" in clause.text:
+        return ClauseReview(clause.id, "redline", "high", 100)
+    return ClauseReview(clause.id, "accept", "low", 50)
+shutil.rmtree("work/d14/order", ignore_errors=True)
+_P("work/d14/order").mkdir(parents=True)
+_P("work/d14/order/cloudnotes.txt").write_text("1. Fees\n1.1 Invoicing\nPay within 30 days.\n2. Liability\n2.1 Cap\nLiability is unlimited.\n", encoding="utf-8")
+_R = lambda: review_contract("work/d14/order/cloudnotes.txt", keyword_review)
+expect("合同名取自文件名", lambda: _R()["contract"], "cloudnotes")
+expect("汇总", lambda: _R()["summary"], {"clauses": 2, "counts": {"accept": 1, "flag": 0, "redline": 1}})
+expect("reviews 是字典列表", lambda: _R()["reviews"], [{"clause_id": "1.1", "verdict": "accept", "risk": "low", "tokens": 50}, {"clause_id": "2.1", "verdict": "redline", "risk": "high", "tokens": 100}])
+--- hints
+- 数据的形状一路在变：路径 → 全文 → `list[Clause]` → `list[ClauseReview]` → 报告字典。每一行的输入都是上一行的输出。
+- 干扰项把「路径」当成「全文」传给了 `split_clauses`。
+
+@@ item d14-12
+type: fix
+title: 修 bug：第二份合同混进了第一份
+level: 2
+--- prompt
+同事给网页服务（像 `clausecheck/api.py` 那样一直开着的进程）写了一个直接接收合同全文的 `review_text`。上线后律师投诉：**第二份合同的报告里混进了第一份合同的条款**。
+
+运行下面的代码，看两次打印的结果，找到原因并修好。（为了不调模型，这里用按关键词判断的 `keyword_review`。）
+
+为什么命令行里看不出来？因为每运行一次命令都是一个新进程；网页服务一直开着，同一个函数会被调用很多次。
+--- starter
+import re
+from dataclasses import dataclass, asdict
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+
+def keyword_review(clause):
+    if "unlimited" in clause.text:
+        return ClauseReview(clause.id, "redline", "high", 100)
+    return ClauseReview(clause.id, "accept", "low", 50)
+
+def review_text(text, review, reviews=[]):
+    for clause in split_clauses(text):
+        reviews.append(review(clause))
+    return {"clauses": len(reviews), "reviews": [asdict(r) for r in reviews]}
+
+first = review_text("1 Fees\nPay within 30 days.\n2 Cap\nLiability is unlimited.", keyword_review)
+second = review_text("1 Term\nOne year.", keyword_review)
+print(first["clauses"], [r["clause_id"] for r in first["reviews"]])
+print(second["clauses"], [r["clause_id"] for r in second["reviews"]])
+--- solution
+import re
+from dataclasses import dataclass, asdict
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+
+def keyword_review(clause):
+    if "unlimited" in clause.text:
+        return ClauseReview(clause.id, "redline", "high", 100)
+    return ClauseReview(clause.id, "accept", "low", 50)
+
+def review_text(text, review):
+    reviews = []
+    for clause in split_clauses(text):
+        reviews.append(review(clause))
+    return {"clauses": len(reviews), "reviews": [asdict(r) for r in reviews]}
+
+first = review_text("1 Fees\nPay within 30 days.\n2 Cap\nLiability is unlimited.", keyword_review)
+second = review_text("1 Term\nOne year.", keyword_review)
+print(first["clauses"], [r["clause_id"] for r in first["reviews"]])
+print(second["clauses"], [r["clause_id"] for r in second["reviews"]])
+--- tests
+A = "1 Fees\nPay within 30 days.\n2 Cap\nLiability is unlimited."
+B = "1 Term\nOne year."
+def _twice():
+    review_text(A, keyword_review)
+    return [r["clause_id"] for r in review_text(B, keyword_review)["reviews"]]
+expect("第二份合同只有它自己的条款", _twice, ["1"])
+expect("第一份合同 2 条", lambda: review_text(A, keyword_review)["clauses"], 2)
+expect("连续跑三次，每次结果一样", lambda: [review_text(B, keyword_review)["clauses"] for _ in range(3)], [1, 1, 1])
+--- hints
+- 默认参数的值只在 `def` 执行的那一刻创建**一次**，之后每次调用用的都是同一个列表（第 9 天的常见 bug 清单里有它）。
+- 最简单的修法：去掉这个参数，在函数里写 `reviews = []`。如果一定要保留参数，就用 `reviews=None`，再在函数里 `if reviews is None: reviews = []`。
+
+@@ item d14-13
+type: code
+title: P6 命令行参数
+level: 2
+--- prompt
+**项目第 6 块（cli.py）的前半。** 写 `build_parser()`，返回一个 `argparse.ArgumentParser`（`prog="minicheck"`），参数：
+
+- 位置参数 `path`：合同文件
+- `--out`：报告路径，默认 `"report.json"`
+- `--only-risk`：只能是 `low` / `medium` / `high`，默认 `None`
+
+注意：参数名里的 `-` 在结果里会变成 `_`，所以要读 `args.only_risk`。例：`build_parser().parse_args(["c.txt", "--only-risk", "high"]).only_risk` → `"high"`
+--- starter
+import argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicheck")
+    return parser
+--- solution
+import argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicheck", description="Review every clause of a contract.")
+    parser.add_argument("path", help="contract .txt file")
+    parser.add_argument("--out", default="report.json", help="report JSON path")
+    parser.add_argument("--only-risk", choices=["low", "medium", "high"], help="keep only reviews with this risk")
+    return parser
+--- tests
+_P = lambda argv: build_parser().parse_args(argv)
+expect("只给路径：其他用默认值", lambda: vars(_P(["contract.txt"])), {"path": "contract.txt", "out": "report.json", "only_risk": None})
+expect("所有参数", lambda: vars(_P(["c.txt", "--out", "work/r.json", "--only-risk", "high"])), {"path": "c.txt", "out": "work/r.json", "only_risk": "high"})
+expect_raises("风险等级拼错：argparse 退出", lambda: _P(["c.txt", "--only-risk", "urgent"]), SystemExit)
+expect_raises("缺少路径：argparse 退出", lambda: _P([]), SystemExit)
+--- hints
+- 位置参数：`parser.add_argument("path")`；可选参数：`parser.add_argument("--out", default="report.json")`。
+- 限定取值用 `choices=["low", "medium", "high"]`；不写 `default` 时，没给这个参数就是 `None`。
+
+@@ item d14-14
+type: predict
+title: asdict 之后是字典
+level: 2
+--- prompt
+写出输出。`asdict` 之后，每条审查变成了普通字典：取值要写 `r["risk"]`，不能再写 `r.risk`。下一题的 `--only-risk` 过滤就是在这种字典上做的。
+--- code
+from dataclasses import dataclass, asdict
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+reviews = [
+    ClauseReview("2.1", "redline", "high", 180),
+    ClauseReview("1.1", "accept", "low", 120),
+    ClauseReview("10.1", "redline", "high", 200),
+]
+report = {"reviews": [asdict(r) for r in reviews]}
+print(report["reviews"][1])
+kept = [r for r in report["reviews"] if r["risk"] == "high"]
+print([r["clause_id"] for r in kept], sum(r["tokens"] for r in kept))
+try:
+    print(report["reviews"][0].risk)
+except AttributeError as e:
+    print("AttributeError:", e)
+--- explain
+`asdict` 把 dataclass 变成字典，这样才能 `json.dumps`。代价是之后只能用 `["键"]` 取值，写成 `.risk` 就会得到 `AttributeError`：看到「'dict' object has no attribute」，第一反应就是「这已经是字典了」。
+
+@@ item d14-15
+type: code
+title: P7 端到端：main
+level: 3
+mock: yes
+--- prompt
+**项目第 7 块（cli.py）：把整个工具接起来。** 前面所有函数都在下面了，按文件分好了段。写 `main(argv=None)`：
+
+1. `args = build_parser().parse_args(argv)`
+2. `report = review_contract(args.path, review_clause)`；如果抛出 `FileNotFoundError` 或 `ValueError`：打印 `error: <错误信息>`，返回 `1`
+3. 给了 `--only-risk`：`report["reviews"]` 只保留 `risk` 等于它的条目（`summary` 不动，仍然统计全部条款）
+4. `out = write_report(report, args.out)`
+5. 打印两行：`counts=<counts> needs_attention=<列表>`，然后 `report written to <out>`
+6. 返回 `0`
+
+测试会先写一个合同文件，再像终端那样调用 `main(["work/d14/p7/contract.txt", "--out", "...", "--only-risk", "high"])`，最后读生成的 JSON。这就是**端到端测试**：从文件进，到文件出，中间的每一块都真的跑了一遍。
+--- starter
+import argparse
+import json
+import os
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+# ===== models.py =====
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+# ===== split.py =====
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+def read_contract(path):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"contract not found: {path}")
+    text = p.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"contract is empty: {path}")
+    return text
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+
+# ===== review.py =====
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+SYSTEM = ("You review one contract clause for the customer. Reply with a JSON object only, with the keys "
+          "clause_id, verdict (accept|flag|redline), risk_level (low|medium|high), topic, rationale.")
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    for _ in range(max_attempts):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+
+def review_clause(clause, call=call_model):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Review clause {clause.id}: {clause.text}"},
+    ]
+    tokens = 0
+    for _ in range(2):
+        data = call(messages)
+        tokens += data["usage"]["total_tokens"]
+        content = data["choices"][0]["message"]["content"]
+        try:
+            v = Verdict.model_validate_json(content)
+        except ValidationError as e:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Invalid reply: {e.errors()[0]['msg']}. Reply with the JSON object only."})
+            continue
+        return ClauseReview(clause.id, v.verdict, v.risk_level, tokens)
+    raise RuntimeError(f"clause {clause.id}: no valid JSON after 2 attempts")
+
+# ===== pipeline.py =====
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+
+def write_report(report, path):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+
+def review_contract(path, review):
+    text = read_contract(path)
+    clauses = split_clauses(text)
+    reviews = [review(c) for c in clauses]
+    summary = summarise(reviews)
+    return {"contract": Path(path).stem, "summary": summary, "reviews": [asdict(r) for r in reviews]}
+
+# ===== cli.py =====
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicheck", description="Review every clause of a contract.")
+    parser.add_argument("path", help="contract .txt file")
+    parser.add_argument("--out", default="report.json", help="report JSON path")
+    parser.add_argument("--only-risk", choices=["low", "medium", "high"], help="keep only reviews with this risk")
+    return parser
+
+def main(argv=None):
+    pass
+--- solution
+import argparse
+import json
+import os
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+# ===== models.py =====
+@dataclass
+class Clause:
+    id: str
+    heading: str
+    text: str
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+    topic: str
+    rationale: str
+
+@dataclass
+class ClauseReview:
+    clause_id: str
+    verdict: str
+    risk: str
+    tokens: int
+
+# ===== split.py =====
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+def read_contract(path):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"contract not found: {path}")
+    text = p.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"contract is empty: {path}")
+    return text
+
+def split_clauses(text):
+    clauses = []
+    current = None
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            current = Clause(m.group(1), m.group(2), "")
+            clauses.append(current)
+        elif current is not None:
+            current.text += line + "\n"
+    for c in clauses:
+        c.text = c.text.strip()
+    return [c for c in clauses if c.text]
+
+# ===== review.py =====
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+RETRYABLE = (429, 500, 503)
+SYSTEM = ("You review one contract clause for the customer. Reply with a JSON object only, with the keys "
+          "clause_id, verdict (accept|flag|redline), risk_level (low|medium|high), topic, rationale.")
+
+def call_model(messages, max_attempts=3):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+    for _ in range(max_attempts):
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code not in RETRYABLE:
+            raise RuntimeError(f"API error {resp.status_code}")
+    raise RuntimeError(f"gave up after {max_attempts} attempts")
+
+def review_clause(clause, call=call_model):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Review clause {clause.id}: {clause.text}"},
+    ]
+    tokens = 0
+    for _ in range(2):
+        data = call(messages)
+        tokens += data["usage"]["total_tokens"]
+        content = data["choices"][0]["message"]["content"]
+        try:
+            v = Verdict.model_validate_json(content)
+        except ValidationError as e:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Invalid reply: {e.errors()[0]['msg']}. Reply with the JSON object only."})
+            continue
+        return ClauseReview(clause.id, v.verdict, v.risk_level, tokens)
+    raise RuntimeError(f"clause {clause.id}: no valid JSON after 2 attempts")
+
+# ===== pipeline.py =====
+RISK_RANK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in reviews:
+        counts[r.verdict] += 1
+    flagged = [r for r in reviews if r.verdict != "accept"]
+    flagged.sort(key=lambda r: (RISK_RANK[r.risk], id_key(r.clause_id)))
+    return {
+        "clauses": len(reviews),
+        "counts": counts,
+        "needs_attention": [r.clause_id for r in flagged],
+        "tokens": sum(r.tokens for r in reviews),
+    }
+
+def write_report(report, path):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+
+def review_contract(path, review):
+    text = read_contract(path)
+    clauses = split_clauses(text)
+    reviews = [review(c) for c in clauses]
+    summary = summarise(reviews)
+    return {"contract": Path(path).stem, "summary": summary, "reviews": [asdict(r) for r in reviews]}
+
+# ===== cli.py =====
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicheck", description="Review every clause of a contract.")
+    parser.add_argument("path", help="contract .txt file")
+    parser.add_argument("--out", default="report.json", help="report JSON path")
+    parser.add_argument("--only-risk", choices=["low", "medium", "high"], help="keep only reviews with this risk")
+    return parser
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        report = review_contract(args.path, review_clause)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"error: {e}")
+        return 1
+    if args.only_risk:
+        report["reviews"] = [r for r in report["reviews"] if r["risk"] == args.only_risk]
+    out = write_report(report, args.out)
+    s = report["summary"]
+    print(f"counts={s['counts']} needs_attention={s['needs_attention']}")
+    print(f"report written to {out}")
+    return 0
+--- tests
+import json
+import shutil
+from pathlib import Path
+DIR = Path("work/d14/p7")
+OUT = "work/d14/p7/out/report.json"
+CONTRACT = """MINI SAAS AGREEMENT
+1. Fees
+1.1 Invoicing
+Fees are payable within thirty (30) days of the invoice date.
+1.2 Suspension
+Provider may suspend the Service without notice if any amount is overdue.
+2. Liability
+2.1 Cap
+Customer's liability shall be unlimited.
+10. Data
+10.1 Location
+Customer Data may be processed in any country.
+"""
+def _setup():
+    shutil.rmtree(DIR, ignore_errors=True)
+    DIR.mkdir(parents=True)
+    (DIR / "contract.txt").write_text(CONTRACT, encoding="utf-8")
+    (DIR / "empty.txt").write_text("\n", encoding="utf-8")
+_setup()
+expect_output("终端输出", lambda: main(["work/d14/p7/contract.txt", "--out", OUT]),
+              "counts={'accept': 1, 'flag': 1, 'redline': 2} needs_attention=['2.1', '10.1', '1.2']\nreport written to work/d14/p7/out/report.json")
+def _run(extra):
+    _setup()
+    code = main(["work/d14/p7/contract.txt", "--out", OUT] + extra)
+    return code, json.loads(Path(OUT).read_text(encoding="utf-8"))
+def _full():
+    code, data = _run([])
+    return [code, data["contract"], data["summary"]["clauses"], len(data["reviews"])]
+expect("返回 0；报告里 4 条都在", _full, [0, "contract", 4, 4])
+def _only_high():
+    code, data = _run(["--only-risk", "high"])
+    return [[r["clause_id"] for r in data["reviews"]], data["summary"]["counts"]]
+expect("--only-risk high：reviews 只留高风险，summary 仍统计全部", _only_high, [["2.1", "10.1"], {"accept": 1, "flag": 1, "redline": 2}])
+expect_output("文件不存在：打印 error", lambda: main(["work/d14/p7/nope.txt"]), "error: contract not found: work/d14/p7/nope.txt")
+expect("文件不存在：返回 1", lambda: main(["work/d14/p7/nope.txt"]), 1)
+expect("空文件：返回 1", lambda: main(["work/d14/p7/empty.txt", "--out", OUT]), 1)
+--- hints
+- 按题目的 6 步写，每步一两行。错误处理：`try: report = review_contract(args.path, review_clause)`，`except (FileNotFoundError, ValueError) as e:` 里 `print(f"error: {e}")` 再 `return 1`。
+- `asdict` 之后 reviews 是字典（上一题的坑），过滤写 `[r for r in report["reviews"] if r["risk"] == args.only_risk]`。
+- 打印：`s = report["summary"]`，`print(f"counts={s['counts']} needs_attention={s['needs_attention']}")`。
+
+@@ item d14-16
+type: local
+title: 本机任务：做成真正的命令行工具
+level: 3
+--- prompt
+把今天的 mini 工具搬到你的电脑上，用真的 DeepSeek 跑一遍示例合同，再和真实项目的结果对比。
+
+1. 新建文件夹 `G:\Contract Clause Reviewer\learn\minicheck\`，照「本机的样子」卡片建好文件：`__init__.py`（空）、`__main__.py`、`models.py`、`split.py`、`review.py`、`pipeline.py`、`cli.py`
+2. 把第 15 题里每一段 `# ===== xxx.py =====` 下面的代码放进对应的文件（最好照着理解重打一遍），`main` 用你自己写的版本
+3. 每个文件顶部补上它自己用到的 `import`。包内互相导入要加点，比如 `cli.py` 里写 `from .pipeline import review_contract, write_report` 和 `from .review import review_clause`
+4. `review.py` 顶部再加三行，读仓库根目录的 `.env`（只有本机需要，网页里的模拟服务器不用）：`from pathlib import Path`、`from dotenv import load_dotenv`、`load_dotenv(Path(__file__).resolve().parents[2] / ".env")`
+5. 在终端运行你的工具，再运行真实项目（两个报告都写在 `data/` 里，`.gitignore` 已经忽略了 `*.report.json`）：
+
+```
+cd "G:\Contract Clause Reviewer\learn"
+python -m minicheck ..\data\sample_contract.txt --out ..\data\mini.report.json
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck review data/sample_contract.txt --mode deepseek --out data/ds.report.json
+```
+
+6. 把两边输出里 `counts=` 开头的那一行都粘贴到下面
+
+两边的数字不一样很正常：真实项目有 playbook、工具调用和长得多的 prompt。对比一下两边的 `needs_attention`：哪几条只有一边标了？你觉得为什么？
+placeholder: 粘贴两行 counts=…（你的 minicheck 一行，真实项目一行）
+verify: counts=\{[\s\S]*counts=\{
+--- hints
+- `ModuleNotFoundError: No module named 'minicheck'`：确认你是在 `learn` 文件夹里运行的（第一个 `cd`），而且 `minicheck` 文件夹里有 `__init__.py`。
+- `ImportError: attempted relative import with no known parent package`：不要直接 `python cli.py`，要用 `python -m minicheck`。
+- 401：`.env` 里的 key 不对，或者 `load_dotenv` 那一行的路径不对。在那一行下面 `print(Path(__file__).resolve().parents[2])` 看看是不是仓库根目录。
+
+@@ item d14-17
+type: local
+title: 本机任务（选做）：给 split 加测试
+level: 2
+--- prompt
+在真实项目的 `tests/test_split.py` 末尾，**自己**加一个测试函数，测一件现有测试还没测的事。三个可选的主意：
+
+- 编号后面带点的标题（`"1. Scope"`）也能被认出来
+- 交叉引用：正文里写着 `See Section 2.` 的条款，`refs` 里有 `"2"`
+- 章节标题（正文为空）的 `is_section_title` 是 `True`
+
+然后只跑这一个文件（不调模型，几秒钟）。注意**不要加 `-q`**：项目的 `pyproject.toml` 里已经配置了 `-q`，再加一次会把最后「N passed」那一行也藏起来。
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m pytest tests/test_split.py
+```
+
+先故意把断言写错一次，看它变红（确认这个测试真的在检查东西），再改对，把绿色的输出粘贴到下面。
+placeholder: 粘贴 pytest 的输出（应该看到 6 passed）
+verify: \d+ passed
+--- hints
+- 照着文件里最后一个测试的样子写：`clauses = split_clauses("1. Scope\nShort.\n2. Payment\nPay.\n")`，再 `assert [c.clause_id for c in clauses] == ["1", "2"]`。
+- 真实项目的 `Clause` 是 Pydantic 模型，编号字段叫 `clause_id`（mini 版叫 `id`）。
+
+@@ item d14-e1
+type: scratch
+title: 周考 1：按条款合并问题
+exam: yes
+level: 3
+--- prompt
+一条条款可能违反好几条规则。用 `@dataclass` 定义 `Finding`：`clause_id: str`、`rule_id: str`、`severity: str`（`low` / `medium` / `high`）。
+
+写 `triage(findings)`：按条款合并，返回元组列表 `[(clause_id, 这条条款最严重的 severity, [它的 rule_id，去重后按字母排序]), ...]`。排序：severity 高的在前（high → medium → low），同一级按编号的数字顺序（`"9.1"` 在 `"10.1"` 前面）。
+
+例：`triage([Finding("8.1", "PB-08", "medium"), Finding("3.2", "PB-04", "medium"), Finding("8.1", "PB-01", "high")])` → `[("8.1", "high", ["PB-01", "PB-08"]), ("3.2", "medium", ["PB-04"])]`
+--- solution
+from collections import defaultdict
+from dataclasses import dataclass
+
+RANK = {"high": 0, "medium": 1, "low": 2}
+
+@dataclass
+class Finding:
+    clause_id: str
+    rule_id: str
+    severity: str
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def triage(findings):
+    by_clause = defaultdict(list)
+    for f in findings:
+        by_clause[f.clause_id].append(f)
+    rows = []
+    for cid, fs in by_clause.items():
+        worst = min((f.severity for f in fs), key=lambda s: RANK[s])
+        rows.append((cid, worst, sorted({f.rule_id for f in fs})))
+    rows.sort(key=lambda r: (RANK[r[1]], id_key(r[0])))
+    return rows
+--- tests
+F = [
+    Finding("10.1", "PB-03", "high"),
+    Finding("8.1", "PB-08", "medium"),
+    Finding("3.2", "PB-04", "medium"),
+    Finding("8.1", "PB-01", "high"),
+    Finding("9.1", "PB-08", "high"),
+    Finding("8.1", "PB-01", "high"),
+    Finding("2.1", "PB-00", "low"),
+]
+expect("合并、取最严重、排序", lambda: triage(F), [("8.1", "high", ["PB-01", "PB-08"]), ("9.1", "high", ["PB-08"]), ("10.1", "high", ["PB-03"]), ("3.2", "medium", ["PB-04"]), ("2.1", "low", ["PB-00"])])
+expect("空列表", lambda: triage([]), [])
+expect("dataclass 能直接比较相等", lambda: Finding("8.1", "PB-01", "high") == Finding("8.1", "PB-01", "high"), True)
+
+@@ item d14-e2
+type: scratch
+title: 周考 2：追加评测历史
+exam: yes
+level: 3
+--- prompt
+评测每跑一次，就把结果追加到一个历史文件里（像 `evals/results.json`，但保留多次）。写 `append_run(history_path, run, keep=5)`：
+
+- `history_path` 是一个 JSON 文件，内容是 `{"runs": [...]}`；文件不存在时当作 `{"runs": []}`，上级文件夹不存在要创建
+- 把字典 `run` 加到 `runs` 的末尾，只保留**最后** `keep` 条
+- 写回文件（`indent=2`，UTF-8），并返回写进去的字典
+- 文件存在、但不是合法 JSON：**不要直接覆盖**（里面可能有人手改过的数据）。先把它改名成原文件名加 `.bak`（`history.json` → `history.json.bak`，改名用 `p.rename(新路径)`），再从 `{"runs": []}` 开始
+--- solution
+import json
+from pathlib import Path
+
+def append_run(history_path, run, keep=5):
+    p = Path(history_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    history = {"runs": []}
+    if p.exists():
+        try:
+            history = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            p.rename(p.with_name(p.name + ".bak"))
+            history = {"runs": []}
+    history["runs"] = (history["runs"] + [run])[-keep:]
+    p.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+    return history
+--- tests
+import json
+import shutil
+from pathlib import Path
+D = Path("work/d14/e2")
+H = "work/d14/e2/evals/history.json"
+def _fresh():
+    shutil.rmtree(D, ignore_errors=True)
+    return append_run(H, {"prompt": "v1", "recall": 1.0})
+expect("第一次：自动建文件夹和文件", lambda: (_fresh(), json.loads(Path(H).read_text(encoding="utf-8")))[1], {"runs": [{"prompt": "v1", "recall": 1.0}]})
+def _trim():
+    shutil.rmtree(D, ignore_errors=True)
+    for i in range(4):
+        append_run(H, {"n": i}, keep=3)
+    return json.loads(Path(H).read_text(encoding="utf-8"))["runs"]
+expect("只保留最后 keep 条", _trim, [{"n": 1}, {"n": 2}, {"n": 3}])
+def _broken():
+    shutil.rmtree(D, ignore_errors=True)
+    Path(H).parent.mkdir(parents=True)
+    Path(H).write_text("{hand-edited, broken", encoding="utf-8")
+    result = append_run(H, {"n": 1})
+    return [result, Path(H + ".bak").read_text(encoding="utf-8")]
+expect("坏文件先改名成 .bak，再从头开始", _broken, [{"runs": [{"n": 1}]}, "{hand-edited, broken"])
+expect("缩进 2 格", lambda: (_fresh(), Path(H).read_text(encoding="utf-8").split("\n")[1])[1], '  "runs": [')
+
+@@ item d14-e3
+type: scratch
+title: 周考 3：按条款检索，标题加权
+exam: yes
+level: 3
+--- prompt
+合同本身就是按条款切好的块。写 `find_clauses(text, query, k)`：
+
+1. **切块**：去掉首尾空白后能匹配 `r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$"` 的行是条款标题，下面直到下一个标题的行是正文；正文为空的标题跳过
+2. **分词**：转小写后 `re.findall(r"[a-z0-9]+", ...)`
+3. **分数** = query 里**不同的**词出现在正文里的个数 + 2 × 出现在标题里的个数（标题最能说明这一条讲什么）
+4. 只保留分数 > 0 的；分数从高到低，同分按编号的数字顺序；返回前 `k` 条的 `(编号, 分数)` 元组列表
+
+例：query 是 `"effect of termination"`，标题 `11.2 Effect of Termination`、正文 `Data is deleted after termination.` 这一条的分数是 1 + 2 × 3 = 7。
+--- solution
+import re
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z].*)$")
+
+def words(text):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+def find_clauses(text, query, k):
+    clauses = []
+    for line in text.split("\n"):
+        m = HEAD.match(line.strip())
+        if m:
+            clauses.append([m.group(1), m.group(2), []])
+        elif clauses:
+            clauses[-1][2].append(line)
+    q = words(query)
+    scored = []
+    for cid, heading, lines in clauses:
+        body = "\n".join(lines).strip()
+        if not body:
+            continue
+        score = len(q & words(body)) + 2 * len(q & words(heading))
+        if score > 0:
+            scored.append((cid, score))
+    scored.sort(key=lambda s: (-s[1], tuple(int(x) for x in s[0].split("."))))
+    return scored[:k]
+--- tests
+DOC = """CLOUDNOTES AGREEMENT
+3. Fees and Payment
+3.1 Invoicing
+Fees are invoiced annually and payable within thirty days.
+3.2 Late Payment
+Overdue amounts accrue interest. Provider may suspend the Service.
+11. Termination
+11.1 Termination for Convenience
+Provider may terminate this Agreement at any time on notice.
+11.2 Effect of Termination
+Customer Data is deleted thirty days after termination."""
+expect("标题加权，分数从高到低", lambda: find_clauses(DOC, "termination of the agreement", 5), [("11.2", 5), ("11.1", 3), ("3.2", 1)])
+expect("k 限制条数", lambda: find_clauses(DOC, "termination of the agreement", 2), [("11.2", 5), ("11.1", 3)])
+expect("同分按编号的数字顺序", lambda: find_clauses(DOC, "provider", 5), [("3.2", 1), ("11.1", 1)])
+expect("没有命中", lambda: find_clauses(DOC, "warranty", 3), [])
+
+@@ item d14-e4
+type: scratch
+title: 周考 4：带纠正的结构化调用
+exam: yes
+level: 3
+mock: yes
+--- prompt
+用 Pydantic 定义 `Verdict`：`clause_id: str`，`verdict` 只能是 `accept` / `flag` / `redline`，`risk_level` 只能是 `low` / `medium` / `high`。
+
+写 `review(clause_text)`：
+
+- POST 到 `https://api.deepseek.com/v1/chat/completions`，请求头 `Authorization: Bearer <环境变量 DEEPSEEK_API_KEY>`，模型 `deepseek-chat`，`response_format` 为 `{"type": "json_object"}`；messages 一开始只有一条 user 消息，内容就是 `clause_text`
+- 状态码 429：再请求一次；其他不是 200 的状态码：`raise RuntimeError`
+- 200：用 `Verdict.model_validate_json` 校验回答文字，合法就返回 `Verdict` 对象；不合法就把模型的回答（role `assistant`）和一条说明错误、要求只回 JSON 的 user 消息追加到 messages，再请求一次
+- 一共最多请求 3 次（429 和校验失败都算一次），还没成功就 `raise RuntimeError`
+--- solution
+import os
+from typing import Literal
+import requests
+from pydantic import BaseModel, ValidationError
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+
+class Verdict(BaseModel):
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk_level: Literal["low", "medium", "high"]
+
+def review(clause_text):
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    messages = [{"role": "user", "content": clause_text}]
+    for _ in range(3):
+        body = {"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}
+        resp = requests.post(URL, headers=headers, json=body, timeout=60)
+        if resp.status_code == 429:
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(f"API error {resp.status_code}")
+        content = resp.json()["choices"][0]["message"]["content"]
+        try:
+            return Verdict.model_validate_json(content)
+        except ValidationError as e:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Invalid: {e.errors()[0]['msg']}. Reply with the JSON object only."})
+    raise RuntimeError("no valid verdict after 3 attempts")
+--- tests
+def _normal():
+    MOCK.reset()
+    v = review("Review clause 8.1: Customer's liability shall be unlimited.")
+    return [type(v).__name__, v.clause_id, v.verdict, v.risk_level, len(MOCK.calls)]
+expect("正常：一次请求", _normal, ["Verdict", "8.1", "redline", "high", 1])
+def _bad():
+    MOCK.reset()
+    v = review("Review clause 3.2: Late fees apply without notice. [bad-json]")
+    return [type(v).__name__, len(MOCK.calls), [m["role"] for m in MOCK.calls[-1]["body"]["messages"]]]
+expect("回答夹了废话：纠正一次", _bad, ["Verdict", 2, ["user", "assistant", "user"]])
+def _429():
+    MOCK.reset()
+    MOCK.fail_next(429, 1)
+    return [review("Review clause 4.2: renews for twenty-four (24) months").verdict, len(MOCK.calls)]
+expect("429 一次后成功", _429, ["redline", 2])
+def _give_up():
+    MOCK.reset()
+    MOCK.fail_next(429, 3)
+    try:
+        review("Review clause 1.1: hello")
+    except RuntimeError:
+        return len(MOCK.calls)
+    return "没有报错"
+expect("一直 429：请求 3 次后 RuntimeError", _give_up, 3)
+
+
+@@ item d14-e5
+type: scratch
+title: 周考 5：评测结果的最后一行
+exam: yes
+level: 3
+--- prompt
+模仿 `evals/run_evals.py` 最后打印的那一行。`cases` 是 `[{"id": ..., "kind": ...}]`，`kind` 可能是 `must_flag`、`trap`、`must_accept` 或别的；`runs` 是 `{用例 id: [每次运行的判定, ...]}`。写 `eval_line(cases, runs)`，返回一行文字，格式（两段之间是两个空格）：
+
+`high-risk recall 0.75  false flags 1/4  flaky: payment-net-30`
+
+- **high-risk recall**：`must_flag` 和 `trap` 用例的所有运行里，判定**不是** `accept` 的比例，两位小数；没有这类运行时算 `1.00`（和 `evals/harness.py` 的 `high_risk_recall` 一样）
+- **false flags**：`must_accept` 用例的所有运行里，判定不是 `accept` 的次数 `/` 这类运行的总次数
+- **flaky**：几次运行的判定不完全一样的用例 id（任何 kind 都算），按 `cases` 的顺序用 `", "` 连接；一个都没有就写 `-`
+- 用例在 `runs` 里没有：当作没跑过，哪一项都不算
+--- solution
+def eval_line(cases, runs):
+    hit = total = false_flags = accept_runs = 0
+    flaky = []
+    for case in cases:
+        verdicts = runs.get(case["id"], [])
+        if len(set(verdicts)) > 1:
+            flaky.append(case["id"])
+        for v in verdicts:
+            if case["kind"] in ("must_flag", "trap"):
+                total += 1
+                if v != "accept":
+                    hit += 1
+            elif case["kind"] == "must_accept":
+                accept_runs += 1
+                if v != "accept":
+                    false_flags += 1
+    recall = hit / total if total else 1.0
+    return f"high-risk recall {recall:.2f}  false flags {false_flags}/{accept_runs}  flaky: {', '.join(flaky) or '-'}"
+--- tests
+CASES = [
+    {"id": "unlimited-liability", "kind": "must_flag"},
+    {"id": "cross-reference-trap", "kind": "trap"},
+    {"id": "payment-net-30", "kind": "must_accept"},
+    {"id": "as-is", "kind": "must_accept"},
+    {"id": "injection", "kind": "injection"},
+]
+RUNS = {
+    "unlimited-liability": ["redline", "redline", "redline"],
+    "cross-reference-trap": ["flag", "accept", "flag"],
+    "payment-net-30": ["accept", "flag"],
+    "as-is": ["accept", "accept"],
+    "injection": ["flag", "redline"],
+}
+expect("完整的一行", lambda: eval_line(CASES, RUNS), "high-risk recall 0.83  false flags 1/4  flaky: cross-reference-trap, payment-net-30, injection")
+expect("全部稳定；没跑的用例不算", lambda: eval_line(CASES, {"unlimited-liability": ["flag", "flag"], "as-is": ["accept", "accept"]}), "high-risk recall 1.00  false flags 0/2  flaky: -")
+expect("没有高风险用例的运行：recall 记 1.00", lambda: eval_line(CASES, {"payment-net-30": ["flag"]}), "high-risk recall 1.00  false flags 1/1  flaky: -")

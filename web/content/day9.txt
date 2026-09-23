@@ -1,0 +1,1130 @@
+@@ day 9
+title: 测试与调试：自己写测试，自己抓 bug
+lang: py
+hours: 4–5 小时
+--- goal
+自己给函数写测试：`assert`、pytest 风格的 `test_` 函数、边界用例、`pytest.raises`、`pytest.approx`；遇到 bug 按「复现 → 缩小 → 打印 → 假设 → 修复 → 补测试」的顺序排查，并学会用 `logging` 留下记录。对应项目里的 `tests/*.py` 和 `evals/test_review.py`，在本机用 `python -m pytest` 运行。
+--- checklist
+- 先清空复习区
+- 读完 7 张知识卡片并改动运行
+- 6 道「写测试」题全部通过：每个藏起来的 bug 版本都被你的测试抓住
+- 练习区其余题目全部通过，包括本机任务（亲眼看一次测试变红再变绿）
+- 闭卷挑战 3 题
+- 打开 `tests/test_split.py`，给每个 `test_` 函数说一句「它在防什么 bug」
+
+@@ concept
+title: assert：最小的测试
+--- body
+`assert 条件, "说明"`：条件为真，什么都不发生；条件为假，抛出 `AssertionError`，说明文字就是错误信息。
+
+```python
+assert section_of("10.1") == "10", "two-digit section"
+```
+
+测试说到底就是**一段调用你的函数、再 assert 结果的代码**。第 7 天你已经用 `assert` 给自己写过例子了。
+
+两个习惯：
+
+- 写上说明，失败时一眼知道是哪条假设错了；不写说明，AssertionError 的信息是空的
+- `assert` 用来写测试、检查「不可能发生」的情况；校验外部输入（模型输出、用户的文件）还是用 `if ... raise ValueError`（第 3 天），因为用 `python -O` 运行时所有 assert 都会被跳过
+--- code
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+
+assert section_of("8.1") == "8"
+assert section_of("12") == "12", "no dot"
+print("two checks passed")
+
+# 故意写错一个期望值，看看失败长什么样
+try:
+    assert section_of("10.1") == "1", "two-digit section"
+except AssertionError as e:
+    print("AssertionError:", e)
+
+@@ concept
+title: 测试函数和 pytest
+--- body
+把 assert 放进以 `test_` 开头的函数里，**一个函数只测一件事**，名字写清楚测的是什么：
+
+```python
+def test_two_digit_section():
+    assert section_of("10.1") == "10"
+```
+
+在本机，pytest 会自动找出 `test_*.py` 文件里所有 `test_` 函数，一个个运行，一个失败不影响其他的：`python -m pytest`。Clause Check 的 `tests/test_split.py` 就是这么写的。
+
+本页的「写测试」题：题目给你一个**正确的函数**，同时偷偷藏了几个故意埋了 bug 的版本。你的测试必须**在正确版本上全部通过**，并且**让每个 bug 版本至少失败一个测试**。这叫变异测试（mutation testing）：测试好不好，就看它能不能抓住故意埋的 bug。下面的例子演示的就是这件事。
+--- code
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+
+def test_simple():
+    assert section_of("8.1") == "8"
+
+def test_two_digit_section():
+    assert section_of("10.1") == "10"
+
+def test_no_dot():
+    assert section_of("12") == "12"
+
+# pytest 做的事大致就是这个循环：逐个调用 test_ 函数，抛出异常就算失败
+def run_tests():
+    for test in [test_simple, test_two_digit_section, test_no_dot]:
+        try:
+            test()
+            print("PASSED", test.__name__)
+        except AssertionError:
+            print("FAILED", test.__name__)
+
+run_tests()
+
+print("--- a buggy version: clause_id[0] ---")
+def section_of(clause_id):
+    return clause_id[0]
+
+run_tests()
+
+@@ concept
+title: 怎么想测试用例
+--- body
+对每个函数，按三类想输入，每个想法写一个测试：
+
+1. **正常**：最典型的一两个例子
+2. **边界**：空（`""`、`[]`）、0、只有一个元素、**刚好等于**上限、两位数编号 `10.1`、三层编号 `10.2.1`
+3. **非法**：坏 JSON、未知判定、负数。函数应该报错还是返回默认值？测试把这个决定写死
+
+bug 最爱藏在边界上：`>` 和 `>=` 只有在「刚好等于」时结果才不同，离边界很远的例子，对的和错的实现都能通过。
+
+测试名写成一句话，比如 `test_exactly_at_limit_is_not_split`。它失败时，名字本身就告诉你坏了什么。
+--- code
+def needs_split(text, limit=20):
+    return len(text) > limit
+
+def needs_split_buggy(text, limit=20):
+    return len(text) >= limit
+
+for text in ["", "short clause", "x" * 20, "x" * 21]:
+    print(len(text), needs_split(text), needs_split_buggy(text))
+
+@@ concept
+title: 测试报错和小数：raises、approx
+--- body
+**该报错的时候，真的报错了吗？** 用 `pytest.raises`：
+
+```python
+import pytest
+
+def test_bad_json_raises():
+    with pytest.raises(ValueError, match="not JSON"):
+        parse_verdict("Sure! {")
+```
+
+`with` 块里的代码必须抛出 `ValueError`，否则这个测试失败（报 `DID NOT RAISE`）。`match=` 是在错误信息里搜索的正则，确认报的正是**这个**错。
+
+最危险的 bug 之一是**吞掉异常**：出错时悄悄返回 None，程序不崩，结果却是错的。`pytest.raises` 专门抓它。
+
+**小数别用 `==` 直接比**：`0.1 + 0.2 == 0.3` 是 False（二进制存不准这些小数）。写 `assert x == pytest.approx(0.3)`，允许极小的误差。
+--- code
+import pytest
+
+print(0.1 + 0.2, 0.1 + 0.2 == 0.3)
+print(0.1 + 0.2 == pytest.approx(0.3))
+
+def parse_risk(text):
+    risk = text.strip().lower()
+    if risk not in ("low", "medium", "high"):
+        raise ValueError(f"unknown risk: {text}")
+    return risk
+
+def test_unknown_risk_raises():
+    with pytest.raises(ValueError, match="unknown risk"):
+        parse_risk("urgent")
+
+test_unknown_risk_raises()
+print("test passed")
+
+def parse_risk_swallowing(text):
+    try:
+        return parse_risk(text)
+    except ValueError:
+        return None
+
+print("swallowed:", parse_risk_swallowing("urgent"))
+
+@@ concept
+title: 调试流程：先复现，再猜，一次只改一处
+--- body
+遇到 bug 别急着改代码，按这个顺序来：
+
+1. **复现**：找到能稳定出错的**最小**输入（一条条款，而不是整份合同）
+2. **读 Traceback**：从最下面一行读起，先看错误类型和信息，再看紧挨着它的那一行代码
+3. **看中间值**：用 `repr(x)` 或 f-string 的 `{x=}` 打印。`repr` 会露出看不见的空格、换行，也分得清 `'8.1'` 和 `8.1`
+4. **一次一个假设**：「我猜是字段名不对」→ 打印验证 → 对了再改；每次只改一处
+5. **补测试**：把刚才那个最小输入写成测试，这个 bug 就再也回不来了
+--- code
+reply = "flag\n"
+print(reply == "flag")
+print(repr(reply))
+print(f"{reply=}")
+
+cid = 8.1
+print(f"{cid=}", type(cid).__name__)
+
+row = {"clause_id": "8.1", "risk_level": "high"}
+print(f"{row=}")
+print(sorted(row))
+
+@@ concept
+title: logging：给程序留下记录
+--- body
+`print` 适合临时看一眼；长期运行的程序（比如把 Clause Check 做成 `api.py` 那样的服务）要用 `logging`：
+
+- 每条记录有**级别**：DEBUG（细节）< INFO（正常进展）< WARNING（有问题但还能继续）< ERROR（失败了）
+- 一行配置决定显示哪些级别、什么格式，调试语句不用删：线上设成 WARNING 就安静了，排查时改成 DEBUG 就能看到全部细节
+
+```python
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+logger.info("clause %s -> %s", cid, verdict)
+```
+
+`getLogger(__name__)` 让每个文件有自己名字的 logger。用 `%s` 占位、把值作为参数传进去，而不是自己先拼好字符串：这条记录被过滤掉时，连拼字符串的功夫都省了。
+--- code
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("clausecheck.review")
+
+for cid, verdict in [("3.1", "accept"), ("8.1", "redline")]:
+    logger.debug("raw reply for %s", cid)
+    logger.info("clause %s -> %s", cid, verdict)
+logger.warning("clause %s: HTTP %d, retrying", "10.1", 429)
+
+@@ concept
+title: 常见 bug 模式
+--- body
+这些 bug 反复出现，面试的「找 bug」题也最爱考它们：
+
+- **差一（off-by-one）**：`range(1, len(xs))` 漏了第一个；`text[:n]` 和 `text[:n - 1]` 差一个字符
+- **`>` 和 `>=`**：只在刚好相等时露馅
+- **可变默认参数**：`def f(tags=[])`（第 8 天）
+- **边遍历边删除**：`for x in xs: xs.remove(x)` 会跳过元素
+- **`is` 和 `==`**：`is` 比的是「是不是同一个对象」。比较值永远用 `==`，`is` 只用在 `is None`
+- **`//` 和 `/`**：`2 // 3` 是 0
+- **忘了 return**：函数悄悄返回 None
+- **覆盖内置名字**：写了 `list = [...]` 之后，`list(...)` 就不能用了
+--- code
+ids = ["3.1", "8.1", "10.1"]
+print([ids[i] for i in range(1, len(ids))])
+print(2 // 3, 2 / 3)
+
+verdicts = ["accept", "accept", "flag"]
+for v in verdicts:
+    if v == "accept":
+        verdicts.remove(v)
+print(verdicts)
+
+def label(risk):
+    if risk == "high":
+        return "HIGH RISK"
+    "normal"
+
+print(label("high"), label("low"))
+
+@@ item d9-01
+type: code
+title: 复习：引用过的规则
+level: 1
+--- prompt
+复习第 8 天的集合。每条审查结果里有一个 `"rule_ids"` 列表。写 `cited_rules(reviews)`：返回所有被引用过的规则编号，**去重并排好序**。
+
+```python
+cited_rules([{"id": "8.1", "rule_ids": ["PB-03", "PB-01"]}, {"id": "3.1", "rule_ids": ["PB-03"]}])
+# → ["PB-01", "PB-03"]
+```
+--- starter
+def cited_rules(reviews):
+    seen = set()
+    return sorted(seen)
+--- solution
+def cited_rules(reviews):
+    seen = set()
+    for r in reviews:
+        for rid in r["rule_ids"]:
+            seen.add(rid)
+    return sorted(seen)
+--- tests
+DATA = [{"id": "8.1", "rule_ids": ["PB-03", "PB-01"]}, {"id": "3.1", "rule_ids": ["PB-03"]}]
+expect("去重并排序", lambda: cited_rules(DATA), ["PB-01", "PB-03"])
+expect("有一条没引用规则", lambda: cited_rules([{"id": "14", "rule_ids": []}, {"id": "9.1", "rule_ids": ["PB-10"]}]), ["PB-10"])
+expect("空", lambda: cited_rules([]), [])
+--- hints
+- 两层循环：外层遍历每条审查结果，内层遍历它的 `rule_ids`，每个都 `seen.add(rid)`。
+
+@@ item d9-02
+type: predict
+title: assert 的输出
+level: 1
+--- prompt
+写出输出。注意最后一个 assert 没有写说明文字。
+--- code
+def check_verdict(v):
+    assert v in ("accept", "flag", "redline"), f"bad verdict: {v}"
+    return v
+
+print(check_verdict("flag"))
+try:
+    check_verdict("HIGH")
+except AssertionError as e:
+    print("AssertionError:", e)
+try:
+    assert len([]) > 0
+except AssertionError as e:
+    print("no message:", repr(str(e)))
+--- explain
+assert 通过时什么也不做，函数照常返回。失败时，逗号后面的说明就是错误信息；没写说明，信息是空字符串 `''`，排查时只能去翻代码。所以测试里的 assert 最好带上说明，或者至少让测试函数名说清楚在测什么。
+
+@@ item d9-03
+type: testwrite
+title: 写测试：预算够不够
+level: 1
+--- prompt
+第一道「写测试」题。被测函数 `fits_budget(tokens, budget)`：`tokens` **不超过**预算（小于或等于 `budget`）时返回 True，否则返回 False。
+
+我们还藏了几个故意埋了 bug 的版本。你的测试文件要做到：
+
+- 在正确的函数上**全部通过**
+- 每个 bug 版本都**至少让一个测试失败**
+
+起始代码里只有一个测试，它太弱了。先运行，看它漏掉了哪些 bug（会提示 bug 的类型），再补测试。每个 `test_` 函数只测一件事。
+--- impl
+def fits_budget(tokens, budget):
+    return tokens <= budget
+--- mutants
+===== 边界：刚好等于预算时
+def fits_budget(tokens, budget):
+    return tokens < budget
+===== 参数：换一个预算时
+def fits_budget(tokens, budget):
+    return tokens <= 4000
+--- starter
+def test_small_request_fits():
+    assert fits_budget(100, 4000) is True
+--- solution
+def test_small_request_fits():
+    assert fits_budget(100, 4000) is True
+
+def test_exactly_at_budget_fits():
+    assert fits_budget(4000, 4000) is True
+
+def test_over_budget_does_not_fit():
+    assert fits_budget(4001, 4000) is False
+
+def test_another_budget():
+    assert fits_budget(600, 500) is False
+--- hints
+- 起始测试用的数离边界很远。bug 最爱藏在边界上：`tokens` 刚好等于 `budget` 的时候。
+- 另一个 bug 版本根本没用 `budget` 参数，只认 4000。换一个别的预算，比如 500，试试超出的情况。
+- 新加一个函数：`def test_exactly_at_budget_fits():`，里面 `assert fits_budget(4000, 4000) is True`。
+
+@@ item d9-04
+type: testwrite
+title: 写测试：清洗判定
+level: 2
+--- prompt
+被测函数 `normalize_verdict(text)` 清洗模型返回的判定：先去掉首尾空白、转小写；结果是 `accept` / `flag` / `redline` 之一就返回它，否则返回 `"flag"`（拿不准的交给人看，**绝不能**默认 accept）。
+
+按输入的种类各写一个测试：正常值、前后有空白的、大小写不同的、未知值。
+--- impl
+VALID = ("accept", "flag", "redline")
+
+def normalize_verdict(text):
+    v = text.strip().lower()
+    if v in VALID:
+        return v
+    return "flag"
+--- mutants
+===== 空白：前后有空格或换行时
+VALID = ("accept", "flag", "redline")
+
+def normalize_verdict(text):
+    v = text.lower()
+    if v in VALID:
+        return v
+    return "flag"
+===== 大小写：模型返回 Accept 这种写法时
+VALID = ("accept", "flag", "redline")
+
+def normalize_verdict(text):
+    v = text.strip()
+    if v in VALID:
+        return v
+    return "flag"
+===== 未知值：拿不准时返回了什么
+VALID = ("accept", "flag", "redline")
+
+def normalize_verdict(text):
+    v = text.strip().lower()
+    if v in VALID:
+        return v
+    return "accept"
+--- starter
+def test_plain_value():
+    assert normalize_verdict("flag") == "flag"
+--- solution
+def test_plain_value():
+    assert normalize_verdict("redline") == "redline"
+
+def test_whitespace_is_removed():
+    assert normalize_verdict("  accept\n") == "accept"
+
+def test_case_is_ignored():
+    assert normalize_verdict("Accept") == "accept"
+
+def test_unknown_goes_to_a_human():
+    assert normalize_verdict("maybe") == "flag"
+--- hints
+- 每种输入一个测试函数，名字说清楚测什么：`test_whitespace_is_removed`、`test_case_is_ignored`……
+- 「未知值」那个 bug 最危险：拿不准时变成了 accept。`normalize_verdict("maybe")` 应该得到什么？
+
+@@ item d9-05
+type: choice
+title: 哪个测试能抓住它
+level: 2
+--- prompt
+`pages(n_clauses)` 应该返回放下所有条款需要几页（每页 10 条，最后一页不满也算一页）。下面的实现有 bug。哪个测试能抓住它？
+--- code
+def pages(n_clauses, per_page=10):
+    return n_clauses // per_page
+--- options
+- `assert pages(20) == 2`
+- `assert pages(0) == 0`
+- `assert pages(10) == 1`
+- `assert pages(25) == 3`
+answer: 4
+--- explain
+前三个输入都刚好整除，有 bug 的版本也算对了。**测试全部通过不代表没有 bug**，要挑能走到出错那条路的输入：这里是「有余数」的情况，25 条算出来是 2 页。写测试时先问自己：这个函数在哪种输入下最容易算错？正确写法是 `(n_clauses + per_page - 1) // per_page` 或 `math.ceil(n_clauses / per_page)`。
+
+@@ item d9-06
+type: testwrite
+title: 写测试：取章节号
+level: 2
+--- prompt
+被测函数 `section_of(clause_id)` 返回条款所属的章：`"8.1"` → `"8"`，`"12"` → `"12"`，`"10.2.1"` → `"10"`。
+
+起始测试只有一个例子。三个 bug 版本各自错在不同**形状**的编号上。先想清楚：条款编号一共有哪几种形状？
+--- impl
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+--- mutants
+===== 两位数的章，比如 10.1
+def section_of(clause_id):
+    return clause_id[0]
+===== 没有小数点的编号
+def section_of(clause_id):
+    return clause_id[:clause_id.find(".")]
+===== 三层编号，比如 10.2.1
+def section_of(clause_id):
+    return clause_id.rsplit(".", 1)[0]
+--- starter
+def test_simple():
+    assert section_of("8.1") == "8"
+--- solution
+def test_simple():
+    assert section_of("8.1") == "8"
+
+def test_two_digit_section():
+    assert section_of("10.1") == "10"
+
+def test_no_dot():
+    assert section_of("12") == "12"
+
+def test_three_levels():
+    assert section_of("10.2.1") == "10"
+--- hints
+- 编号的形状：一位数的章（8.1）、两位数的章（10.1）、没有小数点（12）、三层（10.2.1）。
+- 每种形状写一个测试。
+
+@@ item d9-07
+type: fill
+title: 填空：pytest.raises
+level: 1
+--- prompt
+补全测试函数：检查 `parse_risk("urgent")` 会抛出 `ValueError`，并且错误信息里有 `unknown risk`。
+--- template
+import pytest
+
+def parse_risk(text):
+    risk = text.strip().lower()
+    if risk not in ("low", "medium", "high"):
+        raise ValueError(f"unknown risk: {text}")
+    return risk
+
+def test_bad_risk_raises():
+    [[with]] pytest.[[raises]](ValueError, [[match]]="unknown risk"):
+        parse_risk("urgent")
+--- tests
+expect("测试在正确的函数上通过", lambda: (test_bad_risk_raises(), "passed")[1], "passed")
+def _swallowing():
+    global parse_risk
+    real = parse_risk
+    parse_risk = lambda text: None
+    try:
+        test_bad_risk_raises()
+        return "测试没发现问题"
+    except AssertionError:
+        return "测试失败了（抓住了 bug）"
+    finally:
+        parse_risk = real
+expect("换成吞掉错误的版本，测试会失败", _swallowing, "测试失败了（抓住了 bug）")
+--- hints
+- 形状：`with pytest.raises(错误类型, match="正则"):`，下一行缩进写会出错的调用。
+
+@@ item d9-08
+type: testwrite
+title: 写测试：解析判定
+level: 2
+--- prompt
+被测函数 `parse_verdict(raw)`，`raw` 是模型返回的 JSON 文字：
+
+- 合法：返回其中的 `verdict`
+- 不是合法 JSON：`raise ValueError`，信息以 `not JSON` 开头
+- `verdict` 不是三种之一：`raise ValueError`，信息是 `bad verdict: ` 加上那个值，比如 `bad verdict: HIGH`
+
+报错的情况用 `with pytest.raises(ValueError, match=...)` 来测。有一个 bug 版本把错误**吞掉**了：它不报错，而是悄悄返回 None。程序不会崩，所以这种 bug 最难发现。
+--- impl
+import json
+
+VALID = ("accept", "flag", "redline")
+
+def parse_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"not JSON: {raw[:30]}")
+    verdict = data.get("verdict")
+    if verdict not in VALID:
+        raise ValueError(f"bad verdict: {verdict}")
+    return verdict
+--- mutants
+===== 坏 JSON：该报错时悄悄返回了 None
+import json
+
+VALID = ("accept", "flag", "redline")
+
+def parse_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    verdict = data.get("verdict")
+    if verdict not in VALID:
+        raise ValueError(f"bad verdict: {verdict}")
+    return verdict
+===== 取值：verdict 不是三种之一时
+import json
+
+VALID = ("accept", "flag", "redline")
+
+def parse_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"not JSON: {raw[:30]}")
+    return data.get("verdict")
+===== 错误信息：没说清是哪个值不对
+import json
+
+VALID = ("accept", "flag", "redline")
+
+def parse_verdict(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"not JSON: {raw[:30]}")
+    verdict = data.get("verdict")
+    if verdict not in VALID:
+        raise ValueError("bad verdict")
+    return verdict
+--- starter
+import pytest
+
+def test_valid_json():
+    assert parse_verdict('{"verdict": "flag"}') == "flag"
+--- solution
+import pytest
+
+def test_valid_json():
+    assert parse_verdict('{"verdict": "flag"}') == "flag"
+
+def test_bad_json_raises():
+    with pytest.raises(ValueError, match="not JSON"):
+        parse_verdict("Sure! Here is the JSON")
+
+def test_unknown_verdict_names_the_value():
+    with pytest.raises(ValueError, match="bad verdict: HIGH"):
+        parse_verdict('{"verdict": "HIGH"}')
+--- hints
+- 坏 JSON 的测试：`with pytest.raises(ValueError, match="not JSON"):`，下一行缩进写 `parse_verdict("Sure! ...")`。
+- `match` 是在错误信息里搜索的正则。想抓住「信息里没带值」的 bug，`match` 就要把那个值也写进去：`"bad verdict: HIGH"`。
+
+@@ item d9-09
+type: testwrite
+title: 写测试：通过率
+level: 2
+--- prompt
+被测函数 `pass_rate(results)`：`results` 是每次运行是否通过的列表（True / False），返回通过的比例（0 到 1 的小数）；空列表返回 `0.0`。
+
+结果是小数时用 `pytest.approx` 比较：`2 / 3` 算出来是 `0.6666666666666666`，别手抄这一长串，写 `pytest.approx(2 / 3)`。
+--- impl
+def pass_rate(results):
+    if not results:
+        return 0.0
+    return sum(1 for r in results if r) / len(results)
+--- mutants
+===== 除法：结果应该是小数时
+def pass_rate(results):
+    if not results:
+        return 0.0
+    return sum(1 for r in results if r) // len(results)
+===== 空列表时
+def pass_rate(results):
+    return sum(1 for r in results if r) / len(results)
+===== 数反了：数成了失败的次数
+def pass_rate(results):
+    if not results:
+        return 0.0
+    return sum(1 for r in results if not r) / len(results)
+--- starter
+import pytest
+
+def test_all_passed():
+    assert pass_rate([True, True]) == 1.0
+--- solution
+import pytest
+
+def test_all_passed():
+    assert pass_rate([True, True]) == 1.0
+
+def test_partial_is_a_fraction():
+    assert pass_rate([True, True, False]) == pytest.approx(2 / 3)
+
+def test_empty_is_zero():
+    assert pass_rate([]) == 0.0
+--- hints
+- 起始测试只覆盖了「全部通过」。还差：部分通过（结果是小数）、空列表。
+- `assert pass_rate([True, True, False]) == pytest.approx(2 / 3)`。
+
+@@ item d9-10
+type: order
+title: 排代码：一个测试文件
+level: 2
+--- prompt
+排出一个小测试文件：被测函数 `average_tokens(calls)` 返回平均 token 数；一个测试检查正常情况，另一个检查空列表会抛出 `ZeroDivisionError`。有两行干扰项。
+--- lines
+import pytest
+def average_tokens(calls):
+    return sum(c["tokens"] for c in calls) / len(calls)
+def test_average():
+    calls = [{"tokens": 100}, {"tokens": 250}]
+    assert average_tokens(calls) == pytest.approx(175.0)
+def test_empty_raises():
+    with pytest.raises(ZeroDivisionError):
+        average_tokens([])
+--- distractors
+    assert average_tokens(calls) == pytest.approx(350.0)
+    with pytest.raises(ValueError):
+--- tests
+expect("test_average 通过", lambda: (test_average(), "passed")[1], "passed")
+expect("test_empty_raises 通过", lambda: (test_empty_raises(), "passed")[1], "passed")
+--- hints
+- (100 + 250) / 2 是多少？
+- 空列表时 `len(calls)` 是 0，除以 0 抛出的是哪种错误？
+
+@@ item d9-11
+type: code
+title: 找出第一个出错的输入
+level: 2
+--- prompt
+调试的第一步是找到**能稳定复现的最小输入**。写 `first_failing(inputs, fn)`：按顺序用每个输入调用 `fn(输入)`，返回第一个让 `fn` 抛出异常的 `(输入, "错误类型: 错误信息")`；全部正常就返回 `None`。
+
+错误类型的名字是 `type(e).__name__`。这里要接住**任何**错误，所以写 `except Exception as e:`；平时的代码里只接你预料到的错误（第 3 天）。
+
+```python
+def section_number(cid):
+    return int(cid.split(".")[0])
+
+first_failing(["8.1", "", "12"], section_number)
+# → ("", "ValueError: invalid literal for int() with base 10: ''")
+```
+--- starter
+def first_failing(inputs, fn):
+    for x in inputs:
+        fn(x)
+    return None
+--- solution
+def first_failing(inputs, fn):
+    for x in inputs:
+        try:
+            fn(x)
+        except Exception as e:
+            return x, f"{type(e).__name__}: {e}"
+    return None
+--- tests
+def section_number(cid):
+    return int(cid.split(".")[0])
+def lookup(cid):
+    return {"8.1": "flag"}[cid]
+expect("找到第一个出错的", lambda: first_failing(["8.1", "10.2", "", "x.1"], section_number), ("", "ValueError: invalid literal for int() with base 10: ''"))
+expect("KeyError 也算", lambda: first_failing(["8.1", "9.9"], lookup), ("9.9", "KeyError: '9.9'"))
+expect("全部正常", lambda: first_failing(["8.1", "12"], section_number), None)
+expect("空列表", lambda: first_failing([], section_number), None)
+--- hints
+- 把 `fn(x)` 放进 `try:`，`except Exception as e:` 里立刻 return。
+- 返回的是元组：`return x, f"{type(e).__name__}: {e}"`。
+
+@@ item d9-12
+type: fix
+title: 修 bug：读 Traceback
+level: 2
+--- prompt
+`attention(raws)` 应该返回需要人看的条款编号（风险高的在前）。运行测试会报错。按今天的调试流程来：
+
+1. 从 Traceback **最下面**一行读起：什么错误？哪个键？
+2. 往上一行：出错的是哪个函数的哪一行？
+3. 在那附近加一句 `print(repr(reviews[0]))`，看看一条数据**真正**长什么样
+
+找到原因再修，修好后把 print 删掉。
+--- starter
+import json
+
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def parse(raw):
+    return json.loads(raw)
+
+def rank(reviews):
+    return sorted(reviews, key=lambda r: RISK[r["risk"]])
+
+def attention(raws):
+    reviews = [parse(raw) for raw in raws]
+    return [r["clause_id"] for r in rank(reviews) if r["verdict"] != "accept"]
+--- solution
+import json
+
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def parse(raw):
+    return json.loads(raw)
+
+def rank(reviews):
+    return sorted(reviews, key=lambda r: RISK[r["risk_level"]])
+
+def attention(raws):
+    reviews = [parse(raw) for raw in raws]
+    return [r["clause_id"] for r in rank(reviews) if r["verdict"] != "accept"]
+--- tests
+RAWS = [
+    '{"clause_id": "3.1", "verdict": "accept", "risk_level": "low"}',
+    '{"clause_id": "6.2", "verdict": "flag", "risk_level": "medium"}',
+    '{"clause_id": "8.1", "verdict": "redline", "risk_level": "high"}',
+]
+expect("高风险在前", lambda: attention(RAWS), ["8.1", "6.2"])
+expect("没有需要看的", lambda: attention(RAWS[:1]), [])
+expect("空", lambda: attention([]), [])
+--- hints
+- 最后一行是 `KeyError: 'risk'`：字典里根本没有 `risk` 这个键。
+- 打印出来的数据里，风险字段叫 `risk_level`（和模拟服务器、真实 DeepSeek 返回的一样）。
+
+@@ item d9-13
+type: choice
+title: 调试的第一步
+level: 2
+--- prompt
+`review_all` 审完一份 40 条的合同，结果里第 17 条的判定是 `None`，其他都正常。下面哪种做法最符合今天的调试流程？
+--- options
+- 把 `review_all` 整个重写一遍，也许就好了
+- 在调用处加 `try/except Exception: pass`，让 None 不再出现
+- 只拿第 17 条单独跑一次，打印它的输入和模型原始回答的 `repr`，先确认问题出在输入、模型回答还是解析
+- 同时改 prompt、换模型、加重试，看哪个有用
+answer: 3
+--- explain
+先用最小输入复现（只跑第 17 条，又快又省钱），再看中间值，确定是哪一段出的问题，一次只改一处。同时改三处，就算好了也不知道是哪个起的作用；吞掉异常只会把 bug 藏起来。修好后把第 17 条的输入写成一个测试，它就不会再回来。
+
+@@ item d9-14
+type: predict
+title: logging 的输出
+level: 2
+--- prompt
+写出输出。想一想：哪一条记录会被 `level=logging.INFO` 过滤掉？
+--- code
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger("clausecheck.demo")
+
+logger.debug("raw reply: %s", '{"verdict": "flag"}')
+logger.info("clause %s -> %s", "8.1", "flag")
+logger.warning("HTTP %d, retrying", 429)
+logger.error("gave up on clause %s", "10.1")
+print("done")
+--- explain
+DEBUG 比 INFO 低，被过滤掉了，另外三条按 `format` 输出成「级别 信息」。`%s`、`%d` 由后面的参数依次填上。排查问题时把 `level` 改成 `logging.DEBUG`，那条原始回答就出现了，一行业务代码都不用改。
+
+@@ item d9-15
+type: code
+title: 给函数加上日志
+level: 2
+--- prompt
+写 `safe_classify(clause_id, text, classify)`：
+
+- 调用 `classify(text)` 拿到判定，记一条 INFO：`logger.info("clause %s -> %s", clause_id, verdict)`，返回判定
+- 如果 `classify` 抛出 `ValueError`：记一条 WARNING，内容是 `clause 3.1 failed: 错误信息`，返回 `"flag"`（出错的条款交给人看）
+- **只接** `ValueError`，别的错误照常抛出去，别吞掉
+
+`classify` 由调用方传进来，所以测试时可以传一个假的函数，不用真的调模型。
+--- starter
+import logging
+
+logger = logging.getLogger("clausecheck.review")
+
+def safe_classify(clause_id, text, classify):
+    return classify(text)
+--- solution
+import logging
+
+logger = logging.getLogger("clausecheck.review")
+
+def safe_classify(clause_id, text, classify):
+    try:
+        verdict = classify(text)
+    except ValueError as e:
+        logger.warning("clause %s failed: %s", clause_id, e)
+        return "flag"
+    logger.info("clause %s -> %s", clause_id, verdict)
+    return verdict
+--- tests
+import logging
+
+class _Collect(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(f"{record.levelname} {record.getMessage()}")
+
+_log = logging.getLogger("clausecheck.review")
+for _old in list(_log.handlers):
+    _log.removeHandler(_old)
+_h = _Collect()
+_log.addHandler(_h)
+_log.setLevel(logging.INFO)
+
+def ok(text):
+    return "accept"
+
+def broken(text):
+    raise ValueError("bad json")
+
+def other_error(text):
+    return {}["verdict"]
+
+expect("正常时返回判定", lambda: safe_classify("8.1", "Fees are due.", ok), "accept")
+expect("ValueError 时返回 flag", lambda: safe_classify("3.1", "???", broken), "flag")
+def _logs():
+    _h.lines.clear()
+    safe_classify("8.1", "Fees are due.", ok)
+    safe_classify("3.1", "???", broken)
+    return _h.lines
+expect("日志内容", _logs, ["INFO clause 8.1 -> accept", "WARNING clause 3.1 failed: bad json"])
+expect_raises("别的错误不要吞掉", lambda: safe_classify("4.2", "x", other_error), KeyError)
+--- hints
+- 结构：`try:` 里调用 `classify`；`except ValueError as e:` 里记 warning 并 `return "flag"`；try 外面记 info 并返回判定。
+- warning 那一行：`logger.warning("clause %s failed: %s", clause_id, e)`。
+
+@@ item d9-16
+type: fix
+title: 修 bug：第一条不见了
+level: 2
+--- prompt
+律师反映：导出的清单里**第一条总是不见了**。运行，对照输出找到原因，修好它。修好后想一想：只有一条条款的合同，原来的代码会输出什么？
+--- starter
+def numbered_lines(ids):
+    lines = []
+    for i in range(1, len(ids)):
+        lines.append(f"{i}. {ids[i]}")
+    return lines
+
+print(numbered_lines(["3.1", "8.1", "10.1"]))
+--- solution
+def numbered_lines(ids):
+    return [f"{i}. {cid}" for i, cid in enumerate(ids, 1)]
+
+print(numbered_lines(["3.1", "8.1", "10.1"]))
+--- tests
+expect("三条都在", lambda: numbered_lines(["3.1", "8.1", "10.1"]), ["1. 3.1", "2. 8.1", "3. 10.1"])
+expect("只有一条", lambda: numbered_lines(["12"]), ["1. 12"])
+expect("空", lambda: numbered_lines([]), [])
+--- hints
+- `range(1, len(ids))` 从下标 1 开始，下标 0 的第一条被跳过了。
+- 序号从 1 开始、下标从 0 开始，是两件事。用第 8 天的 `enumerate(ids, 1)` 就不用自己算了。
+
+@@ item d9-17
+type: fix
+title: 修 bug：边遍历边删除
+level: 2
+--- prompt
+`drop_accepted(reviews)` 应该去掉所有 accept，只留下需要人看的。可它有时会漏删。先运行看输出，再修好。
+
+要求：**不要修改**传进来的列表，返回一个新列表。
+--- starter
+def drop_accepted(reviews):
+    for r in reviews:
+        if r["verdict"] == "accept":
+            reviews.remove(r)
+    return reviews
+
+data = [
+    {"id": "3.1", "verdict": "accept"},
+    {"id": "3.2", "verdict": "accept"},
+    {"id": "8.1", "verdict": "flag"},
+]
+print([r["id"] for r in drop_accepted(data)])
+--- solution
+def drop_accepted(reviews):
+    return [r for r in reviews if r["verdict"] != "accept"]
+
+data = [
+    {"id": "3.1", "verdict": "accept"},
+    {"id": "3.2", "verdict": "accept"},
+    {"id": "8.1", "verdict": "flag"},
+]
+print([r["id"] for r in drop_accepted(data)])
+--- tests
+def _data():
+    return [
+        {"id": "3.1", "verdict": "accept"},
+        {"id": "3.2", "verdict": "accept"},
+        {"id": "8.1", "verdict": "flag"},
+        {"id": "9.1", "verdict": "accept"},
+    ]
+expect("连着两条 accept 都删掉", lambda: [r["id"] for r in drop_accepted(_data())], ["8.1"])
+def _untouched():
+    d = _data()
+    drop_accepted(d)
+    return len(d)
+expect("不修改原列表", _untouched, 4)
+expect("空列表", lambda: drop_accepted([]), [])
+--- hints
+- 删掉一个元素后，后面的元素都往前挪了一位，可循环的位置照样往后走，于是跳过了一个。
+- 别在原列表上删：用推导式造一个新列表，`[r for r in reviews if ...]`。
+
+@@ item d9-18
+type: fix
+title: 修 bug：is 和 ==
+level: 2
+--- prompt
+`is_accept(raw)` 判断模型返回的文字是不是 accept。输入明明是 `" Accept "`，它却说 False。运行看看，输出最上面还有一行 Python 给的 `SyntaxWarning`，读一读它说了什么。
+--- starter
+def is_accept(raw):
+    return raw.strip().lower() is "accept"
+
+print(is_accept(" Accept "))
+print(is_accept("accept"))
+--- solution
+def is_accept(raw):
+    return raw.strip().lower() == "accept"
+
+print(is_accept(" Accept "))
+print(is_accept("accept"))
+--- tests
+expect("前后有空格、首字母大写", lambda: is_accept(" Accept "), True)
+expect("本来就是 accept", lambda: is_accept("accept"), True)
+expect("不是 accept", lambda: is_accept("flag"), False)
+--- hints
+- `is` 问的是「是不是同一个对象」。`.lower()` 造出来的是一个新字符串，和代码里写的 `"accept"` 不是同一个对象，哪怕内容一样。
+- 比较值永远用 `==`；`is` 只用在 `x is None`。
+
+@@ item d9-19
+type: testwrite
+title: 写测试：截断文字
+level: 3
+--- prompt
+被测函数 `truncate(text, n)` 把条款正文截短，放进表格里显示：
+
+- 长度不超过 `n`：原样返回
+- 超过：截成**总长度正好是 n** 的字符串，最后一个字符是 `"…"`（这是一个字符）
+- `n` 小于 1：`raise ValueError`
+
+这次提示少一些：自己列出正常、边界、非法三类输入，每类至少一个测试。
+--- impl
+def truncate(text, n):
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    if len(text) <= n:
+        return text
+    return text[:n - 1] + "…"
+--- mutants
+===== 边界：长度刚好等于 n 时
+def truncate(text, n):
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    if len(text) < n:
+        return text
+    return text[:n - 1] + "…"
+===== 长度：截断后多出一个字符
+def truncate(text, n):
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    if len(text) <= n:
+        return text
+    return text[:n] + "…"
+===== 非法参数：n 为 0 时
+def truncate(text, n):
+    if len(text) <= n:
+        return text
+    return text[:n - 1] + "…"
+--- starter
+def test_short_text_unchanged():
+    assert truncate("Fees", 10) == "Fees"
+--- solution
+import pytest
+
+def test_short_text_unchanged():
+    assert truncate("Fees", 10) == "Fees"
+
+def test_exactly_n_unchanged():
+    assert truncate("Fees", 4) == "Fees"
+
+def test_long_text_is_cut_to_n():
+    result = truncate("Liability is unlimited", 10)
+    assert result == "Liability…"
+    assert len(result) == 10
+
+def test_n_below_one_raises():
+    with pytest.raises(ValueError):
+        truncate("Fees", 0)
+--- hints
+- 边界：文字长度**刚好等于** n。非法：n 为 0。
+- 截断的测试同时检查内容和长度：`assert len(result) == 10`。
+
+@@ item d9-20
+type: local
+title: 本机任务：看一次红和绿
+level: 2
+--- prompt
+在自己电脑上，亲手看一次测试从绿变红、再变绿。
+
+1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\test_my_first.py`
+2. **不看页面**，从空白手写 `truncate(text, n)`（规则和上一题一样）和至少 3 个 `test_` 函数：短文本不变、长度刚好等于 n、超长时截断后长度正好是 n
+3. 在终端运行：
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m pytest learn/test_my_first.py
+```
+
+应该看到 `3 passed`（项目的 `pyproject.toml` 里已经配好了 `-q`）。
+
+4. 故意埋一个 bug：把 `<=` 改成 `<`，再运行一次。读 pytest 打印的失败信息，它会把 assert 两边的实际值都显示出来
+5. 改回来，再运行一次，确认全绿
+6. 把三次运行的输出都粘贴到下面
+placeholder: 粘贴三次 pytest 的输出
+verify: \d+ failed[\s\S]*\d+ passed|\d+ passed[\s\S]*\d+ failed
+--- hints
+- 看到 `No module named pytest`：先运行 `python -m pip install pytest`。
+- pytest 只收集以 `test_` 开头的文件和函数。名字拼错了会显示 `no tests ran`。
+
+@@ item d9-e1
+type: scratch
+title: 闭卷：校验审查结果
+exam: yes
+level: 3
+--- prompt
+写 `validate_review(d)`，检查模型返回的一条审查结果（字典）：
+
+1. 按 `clause_id`、`verdict`、`risk_level` 的顺序检查，缺哪个就 `raise ValueError("missing field: 字段名")`
+2. `verdict` 不是 `accept` / `flag` / `redline`：`raise ValueError("bad verdict: 值")`
+3. `risk_level` 不是 `low` / `medium` / `high`：`raise ValueError("bad risk_level: 值")`
+4. 全部合法：返回 `True`
+
+例：`validate_review({"clause_id": "8.1", "verdict": "HIGH", "risk_level": "high"})` 抛出 `ValueError("bad verdict: HIGH")`。
+--- solution
+REQUIRED = ("clause_id", "verdict", "risk_level")
+
+def validate_review(d):
+    for key in REQUIRED:
+        if key not in d:
+            raise ValueError(f"missing field: {key}")
+    if d["verdict"] not in ("accept", "flag", "redline"):
+        raise ValueError(f"bad verdict: {d['verdict']}")
+    if d["risk_level"] not in ("low", "medium", "high"):
+        raise ValueError(f"bad risk_level: {d['risk_level']}")
+    return True
+--- tests
+def _msg(d):
+    try:
+        validate_review(d)
+    except ValueError as e:
+        return str(e)
+    return "没有报错"
+GOOD = {"clause_id": "8.1", "verdict": "flag", "risk_level": "high"}
+expect("合法", lambda: validate_review(GOOD), True)
+expect("缺字段，按顺序报第一个", lambda: _msg({"risk_level": "low"}), "missing field: clause_id")
+expect("判定不合法", lambda: _msg({**GOOD, "verdict": "HIGH"}), "bad verdict: HIGH")
+expect("风险不合法", lambda: _msg({**GOOD, "risk_level": "urgent"}), "bad risk_level: urgent")
+
+@@ item d9-e2
+type: scratch
+title: 闭卷：去重并保留顺序
+exam: yes
+level: 2
+--- prompt
+模型返回的 `rule_ids` 经常有重复，还带着空格。写 `dedupe_keep_order(items)`：
+
+- 每项先 `.strip()`
+- strip 之后相同的算重复，只保留**第一次出现**的，顺序不变
+- strip 之后是空字符串的丢掉
+
+返回一个新列表。
+
+`dedupe_keep_order([" PB-03", "PB-01", "PB-03 ", ""])` → `["PB-03", "PB-01"]`
+--- solution
+def dedupe_keep_order(items):
+    seen = set()
+    result = []
+    for item in items:
+        x = item.strip()
+        if x and x not in seen:
+            seen.add(x)
+            result.append(x)
+    return result
+--- tests
+expect("去重、去空白、保留顺序", lambda: dedupe_keep_order([" PB-03", "PB-01", "PB-03 ", ""]), ["PB-03", "PB-01"])
+expect("没有重复时顺序不变", lambda: dedupe_keep_order(["PB-09", "PB-02"]), ["PB-09", "PB-02"])
+expect("全是空白", lambda: dedupe_keep_order(["", "  "]), [])
+expect("空列表", lambda: dedupe_keep_order([]), [])
+
+@@ item d9-e3
+type: scratch
+title: 闭卷：滑动窗口
+exam: yes
+level: 2
+--- prompt
+审一条条款时，常常要连着看它前后的条款。写 `window(items, size)`：返回所有长度为 `size` 的**连续**片段（每个片段是一个列表），按顺序排列。
+
+- `window(["3.1", "3.2", "3.3", "4.1"], 2)` → `[["3.1", "3.2"], ["3.2", "3.3"], ["3.3", "4.1"]]`
+- `size` 比列表还长：返回 `[]`
+- `size` 小于 1：`raise ValueError`
+--- solution
+def window(items, size):
+    if size < 1:
+        raise ValueError("size must be at least 1")
+    return [items[i:i + size] for i in range(len(items) - size + 1)]
+--- tests
+IDS = ["3.1", "3.2", "3.3", "4.1"]
+expect("长度 2", lambda: window(IDS, 2), [["3.1", "3.2"], ["3.2", "3.3"], ["3.3", "4.1"]])
+expect("刚好等于列表长度", lambda: window(IDS, 4), [IDS])
+expect("比列表长", lambda: window(IDS, 5), [])
+expect_raises("size 为 0", lambda: window(IDS, 0), ValueError)

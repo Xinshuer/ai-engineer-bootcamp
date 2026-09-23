@@ -1,0 +1,1308 @@
+@@ day 13
+title: 评测与追踪：通过率、召回率、装饰器、span、A/B
+lang: py
+hours: 4–5 小时
+--- goal
+把「好像能用」变成数字：评测用例写成数据，每条跑 N 次算通过率，算精确率和召回率，把两版 prompt 并排比较；再给代码加上追踪：装饰器、计时 span、上下文管理器、token 和延迟汇总。
+
+对应项目里的 `evals/cases.json`（用例）、`evals/harness.py`（`check`、`high_risk_recall`）、`evals/run_evals.py`（通过率表）和 `clausecheck/tracing.py`（`@observe` 装饰器）。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每张都改一处再运行
+- 练习区全部通过（包括本机任务：用 DeepSeek 真的比一次 v1 和 v2）
+- 闭卷 3 题
+- 打开 `evals/harness.py`，说出 `high_risk_recall` 的分子和分母各是什么，为什么分母为 0 时返回 1.0
+
+@@ concept
+title: 评测用例是数据，不是感觉
+--- body
+「我试了几条，看起来没问题」不是证据。评测用例把「什么算对」写成**数据**，任何人、任何时候都能重跑。
+
+Clause Check 的 `evals/cases.json` 里每条用例有 `id`、`kind`、`clause` 和 `expect`：
+
+- `kind`：`must_flag`（有风险，必须拦下）、`must_accept`（普通样板条款，必须放过）、`trap`（交叉引用陷阱）、`injection`（提示注入）
+- `expect` 写**允许的答案集合** `verdict_in`，不是唯一答案：flag 和 redline 都算「拦下了」
+- 正确答案来自**人的判断**，不是模型说的
+- 线上每出一个错，先把它变成一条用例（`learn/04_failure_to_dataset.md`）
+
+`harness.py` 的 `check()` 返回**失败原因的列表**，空列表就是通过。好处是失败时知道为什么失败。
+--- code
+CASES = [
+    {"id": "unlimited-liability", "kind": "must_flag", "clause": "Customer's liability shall be unlimited.",
+     "expect": {"verdict_in": ["flag", "redline"], "risk_in": ["high"]}},
+    {"id": "payment-net-30", "kind": "must_accept", "clause": "Fees are payable within thirty (30) days.",
+     "expect": {"verdict_in": ["accept"]}},
+]
+
+def check(case, result):
+    fails = []
+    e = case["expect"]
+    if result["verdict"] not in e["verdict_in"]:
+        fails.append(f"verdict {result['verdict']} not in {e['verdict_in']}")
+    return fails
+
+results = {
+    "unlimited-liability": {"verdict": "accept", "risk_level": "low"},
+    "payment-net-30": {"verdict": "accept", "risk_level": "low"},
+}
+for case in CASES:
+    fails = check(case, results[case["id"]])
+    print(f"{case['id']:<22} {'PASS' if not fails else 'FAIL'} {fails}")
+
+@@ concept
+title: 跑 N 次，看通过率
+mock: yes
+--- body
+同一条用例，模型这次对、下次错。所以每条用例要跑 N 次，报**通过率**（通过次数 ÷ N），而不是「对」或「错」。
+
+- N 至少 5：跑 1 次对了可能只是运气；5 次对 3 次（60%）说明这条不稳
+- 回顾第 7 天：pass@k（k 次里至少对一次）很容易接近 100%；pass^k（k 次全对）才是无人值守要看的。`run_evals.py` 的表里就有 `pass^k` 一列
+- 本页的模拟服务器对 AS IS 免责条款故意摇摆（约 60% 判 accept）。`MOCK.reset()` 会把它的随机种子复位，所以同样的代码每次跑出同样的数，测试才能写死期望值
+
+下面的例子里，跑 1 次是 100%，跑多了才看出它其实不稳。
+--- code
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def classify(clause_text):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+AS_IS = 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS" AND EACH PARTY DISCLAIMS ALL OTHER WARRANTIES.'
+for n in [1, 5, 20]:
+    MOCK.reset()
+    verdicts = [classify(AS_IS)["verdict"] for _ in range(n)]
+    print("runs =", n, " accept rate =", verdicts.count("accept") / n, " all passed:", all(v == "accept" for v in verdicts))
+
+@@ concept
+title: 混淆矩阵、精确率、召回率
+--- body
+把「这条有风险吗」当成是非题。真实答案来自用例（`must_flag` 是有风险），模型的答案是「标记了吗」（verdict 不是 accept）。四种组合：
+
+- **TP**：有风险，标记了（抓对了）
+- **FP**：没风险，却标记了（误报，律师白看一眼）
+- **FN**：有风险，却放过了（漏报，最危险）
+- **TN**：没风险，放过了
+
+**精确率** precision = TP ÷ (TP + FP)：标记出来的里面，有多少是真问题。
+**召回率** recall = TP ÷ (TP + FN)：真有风险的里面，抓住了多少。
+
+合同审查里，漏掉一条无限责任条款（FN）比多标一条（FP）代价大得多，所以项目最看重**高风险召回率**（`harness.py` 的 `high_risk_recall`，`run_evals.py` 要求它至少 0.9）。分母可能是 0（一条风险用例都没有），要先判断，项目里这时返回 1.0。
+--- code
+truth = [True, True, True, False, False]     # 真有风险吗（来自用例）
+flagged = [True, True, False, True, False]   # 模型标记了吗
+pairs = list(zip(truth, flagged))
+tp = sum(1 for t, f in pairs if t and f)
+fp = sum(1 for t, f in pairs if not t and f)
+fn = sum(1 for t, f in pairs if t and not f)
+tn = sum(1 for t, f in pairs if not t and not f)
+print("TP FP FN TN =", tp, fp, fn, tn)
+print("precision =", round(tp / (tp + fp), 2))
+print("recall    =", round(tp / (tp + fn), 2))
+
+@@ concept
+title: 函数是值：装饰器
+--- body
+函数可以当值传来传去（第 2 天的 `sorted(key=...)`，昨天的 `ask=call_model`），也可以**返回一个新函数**。
+
+装饰器就是这样一个函数：收进一个函数，返回一个「包了一层」的新函数。新函数在调用前后做点事（计时、计数、记日志），中间照常调用原函数，并且**把结果 return 出去**。
+
+```python
+@logged
+def section_of(clause_id): ...
+# 完全等于：section_of = logged(section_of)
+```
+
+`*args, **kwargs`（第 8 天读过）让包装函数能接住任何参数，原样转交。`@functools.wraps(fn)` 把原函数的名字和文档复制到包装函数上，否则 `section_of.__name__` 会变成 `"wrapper"`，追踪里全是 wrapper。
+
+`clausecheck/tracing.py` 的 `@observe` 就是装饰器：配了 Langfuse 密钥时用 Langfuse 的版本，每次调用记成一个 span；没配时退化成一个原样调用的包装，什么都不做。
+--- code
+import functools
+
+def logged(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        print("->", fn.__name__, args)
+        result = fn(*args, **kwargs)
+        print("<-", fn.__name__, result)
+        return result
+    return wrapper
+
+@logged
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+
+print(section_of("8.1"))
+print("name:", section_of.__name__)
+
+@@ concept
+title: 计时、假时钟、带参数的装饰器
+--- body
+`time.perf_counter()` 返回一个专门用来算时间差的秒数，前后各取一次相减：`ms = round((end - start) * 1000)`。一次计时记成一个 **span**，比如 `{"name": "review_clause", "ms": 250}`。Langfuse 里看到的就是一串 span。
+
+真实时间每次都不一样，测试没法写死期望值。办法：**把时钟当参数传进来**，默认用 `time.perf_counter`，测试时换成一个假时钟，按顺序吐出事先准备好的时间。`iter(列表)` 把列表变成「一个一个往外取」的迭代器，`next(it)` 取下一个。
+
+装饰器要带参数时（`@timed(clock=...)`，就像 `tracing.py` 的 `@observe(name="review_clause")`），要**多套一层**：`timed(clock)` 先返回一个装饰器，装饰器再返回包装函数。
+--- code
+import functools
+import time
+
+def fake_clock(times):
+    it = iter(times)
+    return lambda: next(it)
+
+def measure(fn, clock=time.perf_counter):
+    start = clock()
+    result = fn()
+    return result, round((clock() - start) * 1000)
+
+print(measure(lambda: "flag", clock=fake_clock([10.0, 10.25])))
+print("real clock is fast:", measure(lambda: "flag")[1] < 1000)
+
+def tagged(label):                        # 第 1 层：收参数
+    def decorator(fn):                    # 第 2 层：收函数
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):     # 第 3 层：每次调用时运行
+            print(f"[{label}] {fn.__name__}{args}")
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@tagged("eval")
+def section_of(clause_id):
+    return clause_id.split(".")[0]
+
+print(section_of("8.1"))
+
+@@ concept
+title: with 和上下文管理器
+--- body
+`with open(...) as f:` 保证文件用完一定关上，哪怕中间出错。你也可以自己写这种「进去时做一件事，出来时**一定**做另一件事」的东西：
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def span(name):
+    start = time.perf_counter()
+    try:
+        yield            # with 里面的代码在这里运行
+    finally:
+        record(name, start)   # 不管有没有出错都会执行
+```
+
+`yield` 把控制权交给 `with` 里面的代码；`finally` 保证出错时也记下这个 span。追踪最需要的恰恰是**出错**那次调用的记录。
+
+经典错误：用 `except Exception:` 代替 `finally`。这样错误被吞掉了，调用方以为一切正常。
+--- code
+from contextlib import contextmanager
+
+SPANS = []
+
+@contextmanager
+def span(name):
+    ok = False
+    try:
+        yield
+        ok = True
+    finally:
+        SPANS.append({"name": name, "ok": ok})
+
+with span("split"):
+    parts = "8.1 Cap\n8.2 Exclusions".split("\n")
+
+try:
+    with span("review"):
+        raise RuntimeError("API error 503")
+except RuntimeError as e:
+    print("caught:", e)
+
+for s in SPANS:
+    print(s)
+
+@@ concept
+title: token、缓存命中率、延迟分位数
+--- body
+把每次调用的 `usage` 加起来，就是这次评测（或这份合同）的总账：
+
+- **总 token** 和**缓存命中率** `hit ÷ (hit + miss)`：命中率低，说明请求开头有东西在变（昨天学的）
+- **成本**：第 7 天的 `estimate_cost`；给客户报价时换算成「每 100 份合同多少钱」
+- **延迟不要只看平均**：一次 30 秒的卡顿会被一堆 1 秒的调用平均掉。要看 **p50**（一半的调用比它快）和 **p95**（95% 的调用比它快，代表「慢的那批」有多慢）
+
+最简单的分位数算法（nearest-rank）：排好序，取第 `ceil(p ÷ 100 × n)` 个（从 1 开始数）。下面 10 个延迟里，p50 是第 5 个，p95 是第 10 个。
+--- code
+latencies = [1450, 820, 30000, 1010, 1200, 950, 1100, 2100, 1300, 1600]
+ordered = sorted(latencies)
+print("mean:", sum(latencies) / len(latencies))
+print("p50: ", ordered[4])
+print("p95: ", ordered[9])
+
+usage = [
+    {"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 900},
+    {"prompt_cache_hit_tokens": 832, "prompt_cache_miss_tokens": 70},
+    {"prompt_cache_hit_tokens": 832, "prompt_cache_miss_tokens": 95},
+]
+hit = sum(u["prompt_cache_hit_tokens"] for u in usage)
+miss = sum(u["prompt_cache_miss_tokens"] for u in usage)
+print("cache hit ratio:", round(hit / (hit + miss), 2))
+
+@@ concept
+title: A/B 对比：一次只改一个东西
+--- body
+改了 prompt，怎么知道变好了？**同一批用例、同样的 N**，两个版本各跑一遍，逐条并排比。三条规矩（`learn/05_prompt_ab.md`）：
+
+- **一次只改一个东西**，否则不知道是谁起的作用
+- 先看高风险召回有没有掉，再看误报有没有少
+- 总分变高也要逐条看：一条从 3/3 掉到 1/3 就是回归，要查
+
+`run_evals.py` 用 f-string 把表格对齐：`{x:<10}` 左对齐占 10 格，`{x:>6}` 右对齐占 6 格，`{rate:.0%}` 把 0.8 显示成 `80%`，合起来就是 `{rate:>6.0%}`。
+--- code
+A = {"unlimited-liability": 1.0, "mutual-warranty-disclaimer": 0.4, "payment-net-30": 1.0}
+B = {"unlimited-liability": 1.0, "mutual-warranty-disclaimer": 0.8, "payment-net-30": 0.6}
+print(f"{'case':<28}{'v1':>6}{'v2':>6}")
+for case_id in A:
+    a, b = A[case_id], B[case_id]
+    note = "  <- worse" if b < a else ""
+    print(f"{case_id:<28}{a:>6.0%}{b:>6.0%}{note}")
+
+@@ item d13-01
+type: predict
+title: 复习：Counter、all 和 any
+level: 1
+--- prompt
+写出输出。复习第 8 天的 `Counter` 和 `all` / `any`，想一想最后一行和 pass^k、pass@k 的关系。
+--- code
+from collections import Counter
+
+verdicts = ["accept", "flag", "accept", "accept", "flag"]
+counts = Counter(verdicts)
+print(counts.most_common(1))
+print(counts["accept"] / len(verdicts))
+print(all(v == "accept" for v in verdicts), any(v == "accept" for v in verdicts))
+--- explain
+5 次里 accept 3 次，通过率 0.6。`all` 就是「5 次全对」（pass^k），这里是 False；`any` 就是「至少对一次」（pass@k），这里是 True。一条用例 pass@k 为真、pass^k 为假，说明它不稳定，需要多跑几次看通过率。
+
+@@ item d13-02
+type: code
+title: 检查一条用例
+level: 2
+--- prompt
+写 `check_case(case, result)`，和 `harness.py` 的 `check()` 一样，返回**失败原因的列表**（空列表 = 通过）。按这个顺序检查：
+
+1. `result["verdict"]` 不在 `case["expect"]["verdict_in"]` 里 → 加 `f"verdict {判定} not in {允许的列表}"`
+2. `expect` 里有 `"risk_in"`，而 `result["risk_level"]` 不在其中 → 加 `f"risk {风险} not in {允许的列表}"`
+3. `expect` 里有 `"topic"`，而 `result["topic"]` 和它不相等 → 加 `f"topic {实际} != {期望}"`
+
+```python
+check_case(UNLIMITED, {"verdict": "accept", "risk_level": "low", "topic": "other"})
+# ["verdict accept not in ['flag', 'redline']", "risk low not in ['high']", "topic other != liability_cap"]
+```
+--- starter
+def check_case(case, result):
+    fails = []
+    return fails
+--- solution
+def check_case(case, result):
+    fails = []
+    e = case["expect"]
+    if result["verdict"] not in e["verdict_in"]:
+        fails.append(f"verdict {result['verdict']} not in {e['verdict_in']}")
+    if "risk_in" in e and result["risk_level"] not in e["risk_in"]:
+        fails.append(f"risk {result['risk_level']} not in {e['risk_in']}")
+    if "topic" in e and result["topic"] != e["topic"]:
+        fails.append(f"topic {result['topic']} != {e['topic']}")
+    return fails
+--- tests
+UNLIMITED = {"id": "unlimited-liability", "kind": "must_flag", "clause": "Customer's liability shall be unlimited.",
+             "expect": {"verdict_in": ["flag", "redline"], "topic": "liability_cap", "risk_in": ["high"]}}
+NET30 = {"id": "payment-net-30", "kind": "must_accept", "clause": "Fees are payable within thirty (30) days.",
+         "expect": {"verdict_in": ["accept"]}}
+expect("三项都错：三条原因，按顺序", lambda: check_case(UNLIMITED, {"verdict": "accept", "risk_level": "low", "topic": "other"}), ["verdict accept not in ['flag', 'redline']", "risk low not in ['high']", "topic other != liability_cap"])
+expect("全对：空列表", lambda: check_case(UNLIMITED, {"verdict": "redline", "risk_level": "high", "topic": "liability_cap"}), [])
+expect("redline 和 flag 都算拦下", lambda: check_case(UNLIMITED, {"verdict": "flag", "risk_level": "high", "topic": "liability_cap"}), [])
+expect("只错风险", lambda: check_case(UNLIMITED, {"verdict": "redline", "risk_level": "medium", "topic": "liability_cap"}), ["risk medium not in ['high']"])
+expect("expect 里没写 risk_in / topic 就不查", lambda: check_case(NET30, {"verdict": "flag", "risk_level": "high", "topic": "other"}), ["verdict flag not in ['accept']"])
+--- hints
+- 先 `e = case["expect"]`，然后三个独立的 `if`（不是 elif：可能同时有好几个问题）。
+- 「expect 里有这个键」用 `"risk_in" in e` 判断，和后面的条件用 `and` 连起来。
+- f-string 里直接放列表，打印出来就是 `['flag', 'redline']` 的样子。
+
+@@ item d13-03
+type: code
+title: 一条用例的通过率
+level: 2
+mock: yes
+--- prompt
+写 `pass_rate(case, runs, review=classify)`：
+
+- 把 `case["clause"]` 交给 `review` 审 `runs` 次
+- 每次用 `check_case(case, 结果)` 判断，空列表算通过
+- 返回通过的比例（0 到 1 之间的小数）
+- `runs` 小于 1：`raise ValueError("runs must be at least 1")`
+
+`classify`（调模拟服务器）和 `check_case`（上一题）已写好。测试会用摇摆的 AS IS 条款，并且先调 `MOCK.reset()`，所以结果是固定的。
+--- starter
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def classify(clause_text):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+def check_case(case, result):
+    fails = []
+    e = case["expect"]
+    if result["verdict"] not in e["verdict_in"]:
+        fails.append(f"verdict {result['verdict']} not in {e['verdict_in']}")
+    if "risk_in" in e and result["risk_level"] not in e["risk_in"]:
+        fails.append(f"risk {result['risk_level']} not in {e['risk_in']}")
+    return fails
+
+def pass_rate(case, runs, review=classify):
+    pass
+--- solution
+import json
+import os
+import requests
+
+URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+
+def classify(clause_text):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": clause_text}], "response_format": {"type": "json_object"}}
+    content = requests.post(URL, headers=HEADERS, json=body).json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+def check_case(case, result):
+    fails = []
+    e = case["expect"]
+    if result["verdict"] not in e["verdict_in"]:
+        fails.append(f"verdict {result['verdict']} not in {e['verdict_in']}")
+    if "risk_in" in e and result["risk_level"] not in e["risk_in"]:
+        fails.append(f"risk {result['risk_level']} not in {e['risk_in']}")
+    return fails
+
+def pass_rate(case, runs, review=classify):
+    if runs < 1:
+        raise ValueError("runs must be at least 1")
+    passed = 0
+    for _ in range(runs):
+        if not check_case(case, review(case["clause"])):
+            passed += 1
+    return passed / runs
+--- tests
+UNLIMITED = {"id": "unlimited-liability", "clause": "Review clause 8.1: Customer's liability shall be unlimited.", "expect": {"verdict_in": ["flag", "redline"], "risk_in": ["high"]}}
+AS_IS = {"id": "mutual-warranty-disclaimer", "clause": 'Review clause 7.2: THE SERVICE IS PROVIDED "AS IS" AND EACH PARTY DISCLAIMS ALL OTHER WARRANTIES.', "expect": {"verdict_in": ["accept"]}}
+def _rate(case, runs):
+    MOCK.reset()
+    return pass_rate(case, runs)
+expect("稳定的用例：5/5", lambda: _rate(UNLIMITED, 5), 1.0)
+expect("摇摆的用例：5 次", lambda: _rate(AS_IS, 5), 0.8)
+expect("摇摆的用例：10 次", lambda: _rate(AS_IS, 10), 0.9)
+expect("真的审了 runs 次", lambda: (_rate(UNLIMITED, 4), len(MOCK.calls))[1], 4)
+expect("换一个一直放行的假审查器：0", lambda: pass_rate(UNLIMITED, 3, review=lambda text: {"verdict": "accept", "risk_level": "low"}), 0.0)
+expect_raises("runs 是 0", lambda: pass_rate(UNLIMITED, 0), ValueError)
+--- hints
+- `check_case` 返回空列表表示通过，所以判断写成 `if not check_case(...):`。
+- 调用审查用参数 `review(case["clause"])`，不要直接写 `classify(...)`，否则测试没法换成假的。
+
+@@ item d13-04
+type: code
+title: 混淆矩阵
+level: 2
+--- prompt
+写 `confusion(cases, predictions)`：
+
+- `cases`：用例列表。`kind` 是 `"must_accept"` 的算「没风险」，其他 kind 都算「有风险」（它们都期望被拦下）
+- `predictions`：`{用例 id: 判定}`。判定不是 `"accept"` 就算「标记了」
+- 返回 `{"TP": ..., "FP": ..., "FN": ..., "TN": ...}`，四个键都要有，没有就是 0
+
+```python
+confusion([{"id": "a", "kind": "must_flag"}, {"id": "b", "kind": "must_accept"}], {"a": "accept", "b": "flag"})
+# {"TP": 0, "FP": 1, "FN": 1, "TN": 0}
+```
+--- starter
+def confusion(cases, predictions):
+    counts = {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
+    return counts
+--- solution
+def confusion(cases, predictions):
+    counts = {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
+    for case in cases:
+        risky = case["kind"] != "must_accept"
+        flagged = predictions[case["id"]] != "accept"
+        if risky and flagged:
+            counts["TP"] += 1
+        elif not risky and flagged:
+            counts["FP"] += 1
+        elif risky and not flagged:
+            counts["FN"] += 1
+        else:
+            counts["TN"] += 1
+    return counts
+--- tests
+CASES = [
+    {"id": "unlimited-liability", "kind": "must_flag"},
+    {"id": "cross-reference-trap", "kind": "trap"},
+    {"id": "prompt-injection", "kind": "injection"},
+    {"id": "payment-net-30", "kind": "must_accept"},
+    {"id": "service-levels", "kind": "must_accept"},
+]
+PRED = {"unlimited-liability": "redline", "cross-reference-trap": "accept", "prompt-injection": "flag", "payment-net-30": "accept", "service-levels": "flag"}
+expect("题目里的例子", lambda: confusion([{"id": "a", "kind": "must_flag"}, {"id": "b", "kind": "must_accept"}], {"a": "accept", "b": "flag"}), {"TP": 0, "FP": 1, "FN": 1, "TN": 0})
+expect("五条用例", lambda: confusion(CASES, PRED), {"TP": 2, "FP": 1, "FN": 1, "TN": 1})
+expect("全判对", lambda: confusion(CASES, {"unlimited-liability": "flag", "cross-reference-trap": "flag", "prompt-injection": "redline", "payment-net-30": "accept", "service-levels": "accept"}), {"TP": 3, "FP": 0, "FN": 0, "TN": 2})
+expect("没有用例", lambda: confusion([], {}), {"TP": 0, "FP": 0, "FN": 0, "TN": 0})
+--- hints
+- 每条用例先算两个布尔值：`risky = case["kind"] != "must_accept"`，`flagged = predictions[case["id"]] != "accept"`。
+- 再用 if / elif 分四种情况，给对应的键加 1。
+
+@@ item d13-05
+type: code
+title: 精确率和召回率
+level: 2
+--- prompt
+写 `precision_recall(counts)`：`counts` 是上一题返回的字典。返回元组 `(precision, recall)`，两个数都用 `round(x, 2)`：
+
+- precision = TP ÷ (TP + FP)；分母是 0（一条都没标记）时返回 `1.0`
+- recall = TP ÷ (TP + FN)；分母是 0（一条风险用例都没有）时返回 `1.0`，和 `harness.py` 的 `high_risk_recall` 一样
+
+`precision_recall({"TP": 3, "FP": 1, "FN": 1, "TN": 5})` → `(0.75, 0.75)`
+--- starter
+def precision_recall(counts):
+    pass
+--- solution
+def precision_recall(counts):
+    tp, fp, fn = counts["TP"], counts["FP"], counts["FN"]
+    precision = tp / (tp + fp) if tp + fp else 1.0
+    recall = tp / (tp + fn) if tp + fn else 1.0
+    return round(precision, 2), round(recall, 2)
+--- tests
+expect("题目里的例子", lambda: precision_recall({"TP": 3, "FP": 1, "FN": 1, "TN": 5}), (0.75, 0.75))
+expect("没有误报，漏了一条", lambda: precision_recall({"TP": 2, "FP": 0, "FN": 1, "TN": 4}), (1.0, 0.67))
+expect("全都没抓到", lambda: precision_recall({"TP": 0, "FP": 2, "FN": 3, "TN": 0}), (0.0, 0.0))
+expect("分母都是 0", lambda: precision_recall({"TP": 0, "FP": 0, "FN": 0, "TN": 6}), (1.0, 1.0))
+--- hints
+- 先把三个数取出来：`tp, fp, fn = counts["TP"], counts["FP"], counts["FN"]`。
+- 分母为 0 的判断可以写成一行：`tp / (tp + fp) if tp + fp else 1.0`（0 是假值）。
+- 返回两个值就是返回元组：`return round(p, 2), round(r, 2)`。
+
+@@ item d13-06
+type: choice
+title: 合同审查先看哪个数
+level: 2
+--- prompt
+律师说：「漏掉一条无限责任条款，客户可能损失几百万；多标一条，我花 30 秒看一眼。」你在调 Clause Check 时，最该先盯住哪个数？
+--- options
+- 精确率：标记出来的都得是真问题
+- 高风险用例的召回率：真有风险的条款一条都不能漏
+- 准确率：所有用例里判对的比例
+- 平均延迟
+answer: 2
+--- explain
+漏报（FN）的代价远大于误报（FP），所以先保召回：`run_evals.py` 要求高风险召回至少 0.9 才算通过。准确率会骗人：10 条用例里只有 1 条有风险时，全判 accept 也有 90% 准确率。但误报也不是免费的：全标 flag 召回是 1.0，工具却没用了。所以 must_accept 用例也要看，这正是项目修样板条款误报的原因。
+
+@@ item d13-07
+type: testwrite
+title: 给 recall 写测试
+level: 3
+--- prompt
+给 `recall(results)` 写测试。`results` 是 `(真有风险吗, 标记了吗)` 元组的列表；召回率 = 抓住的风险条款数 ÷ 全部风险条款数；一条风险条款都没有时返回 `1.0`。
+
+你的测试要在正确的函数上全部通过，并且能抓住藏起来的几个有 bug 的版本。起步代码里只有一个很弱的测试。想一想：
+
+- 一个误报（没风险却标记了）应该影响召回率吗？
+- 结果是 1/3 这种除不尽的数时怎么比较？
+- 空列表呢？
+--- impl
+def recall(results):
+    tp = sum(1 for risky, flagged in results if risky and flagged)
+    fn = sum(1 for risky, flagged in results if risky and not flagged)
+    if tp + fn == 0:
+        return 1.0
+    return tp / (tp + fn)
+--- mutants
+===== 分母用错：拿「被标记的」当分母（那是精确率）
+def recall(results):
+    tp = sum(1 for risky, flagged in results if risky and flagged)
+    fp = sum(1 for risky, flagged in results if not risky and flagged)
+    if tp + fp == 0:
+        return 1.0
+    return tp / (tp + fp)
+===== 边界：一条风险条款都没有时
+def recall(results):
+    tp = sum(1 for risky, flagged in results if risky and flagged)
+    fn = sum(1 for risky, flagged in results if risky and not flagged)
+    if tp + fn == 0:
+        return 0.0
+    return tp / (tp + fn)
+===== 计数：「抓住了」的条件只写了一半
+def recall(results):
+    tp = sum(1 for risky, flagged in results if flagged)
+    fn = sum(1 for risky, flagged in results if risky and not flagged)
+    if tp + fn == 0:
+        return 1.0
+    return tp / (tp + fn)
+--- starter
+import pytest
+
+def test_all_caught():
+    assert recall([(True, True), (False, False)]) == 1.0
+--- solution
+import pytest
+
+def test_all_caught():
+    assert recall([(True, True), (False, False)]) == 1.0
+
+def test_false_alarm_does_not_change_recall():
+    results = [(True, True), (True, False), (True, False), (False, True)]
+    assert recall(results) == pytest.approx(1 / 3)
+
+def test_no_risky_clauses():
+    assert recall([]) == 1.0
+    assert recall([(False, True), (False, False)]) == 1.0
+--- hints
+- 用一组「有风险的漏了、没风险的误报了」混在一起的数据：比如 3 条有风险只抓住 1 条，再加 1 条误报。正确答案是 1/3。
+- 1/3 除不尽，用 `assert recall(...) == pytest.approx(1 / 3)`。
+- 再单独写一个空列表的测试：题目说这时返回 `1.0`。
+
+@@ item d13-08
+type: predict
+title: 装饰器什么时候运行
+level: 2
+--- prompt
+写出输出。注意 `decorating` 那一行是什么时候打印的。
+--- code
+def shout(fn):
+    print("decorating", fn.__name__)
+    def wrapper(text):
+        print("before")
+        result = fn(text)
+        print("after")
+        return result.upper()
+    return wrapper
+
+@shout
+def verdict(text):
+    print("inside")
+    return "flag" if "unlimited" in text else "accept"
+
+print("start")
+print(verdict("liability is unlimited"))
+--- explain
+`@shout` 在**定义函数的那一刻**就执行了（等于 `verdict = shout(verdict)`），所以 `decorating verdict` 在 `start` 之前。之后每次调用 `verdict(...)`，实际运行的是 `wrapper`：先 before，再调原函数（inside），再 after，最后返回改过的结果。
+
+@@ item d13-09
+type: code
+title: 数调用次数的装饰器
+level: 2
+--- prompt
+写装饰器 `count_calls(fn)`：返回的包装函数每被调用一次，就把自己的属性 `calls` 加 1（从 0 开始），然后调用原函数并返回它的结果。用 `functools.wraps` 保留原函数的名字。
+
+```python
+@count_calls
+def classify(text): ...
+
+classify("a"); classify("b")
+classify.calls      # 2
+classify.__name__   # "classify"
+```
+
+函数也是对象，可以给它加属性：在 `return wrapper` 之前写 `wrapper.calls = 0`。
+--- starter
+import functools
+
+def count_calls(fn):
+    pass
+--- solution
+import functools
+
+def count_calls(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        wrapper.calls += 1
+        return fn(*args, **kwargs)
+    wrapper.calls = 0
+    return wrapper
+--- tests
+@count_calls
+def classify(text):
+    return "flag" if "unlimited" in text else "accept"
+expect("返回原函数的结果", lambda: classify("liability is unlimited"), "flag")
+expect("关键字参数也能用", lambda: classify(text="fees"), "accept")
+expect("名字没丢", lambda: classify.__name__, "classify")
+def _fresh():
+    @count_calls
+    def f(x):
+        return x
+    before = f.calls
+    f(1); f(2); f(3)
+    return [before, f.calls]
+expect("调用前是 0，调用 3 次后是 3", _fresh, [0, 3])
+def _separate():
+    @count_calls
+    def a():
+        return 1
+    @count_calls
+    def b():
+        return 2
+    a(); a(); b()
+    return [a.calls, b.calls]
+expect("两个函数各数各的", _separate, [2, 1])
+--- hints
+- 结构：`def count_calls(fn):` 里面定义 `def wrapper(*args, **kwargs):`，最后 `return wrapper`。
+- 在 wrapper 里：先 `wrapper.calls += 1`，再 `return fn(*args, **kwargs)`。
+- 别忘了在 `return wrapper` 之前设初始值 `wrapper.calls = 0`，并在 `def wrapper` 上面加 `@functools.wraps(fn)`。
+
+@@ item d13-10
+type: fix
+title: 修 bug：装了追踪就返回 None
+level: 2
+--- prompt
+同事写了一个追踪装饰器 `traced`。加上以后，`review` 返回的全是 `None`，而且 `review.__name__` 变成了 `wrapper`（日志和追踪里全是 wrapper，没法查）。
+
+运行看看输出，修好这两个 bug。
+--- starter
+import time
+
+SPANS = []
+
+def traced(fn):
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        fn(*args, **kwargs)
+        SPANS.append({"name": fn.__name__, "ms": round((time.perf_counter() - start) * 1000)})
+    return wrapper
+
+@traced
+def review(clause_text):
+    """Review one clause and return a verdict."""
+    return "redline" if "unlimited" in clause_text else "accept"
+
+print(review("Customer's liability shall be unlimited."))
+print(review.__name__, review.__doc__)
+--- solution
+import functools
+import time
+
+SPANS = []
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = fn(*args, **kwargs)
+        SPANS.append({"name": fn.__name__, "ms": round((time.perf_counter() - start) * 1000)})
+        return result
+    return wrapper
+
+@traced
+def review(clause_text):
+    """Review one clause and return a verdict."""
+    return "redline" if "unlimited" in clause_text else "accept"
+
+print(review("Customer's liability shall be unlimited."))
+print(review.__name__, review.__doc__)
+--- tests
+expect("返回原函数的结果", lambda: review("Customer's liability shall be unlimited."), "redline")
+expect("另一条", lambda: review("Fees are payable within thirty (30) days."), "accept")
+expect("名字保留", lambda: review.__name__, "review")
+expect("文档也保留", lambda: review.__doc__, "Review one clause and return a verdict.")
+expect("span 照样记了", lambda: SPANS[-1]["name"], "review")
+--- hints
+- 原函数的返回值被丢掉了：`fn(...)` 的结果存进变量，最后 `return` 它。
+- 名字和文档：`import functools`，在 `def wrapper` 上面加 `@functools.wraps(fn)`。
+
+@@ item d13-11
+type: code
+title: 带假时钟的计时装饰器
+level: 3
+--- prompt
+写**带参数**的装饰器 `timed(clock=time.perf_counter)`，用法：
+
+```python
+@timed()
+def review(text): ...
+
+@timed(clock=fake_clock([10.0, 10.25]))
+def classify(text): ...
+```
+
+每次调用被装饰的函数时：
+
+- 调用前后各读一次 `clock()`
+- 往全局列表 `SPANS` 里加 `{"name": 原函数名, "ms": 耗时毫秒}`，毫秒用 `round(...)` 变成整数；返回原函数的结果
+- 原函数**出错**时也要记一条，多一个键 `"error": 异常的类名`（`type(e).__name__`），然后把错误原样抛出去：在 `except` 里单独写一个 `raise` 就行
+- 用 `functools.wraps` 保留名字
+--- starter
+import functools
+import time
+
+SPANS = []
+
+def timed(clock=time.perf_counter):
+    pass
+--- solution
+import functools
+import time
+
+SPANS = []
+
+def timed(clock=time.perf_counter):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            start = clock()
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as e:
+                SPANS.append({"name": fn.__name__, "ms": round((clock() - start) * 1000), "error": type(e).__name__})
+                raise
+            SPANS.append({"name": fn.__name__, "ms": round((clock() - start) * 1000)})
+            return result
+        return wrapper
+    return decorator
+--- tests
+def fake_clock(times):
+    it = iter(times)
+    return lambda: next(it)
+def classify(text):
+    return "flag" if "unlimited" in text else "accept"
+def _one():
+    SPANS.clear()
+    f = timed(clock=fake_clock([10.0, 10.25]))(classify)
+    return [f("liability is unlimited"), SPANS]
+expect("结果和 span", _one, ["flag", [{"name": "classify", "ms": 250}]])
+def _two():
+    SPANS.clear()
+    f = timed(clock=fake_clock([1.0, 1.1, 5.0, 5.5]))(classify)
+    f("a")
+    f("b")
+    return [s["ms"] for s in SPANS]
+expect("调用两次，两条 span", _two, [100, 500])
+def call_model(text):
+    raise TimeoutError("model took too long")
+def _error():
+    SPANS.clear()
+    f = timed(clock=fake_clock([2.0, 32.0]))(call_model)
+    try:
+        f("x")
+    except TimeoutError:
+        return SPANS
+    return "错误没有抛出来"
+expect("出错也记一条，错误照样抛出", _error, [{"name": "call_model", "ms": 30000, "error": "TimeoutError"}])
+def _default():
+    SPANS.clear()
+    @timed()
+    def section_of(clause_id):
+        return clause_id.split(".")[0]
+    return [section_of("8.1"), section_of.__name__, SPANS[0]["ms"] < 1000]
+expect("默认用真时钟，名字保留", _default, ["8", "section_of", True])
+--- hints
+- 三层：`timed(clock)` 返回 `decorator`；`decorator(fn)` 返回 `wrapper`；`wrapper(*args, **kwargs)` 里干活。照着知识卡片里的 `tagged` 写。
+- 在 wrapper 里：`start = clock()`，然后 `try: result = fn(*args, **kwargs)`；`except Exception as e:` 里记一条带 `"error"` 的，再单独一行 `raise`。
+- try 之后（没出错的路径）：记一条普通的 span，`return result`。
+
+@@ item d13-12
+type: order
+title: 排代码：出错也要记下的 span
+level: 2
+--- prompt
+排出上下文管理器 `span(name, clock=time.perf_counter)`：`with` 里面的代码运行完（**包括出错**），都往 `SPANS` 里记一条 `{"name": ..., "ms": ...}`，错误照样往外抛。
+
+有两行干扰项。
+--- lines
+import time
+from contextlib import contextmanager
+SPANS = []
+@contextmanager
+def span(name, clock=time.perf_counter):
+    start = clock()
+    try:
+        yield
+    finally:
+        SPANS.append({"name": name, "ms": round((clock() - start) * 1000)})
+--- distractors
+    except Exception:
+    yield
+--- tests
+def fake_clock(times):
+    it = iter(times)
+    return lambda: next(it)
+def _normal():
+    SPANS.clear()
+    with span("split", clock=fake_clock([1.0, 1.5])):
+        pass
+    return SPANS
+expect("正常结束：记一条", _normal, [{"name": "split", "ms": 500}])
+def _error():
+    SPANS.clear()
+    try:
+        with span("review", clock=fake_clock([2.0, 2.25])):
+            raise RuntimeError("API error 503")
+    except RuntimeError:
+        return SPANS
+    return "错误被吞掉了"
+expect("出错：照样记一条，错误照样抛出", _error, [{"name": "review", "ms": 250}])
+--- hints
+- `@contextmanager` 写在 `def span` 正上方；函数里先记开始时间，再 `try` / `yield` / `finally`。
+- `yield` 要缩进在 `try:` 里面；`except Exception:` 会把错误吞掉，这里要的是 `finally:`。
+
+@@ item d13-13
+type: code
+title: span 树：谁套着谁
+level: 3
+--- prompt
+真实的追踪是一棵树：`review_clause` 里面套着 `call_model`、`lookup_playbook`。Langfuse 的 `@observe` 嵌套调用时会自动变成父子 span（`tracing.py` 开头的注释），这里自己写一个小的。写上下文管理器 `span(name, spans, clock=time.perf_counter)`：
+
+- 往列表 `spans` 里记 `{"name": 名字, "parent": 外层 span 的名字（最外层是 None）, "ms": 耗时毫秒整数, "ok": 有没有正常结束}`
+- 在 span **结束时**追加，所以里层的先出现在列表里
+- 出错时 `ok` 是 `False`，错误照样往外抛
+- 用全局列表 `STACK` 记住「现在在哪些 span 里面」：进入时 append 名字，结束时 pop（出错也要 pop）
+
+```python
+spans = []
+with span("review_clause", spans):
+    with span("call_model", spans):
+        pass
+# spans 里：先是 call_model（parent 是 "review_clause"），再是 review_clause（parent 是 None）
+```
+--- starter
+import time
+from contextlib import contextmanager
+
+STACK = []
+
+@contextmanager
+def span(name, spans, clock=time.perf_counter):
+    yield
+--- solution
+import time
+from contextlib import contextmanager
+
+STACK = []
+
+@contextmanager
+def span(name, spans, clock=time.perf_counter):
+    parent = STACK[-1] if STACK else None
+    STACK.append(name)
+    start = clock()
+    ok = False
+    try:
+        yield
+        ok = True
+    finally:
+        STACK.pop()
+        spans.append({"name": name, "parent": parent, "ms": round((clock() - start) * 1000), "ok": ok})
+--- tests
+def fake_clock(times):
+    it = iter(times)
+    return lambda: next(it)
+def _nested():
+    spans = []
+    clock = fake_clock([0.0, 0.1, 0.4, 1.0])
+    with span("review_clause", spans, clock):
+        with span("call_model", spans, clock):
+            pass
+    return spans
+expect("嵌套：里层先记，parent 正确", _nested, [
+    {"name": "call_model", "parent": "review_clause", "ms": 300, "ok": True},
+    {"name": "review_clause", "parent": None, "ms": 1000, "ok": True},
+])
+def _siblings():
+    spans = []
+    with span("review_clause", spans):
+        with span("lookup_playbook", spans):
+            pass
+        with span("call_model", spans):
+            pass
+    return [(s["name"], s["parent"]) for s in spans]
+expect("两个并排的子 span", _siblings, [("lookup_playbook", "review_clause"), ("call_model", "review_clause"), ("review_clause", None)])
+def _error():
+    spans = []
+    try:
+        with span("review_clause", spans):
+            with span("call_model", spans):
+                raise TimeoutError("model took too long")
+    except TimeoutError:
+        return [[s["ok"] for s in spans], STACK]
+    return "错误被吞掉了"
+expect("出错：两层都记成 ok=False，STACK 清空了，错误抛出", _error, [[False, False], []])
+--- hints
+- 进入时：先看 `STACK[-1] if STACK else None` 得到 parent，再 `STACK.append(name)`，记开始时间。
+- 用知识卡片里的写法记录 ok：`ok = False`；`try: yield` 之后 `ok = True`；`finally:` 里 `STACK.pop()` 并追加记录。
+- 时钟读取的顺序：外层开始、里层开始、里层结束、外层结束，所以假时钟要按这个顺序给 4 个数。
+
+@@ item d13-14
+type: code
+title: token 汇总和缓存命中率
+level: 2
+mock: yes
+--- prompt
+写两个函数：
+
+- `total_usage(responses)`：`responses` 是一组接口返回的字典（`resp.json()` 的结果）。把每个的 `usage` 里 `KEYS` 这四个数分别加起来，返回有这四个键的字典。空列表返回四个 0
+- `cache_hit_ratio(total)`：`total` 是 `total_usage` 的结果；返回 `prompt_cache_hit_tokens ÷ (hit + miss)`，用 `round(x, 2)`；分母是 0 时返回 `0.0`
+--- starter
+KEYS = ["prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"]
+
+def total_usage(responses):
+    pass
+
+def cache_hit_ratio(total):
+    pass
+--- solution
+KEYS = ["prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"]
+
+def total_usage(responses):
+    total = {k: 0 for k in KEYS}
+    for r in responses:
+        for k in KEYS:
+            total[k] += r["usage"][k]
+    return total
+
+def cache_hit_ratio(total):
+    hit = total["prompt_cache_hit_tokens"]
+    miss = total["prompt_cache_miss_tokens"]
+    if hit + miss == 0:
+        return 0.0
+    return round(hit / (hit + miss), 2)
+--- tests
+import os
+import requests
+R1 = {"usage": {"prompt_tokens": 900, "completion_tokens": 60, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 900}}
+R2 = {"usage": {"prompt_tokens": 902, "completion_tokens": 55, "prompt_cache_hit_tokens": 832, "prompt_cache_miss_tokens": 70}}
+expect("两次调用相加", lambda: total_usage([R1, R2]), {"prompt_tokens": 1802, "completion_tokens": 115, "prompt_cache_hit_tokens": 832, "prompt_cache_miss_tokens": 970})
+expect("空列表", lambda: total_usage([]), {"prompt_tokens": 0, "completion_tokens": 0, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0})
+expect("命中率", lambda: cache_hit_ratio(total_usage([R1, R2])), 0.46)
+expect("没有输入 token", lambda: cache_hit_ratio(total_usage([])), 0.0)
+SYSTEM = "You review one contract clause for the Customer against the playbook. " * 8
+def _real():
+    MOCK.reset()
+    responses = []
+    for clause in ["Review clause 3.1: fees.", "Review clause 8.1: unlimited.", "Review clause 4.2: renewal."]:
+        body = {"model": "deepseek-chat", "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": clause}]}
+        responses.append(requests.post("https://api.deepseek.com/v1/chat/completions", headers={"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}, json=body).json())
+    t = total_usage(responses)
+    return [t["prompt_tokens"] == t["prompt_cache_hit_tokens"] + t["prompt_cache_miss_tokens"], cache_hit_ratio(t) > 0.5]
+expect("模拟服务器的三次真实调用：hit + miss = 输入，命中率过半", _real, [True, True])
+--- hints
+- 先建一个四个键都是 0 的字典：`{k: 0 for k in KEYS}`，再两层循环往里加。
+- 命中率先判断分母是不是 0，再 `round(hit / (hit + miss), 2)`。
+
+@@ item d13-15
+type: code
+title: 延迟分位数
+level: 2
+--- prompt
+写 `percentile(values, p)`，用 nearest-rank 方法：
+
+1. 把 `values` 排序（用 `sorted`，不要改传进来的列表）
+2. `rank = math.ceil(p / 100 * n)`，`n` 是个数；`rank` 小于 1 时当作 1
+3. 返回排好序的第 `rank` 个（从 1 开始数，所以下标是 `rank - 1`）
+
+`values` 是空的，或者 `p` 不在 0 到 100 之间：`raise ValueError`。
+
+`percentile([300, 100, 200, 400], 50)` → `200`
+--- starter
+import math
+
+def percentile(values, p):
+    pass
+--- solution
+import math
+
+def percentile(values, p):
+    if not values or not 0 <= p <= 100:
+        raise ValueError("need values and 0 <= p <= 100")
+    ordered = sorted(values)
+    rank = max(math.ceil(p / 100 * len(ordered)), 1)
+    return ordered[rank - 1]
+--- tests
+LAT = [1450, 820, 30000, 1010, 1200, 950, 1100, 2100, 1300, 1600]
+expect("题目里的例子", lambda: percentile([300, 100, 200, 400], 50), 200)
+expect("p50", lambda: percentile(LAT, 50), 1200)
+expect("p95：慢的那批", lambda: percentile(LAT, 95), 30000)
+expect("p0 是最小值", lambda: percentile(LAT, 0), 820)
+expect("只有一个值", lambda: percentile([700], 95), 700)
+expect("没有改传进来的列表", lambda: (percentile(LAT, 50), LAT[0])[1], 1450)
+expect_raises("空列表", lambda: percentile([], 50), ValueError)
+expect_raises("p 超过 100", lambda: percentile(LAT, 101), ValueError)
+--- hints
+- 先检查：`if not values or not 0 <= p <= 100: raise ValueError(...)`。
+- `rank = max(math.ceil(p / 100 * len(ordered)), 1)`，返回 `ordered[rank - 1]`。
+
+@@ item d13-16
+type: fill
+title: 填空：对齐表格
+level: 2
+--- prompt
+填空：让对比表对齐。第一列左对齐占 28 格；后面每一列右对齐占 6 格，通过率显示成不带小数的百分比（0.8 → `80%`）。
+--- template
+def header(name_a, name_b):
+    return f"{'case':[[<28]]}{name_a:[[>6]]}{name_b:>6}"
+
+def row(case_id, rate_a, rate_b):
+    return f"{case_id:<28}{rate_a:[[>6.0%]]}{rate_b:>6.0%}"
+--- tests
+expect("表头", lambda: header("A", "B"), "case                             A     B")
+expect("一行", lambda: row("unlimited-liability", 1.0, 0.8), "unlimited-liability           100%   80%")
+expect("除不尽的通过率四舍五入", lambda: row("payment-net-30", 0.667, 0.0), "payment-net-30                 67%    0%")
+--- hints
+- `<` 左对齐、`>` 右对齐，后面的数字是宽度。
+- 百分比格式：`.0%` 表示乘 100、不留小数、加 `%`；宽度写在它前面：`>6.0%`。
+
+@@ item d13-17
+type: code
+title: A/B 对比表
+level: 3
+--- prompt
+写 `ab_table(results_a, results_b, name_a="A", name_b="B")`，用 `print` 打印两个版本的对比表（不是 return）：
+
+- `results_a`、`results_b` 是 `{用例 id: 通过率}`；按 `results_a` 的顺序一条一条打印
+- 表头：`f"{'case':<28}{name_a:>6}{name_b:>6}"`
+- 每行：`f"{用例:<28}{a:>6.0%}{b:>6.0%}"`；B 比 A **低**时，行尾加 `"  <- worse"`
+- 用例只在 A 里有、B 里没有：B 那一列打印 `f"{'-':>6}"`，这条不算变差
+- 最后一行：`f"regressions: {变差的条数}"`
+
+```
+case                            v1    v2
+unlimited-liability           100%  100%
+payment-net-30                100%   60%  <- worse
+regressions: 1
+```
+--- starter
+def ab_table(results_a, results_b, name_a="A", name_b="B"):
+    print(f"{'case':<28}{name_a:>6}{name_b:>6}")
+--- solution
+def ab_table(results_a, results_b, name_a="A", name_b="B"):
+    print(f"{'case':<28}{name_a:>6}{name_b:>6}")
+    worse = 0
+    for case_id, a in results_a.items():
+        b = results_b.get(case_id)
+        if b is None:
+            print(f"{case_id:<28}{a:>6.0%}{'-':>6}")
+            continue
+        note = ""
+        if b < a:
+            note = "  <- worse"
+            worse += 1
+        print(f"{case_id:<28}{a:>6.0%}{b:>6.0%}{note}")
+    print(f"regressions: {worse}")
+--- tests
+A = {"unlimited-liability": 1.0, "mutual-warranty-disclaimer": 0.4, "payment-net-30": 1.0, "cross-reference-trap": 0.8}
+B = {"unlimited-liability": 1.0, "mutual-warranty-disclaimer": 0.8, "payment-net-30": 0.6}
+expect_output("完整的表", lambda: ab_table(A, B, "v1", "v2"), "\n".join([
+    "case                            v1    v2",
+    "unlimited-liability           100%  100%",
+    "mutual-warranty-disclaimer     40%   80%",
+    "payment-net-30                100%   60%  <- worse",
+    "cross-reference-trap           80%     -",
+    "regressions: 1",
+]))
+expect_output("没有变差", lambda: ab_table({"unlimited-liability": 0.8}, {"unlimited-liability": 1.0}), "\n".join([
+    "case                             A     B",
+    "unlimited-liability            80%  100%",
+    "regressions: 0",
+]))
+expect_output("没有用例", lambda: ab_table({}, {}), "case                             A     B\nregressions: 0")
+--- hints
+- `for case_id, a in results_a.items():`，B 用 `results_b.get(case_id)` 取，取不到是 `None`。
+- `b is None` 时打印带 `'-'` 的那一行，然后 `continue`。
+- 变差的计数放在循环外面，初始为 0；循环结束后打印最后一行。
+
+@@ item d13-18
+type: choice
+title: 两张表一模一样？
+level: 2
+--- prompt
+你在自己电脑上用 mock 模式跑了两次评测：`run_evals.py --mode mock --prompt v1` 和 `--prompt v2`。两张表一模一样，连 token 都是 0。这说明什么？
+--- options
+- v2 没有任何改进，应该删掉
+- mock 模式用的是基于规则的离线审查器，根本不读 prompt；要比较 prompt，必须用真模型跑
+- 评测脚本坏了
+- 两版 prompt 一样好，随便用哪个
+answer: 2
+--- explain
+`review.py` 的 `review_clause` 里，`settings.mock` 为真时直接走 `rule_based_review`，prompt 一个字都没发出去。mock 模式用来测流水线和评测脚本本身（免费、结果固定），比较 prompt 要在真模型上、用同样的用例和 N 来跑。做 A/B 之前先确认「我改的东西真的进了被测的系统」，这和第 7 天「先看输入」是一回事。
+
+@@ item d13-19
+type: local
+title: 本机任务：真的比一次 v1 和 v2
+level: 2
+--- prompt
+在项目里跑一次真正的 A/B。
+
+1. 先用 mock 模式确认评测脚本能跑（免费，几秒钟）：
+
+```
+cd "G:\Contract Clause Reviewer"
+python evals/run_evals.py --mode mock --runs 3 --out evals/results.mock.json
+```
+
+2. 再用 DeepSeek 分别跑两版 prompt。每遍 11 条用例 × 3 次，大约 5–8 分钟，花费几分钱：
+
+```
+python evals/run_evals.py --mode deepseek --runs 3 --prompt v1 --out evals/results.deepseek.v1.json
+python evals/run_evals.py --mode deepseek --runs 3 --prompt v2 --out evals/results.deepseek.v2.json
+```
+
+`--out` 让两次结果分开保存（`evals/results*.json` 不会进 git）。
+
+3. 把两遍 DeepSeek 的通过率表粘贴到下面（至少要有两行 `high-risk recall`），然后对照 `learn/05_prompt_ab.md` 回答自己三个问题：高风险召回掉了吗？must_accept 用例的误报变少了吗？有没有哪条用例变差？
+placeholder: 粘贴两张 DeepSeek 通过率表
+verify: high-risk recall[\s\S]*high-risk recall
+--- hints
+- 看到 401 或 `needs DEEPSEEK_API_KEY`：检查项目根目录 `.env` 里的 `DEEPSEEK_API_KEY`。
+- 表太长就只粘贴每遍最后的表格部分（从 `case  kind  pass rate` 那一行开始）。
+
+@@ item d13-e1
+type: scratch
+title: 闭卷：每条用例的通过率
+exam: yes
+level: 3
+--- prompt
+写 `evaluate(cases, predict, runs)`：
+
+- `cases`：用例列表，每条是 `{"id": ..., "clause": 条款文字, "expect": {"verdict_in": [允许的判定]}}`
+- `predict(clause_text)` 返回一个判定字符串，比如 `"flag"`
+- 每条用例调用 `predict` 共 `runs` 次，判定在 `verdict_in` 里算通过
+- 返回 `{用例 id: 通过率}`，通过率用 `round(x, 2)`
+- `runs` 小于 1：`raise ValueError`
+--- solution
+def evaluate(cases, predict, runs):
+    if runs < 1:
+        raise ValueError("runs must be at least 1")
+    rates = {}
+    for case in cases:
+        passed = sum(1 for _ in range(runs) if predict(case["clause"]) in case["expect"]["verdict_in"])
+        rates[case["id"]] = round(passed / runs, 2)
+    return rates
+--- tests
+CASES = [
+    {"id": "unlimited-liability", "clause": "Customer's liability shall be unlimited.", "expect": {"verdict_in": ["flag", "redline"]}},
+    {"id": "payment-net-30", "clause": "Fees are payable within thirty (30) days.", "expect": {"verdict_in": ["accept"]}},
+]
+def cycling(answers):
+    state = {"i": 0}
+    def predict(text):
+        answer = answers[state["i"] % len(answers)]
+        state["i"] += 1
+        return answer
+    return predict
+expect("一直判 flag", lambda: evaluate(CASES, lambda text: "flag", 3), {"unlimited-liability": 1.0, "payment-net-30": 0.0})
+expect("轮流判 flag / accept / accept", lambda: evaluate(CASES, cycling(["flag", "accept", "accept"]), 3), {"unlimited-liability": 0.33, "payment-net-30": 0.67})
+expect_raises("runs 是 0", lambda: evaluate(CASES, lambda text: "flag", 0), ValueError)
+
+@@ item d13-e2
+type: scratch
+title: 闭卷：重试装饰器
+exam: yes
+level: 3
+--- prompt
+写带参数的装饰器 `retry(times)`，用法：
+
+```python
+@retry(3)
+def call_model(text): ...
+```
+
+- 被装饰的函数抛出任何 `Exception`，就再调一次，一共最多调用 `times` 次
+- 某一次成功，就返回那次的结果
+- `times` 次全失败：把**最后一次**的异常原样抛出
+- 用 `functools.wraps` 保留原函数的名字
+- `times` 小于 1：在 `retry(0)` 这一步就 `raise ValueError`
+--- solution
+import functools
+
+def retry(times):
+    if times < 1:
+        raise ValueError("times must be at least 1")
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last = None
+            for _ in range(times):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    last = e
+            raise last
+        return wrapper
+    return decorator
+--- tests
+def flaky(fail_times):
+    state = {"calls": 0}
+    def call_model(text):
+        state["calls"] += 1
+        if state["calls"] <= fail_times:
+            raise ConnectionError(f"attempt {state['calls']} failed")
+        return "flag"
+    return call_model, state
+def _ok_after_two():
+    fn, state = flaky(2)
+    wrapped = retry(3)(fn)
+    return [wrapped("x"), state["calls"], wrapped.__name__]
+expect("失败两次，第三次成功", _ok_after_two, ["flag", 3, "call_model"])
+def _give_up():
+    fn, state = flaky(10)
+    try:
+        retry(3)(fn)("x")
+    except ConnectionError as e:
+        return [str(e), state["calls"]]
+    return "没有抛出异常"
+expect("三次都失败：抛出最后一次的异常", _give_up, ["attempt 3 failed", 3])
+expect_raises("retry(0)", lambda: retry(0), ValueError)
+
+@@ item d13-e3
+type: scratch
+title: 闭卷：评测报告
+exam: yes
+level: 3
+--- prompt
+写 `report(cases, predictions)`：
+
+- `cases`：`{"id": ..., "kind": ...}` 的列表；`kind` 是 `"must_accept"` 的算没风险，其他都算有风险
+- `predictions`：`{用例 id: 判定}`；判定不是 `"accept"` 就算标记了；某条用例在 `predictions` 里**没有**，算没标记
+- 返回字典，键是 `"TP"`、`"FP"`、`"FN"`、`"TN"`、`"precision"`、`"recall"`、`"line"`
+- precision = TP ÷ (TP + FP)，recall = TP ÷ (TP + FN)，都用 `round(x, 2)`；分母为 0 时都返回 `1.0`
+- `"line"` 是 `f"precision {precision:.2f}  recall {recall:.2f}"`（中间两个空格）
+--- solution
+def report(cases, predictions):
+    tp = fp = fn = tn = 0
+    for case in cases:
+        risky = case["kind"] != "must_accept"
+        flagged = predictions.get(case["id"], "accept") != "accept"
+        if risky and flagged:
+            tp += 1
+        elif flagged:
+            fp += 1
+        elif risky:
+            fn += 1
+        else:
+            tn += 1
+    precision = round(tp / (tp + fp), 2) if tp + fp else 1.0
+    recall = round(tp / (tp + fn), 2) if tp + fn else 1.0
+    return {"TP": tp, "FP": fp, "FN": fn, "TN": tn, "precision": precision, "recall": recall,
+            "line": f"precision {precision:.2f}  recall {recall:.2f}"}
+--- tests
+CASES = [
+    {"id": "unlimited-liability", "kind": "must_flag"},
+    {"id": "cross-reference-trap", "kind": "trap"},
+    {"id": "data-anywhere", "kind": "must_flag"},
+    {"id": "payment-net-30", "kind": "must_accept"},
+    {"id": "service-levels", "kind": "must_accept"},
+]
+PRED = {"unlimited-liability": "redline", "cross-reference-trap": "flag", "payment-net-30": "accept", "service-levels": "flag"}
+expect("完整报告（data-anywhere 没有预测）", lambda: report(CASES, PRED), {"TP": 2, "FP": 1, "FN": 1, "TN": 1, "precision": 0.67, "recall": 0.67, "line": "precision 0.67  recall 0.67"})
+expect("没有用例", lambda: report([], {}), {"TP": 0, "FP": 0, "FN": 0, "TN": 0, "precision": 1.0, "recall": 1.0, "line": "precision 1.00  recall 1.00"})

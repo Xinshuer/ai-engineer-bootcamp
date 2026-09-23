@@ -1,4 +1,4 @@
-<title>Clause Check 七日营</title>
+<title>Clause Check 编程营</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
@@ -83,8 +83,17 @@ p code, li code, .md code { background: var(--code-bg); border: 1px solid var(--
 .chip label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
 
 .app { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 20px; padding-block: 20px 40px; padding-inline: 20px; max-width: 1440px; margin: 0 auto; }
-.rail { display: flex; flex-direction: column; gap: 4px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 68px); align-self: start; }
+.rail { display: flex; flex-direction: column; gap: 4px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 68px); align-self: start; max-height: calc(100vh - 88px); overflow-y: auto; }
 .rail h4 { font: 600 11px var(--font-head); text-transform: uppercase; letter-spacing: 0.08em; color: var(--faint); margin: 12px 8px 4px; }
+.weekBtn { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 8px; text-align: left; padding: 8px 10px; border-radius: 8px; border: 1px solid transparent; background: none; }
+.weekBtn:hover { background: var(--surface); }
+.weekBtn .wt { font: 600 12px var(--font-head); letter-spacing: 0.06em; color: var(--muted); }
+.weekBtn .wt::before { content: "▸"; display: inline-block; width: 1.1em; color: var(--faint); }
+.weekBtn[aria-expanded="true"] .wt { color: var(--accent); }
+.weekBtn[aria-expanded="true"] .wt::before { content: "▾"; color: var(--accent); }
+.weekBtn .wp { font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.weekBtn .bar { grid-column: 1 / -1; height: 3px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.weekBtn .bar i { display: block; height: 100%; background: var(--pass); }
 .dayBtn { display: grid; grid-template-columns: 34px 1fr; gap: 2px 10px; align-items: center; text-align: left; padding: 8px 10px; border-radius: 8px; border: 1px solid transparent; background: none; }
 .dayBtn:hover { background: var(--surface); }
 .dayBtn[aria-current="true"] { background: var(--surface); border-color: var(--line); box-shadow: var(--shadow); }
@@ -236,9 +245,10 @@ table.dayTable th { font: 600 12px var(--font-head); color: var(--muted); letter
 
 @media (max-width: 1020px) {
   .app { grid-template-columns: minmax(0, 1fr); padding-inline: 16px; }
-  .rail { position: static; flex-direction: row; overflow-x: auto; gap: 6px; padding-bottom: 4px; }
+  .rail { position: static; flex-direction: row; overflow-x: auto; gap: 6px; padding-bottom: 4px; max-height: none; }
   .rail h4 { display: none; }
   .dayBtn { min-width: 150px; }
+  .weekBtn { min-width: 120px; white-space: nowrap; }
   .navBtn { white-space: nowrap; gap: 8px; }
   .dayHead { grid-template-columns: minmax(0, 1fr); padding: 16px; }
   .cardBody { grid-template-columns: minmax(0, 1fr); }
@@ -259,7 +269,7 @@ table.dayTable th { font: 600 12px var(--font-head); color: var(--muted); letter
 </style>
 
 <header class="topbar">
-  <div class="brand">Clause Check 七日营 <small>Python · TypeScript · 手写</small></div>
+  <div class="brand">Clause Check 编程营 <small>Python · TypeScript · 三周手写</small></div>
   <div class="meter" title="掌握 = 通过，并且没有进复习区"><span>已掌握</span><div class="bar"><i id="meterFill" style="width:0%"></i></div><b id="meterText">0 / 0</b></div>
   <div class="spacer"></div>
   <div class="chips">
@@ -282,7 +292,9 @@ const COURSE = window.CC_COURSE || { days: [] };
 const H = window.CC_HARNESS || {};
 const BASE = new URL(".", document.baseURI).href;
 const HAS_CM = typeof window.CodeMirror === "function";
-const KIND = { choice: "选择", predict: "预测输出", code: "写函数", fix: "修 bug", fill: "填空", order: "排代码", scratch: "从零手写", translate: "翻译", local: "本机任务" };
+const KIND = { choice: "选择", predict: "预测输出", code: "写函数", fix: "修 bug", fill: "填空", order: "排代码", scratch: "从零手写", translate: "翻译", local: "本机任务", testwrite: "写测试" };
+const WEEK_TITLE = { 1: "第 1 周 · 入门", 2: "第 2 周 · 写成小程序", 3: "第 3 周 · 工程与 Agent" };
+const weekOf = (dayId) => Math.ceil(Number(dayId) / 7);
 const LANG = { py: "Python", ts: "TypeScript" };
 const RUNNABLE = new Set(["code", "fix", "scratch", "translate", "fill", "order"]);
 const SOLUTION_AFTER_TRIES = 2;
@@ -388,20 +400,54 @@ function merge(other) {
   if (other.startedAt) STATE.startedAt = Math.min(STATE.startedAt, other.startedAt);
   merge.done = true;
 }
+// Cloud layout: progress/<uid> holds status + a summary for Claude (no drafts);
+// progress/<uid>/drafts/d<N> holds that day's code drafts, so no document nears the 256 KiB cap.
+const DRAFT_KEYS = ["code", "fills", "order"];
 function snapshot() {
   const solved = ALL_ITEMS.filter((it) => STATE.items[it.id]?.s === "solved");
+  const items = {};
+  for (const [id, r] of Object.entries(STATE.items)) {
+    const rest = { ...r };
+    for (const k of DRAFT_KEYS) delete rest[k];
+    items[id] = rest;
+  }
+  const byDay = {};
+  for (const d of COURSE.days) byDay[d.id] = `${dayProgress(d).done}/${d.items.length}`;
   return {
     ...STATE,
+    v: 2,
+    items,
     summary: {
       solved: solved.length,
       mastered: solved.filter((it) => !STATE.items[it.id].review).length,
       total: ALL_ITEMS.length,
+      byDay,
       review: ALL_ITEMS.filter((it) => STATE.items[it.id]?.review).map((it) => it.id),
       stuck: ALL_ITEMS.filter((it) => { const r = STATE.items[it.id]; return r && r.s !== "solved" && r.a >= 3; }).map((it) => it.id),
       exams: STATE.exams,
       updatedAt: new Date().toISOString(),
     },
   };
+}
+function draftDocs() {
+  const out = {};
+  for (const [id, r] of Object.entries(STATE.items)) {
+    const it = ITEM[id];
+    if (!it) continue;
+    const d = {};
+    for (const k of DRAFT_KEYS) if (r[k] !== undefined) d[k] = r[k];
+    if (!Object.keys(d).length) continue;
+    d.u = r.u || 0;
+    (out["d" + it.day] ||= { items: {} }).items[id] = d;
+  }
+  return out;
+}
+function mergeDrafts(items) {
+  for (const [id, d] of Object.entries(items || {})) {
+    const mine = rec(id);
+    if ((d.u || 0) < (mine.u || 0)) continue;   // this browser has newer work
+    for (const k of DRAFT_KEYS) if (d[k] !== undefined) mine[k] = d[k];
+  }
 }
 let saveTimer = null;
 function save() {
@@ -411,13 +457,25 @@ function save() {
 }
 
 // ---- cloud progress (db capability): readable by Claude, survives devices
-const CLOUD = { ref: null, ready: false, busy: false, dirty: false, timer: null };
+const CLOUD = { ref: null, drafts: null, sent: {}, ready: false, busy: false, dirty: false, timer: null };
 function setChip(id, cls, text) { const c = $("#" + id); c.className = "chip " + (cls || ""); c.lastElementChild.textContent = text; }
 function scheduleCloud() { if (!CLOUD.ready) return; CLOUD.dirty = true; clearTimeout(CLOUD.timer); CLOUD.timer = setTimeout(flushCloud, 2500); }
 async function flushCloud() {
   if (!CLOUD.ready || CLOUD.busy || !CLOUD.dirty) return;
   CLOUD.busy = true; CLOUD.dirty = false;
-  try { await CLOUD.ref.set(JSON.parse(JSON.stringify(snapshot()))); setChip("syncChip", "ok", "进度：已同步"); }
+  try {
+    await CLOUD.ref.set(JSON.parse(JSON.stringify(snapshot())));
+    // drafts: only the days whose drafts changed since the last write
+    const docs = draftDocs();
+    for (const key of new Set([...Object.keys(docs), ...Object.keys(CLOUD.sent)])) {
+      const text = JSON.stringify(docs[key] || { items: {} });
+      if (CLOUD.sent[key] === text) continue;
+      try { await CLOUD.drafts.doc(key).set(JSON.parse(text)); }
+      catch (e) { if (!(e && e.code === "invalid_argument")) throw e; }   // an oversized day stays local only
+      CLOUD.sent[key] = text;
+    }
+    setChip("syncChip", "ok", "进度：已同步");
+  }
   catch (e) {
     if (e && e.code === "invalid_argument") { CLOUD.ready = false; setChip("syncChip", "bad", "进度：只能存本机"); }
     else { CLOUD.dirty = true; setChip("syncChip", "busy", "进度：同步重试中"); }
@@ -430,11 +488,15 @@ async function initCloud() {
     if (!db) return;
     const uid = user ? await user.id() : null;
     CLOUD.ref = db.doc("progress/" + (uid || "me"));
+    CLOUD.drafts = CLOUD.ref.collection("drafts");
     setChip("syncChip", "busy", "进度：读取中");
-    const snap = await CLOUD.ref.get();
-    if (snap.exists) { merge.done = true; merge(snap.data()); render(); }
+    const [snap, drafts] = await Promise.all([CLOUD.ref.get(), CLOUD.drafts.get().catch(() => null)]);
+    if (snap.exists) { merge.done = true; merge(snap.data()); }   // older (v1) docs still carry drafts inline
+    if (drafts) for (const d of drafts.docs) { const body = d.data() || {}; mergeDrafts(body.items); CLOUD.sent[d.id] = JSON.stringify(body); }
+    if (snap.exists || (drafts && !drafts.empty)) render();
     CLOUD.ready = true;
     setChip("syncChip", "ok", "进度：已同步");
+    if (snap.exists && (snap.data() || {}).v !== 2) scheduleCloud();   // move a v1 doc to the new layout
   } catch (e) { setChip("syncChip", "", "进度：本机"); }
 }
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { clearTimeout(CLOUD.timer); flushCloud(); } });
@@ -473,7 +535,7 @@ self.onmessage = async (e) => {
       run = py.globals.get("run");
       postMessage({ type: "ready" });
     } else if (m.type === "run") {
-      await ccEnsurePydantic(py, ${JSON.stringify(idx)}, wheels, m.code + "\\n" + (m.tests || ""));
+      await ccEnsurePydantic(py, ${JSON.stringify(idx)}, wheels, m.code + "\\n" + (m.tests || "") + "\\n" + (m.setup || ""));
       postMessage({ type: "result", id: m.id, result: JSON.parse(run(m.code, m.tests || "", m.setup || "")) });
     }
   } catch (err) {
@@ -518,12 +580,12 @@ async function pyStartMain() {
   PY.main = { py, run: py.globals.get("run") };
   PY.state = "ready"; pySetChip();
 }
-async function runPython(code, tests, mock) {
+async function runPython(code, tests, mock, extraSetup) {
   try { await pyStart(); }
   catch (e) { return { runtimeError: "浏览器里的 Python 启动失败：" + (e && e.message || e) + "。可以用「复制为本机文件」在 VS Code 里运行同样的题目和测试。" }; }
-  const setup = mock ? H.PY_MOCK : "";
+  const setup = (mock ? H.PY_MOCK + "\n" : "") + (extraSetup || "");
   if (PY.main) {
-    await ccEnsurePydantic(PY.main.py, BASE + "pyodide/", H.WHEELS || [], code + "\n" + (tests || ""));
+    await ccEnsurePydantic(PY.main.py, BASE + "pyodide/", H.WHEELS || [], code + "\n" + (tests || "") + "\n" + setup);
     return JSON.parse(PY.main.run(code, tests || "", setup));
   }
   const id = ++PY.seq;
@@ -603,6 +665,14 @@ const PY_GLOSS = {
   UnboundLocalError: "在函数里给变量赋值之前就读取了它。",
   RuntimeError: "运行时错误，看报错信息的具体说明。",
   HTTPError: "请求返回了错误状态码，看数字：401 是密钥问题，429 是请求太频繁，5xx 是服务器问题。",
+  AssertionError: "assert 的条件不成立：看这一行在检查什么，再打印一下实际的值。",
+  FileNotFoundError: "找不到文件：检查路径和文件名，文件是不是还没写出来。相对路径是相对「当前工作目录」算的。",
+  IsADirectoryError: "这是一个文件夹，不是文件：路径少写了文件名。",
+  NotADirectoryError: "路径中间有一段是文件，不是文件夹。",
+  FileExistsError: "文件或文件夹已经存在：mkdir 时加上 exist_ok=True。",
+  StopIteration: "迭代器已经没有下一个值了：常见于 next(...) 没有给默认值。",
+  NotImplementedError: "这个方法还没有实现（通常是留给你写的）。",
+  TimeoutError: "等待超时：请求或操作在规定时间内没有完成。",
 };
 const TS_GLOSS = {
   2322: "类型不匹配：你给的值和声明的类型不一致。",
@@ -625,6 +695,19 @@ const TS_GLOSS = {
   2349: "这个值不能被调用：它不是函数。",
   1308: "await 只能写在 async 函数里。",
   2801: "这里需要 await：这个值是 Promise。",
+  2741: "对象缺少必需的属性：按类型定义把字段补齐。",
+  2353: "对象里多了一个类型定义里没有的属性：拼错了，或者类型里没声明。",
+  2678: "switch 的这个 case 不可能出现：值的类型里没有它（多半是拼错了）。",
+  2564: "类的属性既没有初始值，也没有在 constructor 里赋值。",
+  18046: "这个值的类型是 unknown：先用 typeof / in / 类型守卫 检查，再使用。",
+  2571: "这个对象的类型是 unknown：先检查再使用。",
+  2769: "没有匹配的函数重载：参数的类型或个数不对。",
+  7053: "不能用这个字符串当下标：给对象标上 Record<string, ...> 类型，或者把键的类型收窄。",
+  2344: "类型参数不满足约束（泛型 extends 的要求）。",
+  2416: "子类的方法签名和父类的不兼容。",
+  2377: "子类的 constructor 必须先调用 super(...)。",
+  17009: "在 super(...) 之前不能使用 this。",
+  2352: "类型断言（as）不成立：这两个类型差得太远。",
 };
 function pyGloss(text) {
   const m = /(\w+(?:Error|Exception))\b/.exec(String(text).split("\n").filter(Boolean).pop() || "");
@@ -674,7 +757,8 @@ function makeEditor(host, { value, lang, exam, onRun, onChange, minHeight }) {
 // ---------------------------------------------------------------- local file export
 function localFile(item, code) {
   if (item.lang === "py") {
-    const prelude = `# ${item.title} —— 从 Clause Check 七日营导出
+    if (item.type === "testwrite") return testwriteFile(item, code);
+    const prelude = `# ${item.title} —— 从 Clause Check 编程营导出
 # 运行：python ${item.id}.py
 import io, sys
 _passed = _total = 0
@@ -706,7 +790,7 @@ def expect_output(label, fn, expected):
   const imports = (code.match(/^import .*$/gm) || []).join("\n");
   const body = code.replace(/^import .*$/gm, "");
   return `${imports}
-// ${item.title} —— 从 Clause Check 七日营导出
+// ${item.title} —— 从 Clause Check 编程营导出
 // 运行：npx tsx ${item.id}.ts      （需要先 npm install zod 才能用 zod）
 let _passed = 0, _total = 0;
 const _pending: Promise<void>[] = [];
@@ -726,6 +810,33 @@ ${body}
 // ---- 测试 ----
 ${item.tests || ""}
 Promise.all(_pending).then(() => console.log(\`\\n\${_passed}/\${_total} 通过\`));
+`;
+}
+function testwriteFile(item, code) {
+  return `# ${item.title} —— 从 Clause Check 编程营导出
+# 运行：python -m pytest ${item.id}.py -q     （需要 pip install pytest）
+#   或：python ${item.id}.py                 （不用 pytest 也能跑，但不能 import pytest）
+
+# ---- 被测函数（正确版本）----
+${item.impl}
+
+# ---- 你的测试 ----
+${code}
+
+
+if __name__ == "__main__":
+    import traceback
+    tests = [(n, f) for n, f in list(globals().items()) if n.startswith("test_") and callable(f)]
+    passed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            passed += 1
+            print("✓", name)
+        except Exception:
+            print("✗", name)
+            traceback.print_exc()
+    print(f"\\n{passed}/{len(tests)} 通过")
 `;
 }
 async function copyText(text) {
@@ -786,14 +897,27 @@ function renderMeter() {
 function renderRail() {
   const rail = $("#rail");
   rail.replaceChildren();
-  rail.append(h("h4", {}, "七天"));
-  for (const d of COURSE.days) {
-    const p = dayProgress(d);
-    const cur = STATE.current.view === "day" && Number(STATE.current.day) === Number(d.id);
-    rail.append(h("button", { class: "dayBtn", "aria-current": cur ? "true" : "false", onclick: () => go({ view: "day", day: Number(d.id) }) },
-      h("span", { class: "num" }, d.id),
-      h("span", { class: "t" }, d.title.split("：")[0]),
-      h("span", { class: "p" }, h("span", { class: "bar" }, h("i", { style: `width:${p.total ? (100 * p.done) / p.total : 0}%` })), `${p.done}/${p.total}`)));
+  // one week open at a time (the current day's week unless the learner opened another)
+  const openWeek = SESSION.railWeek !== undefined ? SESSION.railWeek : weekOf(STATE.current.day);
+  const weeks = [...new Set(COURSE.days.map((d) => weekOf(d.id)))];
+  for (const w of weeks) {
+    const days = COURSE.days.filter((d) => weekOf(d.id) === w);
+    const done = days.reduce((n, d) => n + dayProgress(d).done, 0);
+    const total = days.reduce((n, d) => n + d.items.length, 0);
+    const open = w === openWeek;
+    rail.append(h("button", { class: "weekBtn", "aria-expanded": open ? "true" : "false", onclick: () => { SESSION.railWeek = open ? null : w; renderRail(); } },
+      h("span", { class: "wt" }, WEEK_TITLE[w] || `第 ${w} 周`),
+      h("span", { class: "wp" }, `${done}/${total}`),
+      h("span", { class: "bar" }, h("i", { style: `width:${total ? (100 * done) / total : 0}%` }))));
+    if (!open) continue;
+    for (const d of days) {
+      const p = dayProgress(d);
+      const cur = STATE.current.view === "day" && Number(STATE.current.day) === Number(d.id);
+      rail.append(h("button", { class: "dayBtn", "aria-current": cur ? "true" : "false", onclick: () => go({ view: "day", day: Number(d.id) }) },
+        h("span", { class: "num" }, d.id),
+        h("span", { class: "t" }, d.title.split("：")[0]),
+        h("span", { class: "p" }, h("span", { class: "bar" }, h("i", { style: `width:${p.total ? (100 * p.done) / p.total : 0}%` })), `${p.done}/${p.total}`)));
+    }
   }
   const reviewCount = ALL_ITEMS.filter((it) => STATE.items[it.id]?.review).length;
   rail.append(h("h4", {}, "巩固"));
@@ -801,6 +925,7 @@ function renderRail() {
   rail.append(h("button", { class: "navBtn", "aria-current": STATE.current.view === "stats" ? "true" : "false", onclick: () => go({ view: "stats" }) }, "我的进度", ""));
 }
 function go(patch) {
+  if (patch.day !== undefined) SESSION.railWeek = undefined;   // follow the chosen day's week
   Object.assign(STATE.current, patch);
   save();
   render();
@@ -823,7 +948,7 @@ function renderDay(main) {
   const checks = day.checklist || [];
   const head = h("section", { class: "dayHead" },
     h("div", {},
-      h("div", { class: "eyebrow" }, `第 ${day.id} 天 · ${lang} · ${day.hours || ""}`),
+      h("div", { class: "eyebrow" }, `第 ${weekOf(day.id)} 周 · 第 ${day.id} 天 · ${lang} · ${day.hours || ""}`),
       h("h1", {}, day.title),
       h("p", { html: inline(day.goal || "") })),
     h("div", {},
@@ -926,7 +1051,7 @@ function renderItem(work, item, ctx) {
   const prompt = h("div", { class: "md", html: md(item.prompt) });
   highlightIn(prompt, item.lang);
   work.append(prompt);
-  const renderer = { choice: viewChoice, predict: viewPredict, fill: viewFill, order: viewOrder, local: viewLocal }[item.type] || viewCode;
+  const renderer = { choice: viewChoice, predict: viewPredict, fill: viewFill, order: viewOrder, local: viewLocal, testwrite: viewTestwrite }[item.type] || viewCode;
   renderer(work, item, { ...ctx, exam });
 }
 
@@ -1084,7 +1209,9 @@ async function exportLocal(item, code, out) {
   const ok = await copyText(text);
   const name = `${item.id}.${item.lang === "ts" ? "ts" : "py"}`;
   const area = h("textarea", { class: "copyArea", readonly: true }, text);
-  out.replaceChildren(h("div", { class: "explain", html: md(`${ok ? "已复制到剪贴板。" : "浏览器不允许自动复制，请在下面全选（Ctrl+A）后复制。"}在 VS Code 里新建 \`${name}\`，粘贴保存，然后在终端运行：\n\n\`${item.lang === "ts" ? "npx tsx " + name : "python " + name}\`\n\n文件里包含同样的测试${item.mock ? "和模拟服务器" : ""}，结果会逐条打印。`) }), ok ? "" : area);
+  const cmd = item.lang === "ts" ? "npx tsx " + name : item.type === "testwrite" ? "python -m pytest " + name + " -q" : "python " + name;
+  const what = item.type === "testwrite" ? "文件里是被测函数和你的测试（本机只有正确版本，没有那些坏版本）" : `文件里包含同样的测试${item.mock ? "和模拟服务器" : ""}，结果会逐条打印`;
+  out.replaceChildren(h("div", { class: "explain", html: md(`${ok ? "已复制到剪贴板。" : "浏览器不允许自动复制，请在下面全选（Ctrl+A）后复制。"}在 VS Code 里新建 \`${name}\`，粘贴保存，然后在终端运行：\n\n\`${cmd}\`\n\n${what}。`) }), ok ? "" : area);
   if (!ok) { area.focus(); area.select(); }
 }
 
@@ -1132,7 +1259,7 @@ function viewPredict(work, item, ctx) {
   work.append(codeBlock(item.code, item.lang));
   const ta = h("textarea", { class: "answer", placeholder: "在这里写出输出，每个 print / console.log 一行", spellcheck: "false", id: "ans-" + item.id });
   ta.value = rec(item.id).code || "";
-  ta.addEventListener("input", () => { const r = rec(item.id); r.code = ta.value; r.u = Date.now(); save(); });
+  ta.addEventListener("input", () => { const r = rec(item.id); r.code = ta.value.slice(0, 4000); r.u = Date.now(); save(); });
   const out = h("div", { class: "results" });
   let wrongs = 0;
   work.append(h("p", { class: "panelLabel" }, "你的答案"), ta, h("div", { class: "actions" },
@@ -1257,14 +1384,91 @@ function viewLocal(work, item, ctx) {
   helpers(work, item, { exam: false, solution: item.solution, onRedo: null });
 }
 
+// ---- write the tests: must pass on the correct function and catch every hidden buggy version
+async function runTestwrite(item, tests) {
+  const onImpl = await runPython(tests, H.PY_DISCOVER, item.mock, item.impl);
+  if (onImpl.runtimeError || !isPass(onImpl)) return { onImpl, mutants: [], pass: false };
+  const mutants = [];
+  for (const m of item.mutants) {
+    const r = await runPython(tests, H.PY_DISCOVER, item.mock, m.code);
+    if (r.runtimeError) return { onImpl: r, mutants: [], pass: false };
+    const failed = (r.tests || []).filter((t) => !t.passed).map((t) => t.label);
+    mutants.push({ note: m.note, caught: !!r.error || failed.length > 0, by: failed });
+  }
+  return { onImpl, mutants, pass: mutants.every((m) => m.caught) };
+}
+function testwriteView(res, item, next) {
+  const els = [];
+  const { onImpl, mutants } = res;
+  if (onImpl.runtimeError) { els.push(h("pre", { class: "outBox err" }, onImpl.runtimeError)); return els; }
+  const implOk = isPass(onImpl);
+  const caught = mutants.filter((m) => m.caught).length;
+  const v = h("div", { class: "verdict " + (res.pass ? "pass" : "fail") },
+    res.pass ? `全部抓住：${caught}/${mutants.length} 个坏版本` : !implOk ? "你的测试在正确版本上没通过" : `抓住了 ${caught}/${mutants.length} 个坏版本`);
+  if (res.pass && next) v.append(h("button", { class: "btn next", onclick: next }, "下一题 →"));
+  els.push(v);
+  if (!implOk) els.push(h("p", { class: "note" }, "正确的函数必须让你的每个测试都通过。先看下面哪个测试失败了：是期望值写错了，还是函数名 / 参数不对？"));
+  els.push(h("p", { class: "panelLabel" }, "在正确版本上"));
+  els.push(...resultView(onImpl, { item, noTests: false }).slice(1));
+  if (implOk) {
+    els.push(h("p", { class: "panelLabel" }, "在坏版本上"));
+    els.push(h("ul", { class: "tests" }, mutants.map((m, i) => h("li", { class: m.caught ? "ok" : "no" },
+      h("span", { class: "m" }, m.caught ? "✓" : "✗"),
+      h("div", {}, h("div", {}, `坏版本 ${i + 1}：${m.caught ? "抓住了" : "没抓住"}`),
+        m.caught ? h("div", { class: "detail" }, m.by.length ? `失败的测试：${m.by.join("、")}` : "代码直接报错了")
+          : h("div", { class: "detail" }, `线索：${m.note}。想一个能区分正确版本和它的输入，再写一个测试。`))))));
+  }
+  return els;
+}
+function viewTestwrite(work, item, ctx) {
+  const r = rec(item.id);
+  work.append(h("p", { class: "panelLabel" }, "被测函数（正确版本）"), codeBlock(item.impl, "py"),
+    h("p", { class: "note" }, `另外还有 ${item.mutants.length} 个悄悄改坏的版本，你看不到。好的测试要在正确版本上全部通过，并且每个坏版本都至少让一个测试失败。`),
+    h("p", { class: "panelLabel" }, "你的测试（每个 test_ 开头的函数是一个测试，用 assert 检查）"));
+  const host = h("div", { class: "editorWrap" });
+  work.append(host);
+  const out = h("div", { class: "results" });
+  const blank = item.starter || "";
+  let saveT = null;
+  const ed = makeEditor(host, {
+    value: r.code !== undefined ? r.code : blank, lang: "py", onRun: () => run(),
+    onChange: (v) => { clearTimeout(saveT); saveT = setTimeout(() => { r.code = v.slice(0, 8000); r.u = Date.now(); save(); }, 800); },
+  });
+  const runBtn = h("button", { class: "btn primary", onclick: () => run() }, "运行我的测试 ", h("kbd", {}, "Ctrl+Enter"));
+  work.append(h("div", { class: "actions" }, runBtn,
+    h("button", { class: "btn ghost", onclick: () => { ed.set(blank); out.replaceChildren(); ed.markLines([]); } }, "还原起始代码"),
+    h("button", { class: "btn ghost", onclick: () => exportLocal(item, ed.get(), out) }, "复制为本机文件")));
+  helpers(work, item, { exam: false, solution: item.solution, onRedo: () => { SESSION.redo[item.id] = true; r.code = blank; r.u = Date.now(); save(); ed.set(blank); out.replaceChildren(); ed.focus(); } });
+  work.append(out);
+  if (SESSION.results[item.id]) out.append(...testwriteView(SESSION.results[item.id], item, ctx.next));
+  async function run() {
+    runBtn.disabled = true;
+    out.replaceChildren(h("p", { class: "note" }, PY.state !== "ready" ? "正在启动 Python（第一次需要下载约 14 MB 的运行环境，之后就快了）…" : `运行中：正确版本 + ${item.mutants.length} 个坏版本…`));
+    const code = ed.get();
+    r.code = code.slice(0, 8000);
+    const res = await runTestwrite(item, code);
+    runBtn.disabled = false;
+    SESSION.results[item.id] = res;
+    if (!res.onImpl.runtimeError) markAttempt(item, res.pass);
+    ed.markLines(res.onImpl.error_line ? [res.onImpl.error_line] : []);
+    out.replaceChildren(...testwriteView(res, item, ctx.next));
+    refreshHead(work, item);
+  }
+}
+
 // ---------------------------------------------------------------- exam
+function examTitle(day) {
+  const w = weekOf(day.id);
+  if (Number(day.id) % 7 !== 0) return `第 ${day.id} 天闭卷挑战`;
+  return w === 3 ? "毕业大考" : `第 ${w} 周周考`;
+}
 function renderExam(main, day) {
   const items = examItems(day);
   const e = STATE.exam && Number(STATE.exam.day) === Number(day.id) ? STATE.exam : null;
   const best = STATE.exams[day.id];
   if (!e || !e.active) {
     const panel = h("section", { class: "panel" },
-      h("h2", {}, `第 ${day.id} 天闭卷挑战`),
+      h("h2", {}, examTitle(day)),
       h("div", { class: "md", html: md(`${items.length} 道「从零手写」题，限时 **${Math.round((items.length * EXAM_MS_PER_ITEM) / 60000)} 分钟**。\n\n- 没有提示、不能看答案、**不能粘贴**\n- 写完一题可以先运行判题，全部通过或时间到就交卷\n- 建议：先把今天的练习做完再来。考不过不丢人，会告诉你明天该复习哪题。`) }),
       best ? h("p", { class: "note" }, `历史最好：${best.best}/${items.length}，上次：${best.last}/${items.length}（${new Date(best.at).toLocaleString()}）`) : "",
       h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: () => {

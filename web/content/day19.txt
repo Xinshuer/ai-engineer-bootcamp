@@ -1,0 +1,1302 @@
+@@ day 19
+title: 图与引用：Python 图执行器 + 带引用的 RAG
+lang: py
+hours: 5 小时
+--- goal
+用 Python 再写一遍第 18 天的图执行器：节点函数、固定边和路由函数、JSON 检查点文件、中断后恢复，然后对照读懂真实的 `clausecheck/graph.py`（LangGraph）。下半天给 RAG 回答加上可以查证的引用：检查引用编号是不是检索到的、引号里的原文是不是真的出现在片段里，并用依赖注入让整个流程不联网也能测试。
+--- checklist
+- 先清空复习区
+- 读完 7 张知识卡片并改动运行
+- 练习区全部通过（包括本机任务：在真实项目里跑一次「中断 → 批准 → 恢复」的图）
+- 闭卷挑战 3 题
+- 打开 `clausecheck/graph.py`，对着 `build_graph` 说出每一行对应你今天写的哪一段代码
+
+@@ concept
+title: 图执行器（Python 版）
+--- body
+第 18 天你用 TypeScript 写过图执行器。Clause Check 的 `graph.py` 是 Python 写的，所以今天用 Python 再写一遍。三样东西：
+
+- `nodes`：名字 → 函数。节点拿到整个 state，只返回**它改了的那几个键**（一个小字典）
+- `edges`：名字 → 下一个节点名（字符串），或者一个「看 state 决定去哪」的**路由函数**
+- 执行器：从起点开始，跑节点 → 合并 → 找下一个，直到 `"END"`
+
+合并用 `{**state, **update}`：后面的覆盖前面的，得到一个**新字典**，原来的不变。经典错误是写反成 `{**update, **state}`，旧值把新值盖掉了。
+
+`callable(x)` 判断 x 能不能像函数一样调用，用它区分「固定的边」和「路由函数」。下面手动走两步，练习里你会把它写成循环。
+--- code
+def load(state):
+    return {"clauses": ["3.1", "8.1", "10.1"]}
+
+def review(state):
+    verdicts = {"3.1": "accept", "8.1": "redline", "10.1": "redline"}
+    return {"reviews": [verdicts[c] for c in state["clauses"]]}
+
+def route(state):
+    return "approve" if "redline" in state["reviews"] else "export"
+
+nodes = {"load": load, "review": review}
+edges = {"load": "review", "review": route}
+
+state = {"contract_path": "data/sample_contract.txt"}
+node = "load"
+for _ in range(2):
+    update = nodes[node](state)
+    state = {**state, **update}
+    edge = edges[node]
+    nxt = edge(state) if callable(edge) else edge
+    print(f"{node:<7} -> {nxt:<8} changed {sorted(update)}")
+    node = nxt
+print(state)
+
+@@ concept
+title: TypedDict：给字典状态写类型
+--- body
+`graph.py` 里的 `State` 既不是 dataclass 也不是 Pydantic，而是 `TypedDict`：
+
+```python
+class State(TypedDict, total=False):
+    contract_path: str
+    reviews: list[dict]
+    approved: bool | None
+```
+
+- 运行时它**就是普通 dict**：`state["reviews"]`、`state.get("approved")`、`{**state, **update}` 照常用
+- 类型标注只给编辑器（VS Code 的 Pylance）和 mypy 看：键名写错、类型不对会画红线，但运行时**不报错**
+- `total=False`：每个键都可以暂时没有。图的状态是一步步填满的，一开始只有 `contract_path`
+- 为什么不用 Pydantic？图框架要随时合并状态、存成检查点，dict 最简单。真正需要严格校验的是**模型的输出**，那里用 Pydantic
+--- code
+from typing import TypedDict
+
+class State(TypedDict, total=False):
+    contract_path: str
+    reviews: list[dict]
+    approved: bool | None
+
+s: State = {"contract_path": "data/sample_contract.txt"}
+s["approved"] = None
+print(type(s).__name__, s)
+s["reviews"] = "oops"   # 编辑器会画红线，但运行时不拦
+print(s["reviews"])
+print(sorted(State.__optional_keys__))   # total=False：每个键都是可选的
+
+@@ concept
+title: 检查点文件
+--- body
+审一份合同要好几分钟，中途可能崩掉，也可能要等律师一整天才批准。**检查点**就是每跑完一个节点，把「下一步去哪 + 当前状态」存下来：
+
+```python
+{"next": "summarise", "state": {...}}
+```
+
+恢复时读文件，从 `next` 接着跑。做完的节点不用重做，也就不会重复花钱调模型。
+
+- 路径：`Path("work/checkpoints") / f"{run_id}.json"`，先 `mkdir(parents=True, exist_ok=True)`
+- 状态里只能放 JSON 存得下的东西（字符串、数字、列表、字典、True/False/None）。这就是 `graph.py` 存 `r.model_dump()` 而不是 Pydantic 对象的原因
+- 顺序很重要：**先算出下一个节点，再存**。存成刚跑完的那个节点，恢复时它会再跑一遍
+
+本页的文件存在浏览器里的虚拟磁盘上，刷新页面前一直都在。
+--- code
+import json
+from pathlib import Path
+
+folder = Path("work/d19/demo")
+folder.mkdir(parents=True, exist_ok=True)
+path = folder / "run-1.json"
+
+saved = {"next": "summarise", "state": {"contract_path": "a.txt", "reviews": ["accept", "redline"], "approved": None}}
+path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+
+loaded = json.loads(path.read_text(encoding="utf-8"))
+print(path.name, path.exists())
+print(loaded["next"], loaded["state"]["reviews"], loaded["state"]["approved"])
+print(loaded == saved)
+
+@@ concept
+title: 读 graph.py：和你写的一一对应
+--- body
+打开 `clausecheck/graph.py` 的 `build_graph`，每一行都能对上你自己写的东西：
+
+```python
+g = StateGraph(State)
+g.add_node("review", review)                  # nodes["review"] = review
+g.add_edge(START, "load")                     # start = "load"
+g.add_edge("load", "review")                  # edges["load"] = "review"
+g.add_conditional_edges("summarise", route)   # edges["summarise"] = route
+g.add_edge("export", END)                     # edges["export"] = "END"
+return g.compile(checkpointer=checkpointer)
+```
+
+- `approve` 节点调用 `interrupt({...})`：图停下，状态由 `SqliteSaver` 存进 `data/checkpoints.sqlite`，进程可以退出
+- 每次运行有一个 `thread_id`（相当于我们的 `run_id`）；用 `Command(resume=True)` 继续时，被中断的节点**从头再跑一遍**，这次 `interrupt()` 直接返回 True
+- 批准后由 `export` 里的代码去改文件，模型不能再改主意
+
+今天的简化版：节点返回 `{"__interrupt__": 问题}` 就算中断。
+--- code
+mapping = [
+    ("StateGraph(State)", "State TypedDict + a plain dict"),
+    ('add_node("review", review)', 'nodes["review"] = review'),
+    ('add_edge("load", "review")', 'edges["load"] = "review"'),
+    ('add_conditional_edges("summarise", route)', 'edges["summarise"] = route'),
+    ("interrupt({...})", 'return {"__interrupt__": ...}'),
+    ("SqliteSaver + thread_id", "work/checkpoints/<run_id>.json"),
+    ("Command(resume=True)", "resume(..., approved=True)"),
+]
+for langgraph, ours in mapping:
+    print(f"{langgraph:<42} -> {ours}")
+
+@@ concept
+title: 带引用的回答
+--- body
+RAG 的回答要能**查证**：每句话后面标出处。三步：
+
+1. prompt 里每个片段带编号，`[c1] ...`、`[c2] ...`，并要求「只根据这些片段回答，每句话用 [c1] 这样的格式标出处」
+2. 从回答里抠出引用：`re.findall(r"\[(c\d+)\]", answer)`
+3. 检查：每个引用都必须是**这次检索到的**编号；一个引用都没有的回答算「没有依据」（unsupported）
+
+方括号在正则里有特殊含义，所以写成 `\[`、`\]`。注意 `\d+` 的 `+`：少了它，`[c10]` 就匹配不上。
+--- code
+import re
+
+chunks = [
+    {"id": "c1", "text": "Either party may terminate for convenience upon sixty (60) days' notice."},
+    {"id": "c2", "text": "Fees are payable within thirty (30) days of the invoice date."},
+]
+lines = [f"[{c['id']}] {c['text']}" for c in chunks]
+prompt = "Answer only from the sources. Cite like [c1].\n\n" + "\n".join(lines) + "\n\nQuestion: How long is the notice period?"
+print(prompt)
+print("---")
+answer = "Sixty days' notice is required [c1]. See also [c7]."
+cited = re.findall(r"\[(c\d+)\]", answer)
+allowed = {c["id"] for c in chunks}
+print("cited:", cited)
+print("unknown:", [c for c in cited if c not in allowed])
+
+@@ concept
+title: groundedness：引号里的原文是真的吗
+--- body
+引用编号都对，引号里的「原文」也可能是模型编的。groundedness 检查：回答里用引号引的每一段，都必须**真的出现在它引用的片段里**。
+
+- 比较前先规范化：空白合并成一个空格、全部小写（`" ".join(s.split()).lower()`），不然换行和大小写会造成误报
+- 模型经常输出弯引号 `“…”`，要和直引号 `"…"` 一起认
+- 这是一种很便宜的自动评测（第 13 天）：不用再调模型，纯代码，每个回答都能跑
+
+它能抓住「编造的原文」，抓不住「原文是真的，结论推错了」。
+--- code
+import re
+
+def norm(s):
+    return " ".join(s.split()).lower()
+
+chunk = "Provider may  terminate this Agreement\nfor convenience upon thirty (30) days' notice."
+answer = 'The clause says “Provider may terminate this Agreement for convenience” [c3], and "without any notice" [c3].'
+quotes = re.findall(r'["“]([^"”]+)["”]', answer)
+for q in quotes:
+    print(repr(q), "->", norm(q) in norm(chunk))
+
+@@ concept
+title: 依赖注入让 RAG 可测
+mock: yes
+--- body
+测 RAG 流程时，你要测的是**你的代码**（检索、拼 prompt、查引用），不是模型今天的心情。办法：把「调模型」当成参数传进来：
+
+```python
+def answer(question, chunks, llm):   # llm：任何「字符串进、字符串出」的函数
+    return llm(build_prompt(question, chunks))
+```
+
+- 测试里传一个假的 `llm`：返回固定的字符串，不花钱、不联网、结果每次一样，还能把收到的 prompt 记下来检查
+- 生产里传真的：一个调 DeepSeek 的函数
+- 第 13 天注入时钟、第 16 天注入 `fetchFn` 都是同一个思路：**会变的东西从外面传进来**
+--- code
+import os
+import requests
+
+def build_prompt(question, chunks):
+    return "\n".join(f"[{c['id']}] {c['text']}" for c in chunks) + f"\n\nQuestion: {question}"
+
+def answer(question, chunks, llm):
+    return llm(build_prompt(question, chunks))
+
+def deepseek_llm(prompt):
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+    headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+    data = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=body).json()
+    return data["choices"][0]["message"]["content"]
+
+seen = []
+def fake_llm(prompt):
+    seen.append(prompt)
+    return "Sixty days' notice [c1]."
+
+chunks = [{"id": "c1", "text": "Either party may terminate upon sixty days' notice."}]
+print(answer("Notice period?", chunks, fake_llm))
+print(len(seen), "prompt(s), first line:", seen[0].splitlines()[0])
+reply = answer("Notice period?", chunks, deepseek_llm)   # 本页是模拟服务器：它只复述 prompt 的开头
+print(reply.splitlines()[0])
+
+@@ item d19-01
+type: code
+title: 复习：关键词检索
+level: 1
+--- prompt
+复习第 11 天。写 `top_k(query, chunks, k)`：
+
+- `chunks` 是 `[{"id": "c1", "text": "..."}, ...]`
+- 分词用已经写好的 `tokenize`
+- 一个片段的得分 = 查询里的词（去重后）有几个出现在这个片段的词里
+- 返回得分最高的 `k` 个片段（字典本身），得分高的在前；**同分保持原来的顺序**；得分为 0 的不要
+
+例：`top_k("fees payable", CHUNKS, 1)` → `[{"id": "c2", ...}]`
+--- starter
+import re
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def top_k(query, chunks, k):
+    pass
+--- solution
+import re
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def top_k(query, chunks, k):
+    words = set(tokenize(query))
+    scored = []
+    for c in chunks:
+        score = len(words & set(tokenize(c["text"])))
+        if score > 0:
+            scored.append((score, c))
+    scored.sort(key=lambda pair: -pair[0])
+    return [c for _, c in scored[:k]]
+--- tests
+CHUNKS = [
+    {"id": "c1", "text": "Either party may terminate this Agreement upon sixty days' notice."},
+    {"id": "c2", "text": "Fees are payable within thirty days of the invoice date."},
+    {"id": "c3", "text": "Customer may terminate for material breach after thirty days."},
+]
+ids = lambda result: [c["id"] for c in result]
+expect("最相关的一个", lambda: ids(top_k("fees payable", CHUNKS, 1)), ["c2"])
+expect("得分高的在前，同分保持原顺序", lambda: ids(top_k("terminate after thirty days", CHUNKS, 3)), ["c3", "c1", "c2"])
+expect("得分为 0 的不要", lambda: ids(top_k("invoice", CHUNKS, 5)), ["c2"])
+expect("一个都不相关", lambda: top_k("gdpr", CHUNKS, 2), [])
+expect("返回的是片段字典", lambda: top_k("invoice", CHUNKS, 1), [CHUNKS[1]])
+--- hints
+- 查询的词做成集合 `set(tokenize(query))`，片段的词也做成集合，交集 `&` 的长度就是得分。
+- 先收集 `(得分, 片段)`，再 `sort(key=lambda pair: -pair[0])`。Python 的排序是稳定的，同分自动保持原顺序。
+- 最后取前 k 个：`[c for _, c in scored[:k]]`。
+
+@@ item d19-02
+type: predict
+title: 复习：合并状态
+level: 1
+--- prompt
+写出输出。第 18 天在 TypeScript 里用 `{ ...state, ...update }` 合并状态，Python 的写法是 `{**state, **update}`。注意哪个在后面，以及 TypedDict 在运行时到底是什么。
+--- code
+from typing import TypedDict
+
+class State(TypedDict, total=False):
+    clauses: list[str]
+    redlines: int
+    approved: bool | None
+
+state: State = {"clauses": ["3.1", "8.1"], "redlines": 0}
+update = {"redlines": 2, "approved": None}
+new = {**state, **update}
+print(new)
+print(state)
+wrong = {**update, **state}
+print(wrong["redlines"])
+print(type(new).__name__)
+--- explain
+`{**a, **b}` 先放 a 的键，再用 b 的覆盖，得到新字典，`state` 本身没变。写反了（`{**update, **state}`）旧的 `redlines: 0` 会盖掉新值，这是图执行器里很难发现的 bug。TypedDict 只是给编辑器看的类型，运行时就是 `dict`。
+
+@@ item d19-03
+type: fill
+title: 找下一个节点
+level: 1
+--- prompt
+补全 `next_node(edges, node, state)`：`edges[node]` 可能是字符串（固定的下一个节点），也可能是路由函数（传入 state，返回下一个节点名）。`node` 不在 `edges` 里时抛 `ValueError`。
+--- template
+def next_node(edges, node, state):
+    if node not in edges:
+        raise [[ValueError]](f"no edge from {node!r}")
+    edge = edges[node]
+    if [[callable(edge)]]:
+        return [[edge(state)]]
+    return [[edge]]
+--- tests
+EDGES = {"load": "review", "summarise": lambda s: "approve" if s["redlines"] > 0 else "export", "export": "END"}
+expect("固定的边", lambda: next_node(EDGES, "load", {}), "review")
+expect("路由函数：有 redline", lambda: next_node(EDGES, "summarise", {"redlines": 2}), "approve")
+expect("路由函数：没有 redline", lambda: next_node(EDGES, "summarise", {"redlines": 0}), "export")
+expect_raises("拼错的节点名", lambda: next_node(EDGES, "reviw", {}), ValueError)
+--- hints
+- `callable(edge)` 为 True 说明它是函数，要调用它：`edge(state)`。
+- 不是函数就是字符串，直接返回。
+
+@@ item d19-04
+type: code
+title: 图执行器
+level: 2
+--- prompt
+写 `run_graph(nodes, edges, state, start, max_steps=20)`，返回 `(最终 state, 路径)`：
+
+1. 从 `start` 开始，当前节点是 `"END"` 就停
+2. 跑节点 `update = nodes[node](state)`，合并成**新字典** `state = {**state, **update}`（不要改传进来的字典）
+3. 把节点名加进路径 `path`，用 `next_node` 找下一个
+4. 已经跑了 `max_steps` 个节点还没到 END：`raise RuntimeError`（图里有环时防止死循环）
+5. `nodes` 里没有这个节点：`raise ValueError`
+
+例：三个节点串起来 → `({...}, ["load", "review", "export"])`
+--- starter
+def next_node(edges, node, state):
+    if node not in edges:
+        raise ValueError(f"no edge from {node!r}")
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def run_graph(nodes, edges, state, start, max_steps=20):
+    path = []
+    node = start
+    return state, path
+--- solution
+def next_node(edges, node, state):
+    if node not in edges:
+        raise ValueError(f"no edge from {node!r}")
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def run_graph(nodes, edges, state, start, max_steps=20):
+    path = []
+    node = start
+    while node != "END":
+        if len(path) >= max_steps:
+            raise RuntimeError(f"stopped after {max_steps} steps")
+        if node not in nodes:
+            raise ValueError(f"unknown node {node!r}")
+        update = nodes[node](state)
+        state = {**state, **update}
+        path.append(node)
+        node = next_node(edges, node, state)
+    return state, path
+--- tests
+def load(s):
+    return {"clauses": ["3.1", "8.1"]}
+def review(s):
+    return {"reviews": {"3.1": "accept", "8.1": "redline"}}
+def summarise(s):
+    return {"redlines": list(s["reviews"].values()).count("redline")}
+def approve(s):
+    return {"approved": True}
+def export(s):
+    return {"exported": True}
+NODES = {"load": load, "review": review, "summarise": summarise, "approve": approve, "export": export}
+EDGES = {"load": "review", "review": "summarise", "summarise": lambda s: "approve" if s["redlines"] > 0 else "export", "approve": "export", "export": "END"}
+expect("路径", lambda: run_graph(NODES, EDGES, {"contract_path": "a.txt"}, "load")[1], ["load", "review", "summarise", "approve", "export"])
+expect("最终状态", lambda: run_graph(NODES, EDGES, {}, "load")[0]["redlines"], 1)
+def _no_mutation():
+    start = {"contract_path": "a.txt"}
+    run_graph(NODES, EDGES, start, "load")
+    return start
+expect("不改传进来的 state", _no_mutation, {"contract_path": "a.txt"})
+LOOP = {"a": lambda s: {"n": s.get("n", 0) + 1}, "b": lambda s: {}}
+expect_raises("有环：超过 max_steps", lambda: run_graph(LOOP, {"a": "b", "b": "a"}, {}, "a", max_steps=5), RuntimeError)
+expect_raises("节点不存在", lambda: run_graph(NODES, {"load": "reviw"}, {}, "load"), ValueError)
+--- hints
+- 骨架：`while node != "END":` 循环体里依次做「检查上限 → 检查节点存在 → 跑 → 合并 → 记路径 → 找下一个」。
+- 上限的判断放在跑节点**之前**：`if len(path) >= max_steps: raise RuntimeError(...)`。
+- 用 `state = {**state, **update}` 而不是 `state.update(update)`，后者会改掉调用方的字典。
+
+@@ item d19-05
+type: predict
+title: 图走哪条路
+level: 2
+--- prompt
+写出输出。`review` 第一次模型输出坏了，路由让它回到自己重审一次。
+--- code
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def review(state):
+    tries = state.get("tries", 0) + 1
+    return {"tries": tries, "ok": tries >= 2}
+
+nodes = {
+    "load": lambda s: {"clauses": 3},
+    "review": review,
+    "summarise": lambda s: {"redlines": 0},
+    "export": lambda s: {"exported": True},
+}
+edges = {
+    "load": "review",
+    "review": lambda s: "summarise" if s["ok"] else "review",
+    "summarise": lambda s: "approve" if s["redlines"] > 0 else "export",
+    "export": "END",
+}
+state, node, path = {}, "load", []
+while node != "END":
+    state = {**state, **nodes[node](state)}
+    path.append(node)
+    node = next_node(edges, node, state)
+print(" -> ".join(path))
+print(state["tries"], state["ok"], "approve" in path)
+--- explain
+路由函数可以指回自己，这就是「重试」的图写法。第一次 `tries` 是 1，`ok` 为 False，回到 `review`；第二次才往下走。没有 redline，所以跳过 `approve`。正因为边可以成环，执行器必须有 `max_steps`。
+
+@@ item d19-06
+type: code
+title: 路由函数：四个去向
+level: 2
+--- prompt
+写 `route_after_review(state)`，按顺序判断：
+
+1. `state["errors"]` 不为空（有条款没审完），并且 `state.get("retries", 0) < 2` → `"review"`（再审一遍）
+2. 还有错误，但已经重试了 2 次 → `"human"`（交给人）
+3. `state["reviews"]` 里有 `verdict` 为 `"redline"` 的 → `"approve"`
+4. 否则 → `"export"`
+
+例：`route_after_review({"errors": [], "reviews": [{"id": "8.1", "verdict": "redline"}]})` → `"approve"`
+--- starter
+def route_after_review(state):
+    return "export"
+--- solution
+def route_after_review(state):
+    if state["errors"]:
+        if state.get("retries", 0) < 2:
+            return "review"
+        return "human"
+    if any(r["verdict"] == "redline" for r in state["reviews"]):
+        return "approve"
+    return "export"
+--- tests
+R = [{"id": "3.1", "verdict": "accept"}, {"id": "8.1", "verdict": "redline"}]
+expect("有 redline", lambda: route_after_review({"errors": [], "reviews": R}), "approve")
+expect("全是 accept", lambda: route_after_review({"errors": [], "reviews": R[:1]}), "export")
+expect("有错误，还没重试", lambda: route_after_review({"errors": ["4.2"], "reviews": R}), "review")
+expect("有错误，重试过 1 次", lambda: route_after_review({"errors": ["4.2"], "reviews": R, "retries": 1}), "review")
+expect("有错误，已经重试 2 次", lambda: route_after_review({"errors": ["4.2"], "reviews": R, "retries": 2}), "human")
+expect("没有条款", lambda: route_after_review({"errors": [], "reviews": []}), "export")
+--- hints
+- 错误的判断要放在最前面：有条款没审完时，redline 的数量还不可信。
+- 「有没有任何一条是 redline」：`any(r["verdict"] == "redline" for r in state["reviews"])`。
+
+@@ item d19-07
+type: code
+title: 存检查点、读检查点
+level: 2
+--- prompt
+写两个函数：
+
+- `save_checkpoint(folder, run_id, next_node, state)`：写到 `folder/<run_id>.json`，内容 `{"next": next_node, "state": state}`，用 `indent=2`；文件夹不存在要先建（包括上级）；返回文件的 `Path`
+- `load_checkpoint(folder, run_id)`：读回字典；文件不存在返回 `None`
+
+例：`save_checkpoint("work/d19/ck", "run-1", "summarise", {"n": 3})` → `Path("work/d19/ck/run-1.json")`
+--- starter
+import json
+from pathlib import Path
+
+def save_checkpoint(folder, run_id, next_node, state):
+    pass
+
+def load_checkpoint(folder, run_id):
+    pass
+--- solution
+import json
+from pathlib import Path
+
+def save_checkpoint(folder, run_id, next_node, state):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{run_id}.json"
+    path.write_text(json.dumps({"next": next_node, "state": state}, indent=2), encoding="utf-8")
+    return path
+
+def load_checkpoint(folder, run_id):
+    path = Path(folder) / f"{run_id}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+--- tests
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d19/ck07", ignore_errors=True)
+STATE = {"contract_path": "a.txt", "reviews": [{"id": "8.1", "verdict": "redline"}], "approved": None}
+expect("返回路径，上级文件夹自动建好", lambda: save_checkpoint("work/d19/ck07/deep", "run-1", "summarise", STATE), Path("work/d19/ck07/deep/run-1.json"))
+expect("读回来一模一样", lambda: load_checkpoint("work/d19/ck07/deep", "run-1"), {"next": "summarise", "state": STATE})
+expect_true("用了 indent=2", lambda: '\n  "state"' in Path("work/d19/ck07/deep/run-1.json").read_text(encoding="utf-8"))
+expect("文件不存在 → None", lambda: load_checkpoint("work/d19/ck07/deep", "run-404"), None)
+def _overwrite():
+    save_checkpoint("work/d19/ck07", "run-2", "review", {"n": 1})
+    save_checkpoint("work/d19/ck07", "run-2", "export", {"n": 2})
+    return load_checkpoint("work/d19/ck07", "run-2")
+expect("同一个 run_id 再存会覆盖", _overwrite, {"next": "export", "state": {"n": 2}})
+--- hints
+- 先 `folder = Path(folder)`，这样传字符串也能用 `/` 拼路径。
+- 建文件夹：`folder.mkdir(parents=True, exist_ok=True)`；写：`path.write_text(json.dumps(..., indent=2), encoding="utf-8")`。
+- 读之前先 `if not path.exists(): return None`。
+
+@@ item d19-08
+type: fix
+title: 修 bug：检查点存错了位置
+level: 3
+--- prompt
+`run_saving` 每跑完一个节点就存一次检查点，`resume_saving` 从检查点接着跑。测试模拟了一次崩溃：`export` 第一次运行时抛错（磁盘满了），然后从检查点恢复。
+
+运行测试：恢复后 `review` 又跑了一遍，等于又花了一次调模型的钱，token 也算重了。找到原因，只改 `run_saving`。
+--- starter
+import json
+from pathlib import Path
+
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def save(path, next_name, state):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps({"next": next_name, "state": state}), encoding="utf-8")
+
+def run_saving(nodes, edges, state, start, ckpt):
+    node = start
+    path = []
+    while node != "END":
+        state = {**state, **nodes[node](state)}
+        path.append(node)
+        save(ckpt, node, state)
+        node = next_node(edges, node, state)
+    return state, path
+
+def resume_saving(nodes, edges, ckpt):
+    saved = json.loads(Path(ckpt).read_text(encoding="utf-8"))
+    return run_saving(nodes, edges, saved["state"], saved["next"], ckpt)
+--- solution
+import json
+from pathlib import Path
+
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def save(path, next_name, state):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps({"next": next_name, "state": state}), encoding="utf-8")
+
+def run_saving(nodes, edges, state, start, ckpt):
+    node = start
+    path = []
+    while node != "END":
+        state = {**state, **nodes[node](state)}
+        path.append(node)
+        node = next_node(edges, node, state)
+        save(ckpt, node, state)
+    return state, path
+
+def resume_saving(nodes, edges, ckpt):
+    saved = json.loads(Path(ckpt).read_text(encoding="utf-8"))
+    return run_saving(nodes, edges, saved["state"], saved["next"], ckpt)
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d19/fix08", ignore_errors=True)
+CK = "work/d19/fix08/run.json"
+CALLS = {}
+def load(s):
+    return {"clauses": ["3.1", "8.1"]}
+def review(s):
+    CALLS["review"] = CALLS.get("review", 0) + 1
+    return {"tokens": s.get("tokens", 0) + 1000}
+def export(s):
+    CALLS["export"] = CALLS.get("export", 0) + 1
+    if CALLS["export"] == 1:
+        raise RuntimeError("disk full")
+    return {"exported": True}
+NODES = {"load": load, "review": review, "export": export}
+EDGES = {"load": "review", "review": "export", "export": "END"}
+def _crash_then_resume():
+    CALLS.clear()
+    try:
+        run_saving(NODES, EDGES, {}, "load", CK)
+    except RuntimeError:
+        pass
+    state, path = resume_saving(NODES, EDGES, CK)
+    return {"resumed_path": path, "tokens": state["tokens"], "review_calls": CALLS["review"]}
+expect("恢复后只跑 export，review 只调用 1 次", _crash_then_resume, {"resumed_path": ["export"], "tokens": 1000, "review_calls": 1})
+def _finished():
+    CALLS.clear()
+    CALLS["export"] = 1
+    run_saving(NODES, EDGES, {}, "load", CK)
+    return json.loads(Path(CK).read_text(encoding="utf-8"))["next"]
+expect("正常跑完后，检查点指向 END", _finished, "END")
+--- hints
+- 恢复是从检查点里的 `next` 开始的。`export` 崩溃之前，最后一次存下来的 `next` 是哪个节点？
+- 检查点要存「下一个要跑的节点」，所以要先算出下一个，再存。
+- 把 `node = next_node(...)` 挪到 `save(...)` 上面；这时 `node` 已经是下一个节点了。
+
+@@ item d19-09
+type: order
+title: 排代码：从文件恢复
+level: 2
+--- prompt
+排出 `resume_from_file(nodes, edges, path)`：读检查点文件，从 `next` 接着跑到 END，返回最终 state。有两行干扰项。
+--- lines
+import json
+from pathlib import Path
+def resume_from_file(nodes, edges, path):
+    saved = json.loads(Path(path).read_text(encoding="utf-8"))
+    state = saved["state"]
+    node = saved["next"]
+    while node != "END":
+        state = {**state, **nodes[node](state)}
+        edge = edges[node]
+        node = edge(state) if callable(edge) else edge
+    return state
+--- distractors
+        state = {**nodes[node](state), **state}
+    node = saved["state"]["next"]
+--- tests
+import json
+from pathlib import Path
+Path("work/d19/order09").mkdir(parents=True, exist_ok=True)
+Path("work/d19/order09/run.json").write_text(json.dumps({"next": "summarise", "state": {"reviews": ["accept", "redline"], "tokens": 500}}), encoding="utf-8")
+Path("work/d19/order09/late.json").write_text(json.dumps({"next": "export", "state": {"approved": False}}), encoding="utf-8")
+NODES = {
+    "summarise": lambda s: {"redlines": s["reviews"].count("redline"), "tokens": s["tokens"] + 100},
+    "approve": lambda s: {"approved": True},
+    "export": lambda s: {"exported": s["approved"]},
+}
+EDGES = {"summarise": lambda s: "approve" if s["redlines"] else "export", "approve": "export", "export": "END"}
+expect("从 summarise 接着跑完", lambda: resume_from_file(NODES, EDGES, "work/d19/order09/run.json"), {"reviews": ["accept", "redline"], "tokens": 600, "redlines": 1, "approved": True, "exported": True})
+expect("从 export 开始", lambda: resume_from_file(NODES, EDGES, "work/d19/order09/late.json"), {"approved": False, "exported": False})
+--- hints
+- `next` 和 `state` 是检查点的两个顶层键。
+- 合并时新值要放在后面：`{**state, **更新}`。反过来写，`tokens` 就不会变成 600。
+
+@@ item d19-10
+type: code
+title: 中断和恢复
+level: 3
+--- prompt
+给执行器加上「中断 → 恢复」，就像 `graph.py` 的 `interrupt()` 加 `Command(resume=...)`。
+
+写 `run(nodes, edges, state, start)`：
+
+- 像 `run_graph` 一样一步步跑（这题不用管 max_steps）
+- 某个节点返回的字典里有 `"__interrupt__"` 键：**立刻停**，不合并、不往下走，返回 `{"status": "interrupted", "next": 这个节点名, "state": state, "question": update["__interrupt__"]}`
+- 跑到 END：返回 `{"status": "done", "state": state, "path": path}`
+
+写 `resume(nodes, edges, saved, approved)`：`saved` 是上面的中断结果。把 `"approved": approved` 合并进 `saved["state"]`，然后从 `saved["next"]` 重新 `run`。被中断的节点会再跑一次，这次它看到 `approved` 有值，就不再中断，和 LangGraph 一样。
+--- starter
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def run(nodes, edges, state, start):
+    pass
+
+def resume(nodes, edges, saved, approved):
+    pass
+--- solution
+def next_node(edges, node, state):
+    edge = edges[node]
+    return edge(state) if callable(edge) else edge
+
+def run(nodes, edges, state, start):
+    node = start
+    path = []
+    while node != "END":
+        update = nodes[node](state)
+        if "__interrupt__" in update:
+            return {"status": "interrupted", "next": node, "state": state, "question": update["__interrupt__"]}
+        state = {**state, **update}
+        path.append(node)
+        node = next_node(edges, node, state)
+    return {"status": "done", "state": state, "path": path}
+
+def resume(nodes, edges, saved, approved):
+    state = {**saved["state"], "approved": approved}
+    return run(nodes, edges, state, saved["next"])
+--- tests
+import json
+def summarise(s):
+    return {"redlines": [r["id"] for r in s["reviews"] if r["verdict"] == "redline"]}
+def approve(s):
+    if s.get("approved") is None:
+        return {"__interrupt__": f"Apply {len(s['redlines'])} redline(s)?"}
+    return {}
+def export(s):
+    files = ["report.json"]
+    if s.get("approved"):
+        files.append("report.redlined.txt")
+    return {"exported": files}
+NODES = {"summarise": summarise, "approve": approve, "export": export}
+EDGES = {"summarise": lambda s: "approve" if s["redlines"] else "export", "approve": "export", "export": "END"}
+REVIEWS = [{"id": "3.1", "verdict": "accept"}, {"id": "8.1", "verdict": "redline"}]
+first = lambda: run(NODES, EDGES, {"reviews": REVIEWS}, "summarise")
+expect("有 redline：停在 approve", lambda: [first()["status"], first()["next"], first()["question"]], ["interrupted", "approve", "Apply 1 redline(s)?"])
+expect("中断时的 state 已经包含 summarise 的结果", lambda: first()["state"]["redlines"], ["8.1"])
+expect("批准：从 approve 接着跑，导出两个文件", lambda: [resume(NODES, EDGES, first(), True)["path"], resume(NODES, EDGES, first(), True)["state"]["exported"]], [["approve", "export"], ["report.json", "report.redlined.txt"]])
+expect("拒绝：只导出报告", lambda: resume(NODES, EDGES, first(), False)["state"]["exported"], ["report.json"])
+expect("中断结果存成 JSON 再读回来，也能恢复", lambda: resume(NODES, EDGES, json.loads(json.dumps(first())), True)["status"], "done")
+expect("没有 redline：不中断", lambda: run(NODES, EDGES, {"reviews": REVIEWS[:1]}, "summarise")["path"], ["summarise", "export"])
+--- hints
+- `run` 的循环和 `run_graph` 几乎一样，只是在合并之前多一句：`if "__interrupt__" in update: return {...}`。
+- 中断时返回的 `state` 是**还没合并**这次 update 的 state，`next` 是当前节点本身（恢复时要重跑它）。
+- `resume`：`state = {**saved["state"], "approved": approved}`，然后 `return run(nodes, edges, state, saved["next"])`。
+
+@@ item d19-11
+type: choice
+title: 读 graph.py：interrupt
+level: 2
+--- prompt
+`clausecheck/graph.py` 的 `approve` 节点调用了 `interrupt(...)`。下面哪个说法是对的？
+--- options
+- `interrupt()` 让 Python 进程停在那一行，一直等到有人在终端输入 y
+- 恢复时 LangGraph 直接从 `export` 开始，`approve` 节点不会再跑
+- 图在这里停下，状态由 checkpointer（`SqliteSaver`，存在 `data/checkpoints.sqlite`）保存；之后用同一个 `thread_id` 和 `Command(resume=True)` 继续，换一个进程也可以
+- 批准以后，由模型重新决定要不要真的应用这些 redline
+answer: 3
+--- explain
+问 y/N 的是 `cli.py` 里的 `decide` 函数（它用 `input()`），不是 `interrupt()` 本身：`run_graph` 先 invoke 到中断，从结果的 `__interrupt__` 里拿到待批准的内容，问完人再 `Command(resume=approved)`。`graph.py` 里还有 `pending_interrupt` 和 `resume` 两个函数，说明另一个进程也能查看、继续同一个 thread。恢复时被中断的节点从头再跑，这次 `interrupt()` 直接返回恢复值；之后由 `export` 里的代码执行决定，模型不参与。
+
+@@ item d19-12
+type: local
+title: 本机任务：跑一次真实的图
+level: 2
+--- prompt
+在真实项目里跑一次 LangGraph 版本的流程，亲眼看到「中断 → 人批准 → 恢复」：
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck review data/sample_contract.txt --graph --approve ask --mode mock --out data/day19.report.json --thread day19-1
+```
+
+- `--graph`：走 `graph.py` 的图，而不是普通流水线
+- `--approve ask`：到了中断处问你。看到 `Apply to exported copy? [y/N]` 时输入 `y` 回车
+- `--mode mock`：不调模型，用规则审查器，免费
+- `--thread`：这次运行的 thread id，检查点按它存在 `data/checkpoints.sqlite`
+
+跑完打开 `data/day19.report.json` 和 `data/day19.report.redlined.txt` 看看。再用 `--thread day19-2` 跑一次，这次输入 `n`，对比最后一行 `approved=` 和 `exported=` 有什么不同。
+
+把第一次运行的完整输出粘贴到下面。
+placeholder: 粘贴终端输出，应该包含 Interrupted before export 和 approved=True
+verify: Interrupted before export[\s\S]*approved=True
+--- hints
+- 看到 `No module named 'langgraph'`：先运行 `python -m pip install langgraph langgraph-checkpoint-sqlite`。
+- 开头几行 `RequestsDependencyWarning`、`UserWarning` 是版本提示，不影响运行。
+- 没看到 `Interrupted before export`：检查命令里有没有 `--graph`。
+
+@@ item d19-13
+type: code
+title: 抠出引用编号
+level: 1
+--- prompt
+写 `extract_citations(answer)`：返回回答里所有 `[c数字]` 引用的编号（不带方括号），**按第一次出现的顺序，去掉重复**。
+
+例：`extract_citations("Cap is 12 months [c2]. Notice is 60 days [c1][c2].")` → `["c2", "c1"]`
+--- starter
+import re
+
+def extract_citations(answer):
+    pass
+--- solution
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+--- tests
+expect("去重并保持顺序", lambda: extract_citations("Cap is 12 months [c2]. Notice is 60 days [c1][c2]."), ["c2", "c1"])
+expect("两位数编号", lambda: extract_citations("See [c10] and [c1]."), ["c10", "c1"])
+expect("没有引用", lambda: extract_citations("No sources here."), [])
+expect("没有方括号的不算", lambda: extract_citations("clause c3 and [3]"), [])
+--- hints
+- `re.findall(r"\[(c\d+)\]", answer)` 只返回圆括号里的部分，比如 `"c2"`。
+- 去重又要保持顺序，不能用 `set`（会打乱顺序）。用一个列表，`if cid not in result: result.append(cid)`。
+
+@@ item d19-14
+type: testwrite
+title: 写测试：抠引用
+level: 2
+--- prompt
+被测函数是你上一题写的 `extract_citations`。写测试函数（`def test_...():` 里用 `assert`），要求：在正确的函数上全部通过，同时能抓住几个藏起来的有 bug 的版本。
+
+起始代码里只有一个测试，太弱了。想一想上一题你是在哪几个地方差点写错的，每个地方写一个测试。
+--- impl
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+--- mutants
+===== 重复：同一个编号引用了两次
+import re
+
+def extract_citations(answer):
+    return re.findall(r"\[(c\d+)\]", answer)
+===== 两位数编号，比如 [c10]
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+===== 顺序：按第一次出现的顺序，而不是排序
+import re
+
+def extract_citations(answer):
+    return sorted(set(re.findall(r"\[(c\d+)\]", answer)))
+===== 没有方括号的 c3 不是引用
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"c\d+", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+--- starter
+def test_single_citation():
+    assert extract_citations("Fees are due in 30 days [c1].") == ["c1"]
+--- solution
+def test_single_citation():
+    assert extract_citations("Fees are due in 30 days [c1].") == ["c1"]
+
+def test_dedupe():
+    assert extract_citations("[c1] and again [c1]") == ["c1"]
+
+def test_two_digit_ids():
+    assert extract_citations("see [c10]") == ["c10"]
+
+def test_order_of_first_appearance():
+    assert extract_citations("[c2] then [c1]") == ["c2", "c1"]
+
+def test_bare_ids_are_not_citations():
+    assert extract_citations("clause c3 says so") == []
+--- hints
+- 一个测试只测一件事：重复、两位数、顺序、没有方括号，各写一个。
+- 测顺序时，让大编号先出现：`"[c2] then [c1]"`。排序的版本会返回 `["c1", "c2"]`。
+
+@@ item d19-15
+type: code
+title: 检查引用
+level: 2
+--- prompt
+写 `check_citations(answer, allowed_ids)`。`allowed_ids` 是这次检索到、放进了 prompt 的片段编号（列表或集合都行）。返回：
+
+```python
+{"cited": 回答引用的编号（顺序、去重同上题）,
+ "unknown": 引用了、但不在 allowed_ids 里的编号,
+ "uncited": 一个引用都没有时为 True，否则 False}
+```
+
+例：`check_citations("60 days [c1]. Also [c9].", ["c1", "c2"])` → `{"cited": ["c1", "c9"], "unknown": ["c9"], "uncited": False}`
+
+`unknown` 里的编号说明模型引用了它根本没看到的片段：编的。
+--- starter
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def check_citations(answer, allowed_ids):
+    pass
+--- solution
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def check_citations(answer, allowed_ids):
+    cited = extract_citations(answer)
+    unknown = [c for c in cited if c not in allowed_ids]
+    return {"cited": cited, "unknown": unknown, "uncited": len(cited) == 0}
+--- tests
+expect("有一个编的引用", lambda: check_citations("60 days [c1]. Also [c9].", ["c1", "c2"]), {"cited": ["c1", "c9"], "unknown": ["c9"], "uncited": False})
+expect("全部合法（allowed 是集合）", lambda: check_citations("[c2] and [c1]", {"c1", "c2"}), {"cited": ["c2", "c1"], "unknown": [], "uncited": False})
+expect("没有引用", lambda: check_citations("I think 60 days.", ["c1"]), {"cited": [], "unknown": [], "uncited": True})
+expect("uncited 是 True/False，不是列表或数字", lambda: check_citations("x", [])["uncited"], True)
+expect("编的引用出现两次只算一次", lambda: check_citations("[c7] [c7]", ["c1"])["unknown"], ["c7"])
+--- hints
+- 先 `cited = extract_citations(answer)`，另外两个字段都从它算。
+- `unknown`：列表推导式 `[c for c in cited if c not in allowed_ids]`；`uncited`：`len(cited) == 0`。
+
+@@ item d19-16
+type: code
+title: 抠出引文
+level: 2
+--- prompt
+写 `extract_quotes(answer)`：返回回答里所有被双引号括起来的文字，按出现顺序，去掉首尾空格，空的不要。直引号 `"…"` 和弯引号 `“…”` 都要认，模型经常输出弯引号。
+
+例：`extract_quotes('It says “in perpetuity” [c3] and "sixty days" [c1].')` → `["in perpetuity", "sixty days"]`
+
+起始代码只认直引号。
+--- starter
+import re
+
+def extract_quotes(answer):
+    return re.findall(r'"([^"]+)"', answer)
+--- solution
+import re
+
+def extract_quotes(answer):
+    found = re.findall(r'["“]([^"”]*)["”]', answer)
+    return [q.strip() for q in found if q.strip()]
+--- tests
+expect("直引号", lambda: extract_quotes('The clause says "sixty days" [c1].'), ["sixty days"])
+expect("弯引号", lambda: extract_quotes("It survives “in perpetuity” [c3]."), ["in perpetuity"])
+expect("两种混在一起，按顺序", lambda: extract_quotes('It says “in perpetuity” [c3] and "sixty days" [c1].'), ["in perpetuity", "sixty days"])
+expect("去掉首尾空格，空的不要", lambda: extract_quotes('A " unlimited liability " and "" here'), ["unlimited liability"])
+expect("单引号（撇号）不算", lambda: extract_quotes("Customer's data [c2]"), [])
+--- hints
+- 方括号在正则里表示「这几个字符之一」：`["“]` 匹配直引号或左弯引号，`["”]` 匹配直引号或右弯引号。
+- 中间写 `([^"”]*)`：任意个「不是右引号」的字符。用 `*` 而不是 `+`，空引号也能匹配到，再在结果里过滤掉。
+- 最后 `[q.strip() for q in found if q.strip()]`。
+
+@@ item d19-17
+type: code
+title: groundedness 检查
+level: 3
+--- prompt
+写 `grounded(answer, chunks)`：返回回答里**没有依据**的引文列表（按出现顺序）。
+
+- `chunks`：`[{"id": "c1", "text": "..."}, ...]`，这次检索到的片段
+- 一条引文有依据 = 规范化之后，它是回答**引用了的**某个片段的一部分
+- 规范化：`" ".join(s.split()).lower()`
+- 只在被引用的片段里找（用 `extract_citations`）。原文只出现在没被引用的片段里，也算没有依据：出处标错了
+- `extract_citations` 和 `extract_quotes` 已经写好
+
+例：`'It lasts “in perpetuity” [c3] and is "mutual" [c3].'`，c3 里有 in perpetuity、没有 mutual → `["mutual"]`
+--- starter
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def extract_quotes(answer):
+    found = re.findall(r'["“]([^"”]*)["”]', answer)
+    return [q.strip() for q in found if q.strip()]
+
+def grounded(answer, chunks):
+    pass
+--- solution
+import re
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def extract_quotes(answer):
+    found = re.findall(r'["“]([^"”]*)["”]', answer)
+    return [q.strip() for q in found if q.strip()]
+
+def norm(s):
+    return " ".join(s.split()).lower()
+
+def grounded(answer, chunks):
+    cited = extract_citations(answer)
+    sources = [norm(c["text"]) for c in chunks if c["id"] in cited]
+    unsupported = []
+    for q in extract_quotes(answer):
+        if not any(norm(q) in src for src in sources):
+            unsupported.append(q)
+    return unsupported
+--- tests
+CHUNKS = [
+    {"id": "c1", "text": "Either party may terminate this Agreement\nupon sixty (60) days' written notice."},
+    {"id": "c3", "text": "The obligations in this Section 6 survive termination in perpetuity."},
+    {"id": "c4", "text": "Customer's liability shall be unlimited."},
+]
+expect("有依据：换行和大小写不影响", lambda: grounded('It says "Terminate this Agreement upon sixty (60) days" [c1].', CHUNKS), [])
+expect("编造的引文", lambda: grounded('It lasts “in perpetuity” [c3] and is "mutual" [c3].', CHUNKS), ["mutual"])
+expect("原文在没被引用的片段里：出处标错", lambda: grounded('Liability is "unlimited" [c1].', CHUNKS), ["unlimited"])
+expect("没有任何引用：引文全都没依据", lambda: grounded('It says "sixty (60) days".', CHUNKS), ["sixty (60) days"])
+expect("没有引文", lambda: grounded("Sixty days' notice [c1].", CHUNKS), [])
+--- hints
+- 先算出被引用的片段文字，并且规范化好：`[norm(c["text"]) for c in chunks if c["id"] in cited]`。
+- 对每条引文：`any(norm(q) in src for src in sources)` 为 False 就是没依据。
+- 返回的是引文原样（`q`），不是规范化后的。
+
+@@ item d19-18
+type: choice
+title: groundedness 能抓什么
+level: 2
+--- prompt
+你的 RAG 评测里，`grounded(answer, chunks)` 对一条回答返回了 `[]`（没找到无依据的引文）。能得出什么结论？
+--- options
+- 回答里引号中的原文都能在它引用的片段里找到；但结论推得对不对、有没有漏掉更重要的片段，这个检查不知道
+- 回答是正确的，可以直接交给律师
+- 模型没有任何幻觉
+- 检索找到了所有相关的片段
+answer: 1
+--- explain
+groundedness 只检查「引文是不是真的」。模型可以引用真实的原文却推出相反的结论（引了 "sixty (60) days" 却说是 30 天），也可以根本不加引号地编，这两种它都抓不住。检索漏掉关键片段是召回问题，要靠带标准答案的检索评测。所以它是便宜的第一道自动检查，不能代替评测集和人工抽查。
+
+@@ item d19-19
+type: code
+title: 带引用的 RAG 回答
+level: 3
+--- prompt
+把今天的 RAG 部分串起来。写 `rag_answer(question, chunks, llm, k=2)`：
+
+1. `retrieved = top_k(question, chunks, k)`（已写好，就是第 1 题）
+2. 一个都没检索到：**不要调用** `llm`，直接返回 `{"answer": "", "sources": [], "status": "no_context"}`
+3. 拼 prompt：`INSTRUCTIONS`，空一行，每个检索到的片段一行 `[c2] 片段文字`，空一行，最后一行 `Question: 问题`
+4. `raw = llm(prompt)`，`llm` 是传进来的函数（测试里是假的）
+5. 用 `check_citations(raw, 检索到的编号)` 检查（已写好）
+6. 返回 `{"answer": raw, "sources": 检索到的编号列表, "status": 状态}`。状态：没有引用 → `"unsupported"`；有编的引用 → `"bad_citation"`；否则 `"ok"`
+
+prompt 的样子：
+
+```
+Answer only from the sources below. ...
+
+[c3] Customer may terminate ...
+[c1] Either party may ...
+
+Question: Can Customer terminate after thirty days?
+```
+--- starter
+import re
+
+INSTRUCTIONS = "Answer only from the sources below. Cite every sentence like [c1]. If the sources do not answer the question, say so."
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def top_k(query, chunks, k):
+    words = set(tokenize(query))
+    scored = [(len(words & set(tokenize(c["text"]))), c) for c in chunks]
+    scored = [pair for pair in scored if pair[0] > 0]
+    scored.sort(key=lambda pair: -pair[0])
+    return [c for _, c in scored[:k]]
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def check_citations(answer, allowed_ids):
+    cited = extract_citations(answer)
+    return {"cited": cited, "unknown": [c for c in cited if c not in allowed_ids], "uncited": len(cited) == 0}
+
+def rag_answer(question, chunks, llm, k=2):
+    pass
+--- solution
+import re
+
+INSTRUCTIONS = "Answer only from the sources below. Cite every sentence like [c1]. If the sources do not answer the question, say so."
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def top_k(query, chunks, k):
+    words = set(tokenize(query))
+    scored = [(len(words & set(tokenize(c["text"]))), c) for c in chunks]
+    scored = [pair for pair in scored if pair[0] > 0]
+    scored.sort(key=lambda pair: -pair[0])
+    return [c for _, c in scored[:k]]
+
+def extract_citations(answer):
+    result = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in result:
+            result.append(cid)
+    return result
+
+def check_citations(answer, allowed_ids):
+    cited = extract_citations(answer)
+    return {"cited": cited, "unknown": [c for c in cited if c not in allowed_ids], "uncited": len(cited) == 0}
+
+def rag_answer(question, chunks, llm, k=2):
+    retrieved = top_k(question, chunks, k)
+    if not retrieved:
+        return {"answer": "", "sources": [], "status": "no_context"}
+    ids = [c["id"] for c in retrieved]
+    lines = [f"[{c['id']}] {c['text']}" for c in retrieved]
+    prompt = INSTRUCTIONS + "\n\n" + "\n".join(lines) + "\n\nQuestion: " + question
+    raw = llm(prompt)
+    report = check_citations(raw, ids)
+    if report["uncited"]:
+        status = "unsupported"
+    elif report["unknown"]:
+        status = "bad_citation"
+    else:
+        status = "ok"
+    return {"answer": raw, "sources": ids, "status": status}
+--- tests
+CHUNKS = [
+    {"id": "c1", "text": "Either party may terminate this Agreement upon sixty days' notice."},
+    {"id": "c2", "text": "Fees are payable within thirty days of the invoice date."},
+    {"id": "c3", "text": "Customer may terminate for material breach after thirty days."},
+]
+Q = "Can Customer terminate after thirty days?"
+PROMPTS = []
+def recording_llm(prompt):
+    PROMPTS.append(prompt)
+    return "Yes, for material breach [c3]."
+expect("正常：ok，来源是检索到的两个", lambda: rag_answer(Q, CHUNKS, recording_llm), {"answer": "Yes, for material breach [c3].", "sources": ["c3", "c1"], "status": "ok"})
+def _prompt():
+    PROMPTS.clear()
+    rag_answer(Q, CHUNKS, recording_llm)
+    return PROMPTS[0]
+expect("prompt 的格式", _prompt, INSTRUCTIONS + "\n\n[c3] Customer may terminate for material breach after thirty days.\n[c1] Either party may terminate this Agreement upon sixty days' notice.\n\nQuestion: " + Q)
+expect("引用了没检索到的 c2", lambda: rag_answer(Q, CHUNKS, lambda p: "Fees are due in thirty days [c2].")["status"], "bad_citation")
+expect("没有引用", lambda: rag_answer(Q, CHUNKS, lambda p: "Yes, I believe so.")["status"], "unsupported")
+CALLS = []
+def _no_context():
+    CALLS.clear()
+    result = rag_answer("GDPR?", CHUNKS, lambda p: CALLS.append(p) or "x [c1]")
+    return [result, len(CALLS)]
+expect("检索不到：不调模型", _no_context, [{"answer": "", "sources": [], "status": "no_context"}, 0])
+--- hints
+- 先写检索和「检索不到就提前 return」，再拼 prompt：`INSTRUCTIONS + "\n\n" + "\n".join(lines) + "\n\nQuestion: " + question`。
+- 每行：`f"[{c['id']}] {c['text']}"`。
+- 状态的判断顺序：先看 `uncited`，再看 `unknown`，都没问题就是 `"ok"`。
+
+@@ item d19-e1
+type: scratch
+title: 闭卷：带条件边的图执行器
+exam: yes
+level: 3
+--- prompt
+写 `run_graph(nodes, edges, state, start, max_steps=10)`：
+
+- `nodes`：节点名 → 函数。函数接收 state 字典，返回要更新的键（一个字典）
+- `edges`：节点名 → 下一个节点名（字符串），或者路由函数（接收 state，返回下一个节点名）。`"END"` 表示结束
+- 每跑一个节点：新 state = 旧 state 合并这次的更新（**不修改**传进来的字典），节点名记进 `path`
+- 到 END：返回 `{"state": 最终 state, "path": path, "stop": "end"}`
+- 已经跑了 `max_steps` 个节点还没到 END：停下，返回同样的结构，但 `"stop": "max_steps"`
+- 要跑的节点不在 `nodes` 里，或者节点在 `edges` 里没有出边：`raise ValueError`
+--- solution
+def run_graph(nodes, edges, state, start, max_steps=10):
+    path = []
+    node = start
+    while node != "END":
+        if len(path) >= max_steps:
+            return {"state": state, "path": path, "stop": "max_steps"}
+        if node not in nodes or node not in edges:
+            raise ValueError(f"bad node {node!r}")
+        state = {**state, **nodes[node](state)}
+        path.append(node)
+        edge = edges[node]
+        node = edge(state) if callable(edge) else edge
+    return {"state": state, "path": path, "stop": "end"}
+--- tests
+NODES = {
+    "load": lambda s: {"clauses": ["3.1", "8.1", "10.1"]},
+    "review": lambda s: {"redlines": len(s["clauses"]) - 1},
+    "approve": lambda s: {"approved": True},
+    "export": lambda s: {"done": True},
+}
+EDGES = {"load": "review", "review": lambda s: "approve" if s["redlines"] > 0 else "export", "approve": "export", "export": "END"}
+expect("条件边：走 approve", lambda: run_graph(NODES, EDGES, {}, "load")["path"], ["load", "review", "approve", "export"])
+expect("条件边：走 export", lambda: run_graph({**NODES, "load": lambda s: {"clauses": ["3.1"]}}, EDGES, {}, "load")["path"], ["load", "review", "export"])
+expect("刚好 max_steps 步跑完算 end", lambda: run_graph(NODES, EDGES, {}, "load", max_steps=4)["stop"], "end")
+def _loop():
+    start = {}
+    r = run_graph({"a": lambda s: {"n": s.get("n", 0) + 1}}, {"a": "a"}, start, "a", max_steps=4)
+    return [r["state"], r["stop"], len(r["path"]), start]
+expect("有环：停在 max_steps，不改传入的 state", _loop, [{"n": 4}, "max_steps", 4, {}])
+expect_raises("没有出边", lambda: run_graph({"a": lambda s: {}}, {}, {}, "a"), ValueError)
+
+@@ item d19-e2
+type: scratch
+title: 闭卷：引用检查报告
+exam: yes
+level: 3
+--- prompt
+RAG 回答里的引用写成 `[c数字]`，比如 `[c2]`、`[c10]`。写 `citation_report(answer, retrieved_ids)`，返回：
+
+- `"cited"`：回答里的引用编号（不带方括号），按第一次出现的顺序，去重
+- `"unknown"`：cited 里不在 `retrieved_ids` 中的编号（按 cited 的顺序）
+- `"unused"`：`retrieved_ids` 里一次都没被引用的编号（按 `retrieved_ids` 的顺序）
+- `"status"`：一个引用都没有 → `"unsupported"`；有 unknown → `"bad_citation"`；否则 `"ok"`
+
+例：`citation_report("60 days [c1]. Fees [c2][c1].", ["c1", "c2", "c3"])` → `{"cited": ["c1", "c2"], "unknown": [], "unused": ["c3"], "status": "ok"}`
+--- solution
+import re
+
+def citation_report(answer, retrieved_ids):
+    cited = []
+    for cid in re.findall(r"\[(c\d+)\]", answer):
+        if cid not in cited:
+            cited.append(cid)
+    unknown = [c for c in cited if c not in retrieved_ids]
+    unused = [c for c in retrieved_ids if c not in cited]
+    if not cited:
+        status = "unsupported"
+    elif unknown:
+        status = "bad_citation"
+    else:
+        status = "ok"
+    return {"cited": cited, "unknown": unknown, "unused": unused, "status": status}
+--- tests
+expect("正常", lambda: citation_report("60 days [c1]. Fees [c2][c1].", ["c1", "c2", "c3"]), {"cited": ["c1", "c2"], "unknown": [], "unused": ["c3"], "status": "ok"})
+expect("编的两位数编号", lambda: citation_report("See [c12] and [c1].", ["c1", "c2"]), {"cited": ["c12", "c1"], "unknown": ["c12"], "unused": ["c2"], "status": "bad_citation"})
+expect("没有引用", lambda: citation_report("Probably yes, see c1.", ["c1"]), {"cited": [], "unknown": [], "unused": ["c1"], "status": "unsupported"})
+
+@@ item d19-e3
+type: scratch
+title: 闭卷：引文核查
+exam: yes
+level: 3
+--- prompt
+写 `groundedness(answer, chunks)`：
+
+- `chunks`：字典，片段编号 → 片段文字，如 `{"c1": "Either party may ...", "c2": "..."}`
+- 引文：回答里直双引号 `"…"` 之间的文字，去掉首尾空格，空的忽略
+- 引用：回答里的 `[c数字]`
+- 一条引文**有依据**：规范化（所有空白合并成一个空格、全部小写）以后，它是某个**被回答引用了的**片段（规范化后）的一部分。引用了 chunks 里没有的编号，不算依据
+- 返回 `{"quotes": 引文条数, "unsupported": [没依据的引文原文，按出现顺序], "score": 有依据的条数 / 引文条数，round 到 2 位小数}`；没有引文时 `score` 为 `1.0`
+--- solution
+import re
+
+def norm(s):
+    return " ".join(s.split()).lower()
+
+def groundedness(answer, chunks):
+    cited = re.findall(r"\[(c\d+)\]", answer)
+    sources = [norm(chunks[c]) for c in cited if c in chunks]
+    quotes = [q.strip() for q in re.findall(r'"([^"]*)"', answer) if q.strip()]
+    unsupported = [q for q in quotes if not any(norm(q) in s for s in sources)]
+    if not quotes:
+        return {"quotes": 0, "unsupported": [], "score": 1.0}
+    score = round((len(quotes) - len(unsupported)) / len(quotes), 2)
+    return {"quotes": len(quotes), "unsupported": unsupported, "score": score}
+--- tests
+CHUNKS = {
+    "c1": "Either party may terminate this Agreement\nupon sixty (60) days' written notice.",
+    "c2": "Customer's liability shall be unlimited.",
+}
+expect("两条都有依据", lambda: groundedness('It needs "Sixty (60) days\' written notice" [c1] and "terminate this Agreement upon" [c1].', CHUNKS), {"quotes": 2, "unsupported": [], "score": 1.0})
+expect("一条编造", lambda: groundedness('It needs "thirty days notice" [c1] but "liability shall be unlimited" [c2].', CHUNKS), {"quotes": 2, "unsupported": ["thirty days notice"], "score": 0.5})
+expect("出处标错、编号不存在", lambda: groundedness('"shall be unlimited" [c1], "processed in any country" [c9], "may terminate" [c1].', CHUNKS), {"quotes": 3, "unsupported": ["shall be unlimited", "processed in any country"], "score": 0.33})
+expect("没有引文", lambda: groundedness("Sixty days [c1].", CHUNKS), {"quotes": 0, "unsupported": [], "score": 1.0})

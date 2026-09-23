@@ -53,6 +53,52 @@ def _err_line(exc):
     return line
 
 
+def _install_pytest_shim():
+    """pytest is not installed in the browser: provide pytest.raises and pytest.approx."""
+    try:
+        import pytest  # noqa: F401  (the real one wins when it exists)
+        return
+    except ImportError:
+        pass
+    import re
+    import types
+
+    class _Raises:
+        def __init__(self, exc, match=None):
+            self.exc, self.match, self.value = exc, match, None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, et, ev, tb):
+            if et is None:
+                raise AssertionError(f"DID NOT RAISE {self.exc.__name__}")
+            if not issubclass(et, self.exc):
+                return False
+            if self.match and not re.search(self.match, str(ev)):
+                raise AssertionError(f"Regex pattern did not match: {self.match!r} vs {str(ev)!r}")
+            self.value = ev
+            return True
+
+    class _Approx:
+        def __init__(self, expected, rel=1e-6, abs=1e-12):  # noqa: A002 (pytest's own names)
+            self.expected, self.rel, self.abs = expected, rel, abs
+
+        def __eq__(self, other):
+            return builtins.abs(other - self.expected) <= max(self.rel * builtins.abs(self.expected), self.abs)
+
+        def __repr__(self):
+            return f"{self.expected!r} ± {max(self.rel * builtins.abs(self.expected), self.abs):.1e}"
+
+    mod = types.ModuleType("pytest")
+    mod.raises = _Raises
+    mod.approx = _Approx
+    sys.modules["pytest"] = mod
+
+
+_install_pytest_shim()
+
+
 def _no_input(*_args, **_kwargs):
     raise RuntimeError("这里不能用 input()：请直接给变量赋值，例如 name = \"8.1\"")
 
@@ -127,6 +173,10 @@ def run(user_code, test_code="", setup_code=""):
     ns = {"__name__": "__main__", "__builtins__": builtins, "input": _no_input}
     old_out, old_err = sys.stdout, sys.stderr
     sys.stdout = sys.stderr = out
+    # logging.basicConfig() binds to the stderr of the run that called it; start clean each run
+    import logging
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
     try:
         try:
             if setup_code:

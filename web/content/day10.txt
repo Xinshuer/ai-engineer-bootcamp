@@ -1,0 +1,1184 @@
+@@ day 10
+title: 文件与命令行：pathlib、JSON/CSV、argparse、环境变量
+lang: py
+hours: 4–5 小时
+--- goal
+能用 pathlib 读写文本、JSON 和 CSV 文件；能写一个带参数、带退出码的小命令行程序（argparse + `main(argv)`）；会从环境变量读配置，并按「命令行参数 > 环境变量 > 默认值」合并。对应项目的 `clausecheck/cli.py`、`__main__.py`、`split.load_contract` 和 `config.py`。
+
+本页的文件写在浏览器里的**虚拟磁盘**上：这次打开页面期间一直都在，刷新就没了。最后的本机任务在你电脑的真实磁盘上做。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过（包括本机任务：在真实项目里跑命令行、看退出码）
+- 闭卷挑战 3 题
+- 打开 `clausecheck/cli.py`，找到 `main`，说出 `review` 子命令有哪几个参数、哪个带 `choices`、哪个是 `store_true`
+
+@@ concept
+title: 读写文件：open、with、encoding
+--- body
+程序一结束，变量就没了。想把结果（报告、日志）留下来，就要写进**文件**：
+
+```python
+with open("notes.txt", "w", encoding="utf-8") as f:
+    f.write("8.1 flag\n")
+```
+
+- `with` 块结束时自动关闭文件，中途报错也会关。所以永远用 `with`
+- 模式：`"r"` 读（默认）、`"w"` 写（**先清空**原内容）、`"a"` 追加到末尾
+- `f.read()` 读出整个文件；`for line in f:` 一行一行读，每行末尾带着 `"\n"`
+- **永远写 `encoding="utf-8"`**。Windows 上不写时默认编码往往不是 UTF-8，遇到中文、`§`、`ö` 就乱码或报 `UnicodeDecodeError`。项目 `parse.py` 读合同时就写了它
+--- code
+with open("d10_log.txt", "w", encoding="utf-8") as f:
+    f.write("8.1 flag\n")
+    f.write("3.1 accept\n")
+
+with open("d10_log.txt", "a", encoding="utf-8") as f:
+    f.write("4.2 redline\n")
+
+with open("d10_log.txt", encoding="utf-8") as f:
+    print(repr(f.read()))
+
+with open("d10_log.txt", encoding="utf-8") as f:
+    for n, line in enumerate(f, start=1):
+        print(n, line.rstrip("\n"))
+
+@@ concept
+title: pathlib：路径是对象
+--- body
+用字符串拼路径（`"data" + "/" + name`）很容易拼错。`pathlib.Path` 把路径变成一个对象：
+
+- `Path("data") / "sample_contract.txt"`：用 `/` 拼路径。Windows 上也这么写，打印出来会变成 `data\sample_contract.txt`
+- 拆开看：`.name` 文件名、`.stem` 去掉后缀的名字、`.suffix` 后缀、`.parent` 所在的文件夹
+- `.with_suffix(".report.json")` 换后缀。`cli.py` 没给 `--out` 时就用它算报告路径
+- `.exists()` 在不在；`.read_text(encoding="utf-8")` 和 `.write_text(文字, encoding="utf-8")` 一行读写整个文件，不用自己 `open`
+
+本页跑在浏览器里的 Linux 风格虚拟磁盘上，所以打印出来是 `/`。
+--- code
+from pathlib import Path
+
+p = Path("data") / "sample_contract.txt"
+print(p, "|", p.name, "|", p.stem, "|", p.suffix, "|", p.parent)
+print(p.with_suffix(".report.json"))
+print(p.exists())
+
+note = Path("d10_note.txt")
+note.write_text("Clause 8.1 needs a lawyer.\n", encoding="utf-8")
+print(note.exists(), repr(note.read_text(encoding="utf-8")))
+
+@@ concept
+title: 文件夹：mkdir、glob 和「当前目录」
+--- body
+- `folder.mkdir(parents=True, exist_ok=True)` 建文件夹：`parents=True` 连中间缺的上级一起建，`exist_ok=True` 已经存在也不报错。写文件之前先建它的上级：`path.parent.mkdir(...)`
+- `folder.glob("*.json")` 找出匹配的文件。返回顺序没有保证，所以几乎总是写 `sorted(folder.glob("*.json"))`
+- **相对路径是从「当前目录」算起的**，也就是你运行命令时所在的文件夹，而不是 .py 文件所在的文件夹。`Path.cwd()` 可以看当前目录
+
+所以项目要在 `G:\Contract Clause Reviewer` 里运行，才找得到 `data/sample_contract.txt`。`config.py` 里的 `ROOT = Path(__file__).resolve().parent.parent` 是从代码文件的位置推出项目根目录，这样从哪里运行都不会找错。
+--- code
+from pathlib import Path
+
+folder = Path("work/d10/demo")
+folder.mkdir(parents=True, exist_ok=True)
+for name in ["b.json", "a.json", "notes.txt"]:
+    (folder / name).write_text("{}", encoding="utf-8")
+
+print(Path.cwd())
+print([p.name for p in sorted(folder.glob("*.json"))])
+print([p.name for p in sorted(folder.glob("*"))])
+
+@@ concept
+title: JSON 文件：load 和 dump
+--- body
+第 3 天的 `json.loads` / `json.dumps` 处理的是**字符串**（s 就是 string）。读写**文件**有两种写法：
+
+```python
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(report, f, indent=2, ensure_ascii=False)   # 写
+with open(path, encoding="utf-8") as f:
+    report = json.load(f)                                # 读
+
+report = json.loads(Path(path).read_text(encoding="utf-8"))  # playbook.py 的写法
+```
+
+- `indent=2` 让人能读；`ensure_ascii=False` 让中文原样写出，而不是变成 `\u5f8b` 这样的转义
+- 经典错误：`json.dump(report, "out.json")`。第二个参数要的是**打开的文件**，传字符串会报 `AttributeError: 'str' object has no attribute 'write'`
+--- code
+import json
+from pathlib import Path
+
+report = {"contract": "sample_contract", "counts": {"accept": 17, "redline": 11}, "note": "需要律师看 8.1"}
+path = Path("work/d10/demo/report.json")
+path.parent.mkdir(parents=True, exist_ok=True)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(report, f, indent=2, ensure_ascii=False)
+
+print(path.read_text(encoding="utf-8"))
+with open(path, encoding="utf-8") as f:
+    back = json.load(f)
+print(back == report, back["counts"]["redline"])
+print(json.dumps({"note": "律师"}))
+
+@@ concept
+title: CSV：让律师用 Excel 打开
+--- body
+律师不读 JSON，他们用 Excel。CSV 就是「用逗号分隔的表格文字」，`csv` 模块替你处理引号和正文里的逗号：
+
+- 写：`writer = csv.DictWriter(f, fieldnames=[列名...])`，先 `writer.writeheader()` 写表头，再 `writer.writerows(字典列表)`
+- 打开文件时加 `newline=""`，否则 Windows 上每行之间会多出一个空行
+- 读：`csv.DictReader(f)`，每行是一个字典。**读回来的值全是字符串**，`"340"` 要自己 `int(...)`
+- 想让 Excel 正确显示中文，编码用 `"utf-8-sig"`（文件开头多一个 BOM 标记）；读的时候也用它，否则第一个列名前会多一个看不见的字符
+--- code
+import csv
+from pathlib import Path
+
+rows = [
+    {"clause_id": "8.1", "verdict": "redline", "tokens": 340, "rationale": "cap is not mutual, see 12"},
+    {"clause_id": "3.1", "verdict": "accept", "tokens": 120, "rationale": "standard"},
+]
+path = Path("work/d10/demo/reviews.csv")
+path.parent.mkdir(parents=True, exist_ok=True)
+with open(path, "w", encoding="utf-8", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["clause_id", "verdict", "tokens", "rationale"])
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(path.read_text(encoding="utf-8"))
+with open(path, encoding="utf-8", newline="") as f:
+    back = list(csv.DictReader(f))
+print(back[0])
+print(back[0]["tokens"] + back[1]["tokens"], int(back[0]["tokens"]) + int(back[1]["tokens"]))
+
+@@ concept
+title: 命令行参数：argparse
+--- body
+在终端运行 `python -m clausecheck review data/sample_contract.txt --mode mock` 时，程序拿到的只是一串文字：`["review", "data/sample_contract.txt", "--mode", "mock"]`（就是 `sys.argv[1:]`）。`argparse` 把它变成有名字、有类型、有检查的参数：
+
+```python
+parser = argparse.ArgumentParser(prog="clausecheck")
+parser.add_argument("path")                                  # 位置参数：必填
+parser.add_argument("--out")                                 # 可选，不给就是 None
+parser.add_argument("--mode", choices=["mock", "deepseek"], default="mock")
+parser.add_argument("--limit", type=int)                     # 自动转成 int
+parser.add_argument("--verbose", action="store_true")        # 出现就是 True
+args = parser.parse_args(["data/c.txt", "--limit", "5"])
+```
+
+- 用点取值：`args.path`、`args.limit`。名字里的 `-` 会变成 `_`：`--only-risk` → `args.only_risk`
+- 值不合法（不在 `choices` 里、`--limit abc`）时，argparse 打印用法和原因，然后以退出码 2 结束
+- `-h` 的帮助信息是自动生成的
+--- code
+import argparse
+
+parser = argparse.ArgumentParser(prog="clausecheck", description="Review a contract")
+parser.add_argument("path", help="contract file (.txt or .pdf)")
+parser.add_argument("--out", help="where to write the JSON report")
+parser.add_argument("--mode", choices=["mock", "deepseek", "local"], default="mock")
+parser.add_argument("--limit", type=int, help="review only the first N clauses")
+parser.add_argument("--verbose", action="store_true")
+
+args = parser.parse_args(["data/sample_contract.txt", "--limit", "5", "--verbose"])
+print(args)
+print(args.path, args.mode, args.limit + 1, args.verbose)
+
+try:
+    parser.parse_args(["-h"])
+except SystemExit as e:
+    print("exit code:", e.code)
+
+@@ concept
+title: main(argv)、退出码和 __name__
+--- body
+项目的写法（`clausecheck/cli.py` 和 `__main__.py`）：
+
+```python
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    ...
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- `parse_args(argv)`：`argv` 是 `None` 时读真正的命令行；测试里传一个列表 `main(["c.txt", "--limit", "2"])`，不用开终端
+- **退出码**：`0` 成功，`1` 出错（比如文件不存在），argparse 参数错误是 `2`。脚本和 CI 靠它判断成败，PowerShell 里用 `$LASTEXITCODE` 查看。`raise SystemExit(main())` 把 `main` 的返回值交给系统当退出码
+- `__name__`：直接运行这个文件时是 `"__main__"`，被别的文件 `import` 时是模块名。所以测试里 `from clausecheck.cli import main` 不会顺带把程序跑一遍
+- `python -m clausecheck` 运行的就是包里的 `__main__.py`，它只有两行：`from .cli import main` 和 `raise SystemExit(main())`
+
+本页里 `__name__` 也是 `"__main__"`，但没有真的命令行，所以下面直接调用 `main([...])`。如果你在本页写了 `raise SystemExit(main())`，会看到一段「缺少参数」的用法错误：这里没有命令行参数可读，这是正常的。
+--- code
+import argparse
+from pathlib import Path
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="clausecheck")
+    p.add_argument("path")
+    return p
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    path = Path(args.path)
+    if not path.exists():
+        print(f"error: {path} not found")
+        return 1
+    print(f"{path.name}: {len(path.read_text(encoding='utf-8'))} chars")
+    return 0
+
+demo = Path("work/d10/demo/c.txt")
+demo.parent.mkdir(parents=True, exist_ok=True)
+demo.write_text("8.1 Cap on Liability\nLiability is unlimited.\n", encoding="utf-8")
+print("exit code:", main(["work/d10/demo/c.txt"]))
+print("exit code:", main(["work/d10/demo/missing.txt"]))
+try:
+    main([])
+except SystemExit as e:
+    print("exit code:", e.code)
+print(__name__)
+
+@@ concept
+title: 环境变量和配置
+--- body
+有些设置不该写死在代码里：API 密钥、运行模式、最多几步。它们放在**环境变量**里：
+
+- 读：`os.getenv("CLAUSECHECK_MODE", "mock")`，没设置就用默认值。**读出来永远是字符串**，数字要自己转：`config.py` 里就写着 `int(os.getenv("CLAUSECHECK_MAX_STEPS", "6"))`
+- PowerShell 里临时设置：`$env:CLAUSECHECK_MODE="mock"`
+- 密钥写在项目根目录的 `.env` 文件里，`python-dotenv` 的 `load_dotenv()` 把它读进环境变量。`.env` 写在 `.gitignore` 里，所以**密钥永远不进代码、不进 git**
+- 优先级：**命令行参数 > 环境变量 > 默认值**。`cli.py` 的 `cmd_review` 先 `Settings()`（读环境变量），命令行给了 `--mode` 再覆盖它
+- 写函数时把环境当参数传进来（一个 `env` 字典），测试就不用去改全局的 `os.environ`
+--- code
+import os
+
+def resolve_steps(cli_value, env):
+    if cli_value is not None:
+        return cli_value
+    return int(env.get("CLAUSECHECK_MAX_STEPS", "6"))
+
+print(resolve_steps(None, {}))
+print(resolve_steps(None, {"CLAUSECHECK_MAX_STEPS": "3"}))
+print(resolve_steps(10, {"CLAUSECHECK_MAX_STEPS": "3"}))
+
+os.environ["CLAUSECHECK_MODE"] = "deepseek"
+print(os.getenv("CLAUSECHECK_MODE", "mock"), type(os.getenv("CLAUSECHECK_MODE")).__name__)
+del os.environ["CLAUSECHECK_MODE"]
+print(os.getenv("CLAUSECHECK_MODE", "mock"))
+
+@@ item d10-01
+type: predict
+title: 复习：拆行和 Counter
+level: 1
+--- prompt
+写出输出。复习第 8 天的 `Counter`，同时注意：文件内容通常以 `"\n"` 结尾，`split("\n")` 和 `splitlines()` 的结果差在哪里？
+--- code
+from collections import Counter
+
+text = "8.1 flag\n3.1 accept\n4.2 flag\n"
+print(text.split("\n"))
+print(text.splitlines())
+verdicts = [line.split()[1] for line in text.splitlines()]
+print(Counter(verdicts).most_common(1))
+--- explain
+`split("\n")` 在最后一个换行后面还会切出一个空字符串 `''`，`splitlines()` 不会。读文件时这个空串会让「数行数」多出 1，或者让 `line.split()[1]` 报 `IndexError`。`most_common(1)` 返回出现最多的一项，形式是 `[(值, 次数)]`。
+
+@@ item d10-02
+type: code
+title: 数非空行
+level: 1
+--- prompt
+写 `count_lines(path)`：返回文件里**非空行**的行数（只有空格的行也算空行）。用 `with open(path, encoding="utf-8") as f:` 打开。
+
+例：文件内容是 `"8.1 Cap\n\n   \nLiability is capped.\n"` 时返回 `2`。测试会自己在 `work/d10/lines/` 里准备文件。
+--- starter
+def count_lines(path):
+    pass
+--- solution
+def count_lines(path):
+    count = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+--- tests
+from pathlib import Path
+_dir = Path("work/d10/lines")
+_dir.mkdir(parents=True, exist_ok=True)
+(_dir / "a.txt").write_text("8.1 Cap on Liability\n\n   \nLiability is capped.\n", encoding="utf-8")
+(_dir / "b.txt").write_text("", encoding="utf-8")
+(_dir / "c.txt").write_text("one line, no newline at the end", encoding="utf-8")
+(_dir / "d.txt").write_text("§ 8.1 Ansvar\n§ 8.2 Försäkring\n", encoding="utf-8")
+expect("跳过空行和只有空格的行", lambda: count_lines("work/d10/lines/a.txt"), 2)
+expect("空文件", lambda: count_lines("work/d10/lines/b.txt"), 0)
+expect("最后一行没有换行", lambda: count_lines("work/d10/lines/c.txt"), 1)
+expect("有 § 和 ö 这样的字符", lambda: count_lines("work/d10/lines/d.txt"), 2)
+--- hints
+- `with open(path, encoding="utf-8") as f:`，然后 `for line in f:` 一行一行看。
+- `line.strip()` 去掉空白后如果是空字符串，就是空行；不空才 `count += 1`。
+
+@@ item d10-03
+type: fix
+title: 修 bug：日志只剩一行
+level: 2
+--- prompt
+`log_verdict` 应该把每次的判定**追加**到日志文件末尾，一行一条，比如 `8.1,flag`。可是连着调用三次以后，文件里只剩最后一行。
+
+运行，对比测试结果里的「期望」和「实际」，找到原因再修。
+--- starter
+def log_verdict(path, clause_id, verdict):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{clause_id},{verdict}\n")
+--- solution
+def log_verdict(path, clause_id, verdict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{clause_id},{verdict}\n")
+--- tests
+from pathlib import Path
+Path("work/d10/log").mkdir(parents=True, exist_ok=True)
+def _three():
+    p = Path("work/d10/log/verdicts.log")
+    p.unlink(missing_ok=True)
+    log_verdict(str(p), "8.1", "flag")
+    log_verdict(str(p), "3.1", "accept")
+    log_verdict(str(p), "4.2", "redline")
+    return p.read_text(encoding="utf-8")
+expect("调用三次，三行都在", _three, "8.1,flag\n3.1,accept\n4.2,redline\n")
+def _fresh():
+    p = Path("work/d10/log/new.log")
+    p.unlink(missing_ok=True)
+    log_verdict(str(p), "12", "accept")
+    return p.read_text(encoding="utf-8")
+expect("文件不存在时自动新建", _fresh, "12,accept\n")
+--- hints
+- `"w"` 模式每次打开都会先把文件清空。
+- 追加用 `"a"`：写到末尾，文件不存在时也会新建。
+
+@@ item d10-04
+type: predict
+title: 拆开一个路径
+level: 1
+--- prompt
+写出输出。本页是 Linux 风格的路径，打印用 `/`。注意文件名里有两个点时，`.stem` 和 `.suffix` 各是什么。
+--- code
+from pathlib import Path
+
+p = Path("data") / "contracts" / "cloudnotes.v2.pdf"
+print(p)
+print(p.name, p.stem, p.suffix)
+print(p.parent, p.parent.name)
+print(p.with_suffix(".report.json"))
+print(Path("data/sample_contract.txt").stem)
+--- explain
+`.suffix` 只取**最后一个**点之后的部分，所以 `.stem` 是 `cloudnotes.v2`。`cli.py` 在没给 `--out` 时用 `Path(args.path).with_suffix(".report.json")` 算报告路径，于是 `data/sample_contract.txt` 的报告就是 `data/sample_contract.report.json`，你在项目的 `data/` 里能看到它。
+
+@@ item d10-05
+type: code
+title: 读合同，报清楚的错
+level: 2
+--- prompt
+仿照项目的 `split.load_contract` 写 `load_contract(path)`：
+
+- 文件不存在：`raise FileNotFoundError(f"contract not found: {path}")`
+- 文件存在，但去掉空白后是空的：`raise ValueError(f"contract is empty: {文件名}")`，文件名用 `.name`（不带文件夹）
+- 否则返回文件内容（`encoding="utf-8"`）
+
+Python 自己也会在文件不存在时报 `FileNotFoundError`，但信息是 `[Errno 2] No such file or directory: ...`。**先检查，再报一个人一眼能看懂的错**，是写命令行工具的好习惯。
+--- starter
+from pathlib import Path
+
+def load_contract(path):
+    path = Path(path)
+    pass
+--- solution
+from pathlib import Path
+
+def load_contract(path):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"contract not found: {path}")
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"contract is empty: {path.name}")
+    return text
+--- tests
+from pathlib import Path
+_dir = Path("work/d10/load")
+_dir.mkdir(parents=True, exist_ok=True)
+(_dir / "ok.txt").write_text("8.1 Cap on Liability\nLiability is capped.\n", encoding="utf-8")
+(_dir / "blank.txt").write_text("  \n\n", encoding="utf-8")
+(_dir / "gone.txt").unlink(missing_ok=True)
+expect("正常读出内容", lambda: load_contract("work/d10/load/ok.txt"), "8.1 Cap on Liability\nLiability is capped.\n")
+expect_raises("文件不存在 → FileNotFoundError", lambda: load_contract("work/d10/load/gone.txt"), FileNotFoundError)
+def _msg(name, err):
+    try:
+        load_contract(f"work/d10/load/{name}")
+    except err as e:
+        return str(e)
+expect("不存在时的信息", lambda: _msg("gone.txt", FileNotFoundError), "contract not found: work/d10/load/gone.txt")
+expect_raises("只有空白 → ValueError", lambda: load_contract("work/d10/load/blank.txt"), ValueError)
+expect("空文件的信息只写文件名", lambda: _msg("blank.txt", ValueError), "contract is empty: blank.txt")
+--- hints
+- 先 `if not path.exists():` 就 raise，再读文件。
+- 读出来以后，`if not text.strip():` 就是「只有空白」。文件名是 `path.name`。
+
+@@ item d10-06
+type: choice
+title: 明明有这个文件
+level: 2
+--- prompt
+你在 `G:\Contract Clause Reviewer\tools\` 里新建了 `stats.py`，里面写着 `Path("data/playbook.json").read_text(encoding="utf-8")`，然后在终端运行下面两行，报了 `FileNotFoundError: ... 'data\\playbook.json'`。可是 `G:\Contract Clause Reviewer\data\playbook.json` 明明存在。原因是？
+--- code
+cd "G:\Contract Clause Reviewer\tools"
+python stats.py
+--- options
+- Windows 上路径必须写反斜杠：`data\playbook.json`
+- 相对路径是从**当前目录**（运行命令的地方）算起的，程序去找的是 `tools\data\playbook.json`
+- `read_text` 读不了 JSON 文件，要用 `json.load`
+- 文件正被 VS Code 打开着，被锁住了
+answer: 2
+--- explain
+相对路径永远相对「当前目录」。回到项目根目录运行（`cd "G:\Contract Clause Reviewer"` 再 `python tools\stats.py`）就好了。更稳的做法是像 `config.py` 那样用 `Path(__file__).resolve().parent.parent` 算出项目根目录再拼路径，这样从哪里运行都对。Windows 上代码里写 `/` 完全没问题。
+
+@@ item d10-07
+type: code
+title: 保存报告
+level: 2
+--- prompt
+写 `save_report(report, path)`：把字典 `report` 写成 JSON 文件，**缩进 2 格、中文原样写出**；上级文件夹不存在时自动创建。返回这个文件的 `Path` 对象。
+
+例：`save_report({"counts": {"flag": 1}}, "work/d10/save/runs/r1.json")` 会先建出 `work/d10/save/runs/`，再写文件。
+--- starter
+import json
+from pathlib import Path
+
+def save_report(report, path):
+    path = Path(path)
+    pass
+--- solution
+import json
+from pathlib import Path
+
+def save_report(report, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    return path
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/save", ignore_errors=True)
+REPORT = {"contract": "sample_contract", "counts": {"accept": 2, "redline": 1}, "note": "8.1 需要律师看"}
+TARGET = "work/d10/save/runs/2026-09/report.json"
+def _text():
+    save_report(REPORT, TARGET)
+    return Path(TARGET).read_text(encoding="utf-8")
+expect("返回 Path 对象", lambda: isinstance(save_report(REPORT, TARGET), Path), True)
+expect("自动建出上级文件夹，读回来内容一样", lambda: json.loads(_text()), REPORT)
+expect("缩进 2 格", lambda: _text().splitlines()[1], '  "contract": "sample_contract",')
+expect("中文原样写出", lambda: "需要律师看" in _text(), True)
+--- hints
+- 写之前先 `path.parent.mkdir(parents=True, exist_ok=True)`。
+- `with open(path, "w", encoding="utf-8") as f:` 里写 `json.dump(report, f, indent=2, ensure_ascii=False)`，最后 `return path`。
+
+@@ item d10-08
+type: fix
+title: 修 bug：json.dump
+level: 2
+--- prompt
+`write_json` 想把字典写进文件，可是一调用就报错。运行，读测试结果里报错的最后一行，想一想 `json.dump` 的第二个参数应该是什么，然后修好。
+--- starter
+import json
+from pathlib import Path
+
+def write_json(obj, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    json.dump(obj, path, indent=2)
+--- solution
+import json
+from pathlib import Path
+
+def write_json(obj, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/fixjson", ignore_errors=True)
+def _roundtrip():
+    write_json({"clause_id": "8.1", "verdict": "flag"}, "work/d10/fixjson/v.json")
+    return json.loads(Path("work/d10/fixjson/v.json").read_text(encoding="utf-8"))
+expect("写进去再读出来", _roundtrip, {"clause_id": "8.1", "verdict": "flag"})
+def _indent():
+    write_json({"a": 1}, "work/d10/fixjson/sub/a.json")
+    return Path("work/d10/fixjson/sub/a.json").read_text(encoding="utf-8")
+expect("缩进 2 格", _indent, '{\n  "a": 1\n}')
+--- hints
+- 报错是 `'str' object has no attribute 'write'`：`json.dump` 要往第二个参数里 `.write(...)`，可你给它的是一个字符串。
+- 先 `with open(path, "w", encoding="utf-8") as f:`，再 `json.dump(obj, f, indent=2)`。另一种写法：`Path(path).write_text(json.dumps(obj, indent=2), encoding="utf-8")`。
+
+@@ item d10-09
+type: code
+title: 读出一整个文件夹的报告
+level: 3
+--- prompt
+一个文件夹里存着很多次审查的报告 `*.json`。写 `load_reports(folder)`：
+
+- 按**文件名**排序，读出每个 `.json` 文件，返回字典组成的列表；每个字典再加一个键 `"file"`，值是文件名（如 `"a.json"`）
+- 文件夹里的其他文件（比如 `.txt`）不管
+- 文件夹不存在：返回 `[]`
+- 某个文件不是合法 JSON：`raise ValueError(f"bad JSON in {文件名}")`，让人知道是**哪个文件**坏了
+--- starter
+import json
+from pathlib import Path
+
+def load_reports(folder):
+    folder = Path(folder)
+    reports = []
+    return reports
+--- solution
+import json
+from pathlib import Path
+
+def load_reports(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    reports = []
+    for path in sorted(folder.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            raise ValueError(f"bad JSON in {path.name}")
+        data["file"] = path.name
+        reports.append(data)
+    return reports
+--- tests
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/reports", ignore_errors=True)
+_ok = Path("work/d10/reports/ok")
+_ok.mkdir(parents=True)
+(_ok / "b.json").write_text('{"contract": "beta", "counts": {"flag": 1}}', encoding="utf-8")
+(_ok / "a.json").write_text('{"contract": "alpha", "counts": {"accept": 3}}', encoding="utf-8")
+(_ok / "notes.txt").write_text("not a report", encoding="utf-8")
+_bad = Path("work/d10/reports/bad")
+_bad.mkdir(parents=True)
+(_bad / "a.json").write_text('{"contract": "alpha"}', encoding="utf-8")
+(_bad / "b.json").write_text('{"contract": ', encoding="utf-8")
+expect("按文件名排序，加上 file", lambda: load_reports("work/d10/reports/ok"), [
+    {"contract": "alpha", "counts": {"accept": 3}, "file": "a.json"},
+    {"contract": "beta", "counts": {"flag": 1}, "file": "b.json"},
+])
+expect("文件夹不存在", lambda: load_reports("work/d10/reports/nope"), [])
+def _msg():
+    try:
+        load_reports("work/d10/reports/bad")
+    except ValueError as e:
+        return str(e)
+    return "没有报错"
+expect("坏 JSON：报错信息里有文件名", _msg, "bad JSON in b.json")
+--- hints
+- 先判断 `folder.exists()`；然后 `for path in sorted(folder.glob("*.json")):`，每个 `json.loads(path.read_text(encoding="utf-8"))`。
+- 把 `json.loads` 放进 `try`，`except json.JSONDecodeError:` 里 `raise ValueError(f"bad JSON in {path.name}")`。
+- 小知识：`json.JSONDecodeError` 本身就是 `ValueError` 的一种，所以不接住它也会「报 ValueError」，但信息里没有文件名，排查时就不知道是哪个文件坏了。
+
+@@ item d10-10
+type: fill
+title: 填空：导出 CSV
+level: 2
+--- prompt
+补全 `export_csv(reviews, path)`：把审查结果导出成 CSV，只要 `FIELDS` 里的四列（字典里别的键，比如 `tokens`，忽略掉），返回写了几行数据（不算表头）。
+
+`newline=""` 已经写好了：少了它，Windows 上每行之间会多一个空行。
+--- template
+import csv
+from pathlib import Path
+
+FIELDS = ["clause_id", "verdict", "risk_level", "rationale"]
+
+def export_csv(reviews, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.[[DictWriter]](f, fieldnames=FIELDS, extrasaction=[["ignore"]])
+        writer.[[writeheader()]]
+        writer.writerows(reviews)
+    return [[len(reviews)]]
+--- tests
+import csv
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/csv", ignore_errors=True)
+REVIEWS = [
+    {"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "rationale": "cap is not mutual, see 12", "tokens": 340},
+    {"clause_id": "3.1", "verdict": "accept", "risk_level": "low", "rationale": "standard", "tokens": 120},
+]
+OUT = "work/d10/csv/out/reviews.csv"
+expect("返回数据行数", lambda: export_csv(REVIEWS, OUT), 2)
+def _back():
+    export_csv(REVIEWS, OUT)
+    with open(OUT, encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+expect("读回来：只有四列，正文里的逗号没有搞乱列", lambda: _back()[0], {"clause_id": "8.1", "verdict": "redline", "risk_level": "high", "rationale": "cap is not mutual, see 12"})
+expect("第一行是表头", lambda: (export_csv(REVIEWS, OUT), Path(OUT).read_text(encoding="utf-8").splitlines()[0])[1], "clause_id,verdict,risk_level,rationale")
+--- hints
+- 写字典用 `csv.DictWriter`，先写表头：`writer.writeheader()`。
+- 字典里有 `fieldnames` 以外的键时，默认会报 `ValueError: dict contains fields not in fieldnames`；`extrasaction="ignore"` 让它忽略多出来的键。
+
+@@ item d10-11
+type: code
+title: 读回律师改过的 CSV
+level: 2
+--- prompt
+律师在 Excel 里改完判定，又存回了 CSV（列：`clause_id,verdict,tokens`）。写 `csv_summary(path)`，返回：
+
+`{"rows": 数据行数, "flagged": [verdict 不是 accept 的 clause_id，按文件里的顺序], "tokens": tokens 列的总和（整数）}`
+
+注意：`csv.DictReader` 读出来的值**全是字符串**。打开文件时写 `encoding="utf-8", newline=""`。
+--- starter
+import csv
+
+def csv_summary(path):
+    pass
+--- solution
+import csv
+
+def csv_summary(path):
+    rows = 0
+    flagged = []
+    tokens = 0
+    with open(path, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            rows += 1
+            if row["verdict"] != "accept":
+                flagged.append(row["clause_id"])
+            tokens += int(row["tokens"])
+    return {"rows": rows, "flagged": flagged, "tokens": tokens}
+--- tests
+from pathlib import Path
+Path("work/d10/csv_in").mkdir(parents=True, exist_ok=True)
+Path("work/d10/csv_in/r.csv").write_text("clause_id,verdict,tokens\n8.1,redline,340\n3.1,accept,120\n4.2,flag,95\n", encoding="utf-8")
+Path("work/d10/csv_in/empty.csv").write_text("clause_id,verdict,tokens\n", encoding="utf-8")
+expect("汇总", lambda: csv_summary("work/d10/csv_in/r.csv"), {"rows": 3, "flagged": ["8.1", "4.2"], "tokens": 555})
+expect("tokens 是数字相加，不是字符串拼接", lambda: csv_summary("work/d10/csv_in/r.csv")["tokens"], 555)
+expect("只有表头", lambda: csv_summary("work/d10/csv_in/empty.csv"), {"rows": 0, "flagged": [], "tokens": 0})
+--- hints
+- `for row in csv.DictReader(f):`，每个 `row` 是字典，比如 `{"clause_id": "8.1", "verdict": "redline", "tokens": "340"}`。
+- `"340"` 是字符串，要 `int(row["tokens"])` 再加。
+
+@@ item d10-12
+type: predict
+title: argparse 解析出什么
+level: 2
+--- prompt
+写出输出。注意：没给的参数是什么值、`type=int` 做了什么、`--only-risk` 在 `args` 里叫什么。
+--- code
+import argparse
+
+p = argparse.ArgumentParser(prog="clausecheck")
+p.add_argument("path")
+p.add_argument("--mode", choices=["mock", "deepseek"], default="mock")
+p.add_argument("--limit", type=int)
+p.add_argument("--only-risk")
+p.add_argument("--verbose", action="store_true")
+
+a = p.parse_args(["data/c.txt", "--limit", "5"])
+print(a.path, a.mode, a.limit * 2, a.verbose)
+b = p.parse_args(["--verbose", "--only-risk", "high", "x.txt"])
+print(b.path, b.limit, b.only_risk, b.verbose)
+--- explain
+`--limit 5` 经过 `type=int` 变成整数 5，所以能乘 2。没给的可选参数取默认值，没写 `default` 就是 `None`。`store_true` 出现就是 `True`。位置参数写在前面后面都行。`--only-risk` 变成属性 `only_risk`（`-` 换成 `_`）。
+
+@@ item d10-13
+type: code
+title: 写参数解析器
+level: 2
+--- prompt
+写 `build_parser()`，返回一个 `argparse.ArgumentParser(prog="clausecheck")`，支持：
+
+- 位置参数 `path`
+- `--out`：字符串，默认 `None`
+- `--mode`：只能是 `mock` / `deepseek` / `local`，默认 `"mock"`
+- `--limit`：整数，默认 `None`
+- `--verbose`：开关，出现就是 `True`
+
+测试会调用 `build_parser().parse_args([...])`，再用 `vars(args)` 把结果变成字典来比较。参数不合法时 argparse 会打印用法并 `raise SystemExit`，这正是我们想要的。
+--- starter
+import argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="clausecheck")
+    parser.add_argument("path")
+    return parser
+--- solution
+import argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="clausecheck")
+    parser.add_argument("path")
+    parser.add_argument("--out")
+    parser.add_argument("--mode", choices=["mock", "deepseek", "local"], default="mock")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+--- tests
+P = lambda *argv: vars(build_parser().parse_args(list(argv)))
+expect("默认值", lambda: P("c.txt"), {"path": "c.txt", "out": None, "mode": "mock", "limit": None, "verbose": False})
+expect("全都给", lambda: P("c.txt", "--out", "r.json", "--mode", "deepseek", "--limit", "3", "--verbose"), {"path": "c.txt", "out": "r.json", "mode": "deepseek", "limit": 3, "verbose": True})
+expect_raises("--mode 不在 choices 里", lambda: P("c.txt", "--mode", "fast"), SystemExit)
+expect_raises("--limit 不是数字", lambda: P("c.txt", "--limit", "abc"), SystemExit)
+--- hints
+- 可选参数的名字以 `--` 开头：`parser.add_argument("--out")`。
+- `--mode` 用 `choices=[...]` 加 `default="mock"`；整数用 `type=int`；开关用 `action="store_true"`。
+
+@@ item d10-14
+type: order
+title: 排代码：main(argv)
+level: 2
+--- prompt
+排出一个小命令行工具：`main(argv=None)` 解析参数；文件不存在就打印 `error: <路径> not found` 并返回 `1`；否则打印 `<文件名>: <行数> lines` 并返回 `0`。有两行干扰项。
+--- lines
+import argparse
+from pathlib import Path
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="count-lines")
+    parser.add_argument("path")
+    args = parser.parse_args(argv)
+    path = Path(args.path)
+    if not path.exists():
+        print(f"error: {path} not found")
+        return 1
+    lines = path.read_text(encoding="utf-8").splitlines()
+    print(f"{path.name}: {len(lines)} lines")
+    return 0
+--- distractors
+    args = parser.parse_args()
+    lines = path.read_text(encoding="utf-8").split("\n")
+--- tests
+from pathlib import Path
+Path("work/d10/order").mkdir(parents=True, exist_ok=True)
+Path("work/d10/order/c.txt").write_text("8.1 Cap on Liability\nLiability is capped.\n", encoding="utf-8")
+expect_output("打印行数", lambda: main(["work/d10/order/c.txt"]), "c.txt: 2 lines")
+expect("成功返回 0", lambda: main(["work/d10/order/c.txt"]), 0)
+expect_output("文件不存在的提示", lambda: main(["work/d10/order/nope.txt"]), "error: work/d10/order/nope.txt not found")
+expect("文件不存在返回 1", lambda: main(["work/d10/order/nope.txt"]), 1)
+--- hints
+- 顺序：导入 → def → 建解析器 → 解析 → 检查文件 → 读 → 打印 → 返回。
+- `parse_args()` 不带参数会去读真正的命令行，测试就没法把参数传进来了。
+- 文件以 `"\n"` 结尾时，`split("\n")` 会多出一个空串（今天第 1 题）。
+
+@@ item d10-15
+type: code
+title: 一个真正的小命令行工具
+level: 3
+--- prompt
+写 `main(argv=None)`。解析器 `build_parser()` 已经写好（参数：`path`、`--mode`、`--limit`、`--verbose`），`load_clause_ids(text)` 也写好了，返回合同里所有条款编号。要求：
+
+1. 文件不存在：打印 `error: file not found: <path>`，返回 `1`
+2. 读文件，拿到条款编号；给了 `--limit N` 就只保留前 N 个
+3. 打印一行 `<文件名>: <条数> clauses, mode=<mode>`
+4. 有 `--verbose` 时，再逐行打印每个编号，前面加两个空格
+5. 返回 `0`
+
+例：`main(["work/d10/cli/c.txt", "--limit", "2", "--verbose"])` 打印：
+
+```
+c.txt: 2 clauses, mode=mock
+  1.1
+  3.1
+```
+--- starter
+import argparse
+import re
+from pathlib import Path
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+[A-Z]", re.M)
+
+def load_clause_ids(text):
+    return HEAD.findall(text)
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="clausecheck")
+    parser.add_argument("path")
+    parser.add_argument("--mode", choices=["mock", "deepseek", "local"], default="mock")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return 0
+--- solution
+import argparse
+import re
+from pathlib import Path
+
+HEAD = re.compile(r"^(\d+(?:\.\d+)*)\s+[A-Z]", re.M)
+
+def load_clause_ids(text):
+    return HEAD.findall(text)
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="clausecheck")
+    parser.add_argument("path")
+    parser.add_argument("--mode", choices=["mock", "deepseek", "local"], default="mock")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    path = Path(args.path)
+    if not path.exists():
+        print(f"error: file not found: {path}")
+        return 1
+    ids = load_clause_ids(path.read_text(encoding="utf-8"))
+    if args.limit is not None:
+        ids = ids[:args.limit]
+    print(f"{path.name}: {len(ids)} clauses, mode={args.mode}")
+    if args.verbose:
+        for cid in ids:
+            print(f"  {cid}")
+    return 0
+--- tests
+from pathlib import Path
+Path("work/d10/cli").mkdir(parents=True, exist_ok=True)
+Path("work/d10/cli/c.txt").write_text('CLOUDNOTES AGREEMENT\n1.1 Defined Terms\n"Service" means the platform.\n3.1 Invoicing\nFees are payable within thirty (30) days.\n8.1 Cap on Liability\nLiability is capped at 12 months of fees.\n', encoding="utf-8")
+expect_output("最简单的调用", lambda: main(["work/d10/cli/c.txt"]), "c.txt: 3 clauses, mode=mock")
+expect_output("--limit、--verbose 和 --mode", lambda: main(["work/d10/cli/c.txt", "--limit", "2", "--verbose", "--mode", "deepseek"]), "c.txt: 2 clauses, mode=deepseek\n  1.1\n  3.1")
+expect_output("--limit 0 表示一条都不要", lambda: main(["work/d10/cli/c.txt", "--limit", "0"]), "c.txt: 0 clauses, mode=mock")
+expect("成功返回 0", lambda: main(["work/d10/cli/c.txt"]), 0)
+expect_output("文件不存在的提示", lambda: main(["work/d10/cli/missing.txt"]), "error: file not found: work/d10/cli/missing.txt")
+expect("文件不存在返回 1", lambda: main(["work/d10/cli/missing.txt"]), 1)
+--- hints
+- 结构和上一题的排序题一样：解析 → 检查文件 → 读 → 打印 → return。
+- `--limit` 没给时是 `None`。要写 `if args.limit is not None:`；写成 `if args.limit:` 的话，`--limit 0` 会被当成「没给」。
+- 取前 N 个用切片：`ids = ids[:args.limit]`。
+
+@@ item d10-16
+type: choice
+title: 导入时会跑 main 吗
+level: 2
+--- prompt
+`clausecheck/cli.py` 的最后两行是下面这样。测试文件里写了 `from clausecheck.cli import main`，这时会发生什么？
+--- code
+if __name__ == "__main__":
+    raise SystemExit(main())
+--- options
+- `main()` 会被自动运行一次，测试开始前就打印出一份报告
+- `main()` 不会运行：被 import 时 `__name__` 是 `"clausecheck.cli"`，不等于 `"__main__"`；测试想用时自己调用 `main([...])`
+- 报错：一个文件里不能同时有 `main` 和 `__name__`
+- 程序立刻以退出码 0 结束，后面的测试一个都不会跑
+answer: 2
+--- explain
+`__name__` 在「直接运行」时是 `"__main__"`，被 import 时是模块名。这两行让同一个文件既能当命令行程序用，又能被测试安全地 import。`raise SystemExit(main())` 把 `main` 返回的 0 或 1 变成进程的退出码，CI 和脚本就是靠它判断成功还是失败的。
+
+@@ item d10-17
+type: code
+title: 配置的优先级
+level: 2
+--- prompt
+写 `resolve_mode(cli_value, env)`，按「命令行 > 环境变量 > 默认值」决定运行模式：
+
+- `cli_value` 不是 `None`：用它
+- 否则看 `env` 字典里的 `CLAUSECHECK_MODE`；**没有这个键、或者值是空字符串**，都算没设置
+- 都没有：用 `"mock"`
+- 最后把得到的值去掉首尾空白、转小写；不在 `MODES` 里就 `raise ValueError(f"unknown mode: {值}")`（`值` 是处理后的）
+
+例：`resolve_mode(None, {"CLAUSECHECK_MODE": " DeepSeek "})` → `"deepseek"`
+--- starter
+MODES = ("mock", "deepseek", "local")
+
+def resolve_mode(cli_value, env):
+    pass
+--- solution
+MODES = ("mock", "deepseek", "local")
+
+def resolve_mode(cli_value, env):
+    if cli_value is not None:
+        value = cli_value
+    elif env.get("CLAUSECHECK_MODE"):
+        value = env["CLAUSECHECK_MODE"]
+    else:
+        value = "mock"
+    value = value.strip().lower()
+    if value not in MODES:
+        raise ValueError(f"unknown mode: {value}")
+    return value
+--- tests
+expect("命令行优先", lambda: resolve_mode("local", {"CLAUSECHECK_MODE": "deepseek"}), "local")
+expect("没给命令行就看环境变量", lambda: resolve_mode(None, {"CLAUSECHECK_MODE": " DeepSeek "}), "deepseek")
+expect("都没有就用默认值", lambda: resolve_mode(None, {}), "mock")
+expect("环境变量是空字符串也算没设置", lambda: resolve_mode(None, {"CLAUSECHECK_MODE": ""}), "mock")
+def _msg():
+    try:
+        resolve_mode(None, {"CLAUSECHECK_MODE": "FAST"})
+    except ValueError as e:
+        return str(e)
+    return "没有报错"
+expect("不认识的模式 → ValueError", _msg, "unknown mode: fast")
+--- hints
+- 三个来源按顺序判断：`if cli_value is not None:` / `elif env.get("CLAUSECHECK_MODE"):` / `else:`，先把值放进同一个变量。
+- 空字符串是「假」，所以 `elif env.get(...)` 正好把「没有」和「空」一起排除掉。
+- 最后统一 `value.strip().lower()`，再检查 `in MODES`。
+
+@@ item d10-18
+type: testwrite
+title: 为 env_int 写测试
+level: 3
+--- prompt
+下面的 `env_int(env, name, default)` 从环境变量字典里读一个整数设置，就像 `config.py` 里的 `int(os.getenv("CLAUSECHECK_MAX_STEPS", "6"))`，但更严格：
+
+- 没有这个键，或者值去掉空白后为空：返回 `default`
+- 能转成整数：返回整数（包括 `"0"`）
+- 转不了：`raise ValueError`，信息里带着设置名
+
+用第 9 天的写法为它写测试：每个 `test_` 函数测一种情况。你的测试要在正确版本上全部通过，并且能抓住每一个故意埋了 bug 的版本。
+--- impl
+def env_int(env, name, default):
+    raw = env.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+--- mutants
+===== 类型：返回的是整数还是字符串？
+def env_int(env, name, default):
+    raw = env.get(name, "").strip()
+    if raw == "":
+        return default
+    if not raw.lstrip("-").isdigit():
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+    return raw
+===== 边界：值是 "0" 的时候
+def env_int(env, name, default):
+    raw = env.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw) or default
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+===== 出错时：不合法的值被悄悄换成了默认值
+def env_int(env, name, default):
+    raw = env.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+===== 空白：值只有空格的时候
+def env_int(env, name, default):
+    raw = env.get(name, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+--- starter
+import pytest
+
+def test_reads_a_number():
+    assert env_int({"CLAUSECHECK_MAX_STEPS": "8"}, "CLAUSECHECK_MAX_STEPS", 6) == 8
+--- solution
+import pytest
+
+def test_reads_a_number():
+    assert env_int({"CLAUSECHECK_MAX_STEPS": "8"}, "CLAUSECHECK_MAX_STEPS", 6) == 8
+
+def test_missing_key_uses_default():
+    assert env_int({}, "CLAUSECHECK_MAX_STEPS", 6) == 6
+
+def test_zero_is_a_real_value():
+    assert env_int({"CLAUSECHECK_MAX_STEPS": "0"}, "CLAUSECHECK_MAX_STEPS", 6) == 0
+
+def test_blank_value_uses_default():
+    assert env_int({"CLAUSECHECK_MAX_STEPS": "   "}, "CLAUSECHECK_MAX_STEPS", 6) == 6
+
+def test_bad_value_raises_with_name():
+    with pytest.raises(ValueError, match="CLAUSECHECK_MAX_STEPS"):
+        env_int({"CLAUSECHECK_MAX_STEPS": "six"}, "CLAUSECHECK_MAX_STEPS", 6)
+--- hints
+- 一个 `test_` 函数测一种情况：正常数字、没有这个键、`"0"`、只有空格、不合法的值。
+- 「刚好是 0」是经典边界：`int(raw) or default` 会把 0 当成「没设置」。
+- 测报错：`with pytest.raises(ValueError, match="CLAUSECHECK_MAX_STEPS"):`，下面一行调用函数。
+
+@@ item d10-19
+type: local
+title: 本机任务：跑真实的命令行
+level: 2
+--- prompt
+在你电脑上的真实项目里，把今天的内容跑一遍。打开 VS Code 的终端（PowerShell），逐行运行：
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck -h
+python -m clausecheck clauses data/sample_contract.txt
+New-Item -ItemType Directory -Force work | Out-Null
+python -m clausecheck review data/sample_contract.txt --mode mock --out work/sample.report.json
+echo "exit code: $LASTEXITCODE"
+python -m clausecheck review data/sample_contract.txt --mode fast
+echo "exit code: $LASTEXITCODE"
+```
+
+然后：
+
+1. 在 VS Code 里打开 `work/sample.report.json`，找到 `summary` 里的 `counts`，和终端打印的 `counts=` 对一下
+2. 打开 `clausecheck/cli.py`，找到 `--mode` 那一行：`fast` 为什么被拒绝？退出码为什么是 2？
+3. 把终端输出（从 `review` 那条命令开始到最后）粘贴到下面
+
+`--mode mock` 不调用任何模型，是按规则审查的，不花钱。报告文件名以 `.report.json` 结尾，项目的 `.gitignore` 会忽略它，不会被误提交。
+placeholder: 粘贴终端输出：应该能看到 counts=…、exit code: 0、invalid choice 和 exit code: 2
+verify: ^(?=[\s\S]*counts=)(?=[\s\S]*invalid choice)(?=[\s\S]*exit code: ?2)
+--- hints
+- 看到 `No module named clausecheck`：你不在项目根目录。先 `cd "G:\Contract Clause Reviewer"`，这就是今天讲的「当前目录」。
+- 看到 `No module named 'dotenv'` 之类：运行 `python -m pip install -r requirements.txt`。
+- 为什么要先建 `work` 文件夹？`cli.py` 写报告时没有 `mkdir`，文件夹不存在就会报 `FileNotFoundError`。想亲眼看看，可以把 `--out` 换成 `nowhere/x.report.json` 再运行一次（退出码会是 1）。
+
+@@ item d10-e1
+type: scratch
+title: 闭卷：合并多份报告
+exam: yes
+level: 3
+--- prompt
+写 `merge_reports(folder, out_path)`：
+
+- `folder` 里有若干 `*.json` 报告，每个都像 `{"contract": "alpha", "counts": {"accept": 3, "flag": 1}}`；文件夹里的其他文件不管
+- 把所有报告的 `counts` 按判定加起来，结果写成 JSON 文件到 `out_path`（缩进 2 格；上级文件夹不存在要自动创建），内容是：
+  `{"files": 报告个数, "contracts": [按文件名排序后各报告的 contract], "counts": {判定: 总次数}}`
+- 返回写进去的这个字典
+- `folder` 不存在或里面没有 JSON：`files` 为 `0`，`contracts` 和 `counts` 为空，照样写文件
+--- solution
+import json
+from pathlib import Path
+
+def merge_reports(folder, out_path):
+    folder = Path(folder)
+    paths = sorted(folder.glob("*.json")) if folder.exists() else []
+    contracts = []
+    counts = {}
+    for p in paths:
+        report = json.loads(p.read_text(encoding="utf-8"))
+        contracts.append(report["contract"])
+        for verdict, n in report["counts"].items():
+            counts[verdict] = counts.get(verdict, 0) + n
+    merged = {"files": len(paths), "contracts": contracts, "counts": counts}
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2)
+    return merged
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d10/e1", ignore_errors=True)
+_in = Path("work/d10/e1/in")
+_in.mkdir(parents=True)
+(_in / "b.json").write_text('{"contract": "beta", "counts": {"flag": 2, "redline": 1}}', encoding="utf-8")
+(_in / "a.json").write_text('{"contract": "alpha", "counts": {"accept": 3, "flag": 1}}', encoding="utf-8")
+(_in / "readme.txt").write_text("ignore me", encoding="utf-8")
+EXPECTED = {"files": 2, "contracts": ["alpha", "beta"], "counts": {"accept": 3, "flag": 3, "redline": 1}}
+expect("返回合并结果", lambda: merge_reports("work/d10/e1/in", "work/d10/e1/out/merged.json"), EXPECTED)
+def _written():
+    merge_reports("work/d10/e1/in", "work/d10/e1/out2/deep/m.json")
+    return json.loads(Path("work/d10/e1/out2/deep/m.json").read_text(encoding="utf-8"))
+expect("写出的文件（自动建文件夹）", _written, EXPECTED)
+expect("文件夹不存在", lambda: merge_reports("work/d10/e1/nothing", "work/d10/e1/out3/m.json"), {"files": 0, "contracts": [], "counts": {}})
+
+@@ item d10-e2
+type: scratch
+title: 闭卷：统计判定的命令行
+exam: yes
+level: 3
+--- prompt
+用 argparse 写命令行工具 `count-verdicts` 的 `main(argv=None)`（`prog="count-verdicts"`）：
+
+- 位置参数 `path`：一个 CSV 文件，至少有 `clause_id` 和 `verdict` 两列
+- 可选参数 `--only`：只能是 `accept` / `flag` / `redline`；不合法时由 argparse 报错退出（`SystemExit`）
+- 没给 `--only`：按判定的字母顺序，每种判定打印一行 `判定: 次数`，例如 `accept: 2`
+- 给了 `--only flag`：只打印一行 `flag: 次数`（文件里没有这种判定就打印 `flag: 0`）
+- 成功返回 `0`；文件不存在时打印 `error: file not found: <path>` 并返回 `1`
+--- solution
+import argparse
+import csv
+from collections import Counter
+from pathlib import Path
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="count-verdicts")
+    parser.add_argument("path")
+    parser.add_argument("--only", choices=["accept", "flag", "redline"])
+    args = parser.parse_args(argv)
+    path = Path(args.path)
+    if not path.exists():
+        print(f"error: file not found: {path}")
+        return 1
+    with open(path, encoding="utf-8", newline="") as f:
+        counts = Counter(row["verdict"] for row in csv.DictReader(f))
+    if args.only:
+        print(f"{args.only}: {counts[args.only]}")
+    else:
+        for verdict in sorted(counts):
+            print(f"{verdict}: {counts[verdict]}")
+    return 0
+--- tests
+from pathlib import Path
+Path("work/d10/e2").mkdir(parents=True, exist_ok=True)
+Path("work/d10/e2/r.csv").write_text("clause_id,verdict\n8.1,redline\n3.1,accept\n4.2,redline\n2.1,accept\n", encoding="utf-8")
+expect_output("全部判定，按字母顺序", lambda: main(["work/d10/e2/r.csv"]), "accept: 2\nredline: 2")
+expect_output("--only 一种都没有也打印 0", lambda: main(["work/d10/e2/r.csv", "--only", "flag"]), "flag: 0")
+expect("文件不存在返回 1", lambda: main(["work/d10/e2/none.csv"]), 1)
+expect_raises("--only 不合法", lambda: main(["work/d10/e2/r.csv", "--only", "maybe"]), SystemExit)
+
+@@ item d10-e3
+type: scratch
+title: 闭卷：校验 playbook
+exam: yes
+level: 3
+--- prompt
+写 `load_playbook(path)`，读取并校验一个 playbook JSON 文件：
+
+- 文件不存在：让 `FileNotFoundError` 自然抛出就行
+- 顶层必须是字典，而且 `"rules"` 必须是列表，否则 `raise ValueError("playbook needs a 'rules' list")`
+- 每条规则必须有 `id`、`topic`、`severity` 三个键，**按这个顺序**检查，缺了就 `raise ValueError(f"rule {i} is missing '{key}'")`，`i` 是这条规则在列表里的下标（从 0 开始）
+- 全部合法：返回 `{topic: [这个 topic 下的规则 id，按文件里的顺序]}`
+--- solution
+import json
+from pathlib import Path
+
+REQUIRED = ("id", "topic", "severity")
+
+def load_playbook(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+        raise ValueError("playbook needs a 'rules' list")
+    by_topic = {}
+    for i, rule in enumerate(data["rules"]):
+        for key in REQUIRED:
+            if key not in rule:
+                raise ValueError(f"rule {i} is missing '{key}'")
+        by_topic.setdefault(rule["topic"], []).append(rule["id"])
+    return by_topic
+--- tests
+from pathlib import Path
+_d = Path("work/d10/e3")
+_d.mkdir(parents=True, exist_ok=True)
+(_d / "ok.json").write_text('{"rules": [{"id": "PB-01", "topic": "liability_cap", "severity": "high"}, {"id": "PB-02", "topic": "payment", "severity": "medium"}, {"id": "PB-03", "topic": "liability_cap", "severity": "high"}]}', encoding="utf-8")
+(_d / "norules.json").write_text('{"customer": "studio"}', encoding="utf-8")
+(_d / "missing.json").write_text('{"rules": [{"id": "PB-01", "topic": "payment", "severity": "low"}, {"id": "PB-02", "severity": "high"}]}', encoding="utf-8")
+(_d / "nope.json").unlink(missing_ok=True)
+expect("按 topic 分组", lambda: load_playbook("work/d10/e3/ok.json"), {"liability_cap": ["PB-01", "PB-03"], "payment": ["PB-02"]})
+def _err(name):
+    try:
+        load_playbook(f"work/d10/e3/{name}")
+    except ValueError as e:
+        return str(e)
+    return "没有报 ValueError"
+expect("没有 rules", lambda: _err("norules.json"), "playbook needs a 'rules' list")
+expect("缺字段", lambda: _err("missing.json"), "rule 1 is missing 'topic'")
+expect_raises("文件不存在", lambda: load_playbook("work/d10/e3/nope.json"), FileNotFoundError)

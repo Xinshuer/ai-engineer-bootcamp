@@ -1,0 +1,1555 @@
+@@ day 18
+title: 工作流与状态机：节点、路由、检查点、中断恢复
+lang: ts
+hours: 5 小时
+--- goal
+手写一个小小的「图执行器」：节点、边、条件路由、共享状态、步数上限；再加上检查点（存成 JSON，崩了能接着跑）、中断等人批准再继续、带并发上限的并行审查。这就是 LangGraph（`clausecheck/graph.py`）和 Mastra 工作流的核心，自己写一遍，读框架代码时就不再是黑盒。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过
+- 闭卷挑战 3 题
+- 打开 `clausecheck/graph.py`，把 `add_node`、`add_conditional_edges`、`interrupt`、`Command(resume=...)`、`SqliteSaver` 各对应到今天写的哪个函数
+
+@@ concept
+title: 工作流 vs Agent
+--- body
+昨天的 Agent 是**模型决定下一步**做什么；今天的工作流是**代码决定**：步骤和顺序事先写好。
+
+Clause Check 两种都用，分工很清楚。`review.py` 开头的注释写着：「The outer pipeline is a fixed workflow; *this* node is a small bounded agent」。外层 `load → review → summarise → (approve) → export` 永远是这个顺序，用工作流；只有「审这一条时要不要去读第 12 条」取决于内容，才交给 Agent。
+
+经验法则：**步骤事先知道，就写成工作流**。它更便宜、更可预测、好测试。
+
+那为什么不直接按顺序调几个函数，而要写成「图」？`graph.py` 的注释回答了：第一个真正需要框架的需求是「暂停等人批准，几小时后从另一个进程继续」。今天一步步做到这一点。
+--- code
+const load = (text: string): string[] => text.split("\n");
+const review = (clauses: string[]): string[] =>
+  clauses.filter((c) => c.includes("unlimited")).map((c) => c.split(" ")[0]);
+const summarise = (clauses: string[], redlines: string[]): string =>
+  `${clauses.length} clauses, ${redlines.length} redline(s)`;
+
+const text = "3.1 Fees are payable within thirty days.\n8.1 Liability shall be unlimited.\n12 Governing law is Sweden.";
+const clauses = load(text);
+const redlines = review(clauses);
+console.log(summarise(clauses, redlines));
+console.log(redlines.length > 0 ? "next: approve" : "next: export");
+
+@@ concept
+title: 状态：一个对象从头传到尾
+--- body
+图里所有节点共用**一个状态对象**。每个节点读状态，只返回**它改了的那几个字段**，由执行器合并：
+
+```ts
+type Node = (s: State) => Partial<State>;   // Partial：第 15 天
+state = { ...state, ...node(state) };       // 后面的覆盖前面的
+```
+
+`graph.py` 就是这样：`summarise_node` 只返回 `{"summary": ...}`，`approve` 只返回 `{"approved": ...}`。
+
+**经典错误：在节点里直接改 `s`**（比如 `s.redlines.push(...)`）。旧的状态被悄悄改掉，检查点、测试、排错时看到的「之前的状态」就都不可信了。节点只读 `s`，返回新值。
+--- code
+type State = { text: string; clauses: string[]; redlines: string[] };
+
+const load = (s: State): Partial<State> => ({ clauses: s.text.split("\n") });
+const review = (s: State): Partial<State> => ({
+  redlines: s.clauses.filter((c) => c.includes("unlimited")).map((c) => c.split(" ")[0]),
+});
+
+let state: State = { text: "3.1 Fees within 30 days.\n8.1 Liability is unlimited.", clauses: [], redlines: [] };
+const before = state;
+state = { ...state, ...load(state) };
+console.log(state.clauses.length);
+state = { ...state, ...review(state) };
+console.log(state.redlines);
+console.log(before.clauses.length, before === state);
+
+@@ concept
+title: 边和条件路由
+--- body
+节点之间用**边**连起来。一条边要么是固定的下一个节点名，要么是一个**路由函数**：读状态，返回下一个节点名。`"END"` 表示结束。
+
+```ts
+type Edge = string | ((s: State) => string);
+const edges: Record<string, Edge> = {
+  summarise: (s) => (s.redlines.length > 0 ? "approve" : "export"),
+  export: "END",
+};
+```
+
+执行器用 `typeof edge === "function"` 分辨两种边（第 15 天的类型收窄）。`graph.py` 的 `route` 一模一样：有 redline 就去 `approve`，否则直接 `export`。
+
+路由函数只看状态、不调模型，所以它是确定的，可以单独测试。
+--- code
+type State = { redlines: string[] };
+type Edge = string | ((s: State) => string);
+
+const edges: Record<string, Edge> = {
+  load: "review",
+  review: "summarise",
+  summarise: (s) => (s.redlines.length > 0 ? "approve" : "export"),
+  approve: "export",
+  export: "END",
+};
+
+function nextNode(node: string, state: State): string {
+  const edge = edges[node];
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+console.log(nextNode("load", { redlines: [] }));
+console.log(nextNode("summarise", { redlines: ["8.1"] }));
+console.log(nextNode("summarise", { redlines: [] }));
+console.log(nextNode("export", { redlines: [] }));
+
+@@ concept
+title: 执行器：从 start 走到 END
+--- body
+执行器就是一个循环：
+
+1. 当前节点不是 `"END"` 就继续
+2. 找到节点函数（找不到就 throw：多半是边里的名字拼错了）
+3. 运行、合并状态、把节点名记进 `path`
+4. 根据边算出下一个节点
+
+图可以有**环**（比如「校验不过就回去重审」），所以和 Agent 一样需要**步数上限**，超过就 throw，并在错误信息里带上走过的路径，排错时一眼看出在哪里打转。LangGraph 里对应的是 `recursion_limit`。
+--- code
+type State = { text: string; redlines: string[]; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function runGraph(graph: Graph, state: State, start: string, maxSteps = 10): { state: State; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    if (path.length >= maxSteps) throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    const node = graph.nodes[current];
+    if (!node) throw new Error(`unknown node: ${current}`);
+    state = { ...state, ...node(state) };
+    path.push(current);
+    const edge = graph.edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { state, path };
+}
+
+const graph: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve: () => ({}),
+    export: (s) => ({ exported: `${s.redlines.length} redline(s)` }),
+  },
+  edges: {
+    review: (s) => (s.redlines.length > 0 ? "approve" : "export"),
+    approve: "export",
+    export: "END",
+  },
+};
+
+const r1 = runGraph(graph, { text: "8.1 Liability is unlimited.\n3.1 Fees within 30 days.", redlines: [], exported: "" }, "review");
+console.log(r1.path.join(" -> "), "|", r1.state.exported);
+const r2 = runGraph(graph, { text: "3.1 Fees within 30 days.", redlines: [], exported: "" }, "review");
+console.log(r2.path.join(" -> "), "|", r2.state.exported);
+try {
+  const broken: Graph = { nodes: graph.nodes, edges: { ...graph.edges, export: "review" } };
+  runGraph(broken, { text: "3.1 Fees.", redlines: [], exported: "" }, "review", 5);
+} catch (e) {
+  console.log(e instanceof Error ? e.message : e);
+}
+
+@@ concept
+title: 检查点：崩了也能接着跑
+--- body
+每跑完一个节点，就把 `{ next: 下一个节点, state }` 存成 JSON。程序崩了，读出最后一个检查点，从 `next` 接着跑，已经做完的节点**不用重跑**。审查 30 条条款要调 30 次模型，导出时磁盘满了，你肯定不想再付一遍钱。
+
+还有两个理由：要**等很久**（律师明天才批准），以及**换一个进程**继续（命令行开始，网页后端结束）。`graph.py` 用 `SqliteSaver` 把检查点存进 SQLite，用 `thread_id` 区分每一次运行。
+
+**要求：状态必须是纯 JSON 数据**：字符串、数字、布尔、null、数组、普通对象。`Map`、`Set`、`Date`、类的实例、`undefined` 存进去再读出来都会变样。所以 `graph.py` 的状态里放的是 `contract.model_dump()` 得到的字典，节点用的时候再 `Contract.model_validate(...)` 变回对象。
+--- code
+type State = { clauses: string[]; verdicts: string[]; exported: string };
+let modelCalls = 0;
+let diskFull = true;
+
+const nodes: Record<string, (s: State) => Partial<State>> = {
+  review: (s) => {
+    modelCalls += s.clauses.length;
+    return { verdicts: s.clauses.map((c) => (c.includes("unlimited") ? "redline" : "accept")) };
+  },
+  export: (s) => {
+    if (diskFull) throw new Error("disk full");
+    return { exported: s.verdicts.join(",") };
+  },
+};
+const edges: Record<string, string> = { review: "export", export: "END" };
+
+function run(state: State, start: string, save: (text: string) => void): State {
+  let current = start;
+  while (current !== "END") {
+    state = { ...state, ...nodes[current](state) };
+    current = edges[current];
+    save(JSON.stringify({ next: current, state }));
+  }
+  return state;
+}
+
+let saved = "";
+try {
+  run({ clauses: ["8.1 unlimited", "3.1 fees"], verdicts: [], exported: "" }, "review", (t) => { saved = t; });
+} catch (e) {
+  console.log("crashed:", e instanceof Error ? e.message : e);
+}
+console.log("checkpoint:", saved);
+
+diskFull = false;
+const cp = JSON.parse(saved);
+const final = run(cp.state, cp.next, (t) => { saved = t; });
+console.log("exported:", final.exported, "| model calls:", modelCalls);
+
+@@ concept
+title: 中断和恢复：停下来等人
+--- body
+需要人拍板的节点（比如「把这些 redline 应用到导出文件吗？」），在还没有决定时返回一个 `interrupt` 字段：
+
+```ts
+type Update = Partial<State> & { interrupt?: string };
+approve: (s) => (s.approved === null ? { interrupt: "Apply 2 redline(s)?" } : {}),
+```
+
+执行器看到 `interrupt` 就停下，返回问题和检查点，**`next` 记的是当前节点**（`approve`），然后程序可以直接退出。律师回复后，把决定写进状态（`approved: true`），从检查点继续：`approve` 重新执行，这次看到了决定就放行，`export` 按决定去做。
+
+`graph.py` 里是 `decision = interrupt({...})`，之后用 `Command(resume=True)` 继续，LangGraph 同样会把 `approve` 节点从头再执行一次。注释里那句话很重要：「The approved decision is executed by code - the model does not get to re-decide」。
+--- code
+type State = { redlines: string[]; approved: boolean | null; exported: string };
+type Update = Partial<State> & { interrupt?: string };
+
+const nodes: Record<string, (s: State) => Update> = {
+  approve: (s) => (s.approved === null ? { interrupt: `Apply ${s.redlines.length} redline(s)?` } : {}),
+  export: (s) => ({ exported: s.approved ? "with redlines" : "without redlines" }),
+};
+const edges: Record<string, string> = { approve: "export", export: "END" };
+
+function run(state: State, start: string): string {
+  let current = start;
+  while (current !== "END") {
+    const out = nodes[current](state);
+    if (out.interrupt) {
+      console.log("paused:", out.interrupt);
+      return JSON.stringify({ next: current, state });
+    }
+    state = { ...state, ...out };
+    current = edges[current];
+  }
+  console.log("done:", state.exported);
+  return "";
+}
+
+const checkpoint = run({ redlines: ["8.1", "12"], approved: null, exported: "" }, "approve");
+console.log("saved:", checkpoint);
+// hours later, maybe in another process: the lawyer clicks "approve"
+const cp = JSON.parse(checkpoint);
+run({ ...cp.state, approved: true }, cp.next);
+
+@@ concept
+title: 并行：Promise.all 和并发上限
+--- body
+300 条条款一条一条审太慢。`Promise.all(items.map(fn))` 让它们同时进行，而且**结果顺序和输入顺序一致**（不管谁先完成）。
+
+但 300 个请求同时发出去，DeepSeek 会回 429。所以要**限制并发**。最简单的办法是分批：每批 N 个一起跑，这批全部完成再跑下一批：
+
+```ts
+for (let i = 0; i < items.length; i += limit) {
+  const batch = items.slice(i, i + limit);
+  results.push(...(await Promise.all(batch.map(fn))));
+}
+```
+
+`clausecheck/pipeline.py` 目前是一条一条顺序审的，想提速就是这样改。经典错误：在各个任务完成时 `results.push(...)`，那样顺序是「谁先完成谁在前」。
+--- code
+// 用几次 await 模拟「审查要花时间」，不同条款耗时不同
+async function takeTime(n: number): Promise<void> {
+  for (let i = 0; i < n; i++) await null;
+}
+let active = 0;
+let maxActive = 0;
+const finished: string[] = [];
+
+async function review(id: string, cost: number): Promise<string> {
+  active += 1;
+  maxActive = Math.max(maxActive, active);
+  await takeTime(cost);
+  active -= 1;
+  finished.push(id);
+  return `${id}:done`;
+}
+
+async function main() {
+  const jobs = [["8.1", 30], ["3.1", 5], ["12", 15], ["4.2", 10]] as const;
+  const all = await Promise.all(jobs.map(([id, cost]) => review(id, cost)));
+  console.log("finished in order:", finished.join(" "));
+  console.log("results:", all.join(" "), "| max at once:", maxActive);
+
+  maxActive = 0;
+  const out: string[] = [];
+  for (let i = 0; i < jobs.length; i += 2) {
+    const batch = jobs.slice(i, i + 2);
+    out.push(...(await Promise.all(batch.map(([id, cost]) => review(id, cost)))));
+  }
+  console.log("batches of 2:", out.join(" "), "| max at once:", maxActive);
+}
+main();
+
+@@ concept
+title: 对照框架：LangGraph 和 Mastra 工作流
+--- body
+今天写的每个零件，在 `graph.py` 里都能找到（LangGraph，Python）：
+
+- `StateGraph(State)`：`State` 是一个 TypedDict，就是你的状态类型
+- `g.add_node("review", review)`：你的 `nodes` 表
+- `g.add_edge("load", "review")`、`g.add_edge(START, "load")`：固定边和起点
+- `g.add_conditional_edges("summarise", route)`：你的路由函数边
+- `g.compile(checkpointer=saver)` + `thread_id`：每步之后存检查点
+- `interrupt(...)` 和 `Command(resume=...)`：你的 `interrupt` 字段和恢复
+
+Mastra 的工作流是同一套想法（示意，具体写法以 mastra.ai 文档为准）：用 `createStep` 定义步骤（输入输出也用 Zod 描述），`createWorkflow(...)` 用 `.then()` 把步骤串起来，另有分支和并行，最后 `.commit()`；步骤里可以挂起（suspend），之后恢复（resume）继续。
+
+面试时：「我手写过图执行器、检查点和中断恢复，所以 LangGraph 和 Mastra 的 API 对我来说只是换了名字。」
+--- code
+const parts = [
+  { mine: "nodes: Record<string, Node>", langgraph: "g.add_node(name, fn)" },
+  { mine: "edges: fixed string", langgraph: "g.add_edge(a, b)" },
+  { mine: "edges: route function", langgraph: "g.add_conditional_edges(a, route)" },
+  { mine: "save({ next, state })", langgraph: "compile(checkpointer=SqliteSaver)" },
+  { mine: "return { interrupt }", langgraph: "interrupt(payload)" },
+  { mine: "resume(cp, decision)", langgraph: "invoke(Command(resume=...))" },
+];
+for (const p of parts) {
+  console.log(`${p.mine.padEnd(28)} ${p.langgraph}`);
+}
+
+@@ item d18-01
+type: predict
+title: 复习：对象展开
+level: 1
+--- prompt
+复习第 5、15 天的对象展开 `...`。执行器合并状态全靠它。写出输出。
+--- code
+type Review = { id: string; verdict: string; risk?: string };
+
+const base: Review = { id: "8.1", verdict: "accept", risk: "low" };
+const update: Partial<Review> = { verdict: "flag" };
+const a = { ...base, ...update };
+const b = { ...update, ...base };
+const c = { ...base, risk: undefined };
+console.log(a.verdict, b.verdict);
+console.log(c);
+console.log(base.verdict);
+--- explain
+展开时**后面的覆盖前面的**，所以 `a` 是 flag，`b` 又被 `base` 盖回 accept。明确写出的 `undefined` 也会覆盖旧值：节点没改的字段就不要返回，更不要返回 `undefined`。展开生成的是新对象，`base` 本身没变，这就是「节点不改原状态」的基础。
+
+@@ item d18-02
+type: code
+title: 复习：合并状态
+level: 2
+--- prompt
+写 `mergeState(state, update)`，返回合并后的**新**状态：
+
+- 普通字段：`update` 里有的覆盖 `state` 里的
+- `log` 字段例外：不是覆盖，而是把 `update.log` **追加**到 `state.log` 后面（`update` 里没有 `log` 就保持原样）
+- 不能修改传进来的 `state`
+
+例：`mergeState({ stage: "load", redlines: 0, log: ["a"] }, { stage: "review", log: ["b"] })` → `{ stage: "review", redlines: 0, log: ["a", "b"] }`。LangGraph 里这种「追加而不是覆盖」的字段叫 reducer。
+--- starter
+type State = { stage: string; redlines: number; log: string[] };
+
+function mergeState(state: State, update: Partial<State>): State {
+  return { ...state, ...update };
+}
+--- solution
+type State = { stage: string; redlines: number; log: string[] };
+
+function mergeState(state: State, update: Partial<State>): State {
+  return { ...state, ...update, log: [...state.log, ...(update.log ?? [])] };
+}
+--- tests
+const S: State = { stage: "load", redlines: 0, log: ["loaded 3 clauses"] };
+expect("覆盖普通字段并追加 log", () => mergeState(S, { stage: "review", redlines: 2, log: ["reviewed 3"] }), { stage: "review", redlines: 2, log: ["loaded 3 clauses", "reviewed 3"] });
+expect("没有 log 时保持原样", () => mergeState(S, { stage: "export" }).log, ["loaded 3 clauses"]);
+expect("原来的 state 没被改", () => {
+  mergeState(S, { log: ["x"] });
+  return S.log;
+}, ["loaded 3 clauses"]);
+expect("空更新", () => mergeState(S, {}), S);
+--- hints
+- 先 `{ ...state, ...update }`，最后再单独写一个 `log: ...`，它会覆盖前面展开出来的 log。
+- 新数组：`[...state.log, ...(update.log ?? [])]`。不要用 `push`，那会改掉原来的数组。
+
+@@ item d18-03
+type: choice
+title: 哪一步交给 Agent
+level: 1
+--- prompt
+Clause Check 的流程里，哪一步最适合交给 Agent（由模型决定下一步做什么），而不是写成固定的工作流节点？
+--- options
+- 把合同文字拆成条款
+- 审查某一条时，决定要不要去读它引用的其他条款、读哪几条
+- 统计 accept / flag / redline 各有几条
+- 把报告写成 JSON 文件
+answer: 2
+--- explain
+只有这一步的「下一步做什么」取决于条款内容（有没有写 subject to Section 12），所以 `review.py` 把它做成一个有上限的小 Agent。其他三步每次都一样，用代码写死更便宜、可预测，也好测试。能用确定性代码的地方就不要交给模型（第 7 天 pass^k 的道理）。
+
+@@ item d18-04
+type: fill
+title: 填空：下一个节点
+level: 1
+--- prompt
+填空，完成 `nextNode(edges, node, state)`：边是字符串就直接返回；是函数就用状态调用它；没有这条边就 throw。
+--- template
+type State = { redlines: number };
+type Edge = string | ((s: State) => string);
+
+const EDGES: Record<string, Edge> = {
+  review: "summarise",
+  summarise: (s) => (s.redlines > 0 ? "[[approve]]" : "export"),
+  approve: "export",
+  export: "END",
+};
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "[[function]]" ? [[edge(state)]] : edge;
+}
+--- tests
+expect("固定边", () => nextNode(EDGES, "review", { redlines: 0 }), "summarise");
+expect("有 redline 去审批", () => nextNode(EDGES, "summarise", { redlines: 2 }), "approve");
+expect("没有 redline 直接导出", () => nextNode(EDGES, "summarise", { redlines: 0 }), "export");
+expect("结束", () => nextNode(EDGES, "export", { redlines: 0 }), "END");
+expectThrows("没有这条边", () => nextNode(EDGES, "load", { redlines: 0 }));
+--- hints
+- 有 redline 时应该先让人批准。
+- `typeof` 一个函数得到的字符串是 `"function"`；函数边要用当前状态去调用。
+
+@@ item d18-05
+type: code
+title: 图执行器
+level: 2
+--- prompt
+写 `runGraph(graph, state, start, maxSteps = 10)`，返回 `{ state, path }`：
+
+- 从 `start` 开始，一直走到 `"END"`
+- 每一步：已经走了 `maxSteps` 个节点还没到 END 就 `throw new Error(...)`；节点不存在就 throw；运行节点、合并状态、把节点名放进 `path`；用 `nextNode` 算下一个
+- 不能修改传进来的 `state`
+
+`nextNode` 已经写好（上一题）。
+--- starter
+type State = { text: string; redlines: string[]; approved: boolean; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function runGraph(graph: Graph, state: State, start: string, maxSteps = 10): { state: State; path: string[] } {
+  const path: string[] = [];
+  return { state, path };
+}
+--- solution
+type State = { text: string; redlines: string[]; approved: boolean; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function runGraph(graph: Graph, state: State, start: string, maxSteps = 10): { state: State; path: string[] } {
+  const path: string[] = [];
+  let current = start;
+  while (current !== "END") {
+    if (path.length >= maxSteps) {
+      throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    }
+    const node = graph.nodes[current];
+    if (!node) {
+      throw new Error(`unknown node: ${current}`);
+    }
+    state = { ...state, ...node(state) };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+  }
+  return { state, path };
+}
+--- tests
+const G: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve: () => ({ approved: true }),
+    export: (s) => ({ exported: `${s.redlines.length} redline(s), approved=${s.approved}` }),
+  },
+  edges: {
+    review: (s) => (s.redlines.length > 0 ? "approve" : "export"),
+    approve: "export",
+    export: "END",
+  },
+};
+const init = (text: string): State => ({ text, redlines: [], approved: false, exported: "" });
+const RISKY = init("8.1 Liability is unlimited.\n3.1 Fees within 30 days.\n12 Unlimited means unlimited.");
+expect("有 redline：经过审批", () => runGraph(G, RISKY, "review").path, ["review", "approve", "export"]);
+expect("最终状态", () => runGraph(G, RISKY, "review").state.exported, "2 redline(s), approved=true");
+expect("没有 redline：直接导出", () => runGraph(G, init("3.1 Fees within 30 days."), "review").path, ["review", "export"]);
+expect("不改传进来的 state", () => {
+  runGraph(G, RISKY, "review");
+  return RISKY.redlines;
+}, []);
+expectThrows("边里拼错了节点名", () => runGraph({ nodes: G.nodes, edges: { ...G.edges, approve: "exprot" } }, RISKY, "review"));
+expectThrows("环：超过步数上限", () => runGraph({ nodes: G.nodes, edges: { ...G.edges, export: "review" } }, RISKY, "review", 6));
+--- hints
+- `let current = start;` 然后 `while (current !== "END") { ... }`。
+- 循环里的顺序：先检查步数 → 取节点并检查 → `state = { ...state, ...node(state) }` → `path.push(current)` → `current = nextNode(...)`。
+- `state` 是参数，给它重新赋值不会影响调用方的对象；影响调用方的是修改它的内容（`state.x = ...`），不要那样做。
+
+@@ item d18-06
+type: code
+title: 运行前先检查图
+level: 2
+--- prompt
+图是手写的数据，名字拼错很常见。写 `validateGraph(graph, start)`，在运行之前找出问题，返回问题列表（没问题返回 `[]`）：
+
+1. `start` 不是节点：`"unknown start node: 名字"`
+2. 按 `Object.keys(graph.nodes)` 的顺序检查每个节点：
+   - 没有出边：`"no edge from 名字"`
+   - 出边是字符串，但既不是 `"END"` 也不是已有节点：`"edge 名字 -> 目标: unknown node"`
+
+路由函数的边要运行时才知道去哪，跳过不查。LangGraph 在 `compile()` 时也会做这类检查。
+--- starter
+type State = { redlines: number };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function validateGraph(graph: Graph, start: string): string[] {
+  const problems: string[] = [];
+  return problems;
+}
+--- solution
+type State = { redlines: number };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function validateGraph(graph: Graph, start: string): string[] {
+  const problems: string[] = [];
+  if (!(start in graph.nodes)) {
+    problems.push(`unknown start node: ${start}`);
+  }
+  for (const name of Object.keys(graph.nodes)) {
+    const edge = graph.edges[name];
+    if (edge === undefined) {
+      problems.push(`no edge from ${name}`);
+    } else if (typeof edge === "string" && edge !== "END" && !(edge in graph.nodes)) {
+      problems.push(`edge ${name} -> ${edge}: unknown node`);
+    }
+  }
+  return problems;
+}
+--- tests
+const noop: Node = () => ({});
+const NODES: Record<string, Node> = { review: noop, approve: noop, export: noop };
+const GOOD: Graph = { nodes: NODES, edges: { review: (s) => (s.redlines > 0 ? "approve" : "export"), approve: "export", export: "END" } };
+expect("正确的图", () => validateGraph(GOOD, "review"), []);
+expect("目标拼错", () => validateGraph({ nodes: NODES, edges: { ...GOOD.edges, approve: "exprot" } }, "review"), ["edge approve -> exprot: unknown node"]);
+expect("缺一条边", () => validateGraph({ nodes: NODES, edges: { review: GOOD.edges.review, approve: "export" } }, "review"), ["no edge from export"]);
+expect("起点不存在，问题按顺序列出", () => validateGraph({ nodes: NODES, edges: { review: "summarise", approve: "export" } }, "load"), [
+  "unknown start node: load",
+  "edge review -> summarise: unknown node",
+  "no edge from export",
+]);
+--- hints
+- 判断对象里有没有某个键：`"review" in graph.nodes`。
+- 对每个节点先取 `graph.edges[name]`：`undefined` 说明没有出边；`typeof edge === "string"` 时再检查目标。
+
+@@ item d18-07
+type: predict
+title: 图里的环
+level: 2
+--- prompt
+这个图模拟「模型输出校验不过就重审」：`review` 每次把 `attempts` 加 1，`validate` 在第 2 次时才通过。写出输出。
+--- code
+type S = { attempts: number; valid: boolean };
+
+const nodes: Record<string, (s: S) => Partial<S>> = {
+  review: (s) => ({ attempts: s.attempts + 1 }),
+  validate: (s) => ({ valid: s.attempts >= 2 }),
+  give_up: () => ({}),
+};
+const edges: Record<string, string | ((s: S) => string)> = {
+  review: "validate",
+  validate: (s) => (s.valid ? "END" : s.attempts < 3 ? "review" : "give_up"),
+  give_up: "END",
+};
+
+let state: S = { attempts: 0, valid: false };
+let current = "review";
+const path: string[] = [];
+while (current !== "END") {
+  state = { ...state, ...nodes[current](state) };
+  path.push(current);
+  const edge = edges[current];
+  current = typeof edge === "function" ? edge(state) : edge;
+}
+console.log(path.join(" -> "));
+console.log(state);
+--- explain
+第一次 validate 时 `attempts` 是 1，不通过，`1 < 3` 回到 review；第二次 `attempts` 是 2，通过，走到 END。`give_up` 这次没走到。和 Agent 一样，有环的图要靠上限兜底：这里是 `attempts < 3`，执行器里还有 `maxSteps`。
+
+@@ item d18-08
+type: fix
+title: 修 bug：原地打转
+level: 2
+--- prompt
+这个图应该是「模型输出不是合法 JSON 就重审，最多 3 次」。第一次假模型给坏输出，第二次给好输出，所以正确的路径是 review → validate → review → validate。
+
+运行后执行器报错说超过了步数上限。读报错里的路径，在 `review` 节点里加 `console.log(s)` 看 `attempts` 怎么变，找到原因并修好。执行器本身没有问题。
+--- starter
+type S = { attempts: number; output: string; valid: boolean };
+type Node = (s: S) => Partial<S>;
+type Edge = string | ((s: S) => string);
+
+const FAKE_MODEL = ["Sure! {", '{"verdict": "flag"}'];
+
+function isJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const nodes: Record<string, Node> = {
+  review: (s) => ({ output: FAKE_MODEL[Math.min(s.attempts, 1)], attempts: s.attempts++ }),
+  validate: (s) => ({ valid: isJson(s.output) }),
+  give_up: () => ({ output: "" }),
+};
+const edges: Record<string, Edge> = {
+  review: "validate",
+  validate: (s) => (s.valid ? "END" : s.attempts < 3 ? "review" : "give_up"),
+  give_up: "END",
+};
+
+function runGraph(state: S, start: string, maxSteps = 10): { state: S; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    if (path.length >= maxSteps) throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    state = { ...state, ...nodes[current](state) };
+    path.push(current);
+    const edge = edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { state, path };
+}
+--- solution
+type S = { attempts: number; output: string; valid: boolean };
+type Node = (s: S) => Partial<S>;
+type Edge = string | ((s: S) => string);
+
+const FAKE_MODEL = ["Sure! {", '{"verdict": "flag"}'];
+
+function isJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const nodes: Record<string, Node> = {
+  review: (s) => ({ output: FAKE_MODEL[Math.min(s.attempts, 1)], attempts: s.attempts + 1 }),
+  validate: (s) => ({ valid: isJson(s.output) }),
+  give_up: () => ({ output: "" }),
+};
+const edges: Record<string, Edge> = {
+  review: "validate",
+  validate: (s) => (s.valid ? "END" : s.attempts < 3 ? "review" : "give_up"),
+  give_up: "END",
+};
+
+function runGraph(state: S, start: string, maxSteps = 10): { state: S; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    if (path.length >= maxSteps) throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    state = { ...state, ...nodes[current](state) };
+    path.push(current);
+    const edge = edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { state, path };
+}
+--- tests
+const START: S = { attempts: 0, output: "", valid: false };
+expect("第二次通过", () => runGraph(START, "review").path, ["review", "validate", "review", "validate"]);
+expect("最终状态", () => runGraph(START, "review").state, { attempts: 2, output: '{"verdict": "flag"}', valid: true });
+expect("起始状态没被改", () => {
+  runGraph(START, "review");
+  return START.attempts;
+}, 0);
+--- hints
+- 路径一直是 review → validate → review……说明 `attempts` 从来没变大。
+- `s.attempts++` 返回的是**加之前**的旧值（同时还偷偷改了 `s`）。节点里只读 `s`，算出新值再返回。
+- 改成 `attempts: s.attempts + 1`。
+
+@@ item d18-09
+type: translate
+title: 翻译：汇总节点和路由
+level: 2
+--- prompt
+把 `graph.py` 风格的两个 Python 函数翻译成 TypeScript：`summarise` 是节点（只返回它改的字段），`route` 是路由函数。
+--- source
+def summarise(state):
+    counts = {"accept": 0, "flag": 0, "redline": 0}
+    for r in state["reviews"]:
+        counts[r["verdict"]] += 1
+    needs = [r["clause_id"] for r in state["reviews"] if r["verdict"] != "accept"]
+    return {"counts": counts, "needs_attention": needs}
+
+
+def route(state):
+    return "approve" if state["counts"]["redline"] > 0 else "export"
+--- starter
+type Review = { clause_id: string; verdict: "accept" | "flag" | "redline" };
+type State = { reviews: Review[]; counts: Record<string, number>; needs_attention: string[] };
+
+function summarise(state: State): Partial<State> {
+  return {};
+}
+
+function route(state: State): string {
+  return "export";
+}
+--- solution
+type Review = { clause_id: string; verdict: "accept" | "flag" | "redline" };
+type State = { reviews: Review[]; counts: Record<string, number>; needs_attention: string[] };
+
+function summarise(state: State): Partial<State> {
+  const counts: Record<string, number> = { accept: 0, flag: 0, redline: 0 };
+  for (const r of state.reviews) {
+    counts[r.verdict] += 1;
+  }
+  const needs = state.reviews.filter((r) => r.verdict !== "accept").map((r) => r.clause_id);
+  return { counts, needs_attention: needs };
+}
+
+function route(state: State): string {
+  return state.counts.redline > 0 ? "approve" : "export";
+}
+--- tests
+const REVIEWS: Review[] = [
+  { clause_id: "3.1", verdict: "accept" },
+  { clause_id: "8.1", verdict: "flag" },
+  { clause_id: "12", verdict: "redline" },
+];
+const S: State = { reviews: REVIEWS, counts: {}, needs_attention: [] };
+expect("汇总", () => summarise(S), { counts: { accept: 1, flag: 1, redline: 1 }, needs_attention: ["8.1", "12"] });
+expect("没有条款", () => summarise({ ...S, reviews: [] }), { counts: { accept: 0, flag: 0, redline: 0 }, needs_attention: [] });
+expect("有 redline 去审批", () => route({ ...S, counts: { accept: 1, flag: 1, redline: 1 } }), "approve");
+expect("没有 redline 直接导出", () => route({ ...S, counts: { accept: 2, flag: 1, redline: 0 } }), "export");
+--- hints
+- 列表推导式 `[... for r in ... if ...]` → `filter(...).map(...)`。
+- Python 的 `a if 条件 else b` → TypeScript 的 `条件 ? a : b`。
+
+@@ item d18-10
+type: fix
+title: 修 bug：审查结果去哪了
+level: 2
+--- prompt
+`review` 节点要调模型，所以它是 async 的。运行测试：导出结果是 `0 reviewed`，审查结果好像凭空消失了，却没有任何报错。找到原因，修好 `runGraph`（节点都没有问题）。
+
+提示：展开一个 Promise（`{ ...somePromise }`）什么也得不到，TypeScript 也不会报错。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+type Review = { id: string; verdict: string };
+type State = { clauses: string[]; reviews: Review[]; redlines: number; exported: string };
+type Node = (s: State) => Partial<State> | Promise<Partial<State>>;
+type Graph = { nodes: Record<string, Node>; edges: Record<string, string> };
+
+async function classify(clause: string): Promise<string> {
+  const body = { model: "deepseek-chat", messages: [{ role: "user", content: `Review clause ${clause}` }], response_format: { type: "json_object" } };
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content).verdict;
+}
+
+const GRAPH: Graph = {
+  nodes: {
+    review: async (s) => {
+      const reviews: Review[] = [];
+      for (const c of s.clauses) {
+        reviews.push({ id: c.split(" ")[0], verdict: await classify(c) });
+      }
+      return { reviews };
+    },
+    summarise: (s) => ({ redlines: s.reviews.filter((r) => r.verdict === "redline").length }),
+    export: (s) => ({ exported: `${s.reviews.length} reviewed, ${s.redlines} redline(s)` }),
+  },
+  edges: { review: "summarise", summarise: "export", export: "END" },
+};
+
+async function runGraph(graph: Graph, state: State, start: string): Promise<{ state: State; path: string[] }> {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const update = graph.nodes[current](state);
+    state = { ...state, ...update };
+    path.push(current);
+    current = graph.edges[current];
+  }
+  return { state, path };
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+type Review = { id: string; verdict: string };
+type State = { clauses: string[]; reviews: Review[]; redlines: number; exported: string };
+type Node = (s: State) => Partial<State> | Promise<Partial<State>>;
+type Graph = { nodes: Record<string, Node>; edges: Record<string, string> };
+
+async function classify(clause: string): Promise<string> {
+  const body = { model: "deepseek-chat", messages: [{ role: "user", content: `Review clause ${clause}` }], response_format: { type: "json_object" } };
+  const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content).verdict;
+}
+
+const GRAPH: Graph = {
+  nodes: {
+    review: async (s) => {
+      const reviews: Review[] = [];
+      for (const c of s.clauses) {
+        reviews.push({ id: c.split(" ")[0], verdict: await classify(c) });
+      }
+      return { reviews };
+    },
+    summarise: (s) => ({ redlines: s.reviews.filter((r) => r.verdict === "redline").length }),
+    export: (s) => ({ exported: `${s.reviews.length} reviewed, ${s.redlines} redline(s)` }),
+  },
+  edges: { review: "summarise", summarise: "export", export: "END" },
+};
+
+async function runGraph(graph: Graph, state: State, start: string): Promise<{ state: State; path: string[] }> {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const update = await graph.nodes[current](state);
+    state = { ...state, ...update };
+    path.push(current);
+    current = graph.edges[current];
+  }
+  return { state, path };
+}
+--- tests
+const CLAUSES = ["8.1 Liability shall be unlimited.", "3.1 Fees are payable within thirty days.", "10.1 Data may be processed in any country."];
+const INIT: State = { clauses: CLAUSES, reviews: [], redlines: 0, exported: "" };
+expectAsync("审查结果进了状态", async () => {
+  MOCK.reset();
+  const r = await runGraph(GRAPH, INIT, "review");
+  return [r.state.exported, r.path];
+}, ["3 reviewed, 2 redline(s)", ["review", "summarise", "export"]]);
+expectAsync("每条审查一次，全部在返回前完成", async () => {
+  MOCK.reset();
+  await runGraph(GRAPH, INIT, "review");
+  return MOCK.calls.length;
+}, 3);
+expectAsync("判定", async () => (await runGraph(GRAPH, INIT, "review")).state.reviews.map((r) => r.verdict), ["redline", "accept", "redline"]);
+--- hints
+- `graph.nodes[current](state)` 对 async 节点返回的是一个 Promise，不是更新内容。
+- 在调用节点的地方加 `await`。对同步节点 await 也没有坏处，会直接拿到值。
+
+@@ item d18-11
+type: predict
+title: 状态存成 JSON 会怎样
+level: 2
+--- prompt
+检查点是 `JSON.stringify` 出来的文字。写出输出，看看哪些东西存不进去。
+--- code
+const state = {
+  contract: "cloudnotes.txt",
+  done: new Set(["8.1", "12"]),
+  approved: undefined,
+  reviewed: 2,
+};
+const saved = JSON.stringify(state);
+console.log(saved);
+const back = JSON.parse(saved);
+console.log(back.done instanceof Set, "approved" in back);
+console.log(Object.keys(back).length);
+--- explain
+`Set` 和 `Map` 被 `JSON.stringify` 变成 `{}`，数据悄悄丢了；值为 `undefined` 的键直接消失。恢复之后程序不会报错，只会结果不对，这种 bug 最难找。所以状态里只放纯 JSON：用数组代替 Set，用 `null` 表示「还没决定」（`graph.py` 里 `approved: bool | None` 就是这样）。
+
+@@ item d18-12
+type: code
+title: 检查点和崩溃恢复
+level: 3
+--- prompt
+写两个函数：
+
+1. `run(graph, state, start, save)`：和 `runGraph` 一样走到 `"END"`（不用步数上限），但**每跑完一个节点**，就调用 `save(JSON.stringify({ next: 下一个节点, state: 合并后的状态 }))`。返回 `{ state, path }`
+2. `resume(graph, saved, save)`：`saved` 是一个检查点文字。解析它，从 `next` 开始、用它的 `state` 继续跑（继续存检查点），返回这一次的 `{ state, path }`
+
+测试会让 `export` 第一次失败（模拟磁盘满），再从最后一个检查点恢复，并检查 `review` 没有重跑。
+--- starter
+type State = { clauses: string[]; verdicts: string[]; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type Checkpoint = { next: string; state: State };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function run(graph: Graph, state: State, start: string, save: (text: string) => void): { state: State; path: string[] } {
+  return { state, path: [] };
+}
+
+function resume(graph: Graph, saved: string, save: (text: string) => void): { state: State; path: string[] } {
+  const cp: Checkpoint = JSON.parse(saved);
+  return { state: cp.state, path: [] };
+}
+--- solution
+type State = { clauses: string[]; verdicts: string[]; exported: string };
+type Node = (s: State) => Partial<State>;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type Checkpoint = { next: string; state: State };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  if (edge === undefined) {
+    throw new Error(`no edge from ${node}`);
+  }
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function run(graph: Graph, state: State, start: string, save: (text: string) => void): { state: State; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const node = graph.nodes[current];
+    if (!node) {
+      throw new Error(`unknown node: ${current}`);
+    }
+    state = { ...state, ...node(state) };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+    const cp: Checkpoint = { next: current, state };
+    save(JSON.stringify(cp));
+  }
+  return { state, path };
+}
+
+function resume(graph: Graph, saved: string, save: (text: string) => void): { state: State; path: string[] } {
+  const cp: Checkpoint = JSON.parse(saved);
+  return run(graph, cp.state, cp.next, save);
+}
+--- tests
+let modelCalls = 0;
+let exportFailures = 0;
+const G: Graph = {
+  nodes: {
+    review: (s) => {
+      modelCalls += s.clauses.length;
+      return { verdicts: s.clauses.map((c) => (c.includes("unlimited") ? "redline" : "accept")) };
+    },
+    export: (s) => {
+      if (exportFailures > 0) {
+        exportFailures -= 1;
+        throw new Error("disk full");
+      }
+      return { exported: s.verdicts.join(",") };
+    },
+  },
+  edges: { review: "export", export: "END" },
+};
+const INIT: State = { clauses: ["8.1 unlimited", "3.1 fees"], verdicts: [], exported: "" };
+expect("每个节点之后存一次", () => {
+  const saved: string[] = [];
+  run(G, INIT, "review", (t) => saved.push(t));
+  return saved.map((t) => JSON.parse(t).next);
+}, ["export", "END"]);
+expect("检查点里是合并后的状态", () => {
+  const saved: string[] = [];
+  run(G, INIT, "review", (t) => saved.push(t));
+  return JSON.parse(saved[0]);
+}, { next: "export", state: { clauses: ["8.1 unlimited", "3.1 fees"], verdicts: ["redline", "accept"], exported: "" } });
+expect("崩溃后恢复：review 不重跑", () => {
+  modelCalls = 0;
+  exportFailures = 1;
+  const saved: string[] = [];
+  try {
+    run(G, INIT, "review", (t) => saved.push(t));
+  } catch {
+    // export crashed; the last checkpoint says what to do next
+  }
+  const r = resume(G, saved[saved.length - 1], (t) => saved.push(t));
+  return [r.path, r.state.exported, modelCalls];
+}, [["export"], "redline,accept", 2]);
+expect("从 END 的检查点恢复：什么也不做", () => resume(G, JSON.stringify({ next: "END", state: INIT }), () => {}).path, []);
+--- hints
+- `run` 就是 `runGraph` 的循环，在算出下一个节点之后加一句 `save(JSON.stringify({ next: current, state }))`。
+- `resume` 只有两行：解析检查点，然后 `return run(graph, cp.state, cp.next, save);`。
+
+@@ item d18-13
+type: choice
+title: 律师明天才批准
+level: 2
+--- prompt
+图跑到 `approve` 节点，需要律师批准，而律师明天才回复。程序应该怎么做？
+--- options
+- 在循环里每秒检查一次数据库，一直等到律师点了批准
+- 存下检查点（状态 + 下一步是 approve），然后结束运行；律师批准时（可能是另一个进程，比如网页后端）读出检查点，把决定写进状态，从 approve 继续
+- 让模型替律师决定，省去等待
+- 等律师批准后，带上 `approved: true` 从头把整个图再跑一遍
+answer: 2
+--- explain
+一直开着等，会占着资源，而且进程一重启就什么都没了。从头再跑一遍会重复付费调用模型，结果还可能和第一次不同，律师批准的就不是他看过的那份了。`graph.py` 正是第二种：`SqliteSaver` 存检查点，`pending_interrupt(thread_id)` 能从另一个进程查看等待中的问题，`resume(thread_id, approved)` 继续。
+
+@@ item d18-14
+type: order
+title: 排代码：会暂停的执行器
+level: 2
+--- prompt
+排出 `run`：节点返回的更新里如果有 `interrupt`，就停下来，返回问题和检查点；否则合并状态继续走。类型、`nextNode` 和测试用的图已经写好。有一行干扰项。
+--- lines
+function run(graph: Graph, state: State, start: string): RunResult {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const out = graph.nodes[current](state);
+    if (out.interrupt) {
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: current, state }) };
+    }
+    state = { ...state, ...out };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+  }
+  return { status: "done", state, path };
+}
+--- distractors
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: nextNode(graph.edges, current, state), state }) };
+--- tests
+type State = { text: string; redlines: string[]; approved: boolean | null; exported: string };
+type Update = Partial<State> & { interrupt?: string };
+type Node = (s: State) => Update;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  return typeof edge === "function" ? edge(state) : edge;
+}
+const G: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve: (s) => (s.approved === null ? { interrupt: `Apply ${s.redlines.length} redline(s)?` } : {}),
+    export: (s) => ({ exported: s.approved ? "with redlines" : "without redlines" }),
+  },
+  edges: { review: (s) => (s.redlines.length > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+const init = (text: string): State => ({ text, redlines: [], approved: null, exported: "" });
+expect("有 redline：停在 approve", () => {
+  const r = run(G, init("8.1 Liability is unlimited."), "review");
+  return r.status === "interrupted" ? [r.question, JSON.parse(r.checkpoint).next] : r.status;
+}, ["Apply 1 redline(s)?", "approve"]);
+expect("检查点里有 review 的结果", () => {
+  const r = run(G, init("8.1 Liability is unlimited."), "review");
+  return r.status === "interrupted" ? JSON.parse(r.checkpoint).state.redlines : r.status;
+}, ["8.1"]);
+expect("没有 redline：一路跑完", () => run(G, init("3.1 Fees within 30 days."), "review"), {
+  status: "done",
+  state: { text: "3.1 Fees within 30 days.", redlines: [], approved: null, exported: "without redlines" },
+  path: ["review", "export"],
+});
+expect("已有决定：不再暂停", () => {
+  const r = run(G, { ...init("8.1 Liability is unlimited."), approved: true }, "review");
+  return r.status === "done" ? [r.path, r.state.exported] : r.status;
+}, [["review", "approve", "export"], "with redlines"]);
+--- hints
+- 先调用节点，**先**检查 `out.interrupt`，没有中断才合并状态、记路径、找下一个节点。
+- 中断时检查点的 `next` 应该是**当前**节点：恢复时 approve 要重新执行一次，这次它会看到人的决定。干扰项存的是下一个节点，恢复时就把审批跳过了。
+
+@@ item d18-15
+type: code
+title: 审批节点和恢复
+level: 3
+--- prompt
+上一题的 `run` 已经写好。补全两个函数：
+
+1. `approve(s)`：还没有决定（`s.approved === null`）时返回 `{ interrupt: "Apply N redline(s)?" }`（N 是 `s.redlines.length`）；已有决定就返回 `{}`，放行
+2. `resume(graph, checkpoint, decision)`：解析检查点，把 `decision`（比如 `{ approved: true }`）合并进它的状态，再从 `next` 继续 `run`
+
+`export` 节点已经写好：它**按状态里的决定**导出，模型不参与。
+--- starter
+type State = { text: string; redlines: string[]; approved: boolean | null; exported: string };
+type Update = Partial<State> & { interrupt?: string };
+type Node = (s: State) => Update;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function run(graph: Graph, state: State, start: string): RunResult {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const out = graph.nodes[current](state);
+    if (out.interrupt) {
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: current, state }) };
+    }
+    state = { ...state, ...out };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+  }
+  return { status: "done", state, path };
+}
+
+function approve(s: State): Update {
+  return {};
+}
+
+function resume(graph: Graph, checkpoint: string, decision: Partial<State>): RunResult {
+  const cp = JSON.parse(checkpoint);
+  return run(graph, cp.state, cp.next);
+}
+
+const GRAPH: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve,
+    export: (s) => ({ exported: s.approved ? `exported with ${s.redlines.length} redline(s) applied` : "exported without redlines" }),
+  },
+  edges: { review: (s) => (s.redlines.length > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+--- solution
+type State = { text: string; redlines: string[]; approved: boolean | null; exported: string };
+type Update = Partial<State> & { interrupt?: string };
+type Node = (s: State) => Update;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+
+function nextNode(edges: Record<string, Edge>, node: string, state: State): string {
+  const edge = edges[node];
+  return typeof edge === "function" ? edge(state) : edge;
+}
+
+function run(graph: Graph, state: State, start: string): RunResult {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const out = graph.nodes[current](state);
+    if (out.interrupt) {
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: current, state }) };
+    }
+    state = { ...state, ...out };
+    path.push(current);
+    current = nextNode(graph.edges, current, state);
+  }
+  return { status: "done", state, path };
+}
+
+function approve(s: State): Update {
+  if (s.approved === null) {
+    return { interrupt: `Apply ${s.redlines.length} redline(s)?` };
+  }
+  return {};
+}
+
+function resume(graph: Graph, checkpoint: string, decision: Partial<State>): RunResult {
+  const cp = JSON.parse(checkpoint);
+  return run(graph, { ...cp.state, ...decision }, cp.next);
+}
+
+const GRAPH: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.split("\n").filter((l) => l.includes("unlimited")).map((l) => l.split(" ")[0]) }),
+    approve,
+    export: (s) => ({ exported: s.approved ? `exported with ${s.redlines.length} redline(s) applied` : "exported without redlines" }),
+  },
+  edges: { review: (s) => (s.redlines.length > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+--- tests
+const TEXT = "8.1 Liability is unlimited.\n3.1 Fees within 30 days.\n12 Unlimited means unlimited.";
+const init = (text: string): State => ({ text, redlines: [], approved: null, exported: "" });
+function pauseThenResume(decision: Partial<State>): unknown {
+  const first = run(GRAPH, init(TEXT), "review");
+  if (first.status !== "interrupted") return "第一次运行没有暂停";
+  const r = resume(GRAPH, first.checkpoint, decision);
+  return r.status === "done" ? [r.path, r.state.exported] : `恢复后又暂停了：${r.question}`;
+}
+expect("第一次运行停下来问人", () => {
+  const r = run(GRAPH, init(TEXT), "review");
+  return r.status === "interrupted" ? r.question : r.status;
+}, "Apply 2 redline(s)?");
+expect("批准后继续：approve 重新执行，然后导出", () => pauseThenResume({ approved: true }), [["approve", "export"], "exported with 2 redline(s) applied"]);
+expect("拒绝后继续：不应用 redline", () => pauseThenResume({ approved: false }), [["approve", "export"], "exported without redlines"]);
+expect("没有 redline 的合同不打扰人", () => run(GRAPH, init("3.1 Fees within 30 days."), "review").status, "done");
+--- hints
+- `approve` 和概念卡里的一样，只是写成普通函数：`if (s.approved === null) return { interrupt: ... }; return {};`。
+- `resume` 里把决定合并进去：`run(graph, { ...cp.state, ...decision }, cp.next)`。展开的顺序决定谁覆盖谁。
+
+@@ item d18-16
+type: fix
+title: 修 bug：报告顺序每次都不一样
+level: 2
+--- prompt
+同事把逐条审查改成了并行，速度快了，但律师抱怨：报告里条款的顺序每次都不一样。测试用一个假的 `review`（不同条款耗时不同）重现了问题。运行、修好它：结果顺序必须和 `ids` 一致。
+--- starter
+type Verdict = { id: string; verdict: string };
+
+async function reviewAll(ids: string[], review: (id: string) => Promise<Verdict>): Promise<Verdict[]> {
+  const results: Verdict[] = [];
+  await Promise.all(
+    ids.map(async (id) => {
+      const v = await review(id);
+      results.push(v);
+    }),
+  );
+  return results;
+}
+--- solution
+type Verdict = { id: string; verdict: string };
+
+async function reviewAll(ids: string[], review: (id: string) => Promise<Verdict>): Promise<Verdict[]> {
+  return Promise.all(ids.map((id) => review(id)));
+}
+--- tests
+const DELAY: Record<string, number> = { "8.1": 40, "3.1": 5, "12": 20 };
+const fakeReview = (id: string) =>
+  new Promise<Verdict>((resolve) => setTimeout(() => resolve({ id, verdict: id === "3.1" ? "accept" : "redline" }), DELAY[id]));
+expectAsync("顺序和输入一致", async () => (await reviewAll(["8.1", "3.1", "12"], fakeReview)).map((v) => v.id), ["8.1", "3.1", "12"]);
+expectAsync("判定跟着条款走", async () => (await reviewAll(["12", "3.1"], fakeReview)).map((v) => v.verdict), ["redline", "accept"]);
+expectAsync("空列表", () => reviewAll([], fakeReview), []);
+--- hints
+- `results.push` 发生在每个任务**完成**的时候，谁快谁在前。
+- `Promise.all` 的返回值本身就是按输入顺序排好的结果数组，直接用它。
+
+@@ item d18-17
+type: code
+title: 带并发上限的 map
+level: 2
+--- prompt
+写 `mapLimit(items, limit, fn)`：对每个元素调用 async 的 `fn`，**同时进行的不超过 `limit` 个**，返回结果数组，顺序和 `items` 一致。
+
+用分批的办法：每次取 `limit` 个，`Promise.all` 等这一批全部完成，再取下一批。空数组返回 `[]`。
+--- starter
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  return Promise.all(items.map(fn));
+}
+--- solution
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += limit) {
+    const batch = items.slice(i, i + limit);
+    const done = await Promise.all(batch.map(fn));
+    results.push(...done);
+  }
+  return results;
+}
+--- tests
+let active = 0;
+let maxActive = 0;
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+async function slowDouble(n: number): Promise<number> {
+  active += 1;
+  maxActive = Math.max(maxActive, active);
+  await wait(40 - n * 5);
+  active -= 1;
+  return n * 2;
+}
+expectAsync("结果顺序和输入一致", () => mapLimit([1, 2, 3, 4, 5], 2, slowDouble), [2, 4, 6, 8, 10]);
+expectAsync("同时最多 2 个", async () => {
+  maxActive = 0;
+  await mapLimit([1, 2, 3, 4, 5], 2, slowDouble);
+  return maxActive;
+}, 2);
+expectAsync("limit 比元素多", async () => {
+  maxActive = 0;
+  const r = await mapLimit([1, 2], 10, slowDouble);
+  return [r, maxActive];
+}, [[2, 4], 2]);
+expectAsync("空数组", () => mapLimit([], 3, slowDouble), []);
+--- hints
+- `for (let i = 0; i < items.length; i += limit) { const batch = items.slice(i, i + limit); ... }`
+- 一批的结果：`await Promise.all(batch.map(fn))`，再用 `results.push(...done)` 按顺序接到后面。
+
+@@ item d18-18
+type: choice
+title: 读 graph.py
+level: 2
+--- prompt
+下面对 `clausecheck/graph.py` 的解读，哪一个是**错的**？
+--- options
+- `g.add_conditional_edges("summarise", route)`：summarise 之后调用 `route(state)` 决定去 approve 还是 export，就是你写的路由函数边
+- `g.compile(checkpointer=checkpointer)`：让图在每一步之后把状态存下来（这里存进 SQLite），就是你的 `save(...)`
+- `approve` 里调用 `interrupt(...)` 暂停；之后用 `Command(resume=True)` 继续时，approve 节点会重新执行，这次 `interrupt(...)` 直接返回人的决定
+- 用 `Command(resume=...)` 继续时，LangGraph 会从 load 开始把整个图重跑一遍，只是跳过了 interrupt
+answer: 4
+--- explain
+恢复是从检查点继续，load、review、summarise 都不会重跑（那样会重复调用模型）。只有暂停所在的 approve 节点会从头再执行一次，这和你今天写的完全一样：检查点的 `next` 是 approve，恢复时它看到决定就放行。
+
+@@ item d18-e1
+type: scratch
+title: 闭卷：图执行器
+exam: yes
+level: 3
+--- prompt
+先原样定义这些类型：
+
+```ts
+type State = Record<string, any>;
+type Node = (s: State) => State;               // 返回要更新的字段
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+```
+
+写 `runGraph(graph: Graph, state: State, start: string, maxSteps: number): { state: State; path: string[] }`：
+
+- 从 `start` 走到 `"END"`；每个节点的返回值合并进状态（后者覆盖），节点名依次放进 `path`
+- 边是字符串就直接去，是函数就用**合并后的**状态调用它
+- 已经走了 `maxSteps` 个节点还没到 END、节点不存在、没有出边：都 `throw new Error(...)`
+- 不能修改传进来的 `state` 对象
+--- solution
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function runGraph(graph: Graph, state: State, start: string, maxSteps: number): { state: State; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    if (path.length >= maxSteps) {
+      throw new Error(`exceeded ${maxSteps} steps: ${path.join(" -> ")}`);
+    }
+    const node = graph.nodes[current];
+    if (!node) {
+      throw new Error(`unknown node: ${current}`);
+    }
+    state = { ...state, ...node(state) };
+    path.push(current);
+    const edge = graph.edges[current];
+    if (edge === undefined) {
+      throw new Error(`no edge from ${current}`);
+    }
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { state, path };
+}
+--- tests
+const G: Graph = {
+  nodes: {
+    review: (s) => ({ redlines: s.text.includes("unlimited") ? 1 : 0 }),
+    approve: () => ({ approved: true }),
+    export: (s) => ({ exported: `redlines=${s.redlines} approved=${s.approved}` }),
+  },
+  edges: { review: (s) => (s.redlines > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+const RISKY = { text: "Liability is unlimited.", approved: false };
+expect("条件路由：有 redline", () => runGraph(G, RISKY, "review", 10), {
+  state: { text: "Liability is unlimited.", approved: true, redlines: 1, exported: "redlines=1 approved=true" },
+  path: ["review", "approve", "export"],
+});
+expect("条件路由：没有 redline，原状态不变", () => [runGraph(G, { text: "Fees.", approved: false }, "review", 10).path, RISKY], [["review", "export"], { text: "Liability is unlimited.", approved: false }]);
+expectThrows("没有出边", () => runGraph({ nodes: G.nodes, edges: { review: "export" } }, RISKY, "review", 10));
+expectThrows("环超过上限", () => runGraph({ nodes: G.nodes, edges: { ...G.edges, export: "review" } }, RISKY, "review", 5));
+
+@@ item d18-e2
+type: scratch
+title: 闭卷：检查点和恢复
+exam: yes
+level: 3
+--- prompt
+类型同闭卷 1（原样定义）：
+
+```ts
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+```
+
+写两个函数：
+
+- `runWithCheckpoints(graph, state, start, save: (text: string) => void)`：从 `start` 走到 `"END"`，返回 `{ state, path }`。每跑完一个节点、算出下一个节点后，调用 `save(JSON.stringify({ next, state }))`
+- `resume(graph, saved: string, save)`：解析检查点，从它的 `next` 用它的 `state` 继续（同样存检查点），返回这一次的 `{ state, path }`
+--- solution
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+
+function runWithCheckpoints(graph: Graph, state: State, start: string, save: (text: string) => void): { state: State; path: string[] } {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    state = { ...state, ...graph.nodes[current](state) };
+    path.push(current);
+    const edge = graph.edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+    save(JSON.stringify({ next: current, state }));
+  }
+  return { state, path };
+}
+
+function resume(graph: Graph, saved: string, save: (text: string) => void): { state: State; path: string[] } {
+  const cp = JSON.parse(saved);
+  return runWithCheckpoints(graph, cp.state, cp.next, save);
+}
+--- tests
+let reviews = 0;
+let failNext = false;
+const G: Graph = {
+  nodes: {
+    review: (s) => {
+      reviews += 1;
+      return { verdicts: s.clauses.map((c: string) => (c.includes("unlimited") ? "redline" : "accept")) };
+    },
+    summarise: (s) => ({ redlines: s.verdicts.filter((v: string) => v === "redline").length }),
+    export: (s) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("network down");
+      }
+      return { exported: `redlines=${s.redlines}` };
+    },
+  },
+  edges: { review: "summarise", summarise: "export", export: "END" },
+};
+const INIT = { clauses: ["8.1 unlimited", "3.1 fees"] };
+expect("检查点序列", () => {
+  const saved: string[] = [];
+  runWithCheckpoints(G, INIT, "review", (t) => saved.push(t));
+  return saved.map((t) => JSON.parse(t).next);
+}, ["summarise", "export", "END"]);
+expect("崩溃后恢复，不重跑 review", () => {
+  reviews = 0;
+  failNext = true;
+  const saved: string[] = [];
+  try {
+    runWithCheckpoints(G, INIT, "review", (t) => saved.push(t));
+  } catch {
+    // crashed in export
+  }
+  const r = resume(G, saved[saved.length - 1], (t) => saved.push(t));
+  return [r.path, r.state.exported, reviews, JSON.parse(saved[saved.length - 1]).next];
+}, [["export"], "redlines=1", 1, "END"]);
+
+@@ item d18-e3
+type: scratch
+title: 闭卷：条件路由 + 中断
+exam: yes
+level: 3
+--- prompt
+先原样定义这些类型（节点返回的更新里可以带 `interrupt` 字段，表示「停下来问人」）：
+
+```ts
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+```
+
+写两个函数：
+
+- `run(graph, state, start): RunResult`：从 `start` 走到 `"END"`。调用节点后，如果返回值里有 `interrupt`，立刻返回 `{ status: "interrupted", question: 它的值, checkpoint: JSON.stringify({ next: 当前节点, state: 当前状态 }) }`（这个节点的更新不合并）；否则合并状态、记路径、按边（字符串或路由函数）前进。走到 END 返回 `{ status: "done", state, path }`
+- `resume(graph, checkpoint: string, decision: State): RunResult`：解析检查点，把 `decision` 合并进它的状态，从 `next` 继续 `run`
+--- solution
+type State = Record<string, any>;
+type Node = (s: State) => State;
+type Edge = string | ((s: State) => string);
+type Graph = { nodes: Record<string, Node>; edges: Record<string, Edge> };
+type RunResult =
+  | { status: "done"; state: State; path: string[] }
+  | { status: "interrupted"; question: string; checkpoint: string };
+
+function run(graph: Graph, state: State, start: string): RunResult {
+  let current = start;
+  const path: string[] = [];
+  while (current !== "END") {
+    const out = graph.nodes[current](state);
+    if (out.interrupt) {
+      return { status: "interrupted", question: out.interrupt, checkpoint: JSON.stringify({ next: current, state }) };
+    }
+    state = { ...state, ...out };
+    path.push(current);
+    const edge = graph.edges[current];
+    current = typeof edge === "function" ? edge(state) : edge;
+  }
+  return { status: "done", state, path };
+}
+
+function resume(graph: Graph, checkpoint: string, decision: State): RunResult {
+  const cp = JSON.parse(checkpoint);
+  return run(graph, { ...cp.state, ...decision }, cp.next);
+}
+--- tests
+const G: Graph = {
+  nodes: {
+    summarise: (s) => ({ redlines: s.verdicts.filter((v: string) => v === "redline").length }),
+    approve: (s) => (s.approved === null ? { interrupt: `Apply ${s.redlines} redline(s)?` } : {}),
+    export: (s) => ({ exported: s.approved ? "applied" : "not applied" }),
+  },
+  edges: { summarise: (s) => (s.redlines > 0 ? "approve" : "export"), approve: "export", export: "END" },
+};
+const RISKY = { verdicts: ["redline", "accept", "redline"], approved: null };
+expect("暂停并提问", () => {
+  const r = run(G, RISKY, "summarise");
+  return r.status === "interrupted" ? [r.question, JSON.parse(r.checkpoint).next] : r.status;
+}, ["Apply 2 redline(s)?", "approve"]);
+expect("批准后恢复", () => {
+  const r = run(G, RISKY, "summarise");
+  if (r.status !== "interrupted") return r.status;
+  const done = resume(G, r.checkpoint, { approved: true });
+  return done.status === "done" ? [done.path, done.state.exported] : done.status;
+}, [["approve", "export"], "applied"]);
+expect("没有 redline 直接完成", () => {
+  const r = run(G, { verdicts: ["accept"], approved: null }, "summarise");
+  return r.status === "done" ? r.path : r.status;
+}, ["summarise", "export"]);

@@ -1,0 +1,1576 @@
+@@ day 16
+title: TS 类与错误：class、Result、依赖注入、模块
+lang: ts
+hours: 4–5 小时
+--- goal
+学会写小而清楚的类：私有状态、getter、static 工厂方法；设计错误：自定义 Error 子类、用 `instanceof` 分别处理、用 Result 值代替 throw；把 `fetch`、时钟这类依赖从构造函数传进来，让代码能用假对象测试。TypeScript 的 API 客户端（OpenAI SDK、Mastra）和工具注册表就是这样写的；Python 这边对应 `clausecheck/playbook.py`（Playbook 类）和 `review.py`（两个 Backend 类、按类型捕获 SDK 的错误）。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过
+- 本机任务：把一个客户端拆成三个文件（types.ts / client.ts / main.ts），用真的 DeepSeek 跑通
+- 闭卷挑战 3 题
+
+@@ concept
+title: class 基础
+--- body
+第 3 天你在 Python 里写过 class，TypeScript 几乎一一对应：
+
+- `__init__` → `constructor`，`self` → `this`。方法里读字段**必须**写 `this.xxx`
+- 字段要声明类型：`counts: Record<string, number> = {};`
+- 创建对象要写 `new`：`const c = new VerdictCounter();`
+
+构造函数的参数前加 `private readonly` 或 `readonly`，它会自动变成字段（叫**参数属性**），SDK 源码里很常见：
+
+```ts
+class Client {
+  constructor(private readonly apiKey: string, readonly model = "deepseek-chat") {}
+}
+```
+
+经典错误：方法里忘了写 `this.`，TypeScript 报 `Cannot find name 'counts'`。
+--- code
+class VerdictCounter {
+  counts: Record<string, number> = {};
+
+  add(verdict: string): void {
+    this.counts[verdict] = (this.counts[verdict] ?? 0) + 1;
+  }
+
+  total(): number {
+    return Object.values(this.counts).reduce((sum, n) => sum + n, 0);
+  }
+}
+
+class Client {
+  constructor(private readonly apiKey: string, readonly model = "deepseek-chat") {}
+
+  describe(): string {
+    return `${this.model} with key ${this.apiKey.slice(0, 3)}...`;
+  }
+}
+
+const counter = new VerdictCounter();
+for (const v of ["flag", "accept", "flag"]) {
+  counter.add(v);
+}
+console.log(counter.counts, counter.total());
+console.log(new Client("sk-123456").describe());
+
+@@ concept
+title: 私有状态和 getter
+--- body
+类的价值在于**守住规则**，比如「已用的 token 不能超过预算」。如果谁都能直接改 `used`，这条规则就守不住。
+
+- `#used = 0`：真正的私有字段。类外面读写都不行，运行时也看不到（`Object.keys`、`JSON.stringify` 里都没有它）
+- `private used = 0`：只在**编译时**禁止，运行时它还是一个普通字段
+- getter：`get remaining(): number { ... }`，外面像读字段一样用 `budget.remaining`（不加括号），只能读不能改
+
+新代码推荐用 `#`；读 SDK 源码时两种都会见到。修改状态只通过方法：方法里先检查，再修改。
+--- code
+class TokenBudget {
+  #used = 0;
+  constructor(readonly limit: number) {}
+
+  get used(): number {
+    return this.#used;
+  }
+  get remaining(): number {
+    return this.limit - this.#used;
+  }
+  spend(n: number): boolean {
+    if (n > this.remaining) {
+      return false;
+    }
+    this.#used += n;
+    return true;
+  }
+}
+
+const budget = new TokenBudget(1000);
+console.log(budget.spend(600), budget.spend(600), budget.remaining);
+console.log(Object.keys(budget), JSON.stringify(budget));
+// budget.remaining = 5; // 去掉注释试试：只有 getter，不能赋值
+
+@@ concept
+title: static 和工厂方法
+--- body
+`static` 方法属于**类本身**，用 `类名.方法()` 调用，不用先 new 一个对象。最常见的用途是**工厂方法**：从外部数据创建对象，创建之前先校验。
+
+```ts
+const pb = Playbook.fromJSON(JSON.parse(text)); // 数据不合格就 throw
+```
+
+好处：构造函数只接收已经合格的数据，脏数据在门口就被拦下，并且报一个清楚的错误。Clause Check 的 `clausecheck/playbook.py` 里 `Playbook.load(path)` 就是 Python 版的工厂方法（`@classmethod`），它先用 Pydantic 校验每一条规则，再创建 Playbook。
+
+`static` 也可以是常量：`static readonly VERSION = "2026-09";`
+--- code
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+class Playbook {
+  static readonly VERSION = "2026-09";
+
+  constructor(readonly rules: Rule[]) {}
+
+  static fromJSON(raw: unknown): Playbook {
+    if (typeof raw !== "object" || raw === null || !("rules" in raw) || !Array.isArray(raw.rules)) {
+      throw new Error("playbook JSON needs a 'rules' array");
+    }
+    return new Playbook(raw.rules);
+  }
+
+  topics(): string[] {
+    return this.rules.map((r) => r.topic);
+  }
+}
+
+const pb = Playbook.fromJSON(JSON.parse('{"rules": [{"id": "PB-01", "topic": "liability_cap"}]}'));
+console.log(pb.topics(), Playbook.VERSION);
+try {
+  Playbook.fromJSON({ items: [] });
+} catch (e) {
+  console.log(e instanceof Error ? e.message : e);
+}
+
+@@ concept
+title: 自定义错误和 instanceof
+--- body
+调接口失败的方式很多：429 限流（等一下再试）、401 密钥错（重试没用）、500 服务器错。调用方要**分别处理**，所以给每种失败一个自己的错误类：
+
+```ts
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);          // 必须先调用父类的构造函数
+    this.name = "ApiError";  // 报错时显示的名字
+  }
+}
+```
+
+处理时用 `instanceof` 区分，**子类要先判断**（RateLimitError 也是一种 ApiError）。不认识的错误要继续 `throw e`，别吞掉。TypeScript 里 `catch (e)` 的 e 是 `unknown`，`instanceof` 检查同时也是收窄。
+
+Clause Check 的 `review.py` 就是这样按类型捕获 Anthropic SDK 的 `RateLimitError`、`APIStatusError`。
+--- code
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+class RateLimitError extends ApiError {
+  constructor(message = "rate limited") {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+
+function handle(e: unknown): string {
+  if (e instanceof RateLimitError) {
+    return `wait and retry (${e.status})`;
+  }
+  if (e instanceof ApiError) {
+    return `give up: ${e.name} ${e.status} ${e.message}`;
+  }
+  throw e;
+}
+
+console.log(handle(new RateLimitError()));
+console.log(handle(new ApiError("bad key", 401)));
+const err = new RateLimitError();
+console.log(err instanceof RateLimitError, err instanceof ApiError, err instanceof Error);
+try {
+  handle(new TypeError("x is undefined"));
+} catch (e) {
+  console.log("re-thrown:", e instanceof TypeError);
+}
+
+@@ concept
+title: Result：失败也是一种返回值
+--- body
+throw 适合**意外**：程序 bug、缺配置、没法继续的情况。但有些失败是**预料之中**的：模型偶尔返回坏 JSON，200 条条款里有 3 条解析失败。这时更好的做法是把失败当成普通的返回值：
+
+```ts
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+```
+
+它就是昨天学的可辨识联合：`if (r.ok)` 之后才能读 `r.value`。好处：函数签名直接告诉调用方「这里会失败」，调用方**忘不了**处理；批量处理时一条失败不会中断整批。
+
+Zod 的 `safeParse` 返回 `{ success: true, data } | { success: false, error }`，是同一个设计。Clause Check 的 `review.py` 接住 SDK 抛出的错误，变成 `Step(stop="error", error=...)` 返回，也是这个思路。
+--- code
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseScore(raw: string): Result<number> {
+  const n = Number(raw);
+  if (raw.trim() === "" || Number.isNaN(n)) {
+    return { ok: false, error: `not a number: ${JSON.stringify(raw)}` };
+  }
+  return { ok: true, value: n };
+}
+
+for (const raw of ["0.8", "high", ""]) {
+  const r = parseScore(raw);
+  if (r.ok) {
+    console.log("score", r.value * 100);
+  } else {
+    console.log("skip:", r.error);
+  }
+}
+
+@@ concept
+title: 依赖注入：把外部世界传进来
+--- body
+类里直接调用 `fetch`、`Date.now()`，测试时就只能真的联网、真的等时间。**依赖注入**：把这些依赖作为构造函数参数传进来，给一个真实的默认值；测试时传一个假的：
+
+```ts
+new DeepSeekClient(key);                  // 生产：用真的 fetch
+new DeepSeekClient("sk-test", fakeFetch); // 测试：不联网，结果固定
+```
+
+这也是「组合优于继承」：客户端**拥有**一个 fetch 函数，而不是**继承**某个 HTTP 基类，换掉它不影响别的代码。第 13 天给 `measure` 传假时钟 `clock=fake_clock(...)`，就是同一个想法。Clause Check 的 `review.py` 里，审查循环 `model_review(backend, ...)` 只调用 `backend.step(...)` 等几个方法，传进来的是 Anthropic 后端还是 DeepSeek 后端都可以。
+--- code
+type Clock = () => number;
+
+class Stopwatch {
+  #start: number;
+  constructor(private readonly now: Clock = () => Date.now()) {
+    this.#start = now();
+  }
+  elapsedMs(): number {
+    return this.now() - this.#start;
+  }
+}
+
+// 测试用的假时钟：每调用一次前进 250 毫秒
+let fakeTime = 1000;
+const fakeClock: Clock = () => {
+  fakeTime += 250;
+  return fakeTime;
+};
+const sw = new Stopwatch(fakeClock);
+console.log(sw.elapsedMs(), sw.elapsedMs());
+
+const real = new Stopwatch();
+console.log(real.elapsedMs() >= 0);
+
+@@ concept
+title: 模块：一个文件一件事
+--- body
+真实项目按职责拆文件，每个文件只做一件事：
+
+- `types.ts`：类型和错误类（`Verdict`、`Result`、`ApiError`）
+- `client.ts`：`DeepSeekClient`，只管 HTTP
+- `review.ts`：审查逻辑，只依赖 types 和「客户端接口」
+- `main.ts`：把它们组装起来
+
+写法：`export class DeepSeekClient { ... }`，另一个文件 `import { DeepSeekClient } from "./client";`；只导入类型写 `import type { Verdict } from "./types";`。`class X implements ModelClient` 让编译器检查这个类确实有接口要求的方法。
+
+规则：依赖只朝一个方向（main → review → client → types），**不要互相 import**。循环依赖会出现「用到时还是 undefined」这种怪 bug。本页每题只有一个文件，今天的本机任务会真的拆一次。
+--- code
+// ---- types.ts ----
+type Verdict = "accept" | "flag" | "redline";
+interface ClauseReview {
+  id: string;
+  verdict: Verdict;
+}
+
+// ---- client.ts ----（只管「怎么问模型」）
+interface ModelClient {
+  judge(text: string): Verdict;
+}
+class KeywordClient implements ModelClient {
+  judge(text: string): Verdict {
+    return text.includes("unlimited") ? "redline" : "accept";
+  }
+}
+
+// ---- review.ts ----（只依赖 ModelClient 接口，不关心具体是哪个类）
+function reviewAll(client: ModelClient, clauses: { id: string; text: string }[]): ClauseReview[] {
+  return clauses.map((c) => ({ id: c.id, verdict: client.judge(c.text) }));
+}
+
+// ---- main.ts ----（组装）
+const reviews = reviewAll(new KeywordClient(), [
+  { id: "3.1", text: "Fees are due in 30 days." },
+  { id: "8.1", text: "Liability is unlimited." },
+]);
+console.log(reviews.map((r) => `${r.id}: ${r.verdict}`).join(", "));
+
+@@ concept
+title: Map 和 Set
+--- body
+第 5 天用 `Record<string, T>` 当字典。`Map` 是专门的「键 → 值」容器，这些时候更合适：
+
+- 键会经常增删，需要 `.size`
+- 键不是字符串（数字、对象）
+- 键来自外部数据：普通对象上 `"constructor"` 这类键会撞上内置属性，Map 不会
+
+```ts
+const byId = new Map<string, Rule>();
+byId.set("PB-01", rule);
+byId.get("PB-01"); // Rule | undefined：注意可能没有
+byId.has("PB-02");
+for (const [id, rule] of byId) { ... }
+const seen = new Map([["8.1", "redline"]]); // 也可以用 [键, 值] 对的数组一次建好
+```
+
+`Set` 是「不重复的集合」：`new Set(ids)` 去重，`.has(x)` 查得很快，`.add(x)` 添加，`[...set]` 转回数组。Map 和 Set 都按**插入顺序**遍历。
+--- code
+interface Rule {
+  id: string;
+  topic: string;
+}
+const rules: Rule[] = [
+  { id: "PB-01", topic: "liability_cap" },
+  { id: "PB-02", topic: "auto_renewal" },
+  { id: "PB-07", topic: "liability_cap" },
+];
+const byId = new Map<string, Rule>();
+for (const r of rules) {
+  byId.set(r.id, r);
+}
+console.log(byId.size, byId.has("PB-02"), byId.get("PB-99"));
+console.log(byId.get("PB-07")?.topic);
+
+const topics = new Set(rules.map((r) => r.topic));
+console.log(topics.size, [...topics]);
+
+const verdicts = new Map([["8.1", "redline"], ["3.1", "accept"]]);
+console.log(verdicts.get("8.1"), [...verdicts.keys()]);
+
+const plain: Record<string, number> = {};
+console.log("constructor" in plain, new Map<string, number>().has("constructor"));
+
+@@ item d16-01
+type: code
+title: 复习：可辨识联合
+level: 2
+--- prompt
+复习第 15 天。`Step` 是模型一次回复的三种可能（和 `review.py` 里的 `Step.stop` 一样）。写 `finalText(steps)`，按顺序看每一步：
+
+- 遇到 `error`：立刻返回 `"failed: " + error`
+- 遇到 `end`：记下它的 `text`（后面的 end 覆盖前面的）
+- 看完了：返回最后记下的 text；一个 end 都没有时返回 `"(no answer)"`
+
+例：`[{ stop: "tool_use", tool: "lookup_playbook" }, { stop: "end", text: "flag" }]` → `"flag"`。
+--- starter
+type Step =
+  | { stop: "end"; text: string }
+  | { stop: "tool_use"; tool: string }
+  | { stop: "error"; error: string };
+
+function finalText(steps: Step[]): string {
+  return "(no answer)";
+}
+--- solution
+type Step =
+  | { stop: "end"; text: string }
+  | { stop: "tool_use"; tool: string }
+  | { stop: "error"; error: string };
+
+function finalText(steps: Step[]): string {
+  let answer = "(no answer)";
+  for (const s of steps) {
+    if (s.stop === "error") {
+      return `failed: ${s.error}`;
+    }
+    if (s.stop === "end") {
+      answer = s.text;
+    }
+  }
+  return answer;
+}
+--- tests
+expect("工具后回答", () => finalText([{ stop: "tool_use", tool: "lookup_playbook" }, { stop: "end", text: "flag" }]), "flag");
+expect("中途出错", () => finalText([{ stop: "tool_use", tool: "get_clause" }, { stop: "error", error: "http 429" }, { stop: "end", text: "accept" }]), "failed: http 429");
+expect("后面的 end 覆盖前面的", () => finalText([{ stop: "end", text: "a" }, { stop: "end", text: "b" }]), "b");
+expect("空", () => finalText([]), "(no answer)");
+--- hints
+- 用 `if (s.stop === "error")` 收窄之后，才能读 `s.error`。
+- 用一个变量 `let answer = "(no answer)";` 记住最后一个 end 的 text，循环结束后返回它。
+
+@@ item d16-02
+type: code
+title: Counter 类
+level: 1
+--- prompt
+写 `class Counter`：
+
+- `add(key)`：这个键的次数加 1
+- `get(key)`：返回次数，没见过的键返回 0
+- `top(n)`：返回次数最多的 n 个键；次数相同时，先出现的排前面
+
+例：依次 add `flag, accept, flag, redline, flag, accept` 后，`top(2)` → `["flag", "accept"]`。
+--- starter
+class Counter {
+  counts: Record<string, number> = {};
+
+  add(key: string): void {}
+
+  get(key: string): number {
+    return 0;
+  }
+
+  top(n: number): string[] {
+    return [];
+  }
+}
+--- solution
+class Counter {
+  counts: Record<string, number> = {};
+
+  add(key: string): void {
+    this.counts[key] = (this.counts[key] ?? 0) + 1;
+  }
+
+  get(key: string): number {
+    return this.counts[key] ?? 0;
+  }
+
+  top(n: number): string[] {
+    return Object.keys(this.counts)
+      .sort((a, b) => this.counts[b] - this.counts[a])
+      .slice(0, n);
+  }
+}
+--- tests
+const c = new Counter();
+for (const v of ["flag", "accept", "flag", "redline", "flag", "accept"]) {
+  c.add(v);
+}
+expect("get", () => c.get("flag"), 3);
+expect("没见过的键", () => c.get("maybe"), 0);
+expect("top 2", () => c.top(2), ["flag", "accept"]);
+expect("n 比键多", () => c.top(10), ["flag", "accept", "redline"]);
+expect("每个对象各自计数", () => { const a = new Counter(); a.add("x"); return new Counter().get("x"); }, 0);
+--- hints
+- 方法里读写字段都要写 `this.counts`。
+- `top`：`Object.keys(this.counts)` 按次数从大到小排序（sort 是稳定的，同次数保持先出现的顺序），再 `slice(0, n)`。
+
+@@ item d16-03
+type: translate
+title: 翻译：Playbook 类
+level: 2
+--- prompt
+把 `clausecheck/playbook.py` 里的 `Playbook`（去掉了 `load`）翻译成 TypeScript。对应关系：
+
+- `__init__` → `constructor`
+- `self._by_topic`（下划线表示「内部用」）→ 私有字段 `#byTopic`，类型 `Record<string, Rule[]>`
+- `@property def topics` → getter `get topics()`
+- 方法名改成 camelCase：`for_topic` → `forTopic`；`None` → `undefined`
+- `next((r for r in ...), None)` 就是「找第一个，找不到返回 None」，对应 `find`
+
+`forTopic` 要返回**副本**（Python 里的 `list(...)`），调用方改它不影响 Playbook。
+--- source
+class Playbook:
+    def __init__(self, rules: list[Rule]):
+        self.rules = rules
+        self._by_topic: dict[str, list[Rule]] = {}
+        for r in rules:
+            self._by_topic.setdefault(r.topic, []).append(r)
+
+    @property
+    def topics(self) -> list[str]:
+        return sorted(self._by_topic)
+
+    def for_topic(self, topic: str) -> list[Rule]:
+        return list(self._by_topic.get(topic, []))
+
+    def get(self, rule_id: str) -> Rule | None:
+        return next((r for r in self.rules if r.id == rule_id), None)
+--- starter
+interface Rule {
+  id: string;
+  topic: string;
+  severity: "low" | "medium" | "high";
+}
+
+class Playbook {
+  constructor(rules: Rule[]) {}
+}
+--- solution
+interface Rule {
+  id: string;
+  topic: string;
+  severity: "low" | "medium" | "high";
+}
+
+class Playbook {
+  readonly rules: Rule[];
+  #byTopic: Record<string, Rule[]> = {};
+
+  constructor(rules: Rule[]) {
+    this.rules = rules;
+    for (const r of rules) {
+      if (this.#byTopic[r.topic] === undefined) {
+        this.#byTopic[r.topic] = [];
+      }
+      this.#byTopic[r.topic].push(r);
+    }
+  }
+
+  get topics(): string[] {
+    return Object.keys(this.#byTopic).sort();
+  }
+
+  forTopic(topic: string): Rule[] {
+    return [...(this.#byTopic[topic] ?? [])];
+  }
+
+  get(ruleId: string): Rule | undefined {
+    return this.rules.find((r) => r.id === ruleId);
+  }
+}
+--- tests
+const RULES: Rule[] = [
+  { id: "PB-01", topic: "liability_cap", severity: "high" },
+  { id: "PB-02", topic: "auto_renewal", severity: "medium" },
+  { id: "PB-07", topic: "liability_cap", severity: "medium" },
+];
+const pb = new Playbook(RULES);
+expect("topics 排好序", () => pb.topics, ["auto_renewal", "liability_cap"]);
+expect("forTopic", () => pb.forTopic("liability_cap").map((r) => r.id), ["PB-01", "PB-07"]);
+expect("没有的主题", () => pb.forTopic("payment"), []);
+expect("get", () => [pb.get("PB-02")?.severity, pb.get("PB-99")], ["medium", undefined]);
+expect("返回的是副本", () => { pb.forTopic("liability_cap").push(RULES[1]); return pb.forTopic("liability_cap").length; }, 2);
+--- hints
+- `setdefault(k, []).append(r)`：先判断 `this.#byTopic[r.topic] === undefined` 就放一个空数组，再 `push`。
+- `sorted(dict)` 排的是键：`Object.keys(this.#byTopic).sort()`。副本可以写 `[...(this.#byTopic[topic] ?? [])]`。
+
+@@ item d16-04
+type: predict
+title: getter 与私有字段
+level: 2
+--- prompt
+写出输出。注意 `#` 字段和 `private` 字段在运行时的区别。
+--- code
+class Budget {
+  static created = 0;
+  #used = 0;
+
+  constructor(readonly limit: number) {
+    Budget.created += 1;
+  }
+  get remaining(): number {
+    return this.limit - this.#used;
+  }
+  spend(n: number): void {
+    this.#used += n;
+  }
+}
+
+class Client {
+  private apiKey = "sk-123";
+  model = "deepseek-chat";
+}
+
+const a = new Budget(100);
+const b = new Budget(50);
+a.spend(30);
+a.spend(30);
+console.log(a.remaining, b.remaining, Budget.created);
+console.log(JSON.stringify(a));
+console.log(JSON.stringify(new Client()));
+--- explain
+`static created` 属于类本身，两个对象共用一个计数。`#used` 在运行时是真的藏起来了，JSON 里没有；`private apiKey` 只是编译时不让你在类外面写 `client.apiKey`，运行时它就是普通字段。把这样的客户端对象打进日志，密钥就泄露了，所以密钥这类字段用 `#`。
+
+@@ item d16-05
+type: code
+title: TokenBudget
+level: 2
+--- prompt
+写 `class TokenBudget`（错误类 `BudgetExceededError` 已经写好，后面「自定义错误」那张卡片会细讲）：
+
+- 构造函数接收 `limit`
+- 已用量存在私有字段 `#used` 里；外面只能通过 getter `used` 和 `remaining` 读
+- `spend(n)`：`n` 超过剩余额度时 throw `new BudgetExceededError(...)`，并且**不扣**；否则把 n 加到已用量上
+- `n` 是负数时 throw 普通的 `Error`（不允许「退钱」）
+
+例：`new TokenBudget(1000)` 连续 `spend(600)` 两次，第二次抛出 BudgetExceededError，`remaining` 还是 400。
+--- starter
+class BudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BudgetExceededError";
+  }
+}
+
+class TokenBudget {
+  constructor(readonly limit: number) {}
+
+  get used(): number {
+    return 0;
+  }
+
+  get remaining(): number {
+    return this.limit;
+  }
+
+  spend(n: number): void {}
+}
+--- solution
+class BudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BudgetExceededError";
+  }
+}
+
+class TokenBudget {
+  #used = 0;
+
+  constructor(readonly limit: number) {}
+
+  get used(): number {
+    return this.#used;
+  }
+
+  get remaining(): number {
+    return this.limit - this.#used;
+  }
+
+  spend(n: number): void {
+    if (n < 0) {
+      throw new Error(`cannot spend a negative amount: ${n}`);
+    }
+    if (n > this.remaining) {
+      throw new BudgetExceededError(`need ${n} tokens, only ${this.remaining} left`);
+    }
+    this.#used += n;
+  }
+}
+--- tests
+expect("正常扣", () => { const b = new TokenBudget(1000); b.spend(600); return [b.used, b.remaining]; }, [600, 400]);
+expect("刚好用完", () => { const b = new TokenBudget(100); b.spend(100); return b.remaining; }, 0);
+expect("超了抛 BudgetExceededError", () => {
+  const b = new TokenBudget(1000);
+  b.spend(600);
+  try { b.spend(600); return "没有报错"; } catch (e) { return e instanceof BudgetExceededError; }
+}, true);
+expect("超了不扣", () => { const b = new TokenBudget(1000); b.spend(600); try { b.spend(600); } catch {} return b.remaining; }, 400);
+expectThrows("负数", () => new TokenBudget(10).spend(-5));
+expect("内部字段不外露", () => JSON.stringify(new TokenBudget(5)), '{"limit":5}');
+--- hints
+- 字段写 `#used = 0;`，getter 里 `return this.#used;`。
+- `spend` 里先检查（负数、超额），检查都通过了才 `this.#used += n`。这样出错时状态不会被改坏。
+
+@@ item d16-06
+type: fix
+title: 丢掉的 this
+level: 2
+--- prompt
+运行测试：`addAll` 报了一个 TypeError，而类型检查一声不吭。读报错，想想 `this` 为什么是 undefined，然后修好 `addAll`（只需要改一行）。
+--- starter
+class Counter {
+  counts: Record<string, number> = {};
+
+  add(key: string): void {
+    this.counts[key] = (this.counts[key] ?? 0) + 1;
+  }
+
+  addAll(keys: string[]): void {
+    keys.forEach(this.add);
+  }
+}
+--- solution
+class Counter {
+  counts: Record<string, number> = {};
+
+  add(key: string): void {
+    this.counts[key] = (this.counts[key] ?? 0) + 1;
+  }
+
+  addAll(keys: string[]): void {
+    keys.forEach((k) => this.add(k));
+  }
+}
+--- tests
+expect("addAll", () => { const c = new Counter(); c.addAll(["flag", "accept", "flag"]); return c.counts; }, { flag: 2, accept: 1 });
+expect("addAll 之后还能 add", () => { const c = new Counter(); c.addAll(["x"]); c.add("x"); return c.counts.x; }, 2);
+--- hints
+- `keys.forEach(this.add)` 把方法「拿出来」单独交给 forEach。forEach 调用它时前面没有 `对象.`，方法里的 `this` 就丢了。
+- 箭头函数没有自己的 this，用的是外面的 this：`keys.forEach((k) => this.add(k));`
+
+@@ item d16-07
+type: code
+title: static fromJSON
+level: 3
+--- prompt
+给 `Playbook` 写工厂方法 `static fromJSON(raw: unknown): Playbook`（`PlaybookError` 已经写好）：
+
+- `raw` 必须是对象，并且有 `rules` 数组，否则 throw `PlaybookError("missing rules array")`
+- 每条规则必须有字符串 `id` 和字符串 `topic`，否则 throw `PlaybookError("bad rule at index 2")`（下标从 0 开始）
+- id 不能重复，否则 throw `PlaybookError("duplicate rule id PB-01")`
+- 都合格就 `return new Playbook(rules)`
+
+再写实例方法 `rulesFor(topic)`：返回这个主题的规则 id，保持原顺序。
+--- starter
+class PlaybookError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlaybookError";
+  }
+}
+
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+class Playbook {
+  constructor(readonly rules: Rule[]) {}
+
+  static fromJSON(raw: unknown): Playbook {
+    return new Playbook([]);
+  }
+
+  rulesFor(topic: string): string[] {
+    return [];
+  }
+}
+--- solution
+class PlaybookError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlaybookError";
+  }
+}
+
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+function isRule(x: unknown): x is Rule {
+  return typeof x === "object" && x !== null && "id" in x && typeof x.id === "string" && "topic" in x && typeof x.topic === "string";
+}
+
+class Playbook {
+  constructor(readonly rules: Rule[]) {}
+
+  static fromJSON(raw: unknown): Playbook {
+    if (typeof raw !== "object" || raw === null || !("rules" in raw) || !Array.isArray(raw.rules)) {
+      throw new PlaybookError("missing rules array");
+    }
+    const items: unknown[] = raw.rules;
+    const rules: Rule[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!isRule(item)) {
+        throw new PlaybookError(`bad rule at index ${i}`);
+      }
+      if (rules.some((r) => r.id === item.id)) {
+        throw new PlaybookError(`duplicate rule id ${item.id}`);
+      }
+      rules.push(item);
+    }
+    return new Playbook(rules);
+  }
+
+  rulesFor(topic: string): string[] {
+    return this.rules.filter((r) => r.topic === topic).map((r) => r.id);
+  }
+}
+--- tests
+const GOOD = { rules: [{ id: "PB-01", topic: "liability_cap" }, { id: "PB-02", topic: "auto_renewal" }, { id: "PB-07", topic: "liability_cap" }] };
+const errorOf = (raw: unknown): string => {
+  try {
+    Playbook.fromJSON(raw);
+    return "没有报错";
+  } catch (e) {
+    return e instanceof PlaybookError ? e.message : `不是 PlaybookError：${String(e)}`;
+  }
+};
+expect("合格", () => Playbook.fromJSON(GOOD).rulesFor("liability_cap"), ["PB-01", "PB-07"]);
+expect("没有的主题", () => Playbook.fromJSON(GOOD).rulesFor("payment"), []);
+expect("缺 rules 或不是对象", () => [errorOf({ items: [] }), errorOf(null)], ["missing rules array", "missing rules array"]);
+expect("坏规则的下标", () => errorOf({ rules: [{ id: "PB-01", topic: "x" }, { id: "PB-02", topic: "y" }, { id: 3, topic: "z" }] }), "bad rule at index 2");
+expect("重复 id", () => errorOf({ rules: [{ id: "PB-01", topic: "x" }, { id: "PB-01", topic: "y" }] }), "duplicate rule id PB-01");
+--- hints
+- 第一步和知识卡片一样：`typeof raw !== "object" || raw === null || !("rules" in raw) || !Array.isArray(raw.rules)` 就 throw。
+- 每条规则的检查写成第 15 天那样的类型守卫 `isRule(x: unknown): x is Rule`，用下标循环 `for (let i = 0; ...)` 才能在报错里写出下标。
+- 重复：`rules.some((r) => r.id === item.id)`。
+
+@@ item d16-08
+type: code
+title: 错误类层级
+level: 2
+--- prompt
+为 DeepSeek 接口的失败设计错误类（每个都要设置 `name`）。`ApiError` 已经写好，你来写：
+
+- `AuthError extends ApiError`：用于 401 / 403
+- `RateLimitError extends ApiError`：用于 429
+
+然后改写 `errorFor(status, message)`：**返回**（不是 throw）对应子类的实例，其它状态码返回普通的 `ApiError`。例：`errorFor(429, "slow down")` 是一个 `RateLimitError`，`.status` 为 429，`.name` 为 `"RateLimitError"`。
+--- starter
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+// 在这里写 AuthError 和 RateLimitError
+
+function errorFor(status: number, message: string): ApiError {
+  return new ApiError(message, status);
+}
+--- solution
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+class AuthError extends ApiError {
+  constructor(message: string, status: number) {
+    super(message, status);
+    this.name = "AuthError";
+  }
+}
+
+class RateLimitError extends ApiError {
+  constructor(message: string) {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+
+function errorFor(status: number, message: string): ApiError {
+  if (status === 401 || status === 403) {
+    return new AuthError(message, status);
+  }
+  if (status === 429) {
+    return new RateLimitError(message);
+  }
+  return new ApiError(message, status);
+}
+--- tests
+expect("429 → RateLimitError", () => { const e = errorFor(429, "slow down"); return [e instanceof RateLimitError, e instanceof ApiError, e.name, e.status, e.message]; }, [true, true, "RateLimitError", 429, "slow down"]);
+expect("401 → AuthError", () => { const e = errorFor(401, "bad key"); return [e instanceof AuthError, e.name, e.status]; }, [true, "AuthError", 401]);
+expect("403 也是 AuthError", () => errorFor(403, "forbidden") instanceof AuthError, true);
+expect("500 → 普通 ApiError", () => { const e = errorFor(500, "boom"); return [e instanceof RateLimitError, e instanceof AuthError, e.name]; }, [false, false, "ApiError"]);
+--- hints
+- 子类的构造函数里第一件事是 `super(message, 状态码)`，然后 `this.name = "RateLimitError";`。
+- `errorFor` 里用 if 判断状态码，`return new RateLimitError(message);` 这样返回实例。
+
+@@ item d16-09
+type: fix
+title: 忘了 super
+level: 2
+--- prompt
+运行一下，类型检查报了两个错。读懂它们，修好 `RateLimitError`：它的 message 是 `"rate limited, retry after 5 s"` 这样（5 是 `retryAfterSeconds`），status 固定是 429。
+--- starter
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+class RateLimitError extends ApiError {
+  constructor(readonly retryAfterSeconds: number) {
+    this.name = "RateLimitError";
+  }
+}
+--- solution
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+class RateLimitError extends ApiError {
+  constructor(readonly retryAfterSeconds: number) {
+    super(`rate limited, retry after ${retryAfterSeconds} s`, 429);
+    this.name = "RateLimitError";
+  }
+}
+--- tests
+expect("字段", () => { const e = new RateLimitError(5); return [e.message, e.status, e.retryAfterSeconds, e.name]; }, ["rate limited, retry after 5 s", 429, 5, "RateLimitError"]);
+expect("还是 ApiError", () => new RateLimitError(30) instanceof ApiError, true);
+--- hints
+- 子类的构造函数必须先调用 `super(...)`，把父类需要的参数（message 和 status）交给它；在那之前不能用 `this`。
+- `super(\`rate limited, retry after ${retryAfterSeconds} s\`, 429);`，写在 `this.name = ...` 的前面。
+
+@@ item d16-10
+type: predict
+title: instanceof 的顺序
+level: 2
+--- prompt
+写出输出。注意 `label` 里几个 if 的顺序。
+--- code
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+class RateLimitError extends ApiError {
+  constructor() {
+    super("slow down", 429);
+    this.name = "RateLimitError";
+  }
+}
+
+function label(e: unknown): string {
+  if (e instanceof ApiError) {
+    return `api ${e.status}`;
+  }
+  if (e instanceof RateLimitError) {
+    return "rate limit";
+  }
+  if (e instanceof Error) {
+    return `error ${e.name}`;
+  }
+  return `other ${String(e)}`;
+}
+
+const err = new RateLimitError();
+console.log(err instanceof RateLimitError, err instanceof ApiError, err instanceof Error);
+console.log(err.name, err.message);
+console.log(label(err));
+console.log(label(new TypeError("x")), label("oops"));
+--- explain
+RateLimitError 也是 ApiError（也是 Error），所以第一个 if 就命中了，`"rate limit"` 那一行永远走不到。写 catch 的判断时，**子类在前、父类在后**，最后才是 `Error` 和其它情况。
+
+@@ item d16-11
+type: code
+title: 只重试限流
+level: 3
+--- prompt
+写 `withRetry(fn, tries)`：调用 async 函数 `fn`，成功就返回结果。
+
+- 抛出的是 `RateLimitError`：重试，**一共**最多调用 `tries` 次；全部失败时抛出**最后一次**的错误
+- 其它错误（比如 `AuthError`）：**立刻**抛出，不重试
+
+错误类和泛型签名已经写好。（真实代码在两次重试之间要等一会儿，这里省略。）
+--- starter
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+class RateLimitError extends ApiError {
+  constructor(message = "rate limited") {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+class AuthError extends ApiError {
+  constructor(message = "bad key") {
+    super(message, 401);
+    this.name = "AuthError";
+  }
+}
+
+async function withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T> {
+  return fn();
+}
+--- solution
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+class RateLimitError extends ApiError {
+  constructor(message = "rate limited") {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+class AuthError extends ApiError {
+  constructor(message = "bad key") {
+    super(message, 401);
+    this.name = "AuthError";
+  }
+}
+
+async function withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T> {
+  let lastError: unknown = new Error("tries must be at least 1");
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (!(e instanceof RateLimitError)) {
+        throw e;
+      }
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+--- tests
+function flaky(failures: Error[], value: string) {
+  let calls = 0;
+  const fn = async (): Promise<string> => {
+    calls += 1;
+    const e = failures.shift();
+    if (e) {
+      throw e;
+    }
+    return value;
+  };
+  return { fn, calls: () => calls };
+}
+expectAsync("两次限流后成功", async () => {
+  const f = flaky([new RateLimitError(), new RateLimitError()], "ok");
+  const r = await withRetry(f.fn, 3);
+  return [r, f.calls()];
+}, ["ok", 3]);
+expectAsync("次数用完：抛出最后一次的错误", async () => {
+  const f = flaky([new RateLimitError("1"), new RateLimitError("2"), new RateLimitError("3")], "ok");
+  try { await withRetry(f.fn, 3); return "没有报错"; } catch (e) { return [e instanceof RateLimitError ? e.message : String(e), f.calls()]; }
+}, ["3", 3]);
+expectAsync("AuthError 不重试", async () => {
+  const f = flaky([new AuthError()], "ok");
+  try { await withRetry(f.fn, 3); return "没有报错"; } catch (e) { return [e instanceof AuthError, f.calls()]; }
+}, [true, 1]);
+expectAsync("第一次就成功", async () => {
+  const f = flaky([], "ok");
+  return [await withRetry(f.fn, 3), f.calls()];
+}, ["ok", 1]);
+--- hints
+- 循环 `tries` 次，每次在 try 里调用 fn；catch 里用 `e instanceof RateLimitError` 判断要不要继续。
+- 一定写 `return await fn();`。只写 `return fn();` 的话，Promise 的失败发生在 try 外面，catch 接不到。
+- 用一个变量 `lastError` 记住最后一次的错误，循环结束后 `throw lastError;`。
+
+@@ item d16-12
+type: choice
+title: throw 还是 Result
+level: 2
+--- prompt
+下面哪种情况最适合返回 `Result`（`{ ok: false, error }`），而不是 throw？
+--- options
+- 程序启动时发现没有设置 `DEEPSEEK_API_KEY`
+- 批量审查 200 条条款，模型对其中几条返回了不合格的 JSON
+- 代码里把 `undefined` 当成数组用了（程序 bug）
+- `playbook.json` 文件不存在，程序没法开始
+answer: 2
+--- explain
+预料之中、而且还要继续处理其它数据的失败，用 Result：一条坏 JSON 不该让 200 条全部失败，调用方拿到 Result 后可以记下来、重试或者交给人看。缺配置、缺文件、程序 bug 都是「没法继续」的情况，直接 throw，让它尽早、大声地失败。面试时能说清这个区分，是「会设计错误」的信号。
+
+@@ item d16-13
+type: code
+title: safeParseVerdict
+level: 2
+--- prompt
+写 `safeParseVerdict(raw): Result<Verdict>`，任何情况都不 throw：
+
+- JSON 坏了 → `{ ok: false, error: "bad json" }`
+- 字段不合格 → `{ ok: false, error: "bad field: verdict" }`，冒号后面是 Zod 第一个 issue 的 `path` 用 `"."` 连起来
+- 合格 → `{ ok: true, value: 解析后的对象 }`
+
+schema 已经写好，用它的 `safeParse`。
+--- starter
+import { z } from "zod";
+
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  risk_level: z.enum(["low", "medium", "high"]),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function safeParseVerdict(raw: string): Result<Verdict> {
+  return { ok: false, error: "not implemented" };
+}
+--- solution
+import { z } from "zod";
+
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+const VerdictSchema = z.object({
+  clause_id: z.string(),
+  verdict: z.enum(["accept", "flag", "redline"]),
+  risk_level: z.enum(["low", "medium", "high"]),
+});
+type Verdict = z.infer<typeof VerdictSchema>;
+
+function safeParseVerdict(raw: string): Result<Verdict> {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { ok: false, error: "bad json" };
+  }
+  const parsed = VerdictSchema.safeParse(data);
+  if (!parsed.success) {
+    return { ok: false, error: `bad field: ${parsed.error.issues[0].path.join(".")}` };
+  }
+  return { ok: true, value: parsed.data };
+}
+--- tests
+expect("合格", () => safeParseVerdict('{"clause_id": "8.1", "verdict": "flag", "risk_level": "high"}'), { ok: true, value: { clause_id: "8.1", verdict: "flag", risk_level: "high" } });
+expect("坏 JSON", () => safeParseVerdict("Sure! {"), { ok: false, error: "bad json" });
+expect("判定不合格", () => safeParseVerdict('{"clause_id": "8.1", "verdict": "maybe", "risk_level": "high"}'), { ok: false, error: "bad field: verdict" });
+expect("缺字段", () => safeParseVerdict('{"clause_id": "8.1", "verdict": "flag"}'), { ok: false, error: "bad field: risk_level" });
+expect("用 ok 收窄后读 value", () => { const r = safeParseVerdict('{"clause_id": "3.1", "verdict": "accept", "risk_level": "low"}'); return r.ok ? r.value.clause_id : r.error; }, "3.1");
+--- hints
+- 和第 6 天的 `parseVerdict` 结构一样，只是返回值换成了 Result。
+- `parsed.error.issues[0].path` 是一个数组，比如 `["verdict"]`，用 `.join(".")` 变成文字。
+
+@@ item d16-14
+type: order
+title: 排代码：分拣 Result
+level: 2
+--- prompt
+排出 `collectResults`：把一组 Result 分成成功的值和错误信息两堆，各自保持原顺序。有两行干扰项，想想它们为什么过不了类型检查。
+--- lines
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+function collectResults<T>(results: Result<T>[]): { values: T[]; errors: string[] } {
+  const values: T[] = [];
+  const errors: string[] = [];
+  for (const r of results) {
+    if (r.ok) {
+      values.push(r.value);
+    } else {
+      errors.push(r.error);
+    }
+  }
+  return { values, errors };
+}
+--- distractors
+    if (r.value) {
+      values.push(r.error);
+--- tests
+const RESULTS: Result<number>[] = [{ ok: true, value: 0.8 }, { ok: false, error: "bad json" }, { ok: true, value: 0.4 }, { ok: false, error: "bad field: verdict" }];
+expect("分成两堆", () => collectResults(RESULTS), { values: [0.8, 0.4], errors: ["bad json", "bad field: verdict"] });
+expect("空", () => collectResults([]), { values: [], errors: [] });
+--- hints
+- 只有先用 `r.ok` 收窄，才能读 `r.value` 或 `r.error`：失败的那一种根本没有 `value` 字段。
+- 成功的值进 `values`，错误信息进 `errors`。
+
+@@ item d16-15
+type: code
+title: 注入 fetch 的客户端
+level: 3
+--- prompt
+写 `DeepSeekClient` 的 `review(clauseText)` 方法，返回 `Promise<Result<string>>`：
+
+- POST 到 `API_URL`：请求头 `Authorization: Bearer <apiKey>`，模型 `deepseek-chat`，一条 user 消息，`response_format: { type: "json_object" }`
+- 状态码不是 200 → `{ ok: false, error: "http 429" }` 这样
+- 成功 → 把回答内容 `JSON.parse`，返回 `{ ok: true, value: 它的 verdict 字段 }`
+
+构造函数已经写好：`fetchFn` 默认是全局的 `fetch`。测试会传进一个**假的** fetchFn，所以你必须调用 `this.fetchFn(...)`，不能直接调用 `fetch`。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+type FetchFn = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body: string },
+) => Promise<{ status: number; json(): Promise<any> }>;
+
+class DeepSeekClient {
+  constructor(private readonly apiKey: string, private readonly fetchFn: FetchFn = fetch) {}
+
+  async review(clauseText: string): Promise<Result<string>> {
+    return { ok: false, error: "not implemented" };
+  }
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+type FetchFn = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body: string },
+) => Promise<{ status: number; json(): Promise<any> }>;
+
+class DeepSeekClient {
+  constructor(private readonly apiKey: string, private readonly fetchFn: FetchFn = fetch) {}
+
+  async review(clauseText: string): Promise<Result<string>> {
+    const res = await this.fetchFn(API_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [{ role: "user", content: clauseText }],
+        response_format: { type: "json_object" },
+      }),
+    });
+    if (res.status !== 200) {
+      return { ok: false, error: `http ${res.status}` };
+    }
+    const data = await res.json();
+    return { ok: true, value: JSON.parse(data.choices[0].message.content).verdict };
+  }
+}
+--- tests
+function fakeFetch(status: number, content: string) {
+  const seen: { url: string; body: any; auth: string }[] = [];
+  const fn: FetchFn = async (url, init) => {
+    seen.push({ url, body: JSON.parse(init.body), auth: init.headers.Authorization });
+    return { status, json: async () => ({ choices: [{ message: { content } }] }) };
+  };
+  return { fn, seen };
+}
+expectAsync("假 fetch：成功", async () => {
+  const f = fakeFetch(200, '{"verdict": "flag"}');
+  return new DeepSeekClient("sk-test", f.fn).review("Review clause 3.2: late fees");
+}, { ok: true, value: "flag" });
+expectAsync("假 fetch：请求内容", async () => {
+  const f = fakeFetch(200, '{"verdict": "accept"}');
+  await new DeepSeekClient("sk-test", f.fn).review("hello");
+  const s = f.seen[0];
+  return [s.url, s.auth, s.body.model, s.body.messages[0].content, s.body.response_format.type];
+}, ["https://api.deepseek.com/v1/chat/completions", "Bearer sk-test", "deepseek-chat", "hello", "json_object"]);
+expectAsync("假 fetch：429", async () => {
+  const f = fakeFetch(429, "");
+  return new DeepSeekClient("sk-test", f.fn).review("x");
+}, { ok: false, error: "http 429" });
+expectAsync("不传 fetchFn：用全局 fetch（本页是模拟服务器）", async () => {
+  const client = new DeepSeekClient(process.env.DEEPSEEK_API_KEY ?? "");
+  return client.review("Review clause 8.1: liability is unlimited");
+}, { ok: true, value: "redline" });
+--- hints
+- 请求的写法和第 6 天一样，只是把 `fetch(...)` 换成 `this.fetchFn(...)`，密钥用 `this.apiKey`。
+- 先判断 `res.status !== 200` 就返回失败的 Result；成功时 `JSON.parse(data.choices[0].message.content).verdict`。
+
+@@ item d16-16
+type: fill
+title: 填空：注入时钟的缓存
+level: 2
+--- prompt
+补全一个带过期时间的缓存：同一段条款文字的审查结果，在 `ttlMs` 毫秒内不再重复调用模型。时钟从构造函数注入，测试用假时钟控制时间。当前时间**大于或等于** `expires` 就算过期。
+--- template
+type Clock = () => number;
+
+class TtlCache {
+  #store: Record<string, { value: string; expires: number }> = {};
+
+  constructor(private readonly ttlMs: number, [[private readonly]] now: Clock = () => Date.now()) {}
+
+  set(key: string, value: string): void {
+    this.#store[key] = { value, expires: [[this.now()]] + this.ttlMs };
+  }
+
+  get(key: string): string | undefined {
+    const hit = this.#store[key];
+    if (hit === undefined || this.now() [[>=]] hit.expires) {
+      return undefined;
+    }
+    return hit.value;
+  }
+}
+--- tests
+let t = 500;
+const cache = new TtlCache(1000, () => t);
+cache.set("Liability is unlimited.", "redline");
+expect("还没过期", () => { t = 1499; return cache.get("Liability is unlimited."); }, "redline");
+expect("刚好到期就失效", () => { t = 1500; return cache.get("Liability is unlimited."); }, undefined);
+expect("没有的键", () => cache.get("Fees are due in 30 days."), undefined);
+--- hints
+- 第一个空：怎样让构造函数参数 `now` 自动变成字段，后面能写 `this.now()`？
+- 第二个空：存进去的时候，「现在」要问注入的时钟，不能用 `Date.now()`，否则假时钟就不起作用了。
+
+@@ item d16-17
+type: choice
+title: 模块的依赖方向
+level: 2
+--- prompt
+你把代码拆成了 `types.ts`（类型和错误类）、`client.ts`（DeepSeekClient，它 import 了 types.ts）、`main.ts`（组装）。现在想加一个函数 `defaultClient()`，它会 `new DeepSeekClient(process.env.DEEPSEEK_API_KEY ?? "")`。放在哪里最好？
+--- options
+- 放在 types.ts 里，并在 types.ts 里 `import { DeepSeekClient } from "./client"`
+- 放在 client.ts 或 main.ts 里，types.ts 继续不依赖任何项目文件
+- 把三个文件合成一个，就不用想这个问题了
+- 删掉 client.ts 对 types.ts 的 import
+answer: 2
+--- explain
+client.ts 已经 import 了 types.ts，如果 types.ts 再 import client.ts，就成了循环依赖，常见症状是某个导入在用到时还是 `undefined`。保持单向：types ← client ← main。「创建具体对象」这种组装工作放在最外层，这也是依赖注入的思路。Clause Check 里 `models.py` 不 import 任何项目模块，也是同一个原则。
+
+@@ item d16-18
+type: code
+title: RuleIndex（Map）
+level: 2
+--- prompt
+写 `class RuleIndex`，内部用 `Map` 按 id 存规则：
+
+- `add(rule)`：id 已经存在时 throw `Error("duplicate rule id PB-01")`，并且**不覆盖**
+- `find(id)`：返回规则，没有就返回 `undefined`
+- `size`：getter，规则条数
+- `topics()`：所有主题，去重后按字母排序（用 `Set` 去重）
+
+例：加入 PB-01（liability_cap）、PB-07（liability_cap）、PB-02（auto_renewal）后，`topics()` → `["auto_renewal", "liability_cap"]`。
+--- starter
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+class RuleIndex {
+  #byId = new Map<string, Rule>();
+
+  add(rule: Rule): void {}
+
+  find(id: string): Rule | undefined {
+    return undefined;
+  }
+
+  get size(): number {
+    return 0;
+  }
+
+  topics(): string[] {
+    return [];
+  }
+}
+--- solution
+interface Rule {
+  id: string;
+  topic: string;
+}
+
+class RuleIndex {
+  #byId = new Map<string, Rule>();
+
+  add(rule: Rule): void {
+    if (this.#byId.has(rule.id)) {
+      throw new Error(`duplicate rule id ${rule.id}`);
+    }
+    this.#byId.set(rule.id, rule);
+  }
+
+  find(id: string): Rule | undefined {
+    return this.#byId.get(id);
+  }
+
+  get size(): number {
+    return this.#byId.size;
+  }
+
+  topics(): string[] {
+    const unique = new Set<string>();
+    for (const rule of this.#byId.values()) {
+      unique.add(rule.topic);
+    }
+    return [...unique].sort();
+  }
+}
+--- tests
+const idx = new RuleIndex();
+idx.add({ id: "PB-01", topic: "liability_cap" });
+idx.add({ id: "PB-07", topic: "liability_cap" });
+idx.add({ id: "PB-02", topic: "auto_renewal" });
+expect("size", () => idx.size, 3);
+expect("find", () => [idx.find("PB-07")?.topic, idx.find("PB-99")], ["liability_cap", undefined]);
+expect("topics 去重排序", () => idx.topics(), ["auto_renewal", "liability_cap"]);
+expectThrows("重复 id", () => idx.add({ id: "PB-01", topic: "payment" }));
+expect("重复时不覆盖", () => { try { idx.add({ id: "PB-01", topic: "payment" }); } catch {} return [idx.find("PB-01")?.topic, idx.size]; }, ["liability_cap", 3]);
+expect("「constructor」也只是普通的键", () => new RuleIndex().find("constructor"), undefined);
+--- hints
+- `add`：先 `this.#byId.has(rule.id)` 检查，重复就 throw；否则 `this.#byId.set(rule.id, rule)`。
+- `this.#byId.values()` 可以直接用 `for...of` 遍历；Set 转数组用 `[...unique]`，再 `.sort()`。
+
+@@ item d16-19
+type: local
+title: 本机：拆成三个模块
+level: 2
+--- prompt
+本页每题只有一个文件。今天在自己电脑上真的拆一次模块，并用真的 DeepSeek 跑通。
+
+1. 在 `G:\Contract Clause Reviewer\learn` 下新建文件夹 `ts16`，放三个文件：
+   - `types.ts`：`export type Result<T> = ...`
+   - `client.ts`：第一行 `import type { Result } from "./types";`，然后 `export class DeepSeekClient`（照 d16-15 写，不看答案；默认用全局 `fetch`）
+   - `main.ts`：开头 `import { DeepSeekClient } from "./client";`，然后 `process.loadEnvFile();`（读取当前目录的 `.env`）。再写一个 async 的 `main()`：创建客户端（密钥 `process.env.DEEPSEEK_API_KEY ?? ""`），审查一条条款，`console.log` 结果；最后一行调用 `main();`（和第 6 天一样，不要在最外层直接写 await）
+2. DeepSeek 的 JSON 模式要求提示里出现 json 这个词，所以条款文字这样写：`Reply in JSON with the key verdict (accept, flag or redline). Clause 8.1: The Customer's liability under this Agreement shall be unlimited.`
+3. 在项目根目录运行：
+
+```
+cd "G:\Contract Clause Reviewer"
+npx tsx learn/ts16/main.ts
+```
+
+4. 把输出粘贴到下面，应该看到 `ok: true` 和一个判定。
+placeholder: 粘贴终端输出，例如 { ok: true, value: 'redline' }
+verify: ok\W{0,4}true[\s\S]{0,60}(accept|flag|redline)
+--- hints
+- `Cannot find module './client'`：检查文件名和路径，三个文件要在同一个文件夹里。`TransformError`：多半是在最外层写了 await，把它放进 async 的 `main()` 里。
+- 看到 `http 401`：`.env` 里的密钥不对，或者没有在项目根目录运行（`loadEnvFile` 读的是当前目录的 `.env`）。
+- 看到 `http 400`：多半是提示里没有 json 这个词。
+
+@@ item d16-e1
+type: scratch
+title: 闭卷：限流器
+exam: yes
+level: 3
+--- prompt
+写 `class RateLimiter`：任意连续 `windowMs` 毫秒内最多允许 `max` 次调用。
+
+- 构造函数：`constructor(max: number, windowMs: number, now: () => number = () => Date.now())`
+- `tryAcquire(): boolean`：如果最近的窗口内（时间戳 `s` 满足 `now() - s < windowMs`）已经有 `max` 次成功的调用，返回 `false`（这一次不记录）；否则记下这次的时间，返回 `true`
+- getter `remaining`：当前窗口内还能调用几次（用法 `limiter.remaining`，不加括号）
+--- solution
+class RateLimiter {
+  #stamps: number[] = [];
+
+  constructor(
+    private readonly max: number,
+    private readonly windowMs: number,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  private prune(): void {
+    const t = this.now();
+    this.#stamps = this.#stamps.filter((s) => t - s < this.windowMs);
+  }
+
+  tryAcquire(): boolean {
+    this.prune();
+    if (this.#stamps.length >= this.max) {
+      return false;
+    }
+    this.#stamps.push(this.now());
+    return true;
+  }
+
+  get remaining(): number {
+    this.prune();
+    return this.max - this.#stamps.length;
+  }
+}
+--- tests
+function make(): { lim: RateLimiter; set: (ms: number) => void } {
+  let t = 0;
+  return { lim: new RateLimiter(2, 1000, () => t), set: (ms) => { t = ms; } };
+}
+expect("前两次可以，第三次被拒", () => { const { lim } = make(); return [lim.tryAcquire(), lim.tryAcquire(), lim.tryAcquire()]; }, [true, true, false]);
+expect("remaining", () => { const { lim } = make(); lim.tryAcquire(); return lim.remaining; }, 1);
+expect("999 毫秒时还在窗口里", () => { const { lim, set } = make(); lim.tryAcquire(); lim.tryAcquire(); set(999); return lim.tryAcquire(); }, false);
+expect("1000 毫秒后恢复", () => { const { lim, set } = make(); lim.tryAcquire(); lim.tryAcquire(); set(1000); return [lim.remaining, lim.tryAcquire()]; }, [2, true]);
+
+@@ item d16-e2
+type: scratch
+title: 闭卷：错误层级
+exam: yes
+level: 3
+--- prompt
+设计错误类并写一个处理函数：
+
+- `ApiError extends Error`：构造函数 `(message: string, status: number)`，只读字段 `status`，`name` 为 `"ApiError"`
+- `AuthError extends ApiError`：构造函数 `(message: string)`，status 固定 401，`name` 为 `"AuthError"`
+- `RateLimitError extends ApiError`：构造函数 `(retryAfter: number)`，只读字段 `retryAfter`，status 固定 429，message 为 `"rate limited"`，`name` 为 `"RateLimitError"`
+- `handle(e: unknown): string`：
+  - RateLimitError → `"retry in 5s"`（5 是 retryAfter）
+  - AuthError → `"check DEEPSEEK_API_KEY"`
+  - 其它 ApiError → `"api error 500: boom"`（status 和 message）
+  - 其它 Error → `"bug: " + message`
+  - 其它任何值 → `"unknown: " + String(e)`
+--- solution
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+class AuthError extends ApiError {
+  constructor(message: string) {
+    super(message, 401);
+    this.name = "AuthError";
+  }
+}
+
+class RateLimitError extends ApiError {
+  constructor(readonly retryAfter: number) {
+    super("rate limited", 429);
+    this.name = "RateLimitError";
+  }
+}
+
+function handle(e: unknown): string {
+  if (e instanceof RateLimitError) {
+    return `retry in ${e.retryAfter}s`;
+  }
+  if (e instanceof AuthError) {
+    return "check DEEPSEEK_API_KEY";
+  }
+  if (e instanceof ApiError) {
+    return `api error ${e.status}: ${e.message}`;
+  }
+  if (e instanceof Error) {
+    return `bug: ${e.message}`;
+  }
+  return `unknown: ${String(e)}`;
+}
+--- tests
+expect("RateLimitError 的字段", () => { const e = new RateLimitError(5); return [e.name, e.status, e.message, e.retryAfter, e instanceof ApiError]; }, ["RateLimitError", 429, "rate limited", 5, true]);
+expect("限流和密钥", () => [handle(new RateLimitError(5)), handle(new AuthError("bad key"))], ["retry in 5s", "check DEEPSEEK_API_KEY"]);
+expect("其它 API 错误", () => handle(new ApiError("boom", 500)), "api error 500: boom");
+expect("程序 bug 和其它", () => [handle(new TypeError("x is undefined")), handle("oops")], ["bug: x is undefined", "unknown: oops"]);
+
+@@ item d16-e3
+type: scratch
+title: 闭卷：批量解析
+exam: yes
+level: 3
+--- prompt
+模型对一批条款各返回了一段 JSON 文字。不用 Zod，写：
+
+- `type Result<T> = { ok: true; value: T } | { ok: false; error: string }`
+- `interface Verdict { clause_id: string; verdict: "accept" | "flag" | "redline" }`
+- `parseOne(raw: string): Result<Verdict>`：JSON 坏了 → error `"bad json"`；解析出来不是合格的 Verdict → error `"bad shape"`；否则 ok
+- `parseAll(raws: string[]): { verdicts: Verdict[]; errors: string[] }`：errors 里每一项写成 `"#下标: 错误"`，比如 `"#1: bad json"`，都保持原顺序
+--- solution
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+interface Verdict {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+}
+
+const VERDICTS = ["accept", "flag", "redline"];
+
+function isVerdict(x: unknown): x is Verdict {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "clause_id" in x &&
+    typeof x.clause_id === "string" &&
+    "verdict" in x &&
+    typeof x.verdict === "string" &&
+    VERDICTS.includes(x.verdict)
+  );
+}
+
+function parseOne(raw: string): Result<Verdict> {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { ok: false, error: "bad json" };
+  }
+  if (!isVerdict(data)) {
+    return { ok: false, error: "bad shape" };
+  }
+  return { ok: true, value: data };
+}
+
+function parseAll(raws: string[]): { verdicts: Verdict[]; errors: string[] } {
+  const verdicts: Verdict[] = [];
+  const errors: string[] = [];
+  raws.forEach((raw, i) => {
+    const r = parseOne(raw);
+    if (r.ok) {
+      verdicts.push(r.value);
+    } else {
+      errors.push(`#${i}: ${r.error}`);
+    }
+  });
+  return { verdicts, errors };
+}
+--- tests
+const RAWS = ['{"clause_id": "3.1", "verdict": "accept"}', "Sure! {", '{"clause_id": "8.1", "verdict": "maybe"}', '{"clause_id": "10.1", "verdict": "redline"}'];
+expect("parseOne 成功", () => parseOne(RAWS[0]), { ok: true, value: { clause_id: "3.1", verdict: "accept" } });
+expect("parseOne 三种失败", () => [parseOne(RAWS[1]), parseOne(RAWS[2]), parseOne("null")], [{ ok: false, error: "bad json" }, { ok: false, error: "bad shape" }, { ok: false, error: "bad shape" }]);
+expect("parseAll", () => parseAll(RAWS), { verdicts: [{ clause_id: "3.1", verdict: "accept" }, { clause_id: "10.1", verdict: "redline" }], errors: ["#1: bad json", "#2: bad shape"] });
+expect("空", () => parseAll([]), { verdicts: [], errors: [] });

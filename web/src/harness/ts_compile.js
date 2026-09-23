@@ -76,7 +76,8 @@
       js,
       "} catch (__e) { __error = __errText(__e); }",
       "try { await Promise.all(__pending); } catch (__e) {}",
-      "await new Promise((r) => setTimeout(r, 0));",
+      "await new Promise((r) => __st(r, 0));",
+      "for (let __w = 0; __live.size && __w < 400; __w++) await new Promise((r) => __st(r, 10));",
       "__post({ stdout: __out.join('\\n'), error: __error, tests: __tests });",
       "})(typeof __POST === 'function' ? __POST : (m) => postMessage(m), typeof Zod !== 'undefined' ? Zod : null);",
     ].join("\n");

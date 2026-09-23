@@ -1,0 +1,1248 @@
+@@ day 11
+title: RAG 基础：清洗、切块、关键词检索、向量检索
+lang: py
+hours: 5 小时
+--- goal
+能把合同文字清洗、切块、估算 token；能用关键词和 embeddings（余弦相似度、top-k）两种方法找出和问题最相关的片段；能把检索到的片段带着编号放进 prompt。这就是 RAG（检索增强生成）最小的完整版本。项目里对应 `playbook.py` 按主题查规则、`split.py`「一条条款就是一块」、`parse.py` 去页眉页脚。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过（包括本机任务：在真实合同上跑你自己写的检索）
+- 闭卷挑战 3 题
+- 能用自己的话讲清楚：关键词检索为什么找不到「cancel」对应的终止条款，embeddings 为什么能找到
+
+@@ concept
+title: 为什么需要检索（RAG）
+--- body
+模型没见过这个客户的 playbook，也没见过这份合同。资料少时可以全塞进 prompt（DeepSeek 模式下项目就把整份合同放进 system prompt，见 `config.py` 的 `full_contract`）；资料一多，就又贵又慢、会超出上下文长度，无关内容还会让模型看漏。
+
+**RAG**（Retrieval-Augmented Generation，检索增强生成）：**先找出和问题相关的几段，只把它们放进 prompt，再让模型回答。**
+
+Clause Check 用的是最简单的一种：模型先判断条款的主题，再调用工具 `lookup_playbook(topic)`，`playbook.py` 只返回这个主题的几条规则，而不是整本 playbook。
+
+排错时记住第 7 天的话：**检索错了，看起来就像模型推理错了。**先看送进模型的片段对不对。
+--- code
+PLAYBOOK = [
+    {"id": "PB-01", "topic": "liability_cap", "text": "Liability is capped at 100% of the fees paid in the prior 12 months."},
+    {"id": "PB-03", "topic": "auto_renewal", "text": "Renewal periods must not exceed 12 months."},
+    {"id": "PB-05", "topic": "payment", "text": "Payment within 30 days; no suspension without notice."},
+    {"id": "PB-07", "topic": "termination", "text": "Customer may terminate for convenience on 30 days' notice."},
+]
+
+def lookup_playbook(topic):
+    return [r for r in PLAYBOOK if r["topic"] == topic]
+
+clause = "This Agreement renews automatically for successive twenty-four (24) month periods."
+rules = lookup_playbook("auto_renewal")
+prompt = "Rules:\n" + "\n".join(f"[{r['id']}] {r['text']}" for r in rules) + "\n\nClause:\n" + clause
+print(prompt)
+print(f"\nretrieved {len(rules)} of {len(PLAYBOOK)} rules")
+
+@@ concept
+title: 文本清洗
+--- body
+从 PDF 抽出来的文字很脏：多余的空格和换行，还有每页都有的页眉页脚（`CloudNotes Confidential`、`Page 3 of 12`）。不清洗的话，页脚会混进条款正文，还可能被当成「相关内容」检索出来。
+
+- `re.sub(r"\s+", " ", text).strip()`：所有连续空白（空格、换行、制表符）变成一个空格
+- 去页眉页脚：逐行看，**整行**匹配 `page \d+ of \d+` 这类模式的扔掉。`re.fullmatch(模式, 文字)` 要求整段文字都匹配，不是只找到一部分就算。项目 `parse.py` 的 `_strip_repeated_lines` 更聪明：在大多数页上都重复出现的行，就当页眉页脚删掉
+- **小写只用来比较**：检索时用 `text.lower()`；展示给律师、引用原文时用原文
+--- code
+import re
+
+page = """CloudNotes Confidential
+3.2   Late Payment
+Overdue amounts accrue   interest at three percent
+(3%) per month.
+Page 3 of 12
+"""
+kept = []
+for line in page.splitlines():
+    s = line.strip()
+    if re.fullmatch(r"page \d+ of \d+", s.lower()) or s == "CloudNotes Confidential":
+        continue
+    kept.append(line)
+clean = re.sub(r"\s+", " ", " ".join(kept)).strip()
+print(repr(clean))
+print(clean.lower())
+# 正文里提到 page 的句子：整行不是「page 数字 of 数字」，所以不匹配（None），不会被删
+print(re.fullmatch(r"page \d+ of \d+", "see page 3 of the order form"))
+
+@@ concept
+title: 切块：按结构、按长度、带重叠
+--- body
+检索的单位叫**块（chunk）**。怎么切，决定了能找到什么：
+
+- **按结构切**：合同天然有编号标题，一条条款就是一块。项目 `split.py` 就是这么做的（文件开头写着 structure-aware chunking），每块带着编号、标题和交叉引用
+- **按长度切**：没有结构的长文字，每 `size` 个字符一块。相邻两块**重叠** `overlap` 个字符，免得一句话正好被切成两半、两边都不完整。每次前进 `step = size - overlap`
+- 每块都要带上 `id` 和出处（比如起始位置 `start`），后面引用、排错都靠它
+
+经典错误：`overlap >= size` 时 `step <= 0`，循环永远不前进。所以要先检查参数，不合理就 `raise ValueError`。
+--- code
+text = "ABCDEFGHIJ"
+size, overlap = 4, 1
+step = size - overlap
+start = 0
+while True:
+    print(" " * start + text[start:start + size], "start =", start)
+    if start + size >= len(text):
+        break
+    start += step
+
+@@ concept
+title: token 估算和预算
+--- body
+模型按 **token** 收费，上下文长度也按 token 算。token 是分词器切出来的小片段，不等于字，也不等于词。写代码前先粗估：
+
+- 英文：大约 **4 个字符 ≈ 1 个 token**
+- 中文：不同模型的分词器差别很大。OpenAI 较早的分词器一个汉字常常要 1–2 个 token；DeepSeek 文档给的粗略换算是 1 个中文字符约 0.6 token、1 个英文字符约 0.3 token（以官方文档为准）
+- 精确数字看接口返回的 `usage`（第 4 天），估算只用来做计划
+
+**预算** = 上下文长度 − 系统提示和问题 − 给回答留的空间。剩下的空间按相关度从高到低，一块一块往里放，放不下的跳过。
+--- code
+import math
+
+def estimate_tokens(text):
+    return math.ceil(len(text) / 4)
+
+chunks = [
+    {"id": "c3", "text": "Liability is capped at 100% of the fees paid in the prior 12 months."},
+    {"id": "c7", "text": "Either party may terminate for material breach on thirty days' notice."},
+    {"id": "c1", "text": "Definitions."},
+]
+context_window = 120
+prompt_tokens = 60
+answer_tokens = 30
+budget = context_window - prompt_tokens - answer_tokens
+print("budget:", budget)
+for c in chunks:
+    print(c["id"], len(c["text"]), "chars ->", estimate_tokens(c["text"]), "tokens")
+
+@@ concept
+title: 关键词检索
+--- body
+最简单的检索：问题里的词在块里出现得越多，这块越相关。
+
+1. 分词：`re.findall(r"[a-z0-9]+", text.lower())`
+2. 去掉**停用词**（the、of、and 这些到处都有的词，留着只会制造噪音）
+3. 打分：问题里有几个**不同的**词出现在这块里（集合交集，第 8 天）
+4. 按分数从高到低排，取前 k 个；0 分的不要
+
+Python 的 `sorted` 是**稳定**的：分数相同的元素保持原来的先后顺序，所以只按 `-分数` 排就行。项目的规则版审查（`review.py` 的 `rule_based_review`）就是这样选主题的：数一数每个主题的关键词在条款里命中几次。
+
+缺点：只认字面。问 cancel，找不到写着 terminate 的条款，这叫**同义词问题**。生产里常用的 BM25 也是关键词法，只是打分更讲究（越少见的词分越高），同义词问题照样存在。
+--- code
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+chunks = [
+    {"id": "c1", "text": "Either party may terminate this Agreement for material breach."},
+    {"id": "c2", "text": "Fees are payable within thirty (30) days of the invoice date."},
+    {"id": "c3", "text": "Late fees accrue interest; Provider may suspend the Service."},
+]
+for q in ["When are fees payable?", "Can we cancel early?"]:
+    words = set(tokenize(q))
+    scores = {c["id"]: len(words & set(tokenize(c["text"]))) for c in chunks}
+    print(q, tokenize(q), scores)
+
+@@ concept
+title: 向量和余弦相似度
+--- body
+另一种思路：把每段文字变成一个**向量**（一串小数），意思相近的文字，向量的**方向**也相近。比较两个方向用**余弦相似度**：
+
+```python
+dot = sum(x * y for x, y in zip(a, b))       # 点积
+norm_a = math.sqrt(sum(x * x for x in a))    # 向量的长度
+cos = dot / (norm_a * norm_b)
+```
+
+- 1：方向完全相同；0：互不相关；-1：方向相反
+- 只看方向不看长短：`[1, 2]` 和 `[2, 4]` 的余弦是 1
+- 边界：全 0 向量没有方向，长度是 0，直接除会 `ZeroDivisionError`。约定返回 `0.0`
+- 分母要加括号：`dot / norm_a * norm_b` 是先除后乘，算错了还不报错
+--- code
+import math
+
+a = [1.0, 2.0, 0.0]
+b = [2.0, 4.0, 0.0]
+c = [0.0, 0.0, 3.0]
+
+dot_ab = sum(x * y for x, y in zip(a, b))
+norm_a = math.sqrt(sum(x * x for x in a))
+norm_b = math.sqrt(sum(x * x for x in b))
+print(dot_ab, round(norm_a, 3), round(norm_b, 3))
+print("cos(a, b) =", round(dot_ab / (norm_a * norm_b), 3))
+print("wrong    =", round(dot_ab / norm_a * norm_b, 3))
+
+dot_ac = sum(x * y for x, y in zip(a, c))
+print("cos(a, c) =", dot_ac / (norm_a * math.sqrt(sum(x * x for x in c))))
+
+@@ concept
+title: embeddings 接口
+mock: yes
+--- body
+**embedding 模型**把一段文字变成固定长度的向量，意思相近的文字方向也相近。所以问 cancel 也能找到写着 terminate 的条款。
+
+- 请求：`POST https://api.openai.com/v1/embeddings`，请求头 `Authorization: Bearer <OPENAI_API_KEY>`，请求体 `{"model": "text-embedding-3-small", "input": [文字1, 文字2, ...]}`
+- 回答：`data` 列表，每项有 `index` 和 `embedding`，第 i 项对应第 i 段文字
+- **DeepSeek 没有 embeddings 接口。**常用的是 OpenAI 的 `text-embedding-3-small`（1536 维），或者 LM Studio 里加载的本地 embedding 模型（`http://127.0.0.1:1234/v1/embeddings`，格式一样）
+- 本页的模拟接口格式和 OpenAI 一样，但不是真模型：它把单词（去掉停用词、合并几组合同同义词）哈希成 256 维向量，别把它的分数当真
+- 文档的向量**算一次、存起来**，每次提问只算问题的；一批文字**一次请求**发完
+--- code
+import math
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+texts = [
+    "Can we cancel the contract early?",
+    "Either party may terminate this Agreement for material breach.",
+    "Fees are payable within thirty (30) days of the invoice date.",
+]
+data = requests.post(EMBED_URL, headers=headers, json={"model": "text-embedding-3-small", "input": texts}).json()
+vectors = [d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"])]
+print(len(vectors), "vectors,", len(vectors[0]), "numbers each")
+print("usage:", data["usage"])
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+print("question vs termination:", round(cosine(vectors[0], vectors[1]), 3))
+print("question vs payment:    ", round(cosine(vectors[0], vectors[2]), 3))
+
+@@ concept
+title: 把检索结果放进 prompt
+--- body
+检索到的块要**带着编号**放进 prompt，并且告诉模型怎么用它们：
+
+- **只根据片段回答**：不许模型拿「一般合同都这样」来补
+- **引用编号**：回答里出现 `[c7]`，你就能用代码检查它引用的片段是不是真的给过它、原文是不是真这么说（第 19 天会写这个检查）
+- **允许说不知道**：比编一个答案安全得多
+- 顺序：规则在前，片段在中间，问题在最后
+
+下面用了三引号的 f-string：三引号里可以直接换行，`{...}` 照样会被替换。
+--- code
+import re
+
+chunks = [
+    {"id": "c3", "text": "Either party may terminate this Agreement for material breach."},
+    {"id": "c7", "text": "Customer may terminate for convenience on 30 days' notice."},
+]
+question = "Can we cancel early?"
+excerpts = "\n".join(f"[{c['id']}] {c['text']}" for c in chunks)
+prompt = f"""Answer using ONLY the excerpts below.
+After each claim, cite the excerpt id in brackets, e.g. [c2].
+If the excerpts do not contain the answer, say: not found in the excerpts.
+
+{excerpts}
+
+Question: {question}"""
+print(prompt)
+
+answer = "Yes: the Customer may terminate for convenience on 30 days' notice [c7]."
+print("\ncited:", re.findall(r"\[(c\d+)\]", answer))
+
+@@ item d11-01
+type: code
+title: 复习：把文档读进来
+level: 1
+--- prompt
+RAG 的第一步是把资料读进来（复习第 10 天）。写 `load_docs(folder)`：读出文件夹里所有 `.txt` 文件，**按文件名排序**，返回 `[{"id": 去掉后缀的文件名, "text": 文件内容}, ...]`。文件夹不存在时返回 `[]`。
+
+例：`termination.txt` → `{"id": "termination", "text": "..."}`
+--- starter
+from pathlib import Path
+
+def load_docs(folder):
+    pass
+--- solution
+from pathlib import Path
+
+def load_docs(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    return [{"id": p.stem, "text": p.read_text(encoding="utf-8")} for p in sorted(folder.glob("*.txt"))]
+--- tests
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d11/docs", ignore_errors=True)
+_d = Path("work/d11/docs")
+_d.mkdir(parents=True)
+(_d / "termination.txt").write_text("Customer may terminate on 30 days' notice.", encoding="utf-8")
+(_d / "liability.txt").write_text("Liability is capped at 12 months of fees.", encoding="utf-8")
+(_d / "readme.md").write_text("# not a document", encoding="utf-8")
+expect("按文件名排序，只要 .txt", lambda: load_docs("work/d11/docs"), [
+    {"id": "liability", "text": "Liability is capped at 12 months of fees."},
+    {"id": "termination", "text": "Customer may terminate on 30 days' notice."},
+])
+expect("文件夹不存在", lambda: load_docs("work/d11/nothing"), [])
+--- hints
+- `sorted(Path(folder).glob("*.txt"))` 按名字排好；读文件用 `.read_text(encoding="utf-8")`。
+- 去掉后缀的文件名是 `.stem`。
+
+@@ item d11-02
+type: choice
+title: 模型说合同里没写
+level: 1
+--- prompt
+你做了一个「问合同」的小工具：先检索 3 个最相关的片段，再让模型只根据片段回答。用户问 "Can we cancel the contract early?"，模型回答「片段里没有提到」。可是样例合同的 11.2 明明写着 Customer may terminate this Agreement only at the end of the then-current Term，正好回答了这个问题（不能提前解约）。你第一步应该做什么？
+--- options
+- 换一个更聪明的模型
+- 在 prompt 里加一句「请仔细阅读」
+- 打印出这次检索到的 3 个片段，看 11.2 在不在里面
+- 把 temperature 调成 0
+answer: 3
+--- explain
+模型只看得到你给它的片段。如果检索没把 11.2 找出来，模型说「没有提到」其实是对的：这是**检索错误伪装成了推理错误**（第 7 天的「先看输入」）。这个例子还有一个典型原因：用户说 cancel，合同写的是 terminate，关键词检索对不上。今天后半段的 embeddings 就是为这个准备的。
+
+@@ item d11-03
+type: code
+title: 清洗一页 PDF 文字
+level: 2
+--- prompt
+写 `clean(text)`，清洗从 PDF 抽出来的一页文字：
+
+1. 逐行看：去掉首尾空白、转小写后，**整行**是 `page 数字 of 数字` 的行删掉，比如 `Page 3 of 12`、`PAGE 1 OF 2`
+2. 剩下的行用空格连起来，所有连续空白（空格、换行、制表符）变成一个空格，再去掉首尾空白
+
+例：`clean("3.2  Late\nPayment\nPage 3 of 12\n")` → `"3.2 Late Payment"`
+--- starter
+import re
+
+def clean(text):
+    pass
+--- solution
+import re
+
+FOOTER = re.compile(r"page \d+ of \d+")
+
+def clean(text):
+    kept = [line for line in text.splitlines() if not FOOTER.fullmatch(line.strip().lower())]
+    return re.sub(r"\s+", " ", " ".join(kept)).strip()
+--- tests
+PAGE = "CloudNotes SaaS Agreement\n3.2   Late Payment\nOverdue amounts accrue\tinterest at three percent\n\n(3%) per month.\n   Page 3 of 12  \n"
+expect("删页码行、合并空白", lambda: clean(PAGE), "CloudNotes SaaS Agreement 3.2 Late Payment Overdue amounts accrue interest at three percent (3%) per month.")
+expect("大写的页码行也删", lambda: clean("PAGE 1 OF 2\nFees are payable."), "Fees are payable.")
+expect("正文里提到 page 的句子不能删", lambda: clean("See page 3 of the Order Form."), "See page 3 of the Order Form.")
+expect("空字符串", lambda: clean(""), "")
+--- hints
+- 先 `text.splitlines()` 拆成行，把「不是页码行」的留下来。
+- 判断整行：`re.fullmatch(r"page \d+ of \d+", line.strip().lower())`，匹配上（不是 `None`）就跳过。
+- 最后 `re.sub(r"\s+", " ", " ".join(kept)).strip()`。
+
+@@ item d11-04
+type: code
+title: 按长度切块，带重叠
+level: 2
+--- prompt
+写 `chunk_fixed(text, size, overlap)`：
+
+- 第一块从位置 0 开始，每次前进 `step = size - overlap`
+- 每块是 `{"id": "c1", "start": 起始位置, "text": text[start:start + size]}`，编号从 `c1` 开始
+- 某一块已经到了文字末尾（`start + size >= len(text)`）就停，不再切下一块
+- `text` 为空返回 `[]`
+- 参数不合理时 `raise ValueError`：`size <= 0`、`overlap < 0`、`overlap >= size`
+
+例：`chunk_fixed("abcdefghij", 4, 1)` 切出三块，文字是 `"abcd"`、`"defg"`、`"ghij"`。
+--- starter
+def chunk_fixed(text, size, overlap):
+    chunks = []
+    return chunks
+--- solution
+def chunk_fixed(text, size, overlap):
+    if size <= 0 or overlap < 0 or overlap >= size:
+        raise ValueError(f"bad size/overlap: {size}/{overlap}")
+    chunks = []
+    if not text:
+        return chunks
+    step = size - overlap
+    start = 0
+    while True:
+        chunks.append({"id": f"c{len(chunks) + 1}", "start": start, "text": text[start:start + size]})
+        if start + size >= len(text):
+            break
+        start += step
+    return chunks
+--- tests
+texts = lambda chunks: [c["text"] for c in chunks]
+expect("重叠 1 个字符", lambda: texts(chunk_fixed("abcdefghij", 4, 1)), ["abcd", "defg", "ghij"])
+expect("第二块的完整样子", lambda: chunk_fixed("abcdefghij", 4, 1)[1], {"id": "c2", "start": 3, "text": "defg"})
+expect("不重叠，最后一块短一些", lambda: texts(chunk_fixed("abcdefghij", 4, 0)), ["abcd", "efgh", "ij"])
+expect("文字比 size 短", lambda: chunk_fixed("abc", 10, 2), [{"id": "c1", "start": 0, "text": "abc"}])
+expect("空文字", lambda: chunk_fixed("", 4, 1), [])
+expect_raises("overlap >= size", lambda: chunk_fixed("abcdef", 4, 4), ValueError)
+expect_raises("size 为 0", lambda: chunk_fixed("abcdef", 0, 0), ValueError)
+--- hints
+- 参数检查放在最前面：`if size <= 0 or overlap < 0 or overlap >= size: raise ValueError(...)`。
+- 用 `while True:`：先切一块加进列表，再判断 `start + size >= len(text)` 就 `break`，否则 `start += size - overlap`。
+- 编号在加进列表之前算：`f"c{len(chunks) + 1}"`。
+
+@@ item d11-05
+type: fix
+title: 修 bug：末尾多出来的块
+level: 2
+--- prompt
+同事写了按**词**切块的 `chunk_words(words, size, overlap)`：每块 `size` 个词，相邻两块重叠 `overlap` 个词。可是最后总会多出一两块，内容完全包含在前一块里，检索时会重复命中、白白浪费 token。
+
+运行，比较测试结果里的「期望」和「实际」，修好它：某一块已经到了末尾，就不要再切了。
+--- starter
+def chunk_words(words, size, overlap):
+    step = size - overlap
+    chunks = []
+    for start in range(0, len(words), step):
+        chunks.append(words[start:start + size])
+    return chunks
+--- solution
+def chunk_words(words, size, overlap):
+    step = size - overlap
+    chunks = []
+    for start in range(0, len(words), step):
+        chunks.append(words[start:start + size])
+        if start + size >= len(words):
+            break
+    return chunks
+--- tests
+W = "either party may terminate this agreement for material breach".split()
+expect("9 个词，每块 4 个，重叠 2", lambda: chunk_words(W, 4, 2), [
+    ["either", "party", "may", "terminate"],
+    ["may", "terminate", "this", "agreement"],
+    ["this", "agreement", "for", "material"],
+    ["for", "material", "breach"],
+])
+expect("5 个词，每块 3 个，重叠 1", lambda: chunk_words(["a", "b", "c", "d", "e"], 3, 1), [["a", "b", "c"], ["c", "d", "e"]])
+expect("不重叠时刚好切完", lambda: chunk_words(["a", "b", "c", "d"], 2, 0), [["a", "b"], ["c", "d"]])
+--- hints
+- `range(0, len(words), step)` 会一直走到最后，哪怕上一块已经包含了最后一个词。
+- 每加完一块就判断：`if start + size >= len(words): break`。
+
+@@ item d11-06
+type: choice
+title: 块切多大
+level: 2
+--- prompt
+合同检索里，块切得**太大**（比如一块 3000 个字符）和**太小**（比如一块 50 个字符），各自最可能的问题是？
+--- options
+- 太大：一块里混着好几件事，相关的那句被无关内容冲淡，塞进 prompt 也很费 token；太小：句子被切碎，单独一块看不懂（比如 "Subject to Section 12" 被切到了另一块）
+- 太大：模型会直接报错；太小：检索速度会变慢很多
+- 块的大小不影响检索效果，只影响费用
+- 太大：什么都检索不到；太小：每次都能精确命中
+answer: 1
+--- explain
+块的大小是在「精确」和「完整」之间取舍。合同有编号结构，所以 Clause Check 直接「一条条款一块」（`split.py`），每块天然是一件完整的事，还带着交叉引用；没有结构的长文字才用固定长度加重叠。具体切多大，要用评测（第 13 天）比出来，而不是拍脑袋定。
+
+@@ item d11-07
+type: testwrite
+title: 写测试：token 估算
+level: 2
+--- prompt
+下面的 `estimate_tokens(text)` 按一个粗略规则估算 token：**每个汉字算 1 个，其他字符每 4 个算 1 个，合起来向上取整**；空字符串是 0。（`[\u4e00-\u9fff]` 是常用汉字的范围。）
+
+用第 9 天的写法为它写测试，抓住每一个故意埋了 bug 的版本。先想好几种情况：纯英文刚好 4 个字符、5 个字符、纯中文、中英混合、空字符串。
+--- impl
+import math
+import re
+
+def estimate_tokens(text):
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    other = len(text) - cjk
+    return math.ceil(cjk + other / 4)
+--- mutants
+===== 取整：5 个英文字符应该是几个 token？
+import math
+import re
+
+def estimate_tokens(text):
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    other = len(text) - cjk
+    return (cjk * 4 + other) // 4
+===== 中文：汉字没有单独计算
+import math
+import re
+
+def estimate_tokens(text):
+    return math.ceil(len(text) / 4)
+===== 边界：空字符串
+import math
+import re
+
+def estimate_tokens(text):
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    other = len(text) - cjk
+    return max(1, math.ceil(cjk + other / 4))
+--- starter
+def test_four_letters_is_one_token():
+    assert estimate_tokens("abcd") == 1
+--- solution
+def test_four_letters_is_one_token():
+    assert estimate_tokens("abcd") == 1
+
+def test_five_letters_round_up():
+    assert estimate_tokens("abcde") == 2
+
+def test_chinese_one_token_per_char():
+    assert estimate_tokens("律师") == 2
+
+def test_mixed():
+    assert estimate_tokens("律师 ok") == 3
+
+def test_empty_is_zero():
+    assert estimate_tokens("") == 0
+--- hints
+- 每个 `test_` 函数只测一种情况：`assert estimate_tokens("...") == 期望值`。
+- 「刚好整除」和「多出 1 个字符」各测一次，才看得出是向上还是向下取整。
+- 别忘了纯中文和空字符串。
+
+@@ item d11-08
+type: fill
+title: 填空：按预算装块
+level: 2
+--- prompt
+补全 `pack_chunks(chunks, budget)`：`chunks` 已经按相关度从高到低排好。按顺序往 prompt 里放，估算的 token 总数**不能超过** `budget`（刚好等于可以）。放不下的这块**跳过**，继续看后面可能更小的块。返回放进去的块（保持原顺序）。
+--- template
+import math
+
+def estimate_tokens(text):
+    return math.ceil(len(text) / 4)
+
+def pack_chunks(chunks, budget):
+    picked = []
+    used = 0
+    for c in chunks:
+        cost = estimate_tokens(c["text"])
+        if used + cost [[>]] budget:
+            [[continue]]
+        picked.append(c)
+        used [[+=]] cost
+    return picked
+--- tests
+C = [
+    {"id": "c3", "text": "x" * 16},
+    {"id": "c7", "text": "x" * 32},
+    {"id": "c1", "text": "x" * 12},
+    {"id": "c9", "text": "x" * 8},
+]
+ids = lambda cs: [c["id"] for c in cs]
+expect("四块分别是 4、8、3、2 个 token；预算 7：跳过放不下的", lambda: ids(pack_chunks(C, 7)), ["c3", "c1"])
+expect("预算 9：刚好用完也可以", lambda: ids(pack_chunks(C, 9)), ["c3", "c1", "c9"])
+expect("预算 0", lambda: ids(pack_chunks(C, 0)), [])
+expect("预算够大，全放进去", lambda: ids(pack_chunks(C, 100)), ["c3", "c7", "c1", "c9"])
+--- hints
+- 「不能超过」就是：`used + cost > budget` 时放不下（刚好等于是可以的）。
+- 放不下是「跳过这一块、继续看下一块」，不是结束整个循环。
+- `used` 要累加起来。
+
+@@ item d11-09
+type: predict
+title: 分词和关键词重合
+level: 2
+--- prompt
+写出输出。注意大小写、标点、`'s`，以及最后一行的 cancel 和 terminate。
+--- code
+import re
+
+STOP = {"the", "a", "of", "to", "and", "is", "in", "we", "can"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+q = "Can we TERMINATE the agreement?"
+c = "Either party may terminate this Agreement for material breach."
+print(tokenize(q))
+print(sorted(set(tokenize(q)) & set(tokenize(c))))
+print(tokenize("Customer's fees: 30 days"))
+print(len(set(tokenize("Cancel early")) & set(tokenize(c))))
+--- explain
+先 `lower()` 再找词，所以 `TERMINATE` 和 `terminate`、`Agreement` 和 `agreement` 能对上；标点被扔掉，`Customer's` 被拆成了 `customer` 和 `s`。最后一行是 0：意思一样的 cancel 和 terminate，在关键词检索看来毫无关系。
+
+@@ item d11-10
+type: code
+title: 分词和关键词打分
+level: 2
+--- prompt
+写两个函数：
+
+- `tokenize(text)`：转小写，用 `re.findall(r"[a-z0-9]+", ...)` 取出单词，去掉 `STOP` 里的停用词，返回列表（保持顺序，**不去重**）
+- `keyword_score(query, text)`：两边都先 `tokenize`，返回 `query` 里有多少个**不同的**词出现在 `text` 里
+
+例：`keyword_score("fees payable fees", "Fees are payable within 30 days")` → `2`（`fees` 只算一次）
+--- starter
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    pass
+
+def keyword_score(query, text):
+    pass
+--- solution
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+def keyword_score(query, text):
+    return len(set(tokenize(query)) & set(tokenize(text)))
+--- tests
+expect("小写、去标点、去停用词", lambda: tokenize("Fees are payable within thirty (30) days."), ["fees", "payable", "within", "thirty", "30", "days"])
+expect("重复的词保留", lambda: tokenize("fee FEE"), ["fee", "fee"])
+expect("空文字", lambda: tokenize(""), [])
+expect("不同的词才算", lambda: keyword_score("fees payable fees", "Fees are payable within 30 days"), 2)
+expect("同义词对不上", lambda: keyword_score("Can we cancel early?", "Either party may terminate this Agreement."), 0)
+--- hints
+- `re.findall(r"[a-z0-9]+", text.lower())` 取出所有词，再用列表推导式留下 `not in STOP` 的。
+- 「不同的词」用集合：`set(tokenize(query)) & set(tokenize(text))`，再取 `len(...)`。
+
+@@ item d11-11
+type: code
+title: 关键词 top-k
+level: 3
+--- prompt
+写 `top_k(query, chunks, k)`：用 `keyword_score`（已写好）给每块的 `text` 打分，返回分数最高的 `k` 块的 `id` 列表：
+
+- 分数从高到低；**同分时保持原来在 `chunks` 里的顺序**（不要按 id 排：`"c10"` 按字符串排会在 `"c2"` 前面）
+- 0 分的块不要
+- 不够 `k` 块时，有几块返回几块
+--- starter
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+def keyword_score(query, text):
+    return len(set(tokenize(query)) & set(tokenize(text)))
+
+def top_k(query, chunks, k):
+    pass
+--- solution
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "is", "are", "be", "shall", "may", "we", "can", "this", "that"}
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+
+def keyword_score(query, text):
+    return len(set(tokenize(query)) & set(tokenize(text)))
+
+def top_k(query, chunks, k):
+    scored = []
+    for c in chunks:
+        score = keyword_score(query, c["text"])
+        if score > 0:
+            scored.append((score, c["id"]))
+    scored = sorted(scored, key=lambda pair: -pair[0])
+    return [cid for score, cid in scored[:k]]
+--- tests
+CHUNKS = [
+    {"id": "c10", "text": "Late fees accrue interest; unpaid fees may lead to suspension."},
+    {"id": "c2", "text": "Fees are payable within thirty (30) days of the invoice date."},
+    {"id": "c3", "text": "Either party may terminate this Agreement for material breach."},
+    {"id": "c1", "text": "Fees are invoiced annually in advance."},
+    {"id": "c4", "text": "Payable fees are non-refundable."},
+]
+expect("前 3 个", lambda: top_k("When are fees payable?", CHUNKS, 3), ["c2", "c4", "c10"])
+expect("同分保持原顺序，0 分的不要", lambda: top_k("When are fees payable?", CHUNKS, 10), ["c2", "c4", "c10", "c1"])
+expect("没有相关的", lambda: top_k("Can we cancel early?", CHUNKS, 3), [])
+expect("k 为 1", lambda: top_k("terminate for breach", CHUNKS, 1), ["c3"])
+--- hints
+- 先收集 `(分数, id)`，只收分数大于 0 的。
+- `sorted` 是稳定的：`sorted(scored, key=lambda pair: -pair[0])` 只按分数从高到低，同分的自动保持原顺序。
+- 最后切片 `[:k]`，再取出 id。
+
+@@ item d11-12
+type: predict
+title: 余弦相似度
+level: 2
+--- prompt
+写出输出。先在脑子里想：方向相同、互相垂直、方向相反，各是多少？
+--- code
+import math
+
+def cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+print(cosine([3, 4], [3, 4]))
+print(cosine([3, 4], [6, 8]))
+print(cosine([1, 0], [0, 5]))
+print(cosine([1, 0], [-2, 0]))
+print(round(cosine([1, 1], [1, 0]), 3))
+print(cosine([0, 0], [1, 2]))
+--- explain
+`[3, 4]` 和 `[6, 8]` 方向相同，只是长短不同，余弦还是 1.0；`[1, 0]` 和 `[0, 5]` 互相垂直，是 0.0；方向相反是 -1.0；45 度夹角约 0.707。全 0 向量没有方向，按约定返回 0.0，而不是除以 0 报错。
+
+@@ item d11-13
+type: code
+title: 点积、长度、余弦
+level: 2
+--- prompt
+写三个函数：
+
+- `dot(a, b)`：点积。两个向量**长度不同**时 `raise ValueError`。`zip` 遇到长度不同会悄悄截断，而长度不同通常说明你混用了两个不同的 embedding 模型，必须大声报错
+- `norm(a)`：向量的长度，`math.sqrt(每个数的平方之和)`
+- `cosine(a, b)`：`dot(a, b) / (norm(a) * norm(b))`；任何一个长度是 0 时返回 `0.0`
+
+测试用 `round(..., 3)` 比较小数。
+--- starter
+import math
+
+def dot(a, b):
+    pass
+
+def norm(a):
+    pass
+
+def cosine(a, b):
+    pass
+--- solution
+import math
+
+def dot(a, b):
+    if len(a) != len(b):
+        raise ValueError(f"vector lengths differ: {len(a)} vs {len(b)}")
+    return sum(x * y for x, y in zip(a, b))
+
+def norm(a):
+    return math.sqrt(sum(x * x for x in a))
+
+def cosine(a, b):
+    na = norm(a)
+    nb = norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot(a, b) / (na * nb)
+--- tests
+expect("点积", lambda: dot([1, 2, 3], [4, 5, 6]), 32)
+expect_raises("长度不同要报错", lambda: dot([1, 2], [1, 2, 3]), ValueError)
+expect("长度", lambda: norm([3, 4]), 5.0)
+expect("方向相同", lambda: round(cosine([1, 2, 0], [2, 4, 0]), 3), 1.0)
+expect("45 度", lambda: round(cosine([1, 1], [1, 0]), 3), 0.707)
+expect("零向量返回 0.0", lambda: cosine([0, 0], [1, 2]), 0.0)
+--- hints
+- `dot`：先比 `len(a) != len(b)` 就 raise，再 `sum(x * y for x, y in zip(a, b))`。
+- `cosine`：先算两个长度，有一个是 0 就 `return 0.0`；分母要加括号：`dot(a, b) / (na * nb)`。
+
+@@ item d11-14
+type: fix
+title: 修 bug：向量接口 400
+level: 2
+mock: yes
+--- prompt
+这段代码想取一段文字的 embedding。写它的人平时只用 DeepSeek，就照着聊天接口的写法改了改。运行，看打印出来的状态码和服务器的错误信息，修好它。
+--- starter
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+
+def embed(text):
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+    body = {"model": "deepseek-chat", "input": text}
+    resp = requests.post(EMBED_URL, headers=headers, json=body)
+    print(resp.status_code, resp.json())
+    return resp.json()["data"][0]["embedding"]
+--- solution
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+
+def embed(text):
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+    body = {"model": "text-embedding-3-small", "input": text}
+    resp = requests.post(EMBED_URL, headers=headers, json=body)
+    print(resp.status_code)
+    return resp.json()["data"][0]["embedding"]
+--- tests
+expect("返回 256 个小数", lambda: len(embed("Either party may terminate this Agreement.")), 256)
+expect("和模拟接口算的一样", lambda: embed("Fees are payable within 30 days.") == MOCK.embed("Fees are payable within 30 days."), True)
+expect("请求里用的是 embedding 模型", lambda: (embed("x"), "embedding" in MOCK.calls[-1]["body"]["model"])[1], True)
+--- hints
+- 状态码 400，错误信息说模型不存在：`deepseek-chat` 是聊天模型。**DeepSeek 没有 embeddings 接口**，这里要用 embedding 模型。
+- 把 `"model"` 改成 `"text-embedding-3-small"`；再把 print 改成只打印状态码（成功时回答里有 256 个小数，太长了）。
+
+@@ item d11-15
+type: code
+title: 一次请求取回一批向量
+level: 2
+mock: yes
+--- prompt
+写 `embed_texts(texts)`：**一次请求**取回一批文字的 embedding，返回向量列表，顺序和 `texts` 一致。
+
+- 请求体 `{"model": "text-embedding-3-small", "input": texts}`，`input` 直接传整个列表
+- 回答里 `data` 的每一项有 `index` 和 `embedding`：按 `index` 排好再取 `embedding`，不要假设顺序
+- `texts` 为空：直接返回 `[]`，**不发请求**
+- 请求失败时调用 `resp.raise_for_status()`，它会抛出 `requests.HTTPError`
+
+为什么一次发一批？100 个块发 100 次请求，又慢又容易撞上 429；一批只要一次往返。
+--- starter
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    pass
+--- solution
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    body = {"model": "text-embedding-3-small", "input": texts}
+    resp = requests.post(EMBED_URL, headers=HEADERS, json=body)
+    resp.raise_for_status()
+    items = sorted(resp.json()["data"], key=lambda d: d["index"])
+    return [d["embedding"] for d in items]
+--- tests
+TEXTS = ["Fees are payable within 30 days.", "Either party may terminate.", "Liability is capped."]
+def _batch():
+    MOCK.reset()
+    vectors = embed_texts(TEXTS)
+    return [len(vectors), len(MOCK.calls), MOCK.calls[0]["body"]["input"]]
+expect("三段文字只发一次请求", _batch, [3, 1, TEXTS])
+expect("顺序和输入一致", lambda: embed_texts(TEXTS)[1] == MOCK.embed(TEXTS[1]), True)
+def _empty():
+    MOCK.reset()
+    return [embed_texts([]), len(MOCK.calls)]
+expect("空列表：不发请求", _empty, [[], 0])
+def _fail():
+    MOCK.reset()
+    MOCK.fail_next(503)
+    return embed_texts(TEXTS)
+expect_raises("服务器出错要抛出 HTTPError", _fail, requests.HTTPError)
+--- hints
+- 先处理空列表：`if not texts: return []`。
+- 发请求后先 `resp.raise_for_status()`；`resp.json()["data"]` 是列表，`sorted(..., key=lambda d: d["index"])` 排好，再 `[d["embedding"] for d in ...]`。
+
+@@ item d11-16
+type: code
+title: 语义检索 top-k
+level: 3
+mock: yes
+--- prompt
+写 `semantic_top_k(query, chunks, k)`，用 embeddings 找最相关的块：
+
+1. 用 `embed_texts`（已写好）**一次**取回所有块和问题的向量：问题放在列表最后，`embed_texts([...每块的 text..., query])`
+2. 用 `cosine`（已写好）算问题向量和每个块向量的相似度
+3. 从高到低排，同分保持原顺序，返回前 `k` 块的 `id`
+4. `chunks` 为空返回 `[]`
+
+测试会做一个对比：问 "Can we cancel the contract early?"，关键词检索一块都找不到，你的函数能找到终止条款。
+--- starter
+import math
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    resp = requests.post(EMBED_URL, headers=HEADERS, json={"model": "text-embedding-3-small", "input": texts})
+    resp.raise_for_status()
+    return [d["embedding"] for d in sorted(resp.json()["data"], key=lambda d: d["index"])]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+def semantic_top_k(query, chunks, k):
+    pass
+--- solution
+import math
+import os
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    resp = requests.post(EMBED_URL, headers=HEADERS, json={"model": "text-embedding-3-small", "input": texts})
+    resp.raise_for_status()
+    return [d["embedding"] for d in sorted(resp.json()["data"], key=lambda d: d["index"])]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+def semantic_top_k(query, chunks, k):
+    if not chunks:
+        return []
+    vectors = embed_texts([c["text"] for c in chunks] + [query])
+    q = vectors[-1]
+    scored = [(cosine(q, v), c["id"]) for c, v in zip(chunks, vectors[:-1])]
+    scored = sorted(scored, key=lambda pair: -pair[0])
+    return [cid for score, cid in scored[:k]]
+--- tests
+import re
+CHUNKS = [
+    {"id": "c1", "text": "Fees are payable within thirty (30) days of the invoice date."},
+    {"id": "c2", "text": "Each party's liability is capped at the fees paid in the prior 12 months."},
+    {"id": "c3", "text": "Either party may terminate this Agreement for material breach on thirty days' written notice."},
+    {"id": "c4", "text": "Confidentiality obligations survive for five years."},
+]
+Q = "Can we cancel the contract early?"
+def _keyword_ids(query, chunks):
+    words = set(re.findall(r"[a-z0-9]+", query.lower())) - {"can", "we", "the"}
+    return [c["id"] for c in chunks if words & set(re.findall(r"[a-z0-9]+", c["text"].lower()))]
+expect("对照：关键词检索一块都找不到", lambda: _keyword_ids(Q, CHUNKS), [])
+expect("embeddings：第一名是终止条款", lambda: semantic_top_k(Q, CHUNKS, 1), ["c3"])
+expect("问付款：第一名是付款条款", lambda: semantic_top_k("When do we have to pay the invoice?", CHUNKS, 2)[0], "c1")
+def _one_call():
+    MOCK.reset()
+    semantic_top_k(Q, CHUNKS, 2)
+    return len(MOCK.calls)
+expect("只发一次 embeddings 请求", _one_call, 1)
+expect("没有块", lambda: semantic_top_k(Q, [], 3), [])
+--- hints
+- `vectors = embed_texts([c["text"] for c in chunks] + [query])`，问题的向量是 `vectors[-1]`，块的向量是 `vectors[:-1]`。
+- 用 `zip(chunks, vectors[:-1])` 把块和它的向量配对，算出 `(相似度, id)`。
+- 排序和关键词 top-k 一样：`sorted(..., key=lambda pair: -pair[0])`，再切 `[:k]`。
+
+@@ item d11-17
+type: code
+title: 向量只算一次：存成索引
+level: 3
+mock: yes
+--- prompt
+真实系统里，文档的向量**只算一次**，存起来；每次提问只算问题的向量。写两个函数：
+
+- `build_index(chunks, path)`：用 `embed_texts` 一次算出所有块的向量，把 `[{"id": ..., "text": ..., "vector": [...]}, ...]` 写成 JSON 文件（上级文件夹要自动创建），返回写入的块数
+- `search(path, query, k)`：读出索引文件，**只为问题**调用一次 `embed_texts([query])`，按 `cosine` 从高到低（同分保持原顺序）返回前 `k` 块的 `id`
+
+`embed_texts` 和 `cosine` 已写好。
+--- starter
+import json
+import math
+import os
+from pathlib import Path
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    resp = requests.post(EMBED_URL, headers=HEADERS, json={"model": "text-embedding-3-small", "input": texts})
+    resp.raise_for_status()
+    return [d["embedding"] for d in sorted(resp.json()["data"], key=lambda d: d["index"])]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+def build_index(chunks, path):
+    pass
+
+def search(path, query, k):
+    pass
+--- solution
+import json
+import math
+import os
+from pathlib import Path
+import requests
+
+EMBED_URL = "https://api.openai.com/v1/embeddings"
+HEADERS = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+def embed_texts(texts):
+    if not texts:
+        return []
+    resp = requests.post(EMBED_URL, headers=HEADERS, json={"model": "text-embedding-3-small", "input": texts})
+    resp.raise_for_status()
+    return [d["embedding"] for d in sorted(resp.json()["data"], key=lambda d: d["index"])]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+def build_index(chunks, path):
+    vectors = embed_texts([c["text"] for c in chunks])
+    rows = [{"id": c["id"], "text": c["text"], "vector": v} for c, v in zip(chunks, vectors)]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    return len(rows)
+
+def search(path, query, k):
+    rows = json.loads(Path(path).read_text(encoding="utf-8"))
+    q = embed_texts([query])[0]
+    ranked = sorted(rows, key=lambda r: -cosine(q, r["vector"]))
+    return [r["id"] for r in ranked[:k]]
+--- tests
+import json
+import shutil
+from pathlib import Path
+shutil.rmtree("work/d11/index", ignore_errors=True)
+CHUNKS = [
+    {"id": "c1", "text": "Fees are payable within thirty (30) days of the invoice date."},
+    {"id": "c2", "text": "Each party's liability is capped at the fees paid in the prior 12 months."},
+    {"id": "c3", "text": "Either party may terminate this Agreement for material breach on thirty days' written notice."},
+    {"id": "c4", "text": "Confidentiality obligations survive for five years."},
+]
+IDX = "work/d11/index/v1/chunks.json"
+expect("建索引返回块数", lambda: build_index(CHUNKS, IDX), 4)
+def _saved():
+    build_index(CHUNKS, IDX)
+    rows = json.loads(Path(IDX).read_text(encoding="utf-8"))
+    return [rows[2]["id"], rows[2]["text"][:6], len(rows[2]["vector"])]
+expect("文件里存着 id、text 和 256 维向量", _saved, ["c3", "Either", 256])
+def _search():
+    build_index(CHUNKS, IDX)
+    MOCK.reset()
+    first = search(IDX, "Can we cancel the contract early?", 1)
+    second = search(IDX, "When do we have to pay the invoice?", 1)
+    return [first, second, len(MOCK.calls), MOCK.calls[0]["body"]["input"]]
+expect("提问两次：每次只算问题的向量", _search, [["c3"], ["c1"], 2, ["Can we cancel the contract early?"]])
+--- hints
+- `build_index`：和第 10 天的 `save_report` 一样，先 `path.parent.mkdir(parents=True, exist_ok=True)`，再写 JSON。
+- 用 `zip(chunks, vectors)` 把块和向量配对，拼出要存的字典。
+- `search`：`q = embed_texts([query])[0]`，然后 `sorted(rows, key=lambda r: -cosine(q, r["vector"]))`。
+
+@@ item d11-18
+type: order
+title: 排代码：RAG 的 prompt
+level: 2
+--- prompt
+排出 `build_rag_prompt(question, chunks)`：先写规则，再列出带编号的片段，**问题放在最后**。有两行干扰项。
+
+为什么要编号？模型回答时写 `[c7]`，你就能检查它引用的片段是不是真的给过它。
+--- lines
+def build_rag_prompt(question, chunks):
+    lines = ["Answer using ONLY the excerpts below.", "Cite the excerpt id in brackets after each claim, e.g. [c2]."]
+    lines.append("")
+    for c in chunks:
+        lines.append(f"[{c['id']}] {c['text']}")
+    lines.append("")
+    lines.append(f"Question: {question}")
+    return "\n".join(lines)
+--- distractors
+        lines.append(c["text"])
+    return " ".join(lines)
+--- tests
+CH = [
+    {"id": "c3", "text": "Either party may terminate for material breach."},
+    {"id": "c7", "text": "Customer may terminate for convenience on 30 days' notice."},
+]
+expect("完整的 prompt", lambda: build_rag_prompt("Can we cancel early?", CH), "Answer using ONLY the excerpts below.\nCite the excerpt id in brackets after each claim, e.g. [c2].\n\n[c3] Either party may terminate for material breach.\n[c7] Customer may terminate for convenience on 30 days' notice.\n\nQuestion: Can we cancel early?")
+expect("问题在最后一行", lambda: build_rag_prompt("Is liability capped?", CH).splitlines()[-1], "Question: Is liability capped?")
+--- hints
+- 顺序：规则 → 空行 → 每个片段一行 → 空行 → 问题 → 用 `"\n"` 连起来。
+- 片段前面要有 `[id]`，否则模型没法引用。
+
+@@ item d11-19
+type: local
+title: 本机任务：在真实合同上检索
+level: 3
+--- prompt
+在真实的 Clause Check 合同上跑你自己写的关键词检索。
+
+1. 在项目根目录导出切好的条款：
+
+```
+cd "G:\Contract Clause Reviewer"
+New-Item -ItemType Directory -Force work | Out-Null
+python -m clausecheck clauses data/sample_contract.txt --json work/clauses.json
+```
+
+2. 在 VS Code 里打开 `work/clauses.json` 看一眼：每一项有 `clause_id`、`heading`、`text` 等字段
+3. 新建 `learn/my_search.py`，**不看本页**，从空白手写：
+   - 用 argparse 读一个位置参数 `query`，和 `--k`（整数，默认 3）（第 10 天）
+   - 读 `work/clauses.json`（第 10 天）
+   - 用今天的 `tokenize` 和 `keyword_score`，给每条的 `heading + " " + text` 打分；0 分的不要，分数从高到低取前 k 条
+   - 每条打印一行，比如 `3.2  score=3  Late Payment and Non-Refundability`（编号、分数、标题）；一条都没有就打印 `no match`
+4. 运行两次，把两次的输出都粘贴到下面：
+
+```
+python learn/my_search.py "Can the provider suspend the service?"
+python learn/my_search.py "Can we cancel early?"
+```
+
+第二个问题应该是 `no match`：这份合同里写的是 terminate，没有 cancel。这就是关键词检索的同义词问题，也是 embeddings 存在的理由。
+placeholder: 粘贴两次运行的输出：应该有 score=… 的行和一行 no match
+verify: ^(?=[\s\S]*score=\d)(?=[\s\S]*no match)
+--- hints
+- 卡住时先让最小的版本跑起来：先只打印 `len(clauses)`，再加打分，最后加 argparse。
+- 第一个问题排在前面的应该有 3.2（逾期可以暂停服务）和 11.1。
+- 运行时报 `FileNotFoundError: work/clauses.json`：检查第 1 步，以及你是不是在项目根目录运行（相对路径是相对当前目录的）。
+
+@@ item d11-e1
+type: scratch
+title: 闭卷：按标题切块
+exam: yes
+level: 3
+--- prompt
+写 `chunk_by_heading(text)`，按合同的编号标题切块：
+
+- **标题行**：去掉首尾空白后，以编号开头（如 `8`、`8.1`、`10.2.1`），后面跟空格和一个大写字母。可以用 `re.match(r"\d+(\.\d+)*\s+[A-Z]", 行)` 判断
+- 每个标题行开始一块，下面直到下一个标题之前的行都是它的正文；第一个标题之前的内容忽略
+- 正文的各行用空格连起来，连续空白合并成一个空格，去掉首尾空白；**正文为空的块（只是章节标题）不要**
+- 返回 `[{"id": "c1", "heading": "8.1 Cap on Liability", "text": 正文}, ...]`：`id` 按保留下来的块从 `c1` 开始编号，`heading` 是去掉首尾空白的整个标题行
+--- solution
+import re
+
+HEAD = re.compile(r"\d+(\.\d+)*\s+[A-Z]")
+
+def chunk_by_heading(text):
+    blocks = []
+    for line in text.splitlines():
+        s = line.strip()
+        if HEAD.match(s):
+            blocks.append({"heading": s, "lines": []})
+        elif blocks:
+            blocks[-1]["lines"].append(s)
+    chunks = []
+    for b in blocks:
+        body = re.sub(r"\s+", " ", " ".join(b["lines"])).strip()
+        if body:
+            chunks.append({"id": f"c{len(chunks) + 1}", "heading": b["heading"], "text": body})
+    return chunks
+--- tests
+DOC = """CLOUDNOTES AGREEMENT
+Preamble text.
+8 Limitation of Liability
+8.1 Cap on Liability
+Each party's liability shall not
+exceed   the fees paid.
+12 Exclusions
+The limitations in Section 8 do not apply.
+30 days' notice applies.
+"""
+expect("章节标题 8 没有正文，不要", lambda: [c["id"] + " " + c["heading"] for c in chunk_by_heading(DOC)], ["c1 8.1 Cap on Liability", "c2 12 Exclusions"])
+expect("正文合并空白", lambda: chunk_by_heading(DOC)[0]["text"], "Each party's liability shall not exceed the fees paid.")
+expect("数字开头但后面是小写，不是标题", lambda: chunk_by_heading(DOC)[1]["text"], "The limitations in Section 8 do not apply. 30 days' notice applies.")
+expect("没有标题", lambda: chunk_by_heading("just text\nmore text"), [])
+
+@@ item d11-e2
+type: scratch
+title: 闭卷：关键词检索
+exam: yes
+level: 3
+--- prompt
+写 `retrieve(query, chunks, k)`，用关键词检索找出最相关的块（每块是 `{"id": ..., "text": ...}`）：
+
+- 分词：转小写后 `re.findall(r"[a-z0-9]+", ...)`，去掉停用词 `{"the", "a", "an", "of", "to", "and", "is", "are", "we", "can", "do"}`
+- 一块的分数 = 问题里有多少个**不同的**词出现在这块的 `text` 里
+- 0 分的不要；分数从高到低，同分保持 `chunks` 里的原顺序；返回前 `k` 块的 `id`
+--- solution
+import re
+
+STOP = {"the", "a", "an", "of", "to", "and", "is", "are", "we", "can", "do"}
+
+def tokenize(text):
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP}
+
+def retrieve(query, chunks, k):
+    q = tokenize(query)
+    scored = []
+    for c in chunks:
+        score = len(q & tokenize(c["text"]))
+        if score > 0:
+            scored.append((score, c["id"]))
+    scored = sorted(scored, key=lambda pair: -pair[0])
+    return [cid for score, cid in scored[:k]]
+--- tests
+CHUNKS = [
+    {"id": "c5", "text": "Provider may suspend the Service if fees are overdue."},
+    {"id": "c1", "text": "Customer may terminate for convenience."},
+    {"id": "c2", "text": "Provider may suspend or terminate the Service on notice."},
+    {"id": "c9", "text": "Fees are payable annually."},
+]
+expect("同分保持原顺序", lambda: retrieve("When can the provider suspend the service?", CHUNKS, 5), ["c5", "c2"])
+expect("分数高的在前，取前 2 个", lambda: retrieve("terminate or suspend", CHUNKS, 2), ["c2", "c5"])
+expect("没有相关的", lambda: retrieve("Can we cancel early?", CHUNKS, 3), [])
+
+@@ item d11-e3
+type: scratch
+title: 闭卷：检索+预算+prompt
+exam: yes
+level: 3
+--- prompt
+写 `answer_context(query, chunks, k, budget)`，返回要发给模型的 prompt 字符串（每块是 `{"id": ..., "text": ...}`）：
+
+1. **检索**：查询词 = 查询里**长度至少 4** 的单词（转小写，用 `re.findall(r"[a-z0-9]+", ...)` 取词，去重）。一块的分数 = 有多少个查询词出现在这块 `text` 的单词里（同样转小写取词）。0 分的不要；分数从高到低、同分保持原顺序，取前 `k` 块
+2. **装预算**：按上一步的顺序，每块估算 `math.ceil(len(text) / 4)` 个 token；加上这块会超过 `budget` 就跳过它，继续看下一块
+3. **拼 prompt**：第一行 `Answer using only these excerpts and cite their ids.`，然后每块一行 `[id] text`，最后一行 `Question: <query>`，用 `"\n"` 连接
+4. 一块都没选上时，返回 `"No relevant excerpts found."`
+--- solution
+import math
+import re
+
+def _words(text):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+def answer_context(query, chunks, k, budget):
+    q = {w for w in _words(query) if len(w) >= 4}
+    scored = []
+    for c in chunks:
+        score = len(q & _words(c["text"]))
+        if score > 0:
+            scored.append((score, c))
+    ranked = [c for score, c in sorted(scored, key=lambda p: -p[0])][:k]
+    picked = []
+    used = 0
+    for c in ranked:
+        cost = math.ceil(len(c["text"]) / 4)
+        if used + cost > budget:
+            continue
+        picked.append(c)
+        used += cost
+    if not picked:
+        return "No relevant excerpts found."
+    lines = ["Answer using only these excerpts and cite their ids."]
+    lines += [f"[{c['id']}] {c['text']}" for c in picked]
+    lines.append(f"Question: {query}")
+    return "\n".join(lines)
+--- tests
+CHUNKS = [
+    {"id": "c1", "text": "Fees are payable annually in advance."},
+    {"id": "c2", "text": "Provider may terminate or suspend the Service at any time for convenience, with or without cause, upon notice."},
+    {"id": "c3", "text": "Customer may terminate for convenience on thirty days' notice."},
+]
+Q = "Can the customer terminate for convenience?"
+HEAD = "Answer using only these excerpts and cite their ids."
+expect("两块都放得下：分数高的 c3 在前", lambda: answer_context(Q, CHUNKS, 3, 100), HEAD + "\n[c3] " + CHUNKS[2]["text"] + "\n[c2] " + CHUNKS[1]["text"] + "\nQuestion: " + Q)
+expect("预算只够一块：跳过放不下的 c2", lambda: answer_context(Q, CHUNKS, 3, 20), HEAD + "\n[c3] " + CHUNKS[2]["text"] + "\nQuestion: " + Q)
+expect("k 为 1", lambda: answer_context(Q, CHUNKS, 1, 100).count("\n[c"), 1)
+expect("没有相关的", lambda: answer_context("What about personal data?", CHUNKS, 3, 100), "No relevant excerpts found.")

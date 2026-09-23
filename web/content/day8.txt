@@ -1,0 +1,946 @@
+@@ day 8
+title: 函数与数据建模：元组、集合、dataclass
+lang: py
+hours: 4–5 小时
+--- goal
+用元组、集合和 dataclass 把条款数据整理清楚；用 `enumerate`、`zip`、推导式、`Counter`、多键排序写出又短又对的数据代码；能读懂别人代码里的 `*args` / `**kwargs`。这些写法在 Clause Check 的 `pipeline.py`（`summarise`）、`split.py`（按编号排序）和 `config.py`（`Settings` 就是一个 dataclass）里随处可见。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每张都改一改再运行
+- 练习区全部通过
+- 闭卷挑战 3 题
+- 打开 `clausecheck/pipeline.py` 的 `summarise`：排序的 key 是几项的元组？最后一项是字符串编号，会不会遇到今天的「10.1 排在 8.1 前面」？对照 `split.py` 里的 `_sort_key` 想一想
+
+@@ concept
+title: 元组和拆包
+--- body
+元组 `("8.1", "flag")` 像一个**不能改的小列表**，用来放「固定几样、总是一起出现」的东西：一个编号和它的判定，一个结果和它的原因。
+
+- **拆包**：`cid, verdict = pair`，左边变量的个数要和元组长度一样
+- 函数「返回两个值」其实是返回一个元组：`return ok, reason`，调用时 `ok, reason = check(...)`
+- `a, b = b, a` 一行交换两个变量
+- 你早就用过拆包了：`for k, v in d.items():` 每次拿到的就是一个 `(键, 值)` 元组
+
+常见错误：想改元组里的元素，`pair[1] = "accept"` 会报 `TypeError`。要改就造一个新的元组。
+--- code
+pair = ("8.1", "flag")
+cid, verdict = pair
+print(cid, verdict, len(pair))
+
+def check(verdict):
+    if verdict in ("accept", "flag", "redline"):
+        return True, ""
+    return False, f"unknown verdict: {verdict}"
+
+ok, reason = check("maybe")
+print(ok, reason)
+print(check("flag"))
+
+first, second = "8.1", "3.1"
+first, second = second, first
+print(first, second)
+
+try:
+    pair[1] = "accept"
+except TypeError as e:
+    print("TypeError:", e)
+
+@@ concept
+title: enumerate 和 zip
+--- body
+- `enumerate(列表)` 每次给你一个 `(下标, 元素)`；`enumerate(列表, 1)` 从 1 开始数。Clause Check 的 `pipeline.py` 里就是 `for i, clause in enumerate(clauses, 1):`，用来显示「第 i 条 / 共 n 条」。以后不用再写 `for i in range(len(xs))` 了
+- `zip(a, b)` 把两个列表**按位置配对**：`zip(["8.1", "3.1"], ["flag", "accept"])` 依次给出 `("8.1", "flag")`、`("3.1", "accept")`
+- `dict(zip(ids, verdicts))` 一步配成字典
+
+坑：两个列表长度不同时，`zip` 在**短的那个用完时就停**，多出来的悄悄丢掉，不报错。
+--- code
+ids = ["8.1", "3.1", "10.1"]
+verdicts = ["flag", "accept", "redline"]
+
+for i, cid in enumerate(ids, 1):
+    print(f"{i}/{len(ids)} reviewing {cid}")
+
+for cid, v in zip(ids, verdicts):
+    print(cid, "->", v)
+
+print(dict(zip(ids, verdicts)))
+print(list(zip(ids, ["flag"])))
+
+@@ concept
+title: 集合 set
+--- body
+集合 `{"PB-01", "PB-03"}` 是一堆**不重复、没有顺序**的元素。它最擅长两件事：
+
+- **去重**：`set(["PB-01", "PB-01", "PB-03"])` 只剩两个；`s.add(x)` 往里加一个
+- **判断在不在**：`"PB-03" in rules`，集合再大也很快
+
+集合之间的运算，正好对应「规则检查」：
+
+- `required - cited`：要求引用、却没引用的（漏了哪些）
+- `required & cited`：两边都有的
+- `required | cited`：合在一起
+
+两个坑：空集合要写 `set()`，因为 `{}` 是空**字典**；集合没有顺序，需要稳定的输出时用 `sorted(集合)` 变成排好序的列表。
+--- code
+required = {"PB-01", "PB-03", "PB-07"}
+cited = set(["PB-03", "PB-03", "PB-09"])
+print(len(cited))
+print(sorted(required - cited))
+print(sorted(required & cited))
+print(sorted(required | cited))
+print("PB-07" in required)
+
+seen = set()
+for rid in ["PB-02", "PB-01", "PB-02"]:
+    seen.add(rid)
+print(sorted(seen))
+print(type(set()).__name__, type({}).__name__)
+
+@@ concept
+title: 字典进阶：推导式、Counter、defaultdict
+--- body
+- **字典推导式**：`{r["id"]: r["verdict"] for r in reviews}`，和列表推导式一样，只是写成 `键: 值`
+- **Counter**：专门计数的字典。`Counter(列表)` 一行完成第 2 天那个计数循环；`.most_common(2)` 返回最多的两个 `(值, 次数)`；查不存在的键返回 0，不报错
+- **defaultdict(list)**：取一个不存在的键时，自动先放一个空列表，分组时不用再写 `if key not in groups`。`evals/run_evals.py` 就用 `defaultdict(list)` 收集每条用例的结果
+
+两个都要先导入：`from collections import Counter, defaultdict`。
+
+坑：defaultdict 连「读」一个不存在的键都会把它加进去。交给别人之前，用 `dict(groups)` 转成普通字典。
+--- code
+from collections import Counter, defaultdict
+
+reviews = [
+    {"id": "3.1", "topic": "payment", "verdict": "accept"},
+    {"id": "8.1", "topic": "liability_cap", "verdict": "flag"},
+    {"id": "3.2", "topic": "payment", "verdict": "flag"},
+]
+print({r["id"]: r["verdict"] for r in reviews})
+
+counts = Counter([r["verdict"] for r in reviews])
+print(counts)
+print(counts.most_common(1), counts["redline"])
+
+groups = defaultdict(list)
+for r in reviews:
+    groups[r["topic"]].append(r["id"])
+print(dict(groups))
+print(groups["termination"], len(groups))
+
+@@ concept
+title: any 和 all
+--- body
+- `any(...)`：只要**有一个**为真就是 True。「有没有哪条被 redline？」
+- `all(...)`：**全部**为真才是 True。「所有判定都合法吗？」
+
+括号里通常写一个**去掉方括号的推导式**（叫生成器表达式）：
+
+```python
+any(r["verdict"] == "redline" for r in reviews)
+```
+
+它不先造出一整个列表，边算边判断，一有结论就停。`sum(...)`、`max(...)`、`Counter(...)` 的括号里也能这样写。`evals/harness.py` 里就有一句 `any(t.startswith(prefix) for t in ...)`。
+
+边界要记牢：`any([])` 是 False，`all([])` 是 **True**（没有反例，就算「全部合法」）。如果空列表在你的业务里意味着出错，要单独判断。
+--- code
+reviews = [{"id": "3.1", "verdict": "accept"}, {"id": "8.1", "verdict": "redline"}]
+print(any(r["verdict"] == "redline" for r in reviews))
+print(all(r["verdict"] in ("accept", "flag", "redline") for r in reviews))
+print(sum(1 for r in reviews if r["verdict"] != "accept"))
+print(any([]), all([]))
+
+@@ concept
+title: 多键排序
+--- body
+律师要的顺序常常不止一个条件：「先按风险从高到低，风险一样再按编号」。办法是让 `key` 返回一个**元组**。Python 比较元组时先比第一项，一样再比第二项：
+
+```python
+RISK = {"high": 0, "medium": 1, "low": 2}
+sorted(reviews, key=lambda r: (RISK[r["risk"]], r["id"]))
+```
+
+- `reverse=True` 把整个顺序倒过来；想「一项降序、一项升序」时，把数字取负：`key=lambda r: (-r["tokens"], r["id"])`
+- `max(xs, key=...)` 找「最大」的那一个元素，`min` 同理；列表可能为空时加 `default=None`
+
+编号的坑：字符串是一个字符一个字符比的，所以 `"10.1" < "8.1"`（因为 `"1" < "8"`）。按编号排，要先转成数字元组：`"10.1"` → `(10, 1)`。Clause Check `split.py` 里的 `_sort_key` 就是做这件事的。
+--- code
+RISK = {"high": 0, "medium": 1, "low": 2}
+reviews = [
+    {"id": "10.1", "risk": "high", "tokens": 900},
+    {"id": "3.1", "risk": "low", "tokens": 300},
+    {"id": "8.1", "risk": "high", "tokens": 1200},
+]
+print(sorted(["10.1", "8.1", "3.1"]))
+
+def id_key(cid):
+    return tuple(int(x) for x in cid.split("."))
+
+print(id_key("10.1"), sorted(["10.1", "8.1", "3.1"], key=id_key))
+for r in sorted(reviews, key=lambda r: (RISK[r["risk"]], id_key(r["id"]))):
+    print(r["risk"], r["id"])
+print(max(reviews, key=lambda r: r["tokens"])["id"])
+print(max([], key=len, default=None))
+
+@@ concept
+title: dataclass：只装数据的类
+--- body
+第 3 天写类要手写 `__init__`，一行行 `self.x = x`。如果一个类主要是装数据，用 `@dataclass` 让 Python 替你写：
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Clause:
+    id: str
+    text: str
+    risk: str = "low"
+    tags: list[str] = field(default_factory=list)
+```
+
+自动得到：`__init__`（`Clause("8.1", "...")`）、好读的打印 `Clause(id='8.1', ...)`、按字段比较的 `==`。方法照常写。`asdict(c)` 把它转成字典（方便写 JSON）。
+
+- 列表、字典这种**可变**的默认值必须写 `field(default_factory=list)`，每个对象各有一份新的；写 `= []` 会直接报错。普通函数的 `def f(tags=[])` 也有同样的坑，练习里会遇到
+- dataclass **不做校验**：`Clause(8.1, None)` 也能创建成功
+--- code
+from dataclasses import dataclass, field, asdict
+
+@dataclass
+class Clause:
+    id: str
+    text: str
+    risk: str = "low"
+    tags: list[str] = field(default_factory=list)
+
+    def is_high(self) -> bool:
+        return self.risk == "high"
+
+a = Clause("8.1", "Liability is unlimited.", "high")
+b = Clause("3.1", "Fees are due in 30 days.")
+print(a)
+print(a.is_high(), b.is_high())
+b.tags.append("payment")
+print(b.tags, a.tags)
+print(a == Clause("8.1", "Liability is unlimited.", "high"))
+print(asdict(b))
+
+@@ concept
+title: *args、**kwargs 和只能按名字传的参数
+--- body
+读别人的代码（包括 Clause Check）时，经常看到参数前面有星号：
+
+- 定义时 `def log(event, *args, **kwargs):`：多出来的**位置参数**收进元组 `args`，多出来的**名字参数**收进字典 `kwargs`
+- 调用时 `f(**d)`：把字典展开成名字参数。第 4 天的 `tools[name](**args)` 就是它；`run_evals.py` 里的 `Settings(**kw)` 也是；`review.py` 的 `_create(self, **kwargs)` 把收到的参数原样转交给 `client.messages.create(**kwargs)`
+- `def review(clause_id, *, strict=False):` 中间单独一个 `*`，表示后面的参数**只能按名字传**：`review("8.1", strict=True)` 可以，`review("8.1", True)` 报 `TypeError`。这样调用处一眼就知道那个 `True` 是什么意思
+
+自己写函数时，参数能列清楚就别用 `**kwargs`：它会让拼错的参数名悄悄混过去。
+--- code
+def log(event, *args, **kwargs):
+    print(event, args, kwargs)
+
+log("review")
+log("review", "8.1", "flag", risk="high", ms=120)
+
+def review(clause_id, *, strict=False):
+    return f"{clause_id} strict={strict}"
+
+options = {"strict": True}
+print(review("8.1"), "|", review("8.1", **options))
+try:
+    review("8.1", True)
+except TypeError as e:
+    print("TypeError:", e)
+
+@@ item d8-01
+type: code
+title: 复习：按风险计数
+level: 1
+--- prompt
+先热身，复习第 2 天的计数写法。写 `count_by_risk(reviews)`：`reviews` 是字典列表，每个字典有 `"risk"` 键。返回每种风险出现的次数。
+
+```python
+count_by_risk([{"id": "8.1", "risk": "high"}, {"id": "3.1", "risk": "low"}, {"id": "10.1", "risk": "high"}])
+# → {"high": 2, "low": 1}
+```
+
+今天晚些时候你会学到一行写完它的办法。
+--- starter
+def count_by_risk(reviews):
+    pass
+--- solution
+def count_by_risk(reviews):
+    counts = {}
+    for r in reviews:
+        counts[r["risk"]] = counts.get(r["risk"], 0) + 1
+    return counts
+--- tests
+DATA = [{"id": "8.1", "risk": "high"}, {"id": "3.1", "risk": "low"}, {"id": "10.1", "risk": "high"}]
+expect("两种风险", lambda: count_by_risk(DATA), {"high": 2, "low": 1})
+expect("只有一条", lambda: count_by_risk([{"id": "4.2", "risk": "medium"}]), {"medium": 1})
+expect("空列表", lambda: count_by_risk([]), {})
+--- hints
+- 循环前 `counts = {}`，循环里更新，循环后 `return counts`。
+- 更新那一行：`counts[r["risk"]] = counts.get(r["risk"], 0) + 1`。
+
+@@ item d8-02
+type: predict
+title: 复习：sorted 和 key
+level: 1
+--- prompt
+写出输出。注意最后一行：`sorted` 有没有改动原来的列表？
+--- code
+RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+reviews = [
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "4.2", "risk": "medium"},
+    {"id": "9.1", "risk": "high"},
+]
+ordered = sorted(reviews, key=lambda r: RISK_ORDER[r["risk"]])
+print([r["id"] for r in ordered])
+print(sorted(["b", "a", "c"], reverse=True))
+print(reviews[0]["id"])
+--- explain
+`sorted` 返回一个**新**列表，原来的 `reviews` 不变，所以第一个还是 `3.1`。它是稳定排序：`8.1` 和 `9.1` 都是 high，保持原来的先后顺序。
+
+@@ item d8-03
+type: predict
+title: 拆包、enumerate 和 zip
+level: 1
+--- prompt
+写出输出。特别注意两个列表长度不一样时 `zip` 怎么处理。
+--- code
+pair = ("8.1", "flag")
+cid, verdict = pair
+print(verdict, cid)
+
+ids = ["3.1", "8.1", "10.1"]
+verdicts = ["accept", "flag"]
+for i, cid in enumerate(ids, 1):
+    print(i, cid)
+print(list(zip(ids, verdicts)))
+print(dict(zip(ids, verdicts)))
+--- explain
+`enumerate(ids, 1)` 从 1 开始数。`zip` 在短的列表用完时就停了，`10.1` 被**悄悄丢掉**，没有任何报错。在 Clause Check 里如果模型少返回了一条判定，这样配对会让一条条款无声无息地消失，所以下一题要自己检查长度。
+
+@@ item d8-04
+type: code
+title: 返回两个值
+level: 1
+--- prompt
+写 `check_verdict(verdict)`：
+
+- 合法（`accept` / `flag` / `redline` 之一）：返回 `(True, "")`
+- 否则：返回 `(False, "unknown verdict: " + verdict)`
+
+```python
+ok, reason = check_verdict("maybe")
+# ok → False，reason → "unknown verdict: maybe"
+```
+
+这种「结果 + 原因」的写法，调用方一行就能拆开拿到两样东西。
+--- starter
+VALID = ("accept", "flag", "redline")
+
+def check_verdict(verdict):
+    pass
+--- solution
+VALID = ("accept", "flag", "redline")
+
+def check_verdict(verdict):
+    if verdict in VALID:
+        return True, ""
+    return False, f"unknown verdict: {verdict}"
+--- tests
+expect("合法", lambda: check_verdict("flag"), (True, ""))
+expect("不合法", lambda: check_verdict("maybe"), (False, "unknown verdict: maybe"))
+expect("大写也不合法", lambda: check_verdict("FLAG"), (False, "unknown verdict: FLAG"))
+def _unpack():
+    ok, reason = check_verdict("redline")
+    return ok
+expect("可以拆包", _unpack, True)
+--- hints
+- 两个值之间用逗号：`return True, ""`，Python 会把它们打包成元组。
+- 先判断 `verdict in VALID`，是就返回 `(True, "")`；不是就返回 `False` 和用 f-string 拼好的原因。
+
+@@ item d8-05
+type: code
+title: 带序号的清单
+level: 1
+--- prompt
+律师想要一份带序号的清单。写 `numbered(ids)`：返回字符串列表，每项是 `"序号. 编号"`，序号从 1 开始。
+
+`numbered(["8.1", "10.1"])` → `["1. 8.1", "2. 10.1"]`
+
+用 `enumerate`，不要自己维护一个计数变量。
+--- starter
+def numbered(ids):
+    result = []
+    return result
+--- solution
+def numbered(ids):
+    return [f"{i}. {cid}" for i, cid in enumerate(ids, 1)]
+--- tests
+expect("两条", lambda: numbered(["8.1", "10.1"]), ["1. 8.1", "2. 10.1"])
+expect("一条", lambda: numbered(["12"]), ["1. 12"])
+expect("空", lambda: numbered([]), [])
+--- hints
+- `for i, cid in enumerate(ids, 1):`，第二个参数 1 表示从 1 开始数。
+- 每项是 `f"{i}. {cid}"`。也可以写成一行推导式。
+
+@@ item d8-06
+type: code
+title: 两个列表配成字典
+level: 2
+--- prompt
+模型按顺序返回了一串判定，要和条款编号一一配对。写 `verdict_map(ids, verdicts)`，返回 `{编号: 判定}`。
+
+`verdict_map(["8.1", "3.1"], ["flag", "accept"])` → `{"8.1": "flag", "3.1": "accept"}`
+
+两个列表长度不同，说明哪里出了错（少审了一条？），这时不能像 `zip` 那样悄悄丢数据，而要 `raise ValueError(f"length mismatch: {len(ids)} ids, {len(verdicts)} verdicts")`。
+
+（Python 3.10 起 `zip(..., strict=True)` 也会在长度不同时报错，但这里要求自己写出上面这条清楚的错误信息。）
+--- starter
+def verdict_map(ids, verdicts):
+    return dict(zip(ids, verdicts))
+--- solution
+def verdict_map(ids, verdicts):
+    if len(ids) != len(verdicts):
+        raise ValueError(f"length mismatch: {len(ids)} ids, {len(verdicts)} verdicts")
+    return dict(zip(ids, verdicts))
+--- tests
+expect("两条", lambda: verdict_map(["8.1", "3.1"], ["flag", "accept"]), {"8.1": "flag", "3.1": "accept"})
+expect("空", lambda: verdict_map([], []), {})
+expect_raises("判定少了一条", lambda: verdict_map(["8.1", "3.1"], ["flag"]), ValueError)
+def _message():
+    try:
+        verdict_map(["8.1"], ["flag", "accept"])
+    except ValueError as e:
+        return str(e)
+expect("错误信息", _message, "length mismatch: 1 ids, 2 verdicts")
+--- hints
+- 起始代码对长度一样的情况已经是对的。缺的是：长度不同时要报错。
+- 在 `return` 之前加 `if len(ids) != len(verdicts):`，里面 `raise ValueError(...)`。
+
+@@ item d8-07
+type: predict
+title: 集合运算
+level: 2
+--- prompt
+写出输出。每个集合都用 `sorted` 变成了排好序的列表，所以输出顺序是确定的。
+--- code
+required = {"PB-01", "PB-03", "PB-07"}
+cited = ["PB-03", "PB-09", "PB-03"]
+cited_set = set(cited)
+print(len(cited), len(cited_set))
+print(sorted(required - cited_set))
+print(sorted(cited_set - required))
+print(sorted(required & cited_set))
+print("PB-01" in required, "PB-01" in cited_set)
+print(type({}).__name__)
+--- explain
+`-` 有方向：`required - cited_set` 是「要求了但没引用」，`cited_set - required` 是「引用了但不在要求里」（模型可能编了一条规则）。`{}` 是空字典，空集合要写 `set()`。
+
+@@ item d8-08
+type: code
+title: 漏掉了哪些规则
+level: 2
+--- prompt
+playbook 要求这类条款必须依据某些规则（`required`），模型的回答引用了一些规则（`cited`）。两个都是列表，可能有重复。
+
+写 `missing_rules(required, cited)`：返回「要求了、但没被引用」的规则编号，**去重并排好序**的列表。
+
+`missing_rules(["PB-01", "PB-03"], ["PB-03", "PB-03"])` → `["PB-01"]`
+--- starter
+def missing_rules(required, cited):
+    pass
+--- solution
+def missing_rules(required, cited):
+    return sorted(set(required) - set(cited))
+--- tests
+expect("漏了一条", lambda: missing_rules(["PB-01", "PB-03"], ["PB-03", "PB-03"]), ["PB-01"])
+expect("全都引用了", lambda: missing_rules(["PB-01", "PB-03"], ["PB-03", "PB-01", "PB-09"]), [])
+expect("一条都没引用，结果排好序", lambda: missing_rules(["PB-07", "PB-01"], []), ["PB-01", "PB-07"])
+expect("required 里有重复", lambda: missing_rules(["PB-02", "PB-02"], []), ["PB-02"])
+--- hints
+- 先把两个列表都变成集合：`set(required)`、`set(cited)`。
+- 集合相减得到「在前面、不在后面」的元素，最后 `sorted(...)` 变成列表。
+
+@@ item d8-09
+type: choice
+title: 元组、列表、集合还是字典
+level: 1
+--- prompt
+下面四个场景，哪一个最适合用**集合**？
+--- options
+- 按原文顺序保存一份合同的所有条款，之后要按下标取第 3 条
+- 函数同时返回「是否合法」和「原因」两个值
+- 记录一次审查里已经查过的规则编号：经常要问「这条查过没有」，重复的只算一次
+- 保存每条条款的判定，要能按条款编号查到判定
+answer: 3
+--- explain
+集合的两个长处就是去重和飞快的 `in`。要顺序和下标用列表；固定几样一起出现用元组；按键查值用字典。集合没有顺序，不能写 `s[0]`。
+
+@@ item d8-10
+type: fill
+title: 填空：字典推导式
+level: 1
+--- prompt
+补全 `attention_map(ids, verdicts)`：用 `zip` 把编号和判定配对，只保留不是 `accept` 的，返回 `{编号: 判定}`。
+
+`attention_map(["3.1", "8.1"], ["accept", "flag"])` → `{"8.1": "flag"}`
+--- template
+def attention_map(ids, verdicts):
+    return {[[cid]]: v for cid, v in [[zip]](ids, verdicts) if v [[!=]] "accept"}
+--- tests
+expect("只留需要看的", lambda: attention_map(["3.1", "8.1", "10.1"], ["accept", "flag", "redline"]), {"8.1": "flag", "10.1": "redline"})
+expect("全部 accept", lambda: attention_map(["3.1"], ["accept"]), {})
+--- hints
+- 字典推导式的形状：`{键: 值 for ... in ... if 条件}`。键是编号。
+- 把两个列表按位置配对的函数是哪个？
+
+@@ item d8-11
+type: code
+title: 用 defaultdict 分组
+level: 2
+--- prompt
+用 `defaultdict(list)` 重写第 2 天的分组。写 `group_by_topic(reviews)`：返回 `{主题: [编号, ...]}`，编号保持原顺序。
+
+```python
+group_by_topic([
+    {"id": "3.1", "topic": "payment"},
+    {"id": "8.1", "topic": "liability_cap"},
+    {"id": "3.2", "topic": "payment"},
+])
+# → {"payment": ["3.1", "3.2"], "liability_cap": ["8.1"]}
+```
+
+返回前转成**普通 `dict`**（测试会检查类型）：如果把 defaultdict 交出去，调用方查一个不存在的主题时不会报错，而是悄悄多出一个空列表，bug 就被藏起来了。
+--- starter
+from collections import defaultdict
+
+def group_by_topic(reviews):
+    groups = defaultdict(list)
+    return groups
+--- solution
+from collections import defaultdict
+
+def group_by_topic(reviews):
+    groups = defaultdict(list)
+    for r in reviews:
+        groups[r["topic"]].append(r["id"])
+    return dict(groups)
+--- tests
+DATA = [
+    {"id": "3.1", "topic": "payment"},
+    {"id": "8.1", "topic": "liability_cap"},
+    {"id": "3.2", "topic": "payment"},
+]
+expect("两组", lambda: group_by_topic(DATA), {"payment": ["3.1", "3.2"], "liability_cap": ["8.1"]})
+expect("返回普通 dict", lambda: type(group_by_topic(DATA)).__name__, "dict")
+expect("空", lambda: group_by_topic([]), {})
+--- hints
+- 有了 defaultdict，循环里只要一行：`groups[r["topic"]].append(r["id"])`，不用先判断键在不在。
+- 最后 `return dict(groups)`。
+
+@@ item d8-12
+type: code
+title: 问题最多的主题
+level: 2
+--- prompt
+写 `top_topics(reviews, n)`：只看判定**不是** `accept` 的条款，统计每个主题出现几次，返回次数最多的前 `n` 个 `(主题, 次数)` 组成的列表。次数相同的，先出现的排前面（`Counter.most_common` 本来就是这样）。
+
+```python
+top_topics(reviews, 1)   # → [("liability_cap", 2)]
+```
+--- starter
+from collections import Counter
+
+def top_topics(reviews, n):
+    pass
+--- solution
+from collections import Counter
+
+def top_topics(reviews, n):
+    topics = [r["topic"] for r in reviews if r["verdict"] != "accept"]
+    return Counter(topics).most_common(n)
+--- tests
+DATA = [
+    {"id": "3.1", "topic": "payment", "verdict": "accept"},
+    {"id": "8.1", "topic": "liability_cap", "verdict": "flag"},
+    {"id": "8.2", "topic": "liability_cap", "verdict": "redline"},
+    {"id": "3.2", "topic": "payment", "verdict": "flag"},
+    {"id": "6.2", "topic": "confidentiality", "verdict": "flag"},
+    {"id": "3.3", "topic": "payment", "verdict": "accept"},
+]
+expect("前两名（accept 不算）", lambda: top_topics(DATA, 2), [("liability_cap", 2), ("payment", 1)])
+expect("前一名", lambda: top_topics(DATA, 1), [("liability_cap", 2)])
+expect("n 比主题数多", lambda: top_topics(DATA, 10), [("liability_cap", 2), ("payment", 1), ("confidentiality", 1)])
+expect("全是 accept", lambda: top_topics([DATA[0]], 3), [])
+--- hints
+- 先用推导式取出非 accept 条款的主题列表。
+- `Counter(那个列表).most_common(n)` 返回的正好是 `(主题, 次数)` 元组的列表。
+
+@@ item d8-13
+type: code
+title: 有没有、是不是都
+level: 2
+--- prompt
+写两个函数，各用一个 `any` 或 `all`：
+
+- `any_redline(reviews)`：有任何一条判定是 `redline` 就返回 True
+- `all_valid(reviews)`：每一条的判定都是 `accept` / `flag` / `redline` 之一才返回 True。**空列表返回 False**：一条都没审，不能说「全部合法」
+
+注意 `all([])` 本身是 True，所以第二个函数要单独处理空列表。
+--- starter
+VALID = {"accept", "flag", "redline"}
+
+def any_redline(reviews):
+    pass
+
+def all_valid(reviews):
+    pass
+--- solution
+VALID = {"accept", "flag", "redline"}
+
+def any_redline(reviews):
+    return any(r["verdict"] == "redline" for r in reviews)
+
+def all_valid(reviews):
+    if not reviews:
+        return False
+    return all(r["verdict"] in VALID for r in reviews)
+--- tests
+expect("有 redline", lambda: any_redline([{"verdict": "accept"}, {"verdict": "redline"}]), True)
+expect("没有 redline", lambda: any_redline([{"verdict": "flag"}]), False)
+expect("空列表没有 redline", lambda: any_redline([]), False)
+expect("全部合法", lambda: all_valid([{"verdict": "accept"}, {"verdict": "flag"}]), True)
+expect("有一条不合法", lambda: all_valid([{"verdict": "accept"}, {"verdict": "HIGH"}]), False)
+expect("空列表不算合法", lambda: all_valid([]), False)
+--- hints
+- `any(r["verdict"] == "redline" for r in reviews)`，`all` 的写法一样，条件换成 `r["verdict"] in VALID`。
+- 空列表：在 `all(...)` 之前先 `if not reviews: return False`。
+
+@@ item d8-14
+type: code
+title: 先看风险，再看编号
+level: 3
+--- prompt
+写两个函数：
+
+1. `id_key(clause_id)`：把编号变成数字元组，`"10.1"` → `(10, 1)`，`"12"` → `(12,)`
+2. `sort_reviews(reviews)`：返回排好序的**编号列表**。先按风险从高到低（`high` → `medium` → `low`）；风险相同，按编号的**数值**从小到大：`8.1` 在 `10.1` 前面，`8.2` 在 `8.10` 前面
+
+`reviews` 里每项是 `{"id": ..., "risk": ...}`。
+--- starter
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    pass
+
+def sort_reviews(reviews):
+    pass
+--- solution
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def sort_reviews(reviews):
+    ordered = sorted(reviews, key=lambda r: (RISK[r["risk"]], id_key(r["id"])))
+    return [r["id"] for r in ordered]
+--- tests
+expect("id_key 两层", lambda: id_key("10.1"), (10, 1))
+expect("id_key 没有小数点", lambda: id_key("12"), (12,))
+DATA = [
+    {"id": "10.1", "risk": "high"},
+    {"id": "3.1", "risk": "low"},
+    {"id": "8.10", "risk": "medium"},
+    {"id": "8.1", "risk": "high"},
+    {"id": "8.2", "risk": "medium"},
+]
+expect("风险优先，编号按数值", lambda: sort_reviews(DATA), ["8.1", "10.1", "8.2", "8.10", "3.1"])
+expect("空", lambda: sort_reviews([]), [])
+--- hints
+- `id_key`：`clause_id.split(".")` 得到字符串列表，每个转 `int`，再包成 `tuple(...)`。
+- 排序的 key 返回元组：`(RISK[r["risk"]], id_key(r["id"]))`，最后再取出编号。
+
+@@ item d8-15
+type: code
+title: Clause dataclass
+level: 2
+--- prompt
+用 `@dataclass` 定义 `Clause`，字段依次是：
+
+- `id`：字符串
+- `text`：字符串
+- `risk`：字符串，默认 `"low"`
+- `tags`：字符串列表，默认空列表（每个对象各有一份）
+
+再加一个方法 `is_high()`：`risk` 是 `"high"` 时返回 True，否则 False。
+--- starter
+from dataclasses import dataclass, field
+
+@dataclass
+class Clause:
+    id: str
+--- solution
+from dataclasses import dataclass, field
+
+@dataclass
+class Clause:
+    id: str
+    text: str
+    risk: str = "low"
+    tags: list[str] = field(default_factory=list)
+
+    def is_high(self):
+        return self.risk == "high"
+--- tests
+expect("默认值", lambda: (Clause("3.1", "Fees are due.").risk, Clause("3.1", "Fees are due.").tags), ("low", []))
+expect("is_high", lambda: [Clause("8.1", "x", "high").is_high(), Clause("3.1", "y").is_high()], [True, False])
+expect("按字段比较相等", lambda: Clause("8.1", "x", "high") == Clause("8.1", "x", "high"), True)
+def _independent():
+    a = Clause("1", "a")
+    b = Clause("2", "b")
+    a.tags.append("payment")
+    return b.tags
+expect("两个对象的 tags 互不影响", _independent, [])
+expect("自动生成的打印格式", lambda: repr(Clause("8.1", "x")), "Clause(id='8.1', text='x', risk='low', tags=[])")
+--- hints
+- 每个字段一行 `名字: 类型`，有默认值的写在后面：`risk: str = "low"`。
+- 列表默认值：`tags: list[str] = field(default_factory=list)`。方法和普通类一样，第一个参数是 `self`。
+
+@@ item d8-16
+type: fix
+title: 修 bug：可变默认参数
+level: 2
+--- prompt
+`add_tag(tag, tags)` 把标签加进列表并返回。只调用一次看不出问题，**连续调用**就不对了。先运行，看输出的第二行，再看测试里「再调用一次」得到了什么，然后修好它。
+--- starter
+def add_tag(tag, tags=[]):
+    tags.append(tag)
+    return tags
+
+print(add_tag("payment"))
+print(add_tag("liability_cap"))
+--- solution
+def add_tag(tag, tags=None):
+    if tags is None:
+        tags = []
+    tags.append(tag)
+    return tags
+
+print(add_tag("payment"))
+print(add_tag("liability_cap"))
+--- tests
+expect("单独调用", lambda: add_tag("payment"), ["payment"])
+expect("再调用一次，不带着上次的标签", lambda: add_tag("termination"), ["termination"])
+expect("传入已有列表就往里加", lambda: add_tag("b", ["a"]), ["a", "b"])
+--- hints
+- 默认值 `[]` 只在 `def` 那一行执行时创建**一次**，之后每次不传 `tags` 的调用，用的都是同一个列表。
+- 惯用写法：默认值写 `None`，函数里 `if tags is None: tags = []`（判断 None 用 `is`）。
+
+@@ item d8-17
+type: fix
+title: 修 bug：列表默认值
+level: 2
+--- prompt
+这段代码一运行就报错，连测试都跑不到。读最后一行错误信息：Python 其实已经告诉你该怎么改了。
+--- starter
+from dataclasses import dataclass
+
+@dataclass
+class Review:
+    clause_id: str
+    verdict: str = "accept"
+    rule_ids: list[str] = []
+
+    def cite(self, rule_id):
+        self.rule_ids.append(rule_id)
+--- solution
+from dataclasses import dataclass, field
+
+@dataclass
+class Review:
+    clause_id: str
+    verdict: str = "accept"
+    rule_ids: list[str] = field(default_factory=list)
+
+    def cite(self, rule_id):
+        self.rule_ids.append(rule_id)
+--- tests
+expect("默认空列表", lambda: Review("8.1").rule_ids, [])
+expect("默认判定", lambda: Review("8.1").verdict, "accept")
+def _two():
+    a = Review("8.1")
+    b = Review("3.1")
+    a.cite("PB-03")
+    return [a.rule_ids, b.rule_ids]
+expect("每个对象各有一份", _two, [["PB-03"], []])
+--- hints
+- 错误信息最后说的是 `use default_factory`。
+- 改成 `field(default_factory=list)`，别忘了从 `dataclasses` 导入 `field`。
+
+@@ item d8-18
+type: choice
+title: dataclass 或 Pydantic
+level: 2
+--- prompt
+Clause Check 里，程序内部的配置 `Settings` 是一个 `@dataclass`（`config.py`），而模型返回的判定 `ClauseVerdict` 用的是 Pydantic（`models.py`）。模型输出为什么不用 dataclass？
+--- options
+- dataclass 不能有默认值
+- dataclass 不检查类型和取值：模型返回 `"verdict": "HIGH"` 也能创建成功，错误会悄悄流到后面
+- Pydantic 运行得比 dataclass 快
+- dataclass 不能转成字典
+answer: 2
+--- explain
+dataclass 只是替你写 `__init__`，类型标注在运行时不检查（第 3 天说过）。模型输出是**外部数据**，必须一进门就校验，失败了还要把错误回传给模型（第 4 天）。程序自己造的内部数据（配置、中间结果）用 dataclass 更轻便。dataclass 有默认值，也能用 `asdict` 转字典。面试常问这个区别。
+
+@@ item d8-19
+type: order
+title: 排代码：dataclass
+level: 2
+--- prompt
+排出程序：定义 `Review` dataclass（`clause_id` 字符串、`risk_score` 整数），再写 `riskiest_first(reviews)`：按 `risk_score` **从大到小**，分数相同按 `clause_id` **从小到大**，返回编号列表。有两行干扰项。
+--- lines
+from dataclasses import dataclass
+@dataclass
+class Review:
+    clause_id: str
+    risk_score: int
+def riskiest_first(reviews):
+    ordered = sorted(reviews, key=lambda r: (-r.risk_score, r.clause_id))
+    return [r.clause_id for r in ordered]
+--- distractors
+    ordered = sorted(reviews, key=lambda r: (r.risk_score, r.clause_id), reverse=True)
+    return [r["clause_id"] for r in ordered]
+--- tests
+REVIEWS = [Review("3.1", 1), Review("8.2", 3), Review("8.1", 3), Review("4.2", 2)]
+expect("分数高的在前，同分按编号", lambda: riskiest_first(REVIEWS), ["8.1", "8.2", "4.2", "3.1"])
+expect("空", lambda: riskiest_first([]), [])
+--- hints
+- `reverse=True` 会把**两项都**倒过来，同分时编号也变成从大到小了。只想让分数降序，就给分数取负。
+- dataclass 对象用点取字段：`r.clause_id`，不是 `r["clause_id"]`。
+
+@@ item d8-20
+type: choice
+title: 读懂星号参数
+level: 2
+--- prompt
+读下面的代码。哪个调用会报 `TypeError`？
+--- code
+def review(clause_id, *, strict=False, **extra):
+    return clause_id, strict, extra
+
+opts = {"strict": True, "model": "deepseek-chat"}
+--- options
+- `review("8.1")`
+- `review("8.1", strict=True)`
+- `review("8.1", True)`
+- `review("8.1", **opts)`
+answer: 3
+--- explain
+单独的 `*` 后面的参数只能按名字传，第二个位置参数 `True` 没地方放，报 `takes 1 positional argument but 2 were given`。`**opts` 展开成 `strict=True, model="deepseek-chat"`：`strict` 对上了参数，`model` 被 `**extra` 收走。读 `review.py` 里的 `client.messages.create(**kwargs)` 也是这个道理：把一个字典原样展开传给 SDK。
+
+@@ item d8-e1
+type: scratch
+title: 闭卷：审查汇总
+exam: yes
+level: 3
+--- prompt
+写 `summarise(reviews)`。`reviews` 是字典列表，每个字典有 `"id"`（如 `"8.1"`）、`"verdict"`（`accept` / `flag` / `redline`）、`"risk"`（`high` / `medium` / `low`）。返回：
+
+```python
+{
+    "total": 条数,
+    "counts": {判定: 次数},       # 只包含出现过的判定
+    "needs_attention": [编号, ...],
+}
+```
+
+`needs_attention` 是判定不为 `accept` 的编号：风险高的在前（high → medium → low）；风险相同时按编号的数值从小到大（`8.1` 在 `10.1` 前面）。
+--- solution
+from collections import Counter
+
+RISK = {"high": 0, "medium": 1, "low": 2}
+
+def id_key(clause_id):
+    return tuple(int(x) for x in clause_id.split("."))
+
+def summarise(reviews):
+    counts = Counter(r["verdict"] for r in reviews)
+    flagged = [r for r in reviews if r["verdict"] != "accept"]
+    ordered = sorted(flagged, key=lambda r: (RISK[r["risk"]], id_key(r["id"])))
+    return {
+        "total": len(reviews),
+        "counts": dict(counts),
+        "needs_attention": [r["id"] for r in ordered],
+    }
+--- tests
+DATA = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "10.1", "verdict": "redline", "risk": "high"},
+    {"id": "4.2", "verdict": "flag", "risk": "medium"},
+    {"id": "8.1", "verdict": "flag", "risk": "high"},
+    {"id": "9.1", "verdict": "flag", "risk": "low"},
+]
+expect("完整汇总", lambda: summarise(DATA), {"total": 5, "counts": {"accept": 1, "redline": 1, "flag": 3}, "needs_attention": ["8.1", "10.1", "4.2", "9.1"]})
+expect("空", lambda: summarise([]), {"total": 0, "counts": {}, "needs_attention": []})
+
+@@ item d8-e2
+type: scratch
+title: 闭卷：Rule dataclass
+exam: yes
+level: 2
+--- prompt
+用 `@dataclass` 写 `Rule`，字段依次是：`id`（字符串）、`topic`（字符串）、`keywords`（字符串列表，默认空列表，每个对象各有一份）。
+
+再加方法 `matches(text)`：只要有一个关键词出现在 `text` 里（**不区分大小写**）就返回 True；否则返回 False（没有关键词时也是 False）。
+
+`Rule("PB-01", "liability_cap", ["unlimited"]).matches("Liability is UNLIMITED.")` → `True`
+--- solution
+from dataclasses import dataclass, field
+
+@dataclass
+class Rule:
+    id: str
+    topic: str
+    keywords: list[str] = field(default_factory=list)
+
+    def matches(self, text):
+        lowered = text.lower()
+        return any(k.lower() in lowered for k in self.keywords)
+--- tests
+R = Rule("PB-01", "liability_cap", ["unlimited", "Uncapped"])
+expect("命中，不区分大小写", lambda: [R.matches("Liability is UNLIMITED."), R.matches("an uncapped indemnity")], [True, True])
+expect("没命中", lambda: R.matches("Fees are due in 30 days."), False)
+expect("没有关键词", lambda: Rule("PB-00", "other").matches("anything"), False)
+def _independent():
+    a = Rule("A", "x")
+    b = Rule("B", "y")
+    a.keywords.append("k")
+    return b.keywords
+expect("默认列表各自一份", _independent, [])
+
+@@ item d8-e3
+type: scratch
+title: 闭卷：规则变更
+exam: yes
+level: 2
+--- prompt
+playbook 改版了。写 `diff_rules(before, after)`：两个参数都是规则编号列表（可能有重复）。返回：
+
+`{"added": 新版有、旧版没有的, "removed": 旧版有、新版没有的}`
+
+两个列表都要去重并排好序。
+
+`diff_rules(["PB-01", "PB-02"], ["PB-02", "PB-03"])` → `{"added": ["PB-03"], "removed": ["PB-01"]}`
+--- solution
+def diff_rules(before, after):
+    old = set(before)
+    new = set(after)
+    return {"added": sorted(new - old), "removed": sorted(old - new)}
+--- tests
+expect("一增一减", lambda: diff_rules(["PB-01", "PB-02"], ["PB-02", "PB-03"]), {"added": ["PB-03"], "removed": ["PB-01"]})
+expect("有重复，结果排序", lambda: diff_rules(["PB-05", "PB-05"], ["PB-09", "PB-04", "PB-09"]), {"added": ["PB-04", "PB-09"], "removed": ["PB-05"]})
+expect("没有变化", lambda: diff_rules(["PB-01"], ["PB-01", "PB-01"]), {"added": [], "removed": []})
+expect("都是空的", lambda: diff_rules([], []), {"added": [], "removed": []})

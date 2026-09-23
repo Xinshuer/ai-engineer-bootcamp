@@ -1,0 +1,972 @@
+@@ day 20
+title: 面试实战：预测、找 bug、重构、实现、设计
+lang: py
+langs: Python + TypeScript
+hours: 5 小时
+--- goal
+按技术面试的五种题型练一遍：读代码预测输出、在 Agent 循环和异步代码里找 bug、不改行为地重构再加需求、限时实现合同领域的小函数、有条理地回答设计题。Python 和 TypeScript 大约各占一半，例子全部来自 Clause Check。今天的重点不只是写对，还要能**边做边说**。
+--- checklist
+- 先清空复习区
+- 读完 6 张知识卡片
+- 每道题动手之前，先大声说出（或写在纸上）你的思路
+- 练习区全部通过
+- 闭卷挑战 3 题，每题给自己计时 12 分钟
+- 用设计题的六步框架口头回答一遍：「Clause Check 要每天审 1000 份合同，你怎么做？」
+
+@@ concept
+title: 面试题的五种形式
+--- body
+AI Engineer 的技术面，常见五种题，考的东西各不相同：
+
+1. **预测输出**：读一段代码，说出会打印什么。考你脑子里能不能「跑」代码
+2. **找 bug**：给一段有时候出错的代码，经常就是 Agent 循环。考排查的顺序
+3. **重构**：代码能跑但很乱，还要加一个小需求。考你能不能**不改行为**地整理
+4. **实现**：15–20 分钟写一个小函数。考边界情况和测试意识
+5. **设计**：「300 页合同怎么办？」没有标准答案，考思路有没有条理
+
+每一种都要**边做边说**：先复述题目和输入输出，说出打算，写完主动拿例子验证。一声不吭地写十分钟，是最吃亏的表现。
+--- code
+forms = {
+    "predict": "我先看输入，再一行行跟踪变量的值",
+    "debug": "先复现，再按清单一条条排除",
+    "refactor": "先用测试锁住现在的行为，再小步改",
+    "implement": "先写签名和两三个例子，包括一个边界",
+    "design": "需求 → 数据流 → 失败 → 评测 → 成本 → 第一步",
+}
+for i, (form, opener) in enumerate(forms.items(), 1):
+    print(f"{i}. {form:<10} {opener}")
+
+@@ concept
+title: 读代码的顺序
+--- body
+拿到陌生代码，不要从第一行硬读到最后一行。按顺序问四个问题：
+
+1. **输入**：参数是什么类型？可能是空的吗？
+2. **输出**：返回什么？每条路径都有 return 吗？
+3. **循环**：循环几次？什么时候停？有没有可能停不下来？
+4. **副作用**：改了传进来的列表或字典吗？写了文件、发了请求吗？
+
+这四问正好对应最常见的四类 bug：空输入、漏了 return、循环不停、偷偷改了别人的数据。下面的例子「看起来只是在挑条款」，运行一下看最后一行。
+--- code
+def needs_review(reviews, limit=2):
+    # 1 输入：reviews 是字典列表，可能为空
+    picked = []
+    for r in reviews:                 # 3 循环：每条看一次，一定会停
+        if r["verdict"] != "accept":
+            r["seen"] = True          # 4 副作用：改了调用方的字典！
+            picked.append(r["id"])
+    return picked[:limit]             # 2 输出：最多 limit 个编号
+
+reviews = [{"id": "8.1", "verdict": "redline"}, {"id": "3.1", "verdict": "accept"}, {"id": "9.1", "verdict": "flag"}]
+print(needs_review(reviews))
+print(needs_review([]))
+print(reviews[0])
+
+@@ concept
+title: 找 bug 的清单
+lang: ts
+--- body
+面试官给你一段「有时候不对」的代码时，对照清单一条条过，比盯着看有效得多：
+
+- **边界差一**：`range(n)` 和 `range(n + 1)`、`<` 和 `<=`、切片 `[:k]`
+- **边遍历边修改**：在 `for` 里 `remove` 同一个列表
+- **忘了 await**（TS）：`forEach(async ...)` 根本不会等
+- **忘了 return**：某条路径返回了 `None` / `undefined`
+- **键名写错**：`risk` 和 `risk_level`，`.get()` 默默返回 None
+- **没有上限的循环**：Agent 没有 `max_steps`，或者计数器没加
+- **吞掉错误**：`except Exception: pass`，失败时还默认 `accept`
+
+Agent 循环里最常见的三个：工具结果没放回 messages、assistant 和 tool 消息顺序反了、步数不加。下面演示「忘了 await」：`forEach` 启动了回调就往下走，打印的时候结果还没回来。
+--- code
+async function review(id: string): Promise<string> {
+  await Promise.resolve(); // 假装在等模型
+  return `${id}:ok`;
+}
+async function main() {
+  const ids = ["8.1", "4.2"];
+  const bad: string[] = [];
+  ids.forEach(async (id) => {
+    bad.push(await review(id));
+  });
+  console.log("forEach, right after:", bad);
+  const good: string[] = [];
+  for (const id of ids) {
+    good.push(await review(id));
+  }
+  console.log("for...of:", good);
+  console.log("forEach, later:", bad);
+}
+main();
+
+@@ concept
+title: 重构的原则
+--- body
+重构 = **行为不变**，结构变好。面试里的重构题通常还会加一个小需求：考你先整理再加，而不是在乱代码上再堆一层 if。
+
+1. **先有测试**：用几个例子把现在的行为锁住
+2. **小步改，每步都跑测试**：改名（`x` → `verdict`）、提取函数、提前 return 减少嵌套、去掉重复（三段几乎一样的代码 → 一个循环或一张表）
+3. **最后加新需求**，理想情况下只改一个地方
+
+说出来：「我先不改行为，把这三段重复的判断收成一张表，然后新需求只要加一行。」下面的新旧两版，对所有输入结果都一样。
+--- code
+def label_old(v):
+    if v["verdict"] == "redline":
+        if v["risk"] == "high":
+            return "URGENT"
+        else:
+            return "REVIEW"
+    else:
+        if v["verdict"] == "flag":
+            return "REVIEW"
+        else:
+            return "OK"
+
+def label_new(v):
+    if v["verdict"] == "redline" and v["risk"] == "high":
+        return "URGENT"
+    if v["verdict"] in ("redline", "flag"):
+        return "REVIEW"
+    return "OK"
+
+cases = [{"verdict": a, "risk": b} for a in ["accept", "flag", "redline"] for b in ["low", "high"]]
+print(all(label_old(c) == label_new(c) for c in cases))
+print([label_new(c) for c in cases])
+
+@@ concept
+title: 复杂度直觉
+--- body
+面试官问「这段代码的复杂度是多少」，要能说出直觉：
+
+- 一层循环走 n 个元素：**O(n)**
+- 循环里再套一层循环，或者在循环里对**列表**用 `in`：**O(n²)**。`x in 列表` 要一个个比，`x in 集合` / `x in 字典` 几乎一步到位
+- 排序：O(n log n)
+
+一份合同 300 条，n² 也才 9 万次比较，电脑一眨眼就做完。**真正慢的是 300 次模型调用**（每次几秒）。所以要说清楚：「这里 O(n²) 没关系，瓶颈在网络调用，我会先做有上限的并发和缓存。」数据量到几十万（比如跨所有合同去重）时，才需要把列表换成集合或字典。
+--- code
+ids = [f"{i}.1" for i in range(300)]
+cited = ids[::2]             # 150 条被引用过
+
+comparisons = 0
+for i in ids:
+    for c in cited:           # 列表：一个个比
+        comparisons += 1
+print("两层循环比较次数:", comparisons)
+
+cited_set = set(cited)       # 集合：直接查
+missing = [i for i in ids if i not in cited_set]
+print("用集合：查了", len(ids), "次，没被引用的", len(missing), "条")
+
+@@ concept
+title: 设计题的回答框架
+lang: ts
+--- body
+设计题（「每天要审 1000 份合同，你怎么做？」）按六步讲，每步一两句，用 Clause Check 举例：
+
+1. **需求**：谁用？要多快？错了代价多大？（律师：漏掉风险条款比多标一条严重）
+2. **数据流**：上传 → 解析 → 切条款 → 逐条审（模型 + playbook 检索）→ 汇总 → 人批准 → 导出
+3. **失败模式**：解析出错、输出格式坏了、429、提示注入、模型漏报
+4. **评测**：用例集跑 N 次看通过率，盯住高风险条款的召回率
+5. **成本和延迟**：前缀缓存、有上限的并发、重复条款只审一次
+6. **第一步**：「我先加 trace 量出每一步的耗时，再决定优化哪里」
+
+第 6 步最关键：面试官想听到你**先测量，再动手**。
+--- code
+const answer: [string, string][] = [
+  ["requirements", "lawyers; a missed risky clause costs most"],
+  ["data flow", "parse -> split -> review -> summarise -> approve"],
+  ["failure modes", "bad JSON, 429, injection, missed risk"],
+  ["evals", "cases x N runs, high-risk recall"],
+  ["cost/latency", "prefix cache, bounded concurrency, dedupe"],
+  ["first step", "add tracing, measure, then optimise"],
+];
+answer.forEach(([step, note], i) => console.log(`${i + 1}. ${step.padEnd(14)} ${note}`));
+
+@@ item d20-01
+type: predict
+title: 复习：默认参数
+level: 1
+--- prompt
+复习第 8、9 天。写出输出。这是面试官很爱问的一题。
+--- code
+def add_flag(clause_id, flags=[]):
+    flags.append(clause_id)
+    return flags
+
+a = add_flag("8.1")
+b = add_flag("4.2")
+c = add_flag("9.1", [])
+print(a)
+print(b is a, c)
+--- explain
+默认值 `[]` 只在 `def` 执行的那一刻创建一次，之后每次不传 `flags` 都用同一个列表，所以 a 和 b 是同一个对象，两次追加都在里面；自己传了新列表的 c 不受影响。标准写法是 `flags=None`，函数里 `if flags is None: flags = []`。面试时要说出那句关键话：默认参数在定义时求值。
+
+@@ item d20-02
+type: predict
+title: 循环里的闭包
+level: 2
+--- prompt
+写出输出。`lambda` 里用到的 `limit`，是创建时的值，还是调用时的值？
+--- code
+checks = []
+for limit in [1, 2, 3]:
+    checks.append(lambda n: n > limit)
+print([check(2) for check in checks])
+
+fixed = []
+for limit in [1, 2, 3]:
+    fixed.append(lambda n, limit=limit: n > limit)
+print([check(2) for check in fixed])
+--- explain
+lambda 记住的是**变量**，不是当时的值。调用时循环早就结束了，`limit` 是 3，所以三次都是 `2 > 3`，全是 False。第二段用默认参数 `limit=limit` 在创建时把当前值「拍下来」：上一题的坑在这里反而派上了用场。给每条 playbook 规则生成一个检查函数时，就会碰到这个问题。
+
+@@ item d20-03
+type: predict
+title: 排序的稳定性
+level: 2
+--- prompt
+写出输出。Python 的排序是**稳定**的：key 相同的元素保持原来的先后顺序，加了 `reverse=True` 也一样。
+--- code
+reviews = [
+    ("3.2", "medium"), ("8.1", "high"), ("4.2", "medium"),
+    ("9.1", "high"), ("1.1", "low"),
+]
+RANK = {"low": 0, "medium": 1, "high": 2}
+by_risk = sorted(reviews, key=lambda r: RANK[r[1]], reverse=True)
+print([cid for cid, _ in by_risk])
+by_id = sorted(reviews)
+print([cid for cid, _ in by_id][:3])
+print(sorted(["10.1", "9.1", "8.2"]))
+--- explain
+按风险倒序时，同为 high 的 8.1、9.1 和同为 medium 的 3.2、4.2 都保持原顺序，所以 `summarise` 里「同风险保持原顺序」不用额外处理。元组排序先比第一个元素，也就是编号字符串。最后一行是老陷阱：字符串逐个字符比较，"1" 比 "8" 小，所以 "10.1" 排在最前。要按数字排，key 用 `tuple(int(p) for p in cid.split("."))`。
+
+@@ item d20-04
+type: predict
+title: var 和 let
+level: 2
+lang: ts
+--- prompt
+写出输出。`var` 是老式的声明，整个函数共用**一个**变量；`let` 在 for 循环里**每一轮都是新的一份**。
+--- code
+const withVar: (() => number)[] = [];
+for (var i = 0; i < 3; i++) {
+  withVar.push(() => i);
+}
+const withLet: (() => number)[] = [];
+for (let j = 0; j < 3; j++) {
+  withLet.push(() => j);
+}
+console.log(withVar.map((f) => f()).join(","));
+console.log(withLet.map((f) => f()).join(","));
+--- explain
+三个箭头函数引用的是同一个 `i`，调用时循环已经结束，`i` 是 3。`let j` 每一轮都是新的一份，各自记住 0、1、2。Python 的循环变量更像 `var`，这就是前面闭包题三个 False 的原因。写 TypeScript 一律用 `let` / `const`。
+
+@@ item d20-05
+type: predict
+title: 异步的执行顺序
+level: 3
+lang: ts
+--- prompt
+写出输出，一行一个。三条规则：
+
+1. 同步代码先全部跑完
+2. `await` 后面的部分、`.then` 的回调排进「微任务」队列，同步代码跑完后按排队顺序执行
+3. `setTimeout` 即使是 0 毫秒，也排在所有微任务之后
+--- code
+async function review(id: string): Promise<string> {
+  console.log(`start ${id}`);
+  await Promise.resolve();
+  console.log(`end ${id}`);
+  return id;
+}
+console.log("A");
+setTimeout(() => console.log("timeout"), 0);
+review("8.1").then((id) => console.log(`then ${id}`));
+review("4.2");
+console.log("B");
+--- explain
+同步阶段：A，两个 start（每个 review 跑到 await 就先交回控制权），B。然后是微任务：8.1 先排队所以先 end，接着 4.2 end；8.1 的 Promise 完成之后，`.then` 的回调才排进队列，所以在两个 end 后面。最后才是 timeout。面试里讲清楚「同步 → 微任务 → 定时器」三层就够了。
+
+@@ item d20-06
+type: fix
+title: 修 bug：Agent 一直调工具
+level: 2
+mock: yes
+--- prompt
+这个 Agent 循环有 bug。运行测试：模型一直在要求调工具，4 步用完返回了 `"STOPPED"`。对照 Agent 循环的检查清单，找出原因并修好。
+
+修好以后，第二次请求的 messages 应该是 user → assistant（带 tool_calls）→ tool。本页的模拟服务器比较宽容，真的 DeepSeek 对顺序错的请求会直接返回 400。
+--- starter
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic. Call it before deciding.", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+def lookup_playbook(topic):
+    return f"rule for {topic}: cap at 12 months of fees"
+
+def agent(question, max_steps=4):
+    messages = [{"role": "user", "content": question}]
+    for step in range(max_steps):
+        body = {"model": "deepseek-chat", "messages": messages, "tools": TOOLS}
+        message = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]["message"]
+        if not message.get("tool_calls"):
+            return message["content"]
+        call = message["tool_calls"][0]
+        result = lookup_playbook(**json.loads(call["function"]["arguments"]))
+        messages.append(message)
+    return "STOPPED"
+--- solution
+import json
+import os
+import requests
+
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
+TOOLS = [{"type": "function", "function": {"name": "lookup_playbook", "description": "Return the customer's rule for a topic. Call it before deciding.", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}}]
+
+def lookup_playbook(topic):
+    return f"rule for {topic}: cap at 12 months of fees"
+
+def agent(question, max_steps=4):
+    messages = [{"role": "user", "content": question}]
+    for step in range(max_steps):
+        body = {"model": "deepseek-chat", "messages": messages, "tools": TOOLS}
+        message = requests.post(API_URL, headers=HEADERS, json=body).json()["choices"][0]["message"]
+        if not message.get("tool_calls"):
+            return message["content"]
+        call = message["tool_calls"][0]
+        result = lookup_playbook(**json.loads(call["function"]["arguments"]))
+        messages.append(message)
+        messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+    return "STOPPED"
+--- tests
+def _run():
+    MOCK.reset()
+    answer = agent("Is unlimited liability acceptable?")
+    return [answer, len(MOCK.calls)]
+expect("拿到回答，一共请求 2 次", _run, ["Based on the playbook: rule for liability_cap: cap at 12 months of fees", 2])
+expect("第二次请求的消息顺序", lambda: [m["role"] for m in MOCK.calls[1]["body"]["messages"]], ["user", "assistant", "tool"])
+def _ids_match():
+    ms = MOCK.calls[1]["body"]["messages"]
+    return ms[2]["tool_call_id"] == ms[1]["tool_calls"][0]["id"]
+expect_true("tool 消息的 tool_call_id 和模型的调用 id 一致", _ids_match)
+--- hints
+- 模型为什么一直要调工具？想想它在第二次请求里看到了什么：`result` 算出来以后去哪了？
+- 每次工具调用后要往 messages 里加**两条**：先是模型那条消息，再是 `{"role": "tool", "tool_call_id": call["id"], "content": result}`，顺序不能反。
+
+@@ item d20-07
+type: fix
+title: 修 bug：吞掉的错误
+level: 2
+--- prompt
+这个函数上线一周后，律师发现几条明显有风险的条款被判成了 accept，日志里却一条错误都没有。原因：`except Exception` 把所有错误都吞了，还默认成最危险的 accept。改成：
+
+- 模型的回答不是合法 JSON，或者缺 `verdict`：返回 `{"clause_id": ..., "verdict": "flag", "error": "bad_output"}`，交给人看
+- 其他错误（比如网络断了，`call_model` 抛出 `ConnectionError`）：不要接住，让它抛出去，上层会重试或报警
+
+`call_model` 是传进来的函数，测试会传假的进来。
+--- starter
+import json
+
+def review_one(clause_id, text, call_model):
+    try:
+        raw = call_model(f"Review clause {clause_id}: {text}")
+        data = json.loads(raw)
+        return {"clause_id": clause_id, "verdict": data["verdict"]}
+    except Exception:
+        return {"clause_id": clause_id, "verdict": "accept"}
+--- solution
+import json
+
+def review_one(clause_id, text, call_model):
+    raw = call_model(f"Review clause {clause_id}: {text}")
+    try:
+        data = json.loads(raw)
+        return {"clause_id": clause_id, "verdict": data["verdict"]}
+    except (json.JSONDecodeError, KeyError):
+        return {"clause_id": clause_id, "verdict": "flag", "error": "bad_output"}
+--- tests
+ok = lambda prompt: '{"verdict": "redline"}'
+chatty = lambda prompt: "Sure! This clause looks risky."
+missing = lambda prompt: '{"risk": "high"}'
+def down(prompt):
+    raise ConnectionError("network down")
+expect("正常", lambda: review_one("8.1", "unlimited", ok), {"clause_id": "8.1", "verdict": "redline"})
+expect("不是 JSON → flag", lambda: review_one("8.1", "x", chatty), {"clause_id": "8.1", "verdict": "flag", "error": "bad_output"})
+expect("缺 verdict → flag", lambda: review_one("8.1", "x", missing), {"clause_id": "8.1", "verdict": "flag", "error": "bad_output"})
+expect_raises("网络错误要抛出去", lambda: review_one("8.1", "x", down), ConnectionError)
+--- hints
+- 只把「解析模型回答」的两行放进 `try`，调用 `call_model` 放到 `try` 外面，它的错误就会自然抛出去。
+- 坏 JSON 抛 `json.JSONDecodeError`，缺键抛 `KeyError`：`except (json.JSONDecodeError, KeyError):`。
+
+@@ item d20-08
+type: fix
+title: 修 bug：forEach 不等人
+level: 2
+lang: ts
+--- prompt
+`reviewAll` 应该按顺序审完所有条款再返回结果，测试却拿到了空数组。运行，读测试输出，修好它。
+--- starter
+type Verdict = { id: string; verdict: string };
+
+async function reviewClause(id: string): Promise<Verdict> {
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  return { id, verdict: id.startsWith("8") ? "redline" : "accept" };
+}
+
+async function reviewAll(ids: string[]): Promise<Verdict[]> {
+  const results: Verdict[] = [];
+  ids.forEach(async (id) => {
+    results.push(await reviewClause(id));
+  });
+  return results;
+}
+--- solution
+type Verdict = { id: string; verdict: string };
+
+async function reviewClause(id: string): Promise<Verdict> {
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  return { id, verdict: id.startsWith("8") ? "redline" : "accept" };
+}
+
+async function reviewAll(ids: string[]): Promise<Verdict[]> {
+  const results: Verdict[] = [];
+  for (const id of ids) {
+    results.push(await reviewClause(id));
+  }
+  return results;
+}
+--- tests
+expectAsync("三条都审完", async () => (await reviewAll(["3.1", "8.1", "9.1"])).length, 3);
+expectAsync("顺序和输入一致", async () => (await reviewAll(["8.1", "3.1"])).map((v) => `${v.id}:${v.verdict}`), ["8.1:redline", "3.1:accept"]);
+expectAsync("空列表", () => reviewAll([]), []);
+--- hints
+- `forEach` 不会等 async 回调：它把每个回调启动就走了，`return results` 时一条都还没审完。
+- 改成 `for (const id of ids) { results.push(await reviewClause(id)); }`。想并发的话可以用 `Promise.all(ids.map(reviewClause))`，结果也保持输入的顺序。
+
+@@ item d20-09
+type: fix
+title: 修 bug：快照全变了
+level: 2
+lang: ts
+--- prompt
+`replay` 要保存每一步之后的状态快照（像检查点一样，可以回看、撤销）。测试发现所有快照都变成了最后一步的样子。原因在 `apply`：它直接改了传进来的 state。改成返回一个**新对象**，旧的不动。
+--- starter
+type State = { counts: Record<string, number>; seen: string[] };
+type ReviewEvent = { clauseId: string; verdict: "accept" | "flag" | "redline" };
+
+function apply(state: State, e: ReviewEvent): State {
+  state.counts[e.verdict] = (state.counts[e.verdict] ?? 0) + 1;
+  state.seen.push(e.clauseId);
+  return state;
+}
+
+function replay(events: ReviewEvent[]): State[] {
+  const history: State[] = [];
+  let state: State = { counts: {}, seen: [] };
+  for (const e of events) {
+    state = apply(state, e);
+    history.push(state);
+  }
+  return history;
+}
+--- solution
+type State = { counts: Record<string, number>; seen: string[] };
+type ReviewEvent = { clauseId: string; verdict: "accept" | "flag" | "redline" };
+
+function apply(state: State, e: ReviewEvent): State {
+  return {
+    counts: { ...state.counts, [e.verdict]: (state.counts[e.verdict] ?? 0) + 1 },
+    seen: [...state.seen, e.clauseId],
+  };
+}
+
+function replay(events: ReviewEvent[]): State[] {
+  const history: State[] = [];
+  let state: State = { counts: {}, seen: [] };
+  for (const e of events) {
+    state = apply(state, e);
+    history.push(state);
+  }
+  return history;
+}
+--- tests
+const EVENTS: ReviewEvent[] = [
+  { clauseId: "3.1", verdict: "accept" },
+  { clauseId: "8.1", verdict: "redline" },
+  { clauseId: "9.1", verdict: "redline" },
+];
+expect("第一步的快照", () => replay(EVENTS)[0], { counts: { accept: 1 }, seen: ["3.1"] });
+expect("最后一步", () => replay(EVENTS)[2], { counts: { accept: 1, redline: 2 }, seen: ["3.1", "8.1", "9.1"] });
+expect("apply 不改传进来的状态（里面的 counts 和 seen 也不改）", () => {
+  const before: State = { counts: { flag: 1 }, seen: ["4.2"] };
+  apply(before, { clauseId: "8.1", verdict: "redline" });
+  return before;
+}, { counts: { flag: 1 }, seen: ["4.2"] });
+--- hints
+- 所有快照都是**同一个对象**：`apply` 改完返回的还是传进来的那个。
+- 只写 `{ ...state }` 不够：展开只复制一层，里面的 `counts` 和 `seen` 还是原来那一份。
+- 新对象：`{ counts: { ...state.counts, [e.verdict]: 新数量 }, seen: [...state.seen, e.clauseId] }`。
+
+@@ item d20-10
+type: code
+title: 重构：加一种判定
+level: 3
+--- prompt
+下面的 `summary` 能用，但很乱：三个计数器、三段几乎一样的循环。新需求：
+
+1. 新判定 `needs_info`（信息不足，要客户补材料）：计数行放在 redline 后面；它也算「需要人看」
+2. 新风险等级 `critical`：排在 high 前面
+
+先整理成「表驱动」：判定列表 `VERDICTS`、风险顺序 `RISK_ORDER`，然后两个新需求各只改一行。输出格式不变（看测试），同一风险等级内保持原来的顺序。
+--- starter
+def summary(reviews):
+    out = []
+    a = 0
+    f = 0
+    r = 0
+    for x in reviews:
+        if x["verdict"] == "accept":
+            a = a + 1
+        if x["verdict"] == "flag":
+            f = f + 1
+        if x["verdict"] == "redline":
+            r = r + 1
+    out.append("accept: " + str(a))
+    out.append("flag: " + str(f))
+    out.append("redline: " + str(r))
+    hi = []
+    for x in reviews:
+        if x["verdict"] != "accept":
+            if x["risk"] == "high":
+                hi.append(x["id"])
+    for x in reviews:
+        if x["verdict"] != "accept":
+            if x["risk"] == "medium":
+                hi.append(x["id"])
+    for x in reviews:
+        if x["verdict"] != "accept":
+            if x["risk"] == "low":
+                hi.append(x["id"])
+    out.append("attention: " + ", ".join(hi))
+    return "\n".join(out)
+--- solution
+VERDICTS = ["accept", "flag", "redline", "needs_info"]
+RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+def summary(reviews):
+    lines = [f"{v}: {sum(1 for r in reviews if r['verdict'] == v)}" for v in VERDICTS]
+    attention = [r for r in reviews if r["verdict"] != "accept"]
+    attention.sort(key=lambda r: RISK_ORDER[r["risk"]])
+    lines.append("attention: " + ", ".join(r["id"] for r in attention))
+    return "\n".join(lines)
+--- tests
+OLD = [
+    {"id": "3.1", "verdict": "accept", "risk": "low"},
+    {"id": "4.2", "verdict": "flag", "risk": "medium"},
+    {"id": "8.1", "verdict": "redline", "risk": "high"},
+    {"id": "6.2", "verdict": "flag", "risk": "low"},
+]
+expect("老数据：计数和顺序不变，多了一行 needs_info", lambda: summary(OLD), "accept: 1\nflag: 2\nredline: 1\nneeds_info: 0\nattention: 8.1, 4.2, 6.2")
+NEW = OLD + [
+    {"id": "12", "verdict": "redline", "risk": "critical"},
+    {"id": "5.1", "verdict": "needs_info", "risk": "medium"},
+]
+expect("新判定和新风险等级", lambda: summary(NEW), "accept: 1\nflag: 2\nredline: 2\nneeds_info: 1\nattention: 12, 8.1, 4.2, 5.1, 6.2")
+expect("空列表", lambda: summary([]), "accept: 0\nflag: 0\nredline: 0\nneeds_info: 0\nattention: ")
+--- hints
+- 三个计数器 → 对 `VERDICTS` 循环，每个判定生成一行 `f"{v}: {数量}"`，数量可以用 `sum(1 for r in reviews if r["verdict"] == v)`。
+- 三段循环 → 先挑出非 accept 的，再 `sort(key=lambda r: RISK_ORDER[r["risk"]])`。排序是稳定的，同风险自动保持原顺序。
+- 新需求：`VERDICTS` 末尾加 `"needs_info"`；`RISK_ORDER` 里加 `"critical": 0`，其他往后挪一位。
+
+@@ item d20-11
+type: code
+title: 重构：工具分发表
+level: 3
+lang: ts
+--- prompt
+`runTool` 能用，但每加一个工具就要多一段 `else if`。新需求：
+
+1. 新工具 `mark_for_review`，必填参数 `reason`，返回 `marked: <reason>`
+2. 未知工具的错误要告诉模型有哪些工具：`ERROR: unknown tool delete_all (available: lookup_playbook, get_clause, mark_for_review)`
+3. 参数不是合法 JSON 时返回 `ERROR: bad arguments`（现在会直接崩）
+
+先检查工具名，再解析参数。原来的行为（包括 `ERROR: missing clause_id` 这样的提示）保持不变。建议先改成一张表 `TOOLS: Record<string, ToolDef>`，这样新工具只加一行，可用工具列表也能从表里生成。
+--- starter
+type ToolDef = { required: string; run: (args: any) => string };
+
+function runTool(name: string, argsText: string): string {
+  const args = JSON.parse(argsText);
+  if (name === "lookup_playbook") {
+    if (!args.topic) {
+      return "ERROR: missing topic";
+    }
+    return `rule for ${args.topic}`;
+  } else if (name === "get_clause") {
+    if (!args.clause_id) {
+      return "ERROR: missing clause_id";
+    }
+    return `text of clause ${args.clause_id}`;
+  } else {
+    return "ERROR: unknown tool";
+  }
+}
+--- solution
+type ToolDef = { required: string; run: (args: any) => string };
+
+const TOOLS: Record<string, ToolDef> = {
+  lookup_playbook: { required: "topic", run: (a) => `rule for ${a.topic}` },
+  get_clause: { required: "clause_id", run: (a) => `text of clause ${a.clause_id}` },
+  mark_for_review: { required: "reason", run: (a) => `marked: ${a.reason}` },
+};
+
+function runTool(name: string, argsText: string): string {
+  const tool = TOOLS[name];
+  if (!tool) {
+    return `ERROR: unknown tool ${name} (available: ${Object.keys(TOOLS).join(", ")})`;
+  }
+  let args: any;
+  try {
+    args = JSON.parse(argsText);
+  } catch {
+    return "ERROR: bad arguments";
+  }
+  if (!args[tool.required]) {
+    return `ERROR: missing ${tool.required}`;
+  }
+  return tool.run(args);
+}
+--- tests
+expect("原来的：查 playbook", () => runTool("lookup_playbook", '{"topic": "payment"}'), "rule for payment");
+expect("原来的：缺参数", () => runTool("get_clause", "{}"), "ERROR: missing clause_id");
+expect("新工具", () => runTool("mark_for_review", '{"reason": "ambiguous"}'), "marked: ambiguous");
+expect("新工具缺参数", () => runTool("mark_for_review", "{}"), "ERROR: missing reason");
+expect("未知工具列出可用工具", () => runTool("delete_all", "{}"), "ERROR: unknown tool delete_all (available: lookup_playbook, get_clause, mark_for_review)");
+expect("坏 JSON 不崩", () => runTool("get_clause", '{"clause_id": '), "ERROR: bad arguments");
+--- hints
+- 表的一项：`lookup_playbook: { required: "topic", run: (a) => "rule for " + a.topic }`。
+- `runTool` 变成四步：查表（没有 → unknown）→ 在 try/catch 里 `JSON.parse`（失败 → bad arguments）→ 检查 `args[tool.required]` → `tool.run(args)`。
+- 可用工具列表：`Object.keys(TOOLS).join(", ")`，顺序就是你写表的顺序。
+
+@@ item d20-12
+type: code
+title: 去重条款
+level: 2
+--- prompt
+合同模板里常有重复的样板条款：审过一条，一模一样的就不用再花钱审了。写两个函数：
+
+- `normalize(text)`：转小写 → 去掉「字母、数字、空白」以外的字符 → 空白合并成一个空格、去掉首尾空白
+- `dedupe_clauses(clauses)`：`clauses` 是 `[{"id": "2.1", "text": "..."}, ...]`；规范化后文字相同就是重复。返回 `{"unique": [保留的编号，即第一次出现的那条], "duplicates": {重复条的编号: 保留的那条的编号}}`
+
+用字典记「规范化文字 → 第一次出现的编号」，一遍循环做完，复杂度 O(n)。
+
+例：`normalize("  This Agreement,\nis GOVERNED.  ")` → `"this agreement is governed"`
+--- starter
+import re
+
+def normalize(text):
+    pass
+
+def dedupe_clauses(clauses):
+    pass
+--- solution
+import re
+
+def normalize(text):
+    text = re.sub(r"[^a-z0-9\s]", "", text.lower())
+    return " ".join(text.split())
+
+def dedupe_clauses(clauses):
+    first = {}
+    unique = []
+    duplicates = {}
+    for c in clauses:
+        key = normalize(c["text"])
+        if key in first:
+            duplicates[c["id"]] = first[key]
+        else:
+            first[key] = c["id"]
+            unique.append(c["id"])
+    return {"unique": unique, "duplicates": duplicates}
+--- tests
+CLAUSES = [
+    {"id": "2.1", "text": "This Agreement is governed by the laws of Sweden."},
+    {"id": "7.4", "text": "This agreement is governed by the  laws of Sweden"},
+    {"id": "3.1", "text": "Fees are payable within thirty days."},
+    {"id": "15.2", "text": "THIS AGREEMENT IS GOVERNED BY THE LAWS OF SWEDEN."},
+]
+expect("规范化", lambda: normalize("  This Agreement,\nis GOVERNED.  "), "this agreement is governed")
+expect("保留第一次出现的", lambda: dedupe_clauses(CLAUSES)["unique"], ["2.1", "3.1"])
+expect("重复的指向保留的那条", lambda: dedupe_clauses(CLAUSES)["duplicates"], {"7.4": "2.1", "15.2": "2.1"})
+expect("只是相似不算重复", lambda: dedupe_clauses([{"id": "a", "text": "Fees are payable within thirty days."}, {"id": "b", "text": "Fees are payable within sixty days."}])["unique"], ["a", "b"])
+expect("空列表", lambda: dedupe_clauses([]), {"unique": [], "duplicates": {}})
+--- hints
+- 去掉标点：`re.sub(r"[^a-z0-9\s]", "", text.lower())`，`[^...]` 表示「不是这些字符」。空白合并：`" ".join(text.split())`。
+- 循环里：规范化后的文字已经在字典里 → 记进 `duplicates`；不在 → 存进字典，编号加进 `unique`。
+
+@@ item d20-13
+type: code
+title: 合并 redline 区间
+level: 2
+lang: ts
+--- prompt
+一条条款可能有好几处要改，每处是一个字符区间 `[start, end]`（包含 start，不包含 end）。区间重叠的话，像 `graph.py` 那样从后往前替换文字就会出错，所以要先合并。写 `mergeSpans(spans)`：
+
+- 按 start 排序，重叠或**首尾相接**（下一个的 start ≤ 当前的 end）的合并成一个
+- 返回新数组，按 start 从小到大；不要改传进来的数组
+
+例：`mergeSpans([[10, 20], [15, 30], [40, 50]])` → `[[10, 30], [40, 50]]`
+--- starter
+function mergeSpans(spans: [number, number][]): [number, number][] {
+  return [];
+}
+--- solution
+function mergeSpans(spans: [number, number][]): [number, number][] {
+  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+  const out: [number, number][] = [];
+  for (const [start, end] of sorted) {
+    const last = out[out.length - 1];
+    if (last && start <= last[1]) {
+      last[1] = Math.max(last[1], end);
+    } else {
+      out.push([start, end]);
+    }
+  }
+  return out;
+}
+--- tests
+expect("重叠的合并", () => mergeSpans([[10, 20], [15, 30], [40, 50]]), [[10, 30], [40, 50]]);
+expect("输入是乱序的", () => mergeSpans([[40, 50], [10, 20], [18, 25]]), [[10, 25], [40, 50]]);
+expect("首尾相接也合并", () => mergeSpans([[0, 5], [5, 9]]), [[0, 9]]);
+expect("整个包在里面", () => mergeSpans([[0, 100], [10, 20]]), [[0, 100]]);
+expect("空数组", () => mergeSpans([]), []);
+expect("不改传进来的数组", () => {
+  const input: [number, number][] = [[5, 8], [1, 3], [2, 6]];
+  mergeSpans(input);
+  return input;
+}, [[5, 8], [1, 3], [2, 6]]);
+--- hints
+- 先复制再排序：`[...spans].sort((a, b) => a[0] - b[0])`，因为 `sort` 会改原数组。
+- 依次看每个区间：和结果里最后一个重叠，就把最后一个的 end 改大；否则推一个**新的** `[start, end]` 进去（新数组，才不会改到输入）。
+- 改 end 要用 `Math.max(last[1], end)`，不然「整个包在里面」的情况会把区间改小。
+
+@@ item d20-14
+type: code
+title: 按限流分批
+level: 3
+--- prompt
+OpenAI 等服务会按「每分钟请求数」和「每分钟 token 数」限流（具体数字看各家文档）。写 `plan_batches(clauses, max_requests, max_tokens)`，规划每一分钟发哪些条款：
+
+- `clauses`：`[{"id": "1.1", "tokens": 400}, ...]`，按原顺序处理，不要重排
+- 一分钟里的条数不超过 `max_requests`，token 总数不超过 `max_tokens`（刚好等于可以）
+- 当前这一分钟放不下下一条，就开始新的一分钟
+- 某一条自己就超过 `max_tokens`：永远发不出去，`raise ValueError`
+- 返回每分钟的编号列表组成的列表；空输入返回 `[]`
+
+例：`plan_batches(C, 10, 800)` → `[["1.1", "2.1"], ["3.1", "4.1", "5.1"]]`（第一分钟 400 + 300 = 700，再加 500 就超了）
+--- starter
+def plan_batches(clauses, max_requests, max_tokens):
+    pass
+--- solution
+def plan_batches(clauses, max_requests, max_tokens):
+    batches = []
+    current = []
+    used = 0
+    for c in clauses:
+        if c["tokens"] > max_tokens:
+            raise ValueError(f"clause {c['id']} needs {c['tokens']} tokens, limit is {max_tokens}")
+        if current and (len(current) >= max_requests or used + c["tokens"] > max_tokens):
+            batches.append(current)
+            current, used = [], 0
+        current.append(c["id"])
+        used += c["tokens"]
+    if current:
+        batches.append(current)
+    return batches
+--- tests
+C = [{"id": "1.1", "tokens": 400}, {"id": "2.1", "tokens": 300}, {"id": "3.1", "tokens": 500}, {"id": "4.1", "tokens": 100}, {"id": "5.1", "tokens": 100}]
+expect("按 token 上限分", lambda: plan_batches(C, 10, 800), [["1.1", "2.1"], ["3.1", "4.1", "5.1"]])
+expect("按请求数上限分", lambda: plan_batches(C, 2, 10_000), [["1.1", "2.1"], ["3.1", "4.1"], ["5.1"]])
+expect("刚好等于 token 上限可以放", lambda: plan_batches(C[:2], 2, 700), [["1.1", "2.1"]])
+expect("空列表", lambda: plan_batches([], 5, 100), [])
+expect_raises("一条就超过 token 上限", lambda: plan_batches([{"id": "9.1", "tokens": 900}], 5, 800), ValueError)
+--- hints
+- 维护三样东西：`batches`（排好的每一分钟）、`current`（这一分钟的编号）、`used`（这一分钟已用的 token）。
+- 放进去之前先判断：`current` 不为空，并且「条数已满」或「加上这条会超」，就把 `current` 收进 `batches`，重新开始一分钟。
+- 循环结束后别忘了最后一分钟：`if current: batches.append(current)`。
+
+@@ item d20-15
+type: choice
+title: 设计题：先看哪个指标
+level: 2
+--- prompt
+律师说：「漏掉一条有风险的条款，比多标一条没问题的条款严重得多。」你的评测把「有风险」当作正类。你先盯哪个指标，往哪个方向调？
+--- options
+- 提高精确率（precision）：让标出来的尽量都真有风险
+- 提高召回率（recall）：让真有风险的尽量都被标出来，可以接受多一些误报
+- 提高准确率（accuracy）：整体判对的比例
+- 降低 token 成本
+answer: 2
+--- explain
+漏报就是 FN，recall = TP / (TP + FN) 直接反映漏报，这也是 Clause Check 的 `run_evals.py` 专门打印 `high-risk recall` 的原因。代价是误报变多（precision 下降），律师要多看几条。常见做法：不确定时判 flag、红旗正则兜底（命中的条款不能是 accept）。accuracy 在风险条款很少时会骗人：全判 accept 也可能有 90% 的准确率。
+
+@@ item d20-16
+type: choice
+title: 设计题：合同太慢
+level: 2
+--- prompt
+客户上传了一份 300 页、600 条的合同，审完要 40 分钟。面试官问：「你第一步做什么？」最好的回答是：
+--- options
+- 换一个更快的模型
+- 把所有条款拼成一个请求，一次发给模型
+- 把 Python 换成 TypeScript，运行得更快
+- 先看 trace，量出时间花在哪一步（解析？每条的模型调用？工具循环的步数？重试？），再对最慢的那一步下手；如果是 600 次串行调用，就改成有上限的并发
+answer: 4
+--- explain
+设计题的第一步永远是测量。600 条 × 每条 4 秒 ≈ 40 分钟，瓶颈是网络上的模型调用，不是代码本身的速度，换语言没用。并发要有上限（比如同时 8 个，否则会 429）；稳定的前缀放前面吃缓存；重复的样板条款只审一次（今天的去重题）。一次全发：输出太长、质量下降，一条出错整份重来。换模型也许有用，但要先用评测确认召回率没掉。
+
+@@ item d20-e1
+type: scratch
+title: 闭卷：需要复查的条款（Python）
+exam: yes
+level: 3
+--- prompt
+条款之间有交叉引用（比如 "subject to Section 12"）。一条条款本身判了 accept，但它引用的条款判了 redline，它就需要复查。
+
+写 `needs_recheck(verdicts, refs)`：
+
+- `verdicts`：条款编号 → 判定，如 `{"8.1": "accept", "12": "redline"}`
+- `refs`：条款编号 → 它引用的编号列表，如 `{"8.1": ["12"]}`；没有引用的条款可能不在 `refs` 里
+- 返回：判定为 accept、并且**直接**引用了至少一条 redline 条款的编号，按条款号的**数字**顺序排（"9.2" 在 "10.1" 前面，"8.1" 在 "8.10" 前面）
+- 引用了 `verdicts` 里没有的编号：忽略
+--- solution
+def clause_key(cid):
+    return tuple(int(p) for p in cid.split("."))
+
+def needs_recheck(verdicts, refs):
+    result = []
+    for cid, verdict in verdicts.items():
+        if verdict != "accept":
+            continue
+        if any(verdicts.get(r) == "redline" for r in refs.get(cid, [])):
+            result.append(cid)
+    return sorted(result, key=clause_key)
+--- tests
+V = {"8.1": "accept", "12": "redline", "9.2": "accept", "10.1": "accept", "4.2": "redline", "11.2": "flag", "6.1": "accept"}
+R = {"8.1": ["12"], "10.1": ["4.2", "99"], "9.2": ["4.2"], "11.2": ["4.2"], "6.1": ["11.2"]}
+expect("找出来并按数字顺序", lambda: needs_recheck(V, R), ["8.1", "9.2", "10.1"])
+expect("没有引用", lambda: needs_recheck(V, {}), [])
+expect("只引用了不存在的编号", lambda: needs_recheck({"1.1": "accept"}, {"1.1": ["7"]}), [])
+expect("8.1 在 8.10 前面", lambda: needs_recheck({"8.10": "accept", "8.1": "accept", "3": "redline"}, {"8.10": ["3"], "8.1": ["3"]}), ["8.1", "8.10"])
+
+@@ item d20-e2
+type: scratch
+title: 闭卷：应用 redline（TypeScript）
+exam: yes
+level: 3
+lang: ts
+--- prompt
+定义 `type Edit = { start: number; end: number; replacement: string }`，写 `applyRedlines(text: string, edits: Edit[]): string`：把每个 edit 的区间（包含 start，不包含 end）替换成 `replacement`。
+
+- `edits` 的顺序不固定；所有位置都是相对**原文**的（`graph.py` 的做法：从后往前替换，前面的位置就不会被改乱）
+- 按 start 排序后，下一个的 start 小于上一个的 end 就是重叠：`throw new Error(...)`；首尾相接可以
+- 不要修改传进来的 `edits` 数组；没有 edit 时原样返回
+--- solution
+type Edit = { start: number; end: number; replacement: string };
+
+function applyRedlines(text: string, edits: Edit[]): string {
+  const sorted = [...edits].sort((a, b) => a.start - b.start);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].start < sorted[i - 1].end) {
+      throw new Error(`overlapping edits at ${sorted[i].start}`);
+    }
+  }
+  let out = text;
+  for (const e of sorted.reverse()) {
+    out = out.slice(0, e.start) + e.replacement + out.slice(e.end);
+  }
+  return out;
+}
+--- tests
+const TEXT = "Fees are due in 60 days. Liability is unlimited.";
+const e1 = { start: TEXT.indexOf("60 days"), end: TEXT.indexOf("60 days") + 7, replacement: "30 days" };
+const e2 = { start: TEXT.indexOf("unlimited"), end: TEXT.indexOf("unlimited") + 9, replacement: "capped at 12 months of fees" };
+expect("两处替换", () => applyRedlines(TEXT, [e1, e2]), "Fees are due in 30 days. Liability is capped at 12 months of fees.");
+expect("顺序打乱也一样", () => applyRedlines(TEXT, [e2, e1]), "Fees are due in 30 days. Liability is capped at 12 months of fees.");
+expect("没有 edit", () => applyRedlines(TEXT, []), TEXT);
+expectThrows("区间重叠", () => applyRedlines(TEXT, [e1, { start: e1.start + 2, end: e1.end + 3, replacement: "x" }]));
+expect("不改传进来的数组", () => {
+  const edits = [e2, e1];
+  applyRedlines(TEXT, edits);
+  return edits[0].replacement;
+}, "capped at 12 months of fees");
+
+@@ item d20-e3
+type: scratch
+title: 闭卷：重写重试函数（TypeScript）
+exam: yes
+level: 3
+lang: ts
+--- prompt
+下面的 `withRetry` 有 3 个 bug。不要在它上面修修补补：在空白编辑器里从头写出正确的版本。
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T | undefined> {
+  for (let i = 0; i <= tries; i++) {
+    try {
+      return fn();
+    } catch (e) {
+      console.log("retrying");
+    }
+  }
+}
+```
+
+正确版本的签名：`withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T>`
+
+- 最多调用 `fn` 共 `tries` 次；某一次成功就返回它的结果
+- `fn` 失败（Promise 被 reject）就再试
+- 全部失败：把**最后一次**的错误抛出去，不能返回 undefined
+--- solution
+async function withRetry<T>(fn: () => Promise<T>, tries: number): Promise<T> {
+  let lastError: unknown = new Error("tries must be at least 1");
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+--- tests
+function flaky(failures: number) {
+  let calls = 0;
+  const fn = async (): Promise<string> => {
+    calls += 1;
+    if (calls <= failures) throw new Error(`fail ${calls}`);
+    return "ok";
+  };
+  return { fn, count: () => calls };
+}
+expectAsync("失败两次后成功，一共调用 3 次", async () => {
+  const f = flaky(2);
+  const r = await withRetry(f.fn, 3);
+  return [r, f.count()];
+}, ["ok", 3]);
+expectAsync("全部失败：抛出最后一次的错误，只调用 tries 次", async () => {
+  const f = flaky(10);
+  try {
+    await withRetry(f.fn, 3);
+    return "没有报错";
+  } catch (e) {
+    return [e instanceof Error ? e.message : String(e), f.count()];
+  }
+}, ["fail 3", 3]);
+expectAsync("第一次就成功", async () => {
+  const f = flaky(0);
+  return [await withRetry(f.fn, 3), f.count()];
+}, ["ok", 1]);

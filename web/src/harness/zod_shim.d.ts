@@ -15,6 +15,7 @@ declare module "zod" {
     array(): ZodArray<ZodType<T>>;
     default(value: Exclude<T, undefined>): ZodType<Exclude<T, undefined>>;
     describe(description: string): this;
+    refine(check: (value: T) => boolean, message?: string): this;
   }
   interface ZodString extends ZodType<string> {
     min(n: number, message?: string): ZodString;
@@ -49,6 +50,10 @@ declare module "zod" {
     enum<const T extends readonly [string, ...string[]]>(values: T): ZodType<T[number]> & { readonly options: T };
     array<I extends ZodType<any>>(item: I): ZodArray<I>;
     object<S extends Shape>(shape: S): ZodObject<S>;
+    union<const T extends readonly [ZodType<any>, ...ZodType<any>[]]>(options: T): ZodType<T[number]["_output"]>;
+    discriminatedUnion<const T extends readonly [ZodObject<any>, ...ZodObject<any>[]]>(key: string, options: T): ZodType<T[number]["_output"]>;
+    record<V extends ZodType<any>>(key: ZodType<string>, value: V): ZodType<Record<string, V["_output"]>>;
+    toJSONSchema(schema: ZodType<any>): Record<string, any>;
   };
   export namespace z {
     type infer<T extends ZodType<any>> = T["_output"];

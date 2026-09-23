@@ -1,6 +1,7 @@
-// Build the 7-day course site into dist/.
-//   node build.mjs            parse content, validate every exercise, emit dist/
-//   node build.mjs --day 3    validate only day 3 (still emits everything)
+// Build the course site into dist/.
+//   node build.mjs              parse content, validate every exercise, emit dist/
+//   node build.mjs --day 3      validate only day 3, emit nothing (safe to run several at once)
+//   node build.mjs --day 8,9    validate days 8 and 9
 // Validation runs the SAME runners the page uses: Pyodide for Python, the TS compiler +
 // a sandboxed job for TypeScript. Every solution must pass, every starter must fail,
 // and predict-the-output answers are computed here, never typed by hand.
@@ -14,7 +15,11 @@ import ts from "typescript";
 const ROOT = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
 const P = (...p) => path.join(decodeURIComponent(ROOT), ...p);
 const DIST = P("dist");
-const onlyDay = process.argv.includes("--day") ? Number(process.argv[process.argv.indexOf("--day") + 1]) : null;
+const onlyDays = process.argv.includes("--day")
+  ? new Set(String(process.argv[process.argv.indexOf("--day") + 1]).split(",").map(Number))
+  : null;
+const EMIT = onlyDays === null;
+const SHOW = process.argv.includes("--show");   // print concept / predict outputs while validating
 
 // ---------------------------------------------------------------- parse
 function parseContent(file) {
@@ -59,6 +64,13 @@ function normalize(o, day) {
     out.starter = o.template.replace(/\[\[(.*?)\]\]/g, "");
     out.fills = [...o.template.matchAll(/\[\[(.*?)\]\]/g)].map((m) => m[1]);
   }
+  if (o.type === "testwrite") {
+    // --- mutants: variants of --- impl, each starting with a "===== clue" line
+    out.mutants = (o.mutants || "").split(/^=====[ \t]*/m).slice(1).map((chunk) => {
+      const nl = chunk.indexOf("\n");
+      return { note: chunk.slice(0, nl).trim(), code: chunk.slice(nl + 1).replace(/\s+$/, "") };
+    });
+  }
   if (o.type === "order") {
     out.lines = o.lines.split("\n");
     out.distractors = o.distractors ? o.distractors.split("\n") : [];
@@ -69,19 +81,13 @@ function normalize(o, day) {
 }
 
 const DAYS = [];
-for (const f of fs.readdirSync(P("content")).filter((f) => /^day\d+\.txt$/.test(f)).sort()) parseContent(P("content", f));
+const dayNum = (f) => Number(/\d+/.exec(f)[0]);
+for (const f of fs.readdirSync(P("content")).filter((f) => /^day\d+\.txt$/.test(f)).sort((a, b) => dayNum(a) - dayNum(b))) parseContent(P("content", f));
 
-// ---------------------------------------------------------------- dist + runtimes
-fs.rmSync(DIST, { recursive: true, force: true });
-fs.mkdirSync(P("dist", "pyodide"), { recursive: true });
-// The artifact host serves no .zip/.whl, so archives ship under a binary-safe .wasm name:
-// the stdlib is loaded via stdLibURL, the Pydantic wheels are unpacked into site-packages.
-for (const f of ["pyodide.mjs", "pyodide.asm.mjs", "pyodide.asm.wasm", "pyodide-lock.json"])
-  fs.copyFileSync(P("node_modules", "pyodide", f), P("dist", "pyodide", f));
-fs.copyFileSync(P("node_modules", "pyodide", "python_stdlib.zip"), P("dist", "pyodide", "python_stdlib.wasm"));
-fs.mkdirSync(P("dist", "pyodide", "pkg"), { recursive: true });
+// ---------------------------------------------------------------- runtimes
+// Validation runs from node_modules + vendor/, so --day runs never touch dist/.
 const WHEELS = fs.readdirSync(P("vendor")).filter((f) => f.endsWith(".whl")).map((f) => f.replace(/\.whl$/, ".wasm"));
-for (const f of WHEELS) fs.copyFileSync(P("vendor", f.replace(/\.wasm$/, ".whl")), P("dist", "pyodide", "pkg", f));
+fs.mkdirSync(P("build"), { recursive: true });
 
 const libs = {};
 const libDir = P("node_modules", "typescript", "lib");
@@ -94,31 +100,37 @@ for (const todo = ["lib.es2022.d.ts"]; todo.length;) {
 libs["env.d.ts"] = fs.readFileSync(P("src", "harness", "ts_env.d.ts"), "utf8");
 libs["zod.d.ts"] = fs.readFileSync(P("src", "harness", "zod_shim.d.ts"), "utf8");
 
-fs.writeFileSync(P("build", "zod-entry.js"), 'export * from "zod";\n');
-execFileSync(process.execPath, [P("node_modules", "esbuild", "bin", "esbuild"), P("build", "zod-entry.js"), "--bundle", "--format=iife", "--global-name=Zod", "--minify", `--outfile=${P("dist", "zod.iife.js")}`], { stdio: "ignore" });
+const ZOD_ENTRY = P("build", `zod-entry-${process.pid}.js`);
+const ZOD_FILE = P("build", `zod-${process.pid}.iife.js`);
+fs.writeFileSync(ZOD_ENTRY, 'export * from "zod";\n');
+execFileSync(process.execPath, [P("node_modules", "esbuild", "bin", "esbuild"), ZOD_ENTRY, "--bundle", "--format=iife", "--global-name=Zod", "--minify", `--outfile=${ZOD_FILE}`], { stdio: "ignore" });
 
 const PY_RUNNER = fs.readFileSync(P("src", "harness", "py_runner.py"), "utf8");
 const PY_MOCK = fs.readFileSync(P("src", "harness", "py_mock.py"), "utf8");
 const TS_RUNTIME = fs.readFileSync(P("src", "harness", "ts_runtime.js"), "utf8");
+const PY_DISCOVER = fs.readFileSync(P("src", "harness", "py_discover.py"), "utf8");
 const TS_COMPILE = fs.readFileSync(P("src", "harness", "ts_compile.js"), "utf8");
 vm.runInThisContext(TS_COMPILE);
-const ZOD = fs.readFileSync(P("dist", "zod.iife.js"), "utf8");
+const ZOD = fs.readFileSync(ZOD_FILE, "utf8");
+for (const f of [ZOD_ENTRY, ZOD_FILE]) fs.rmSync(f, { force: true });
 
-const { loadPyodide } = await import(new URL("file:///" + P("dist", "pyodide", "pyodide.mjs").replace(/\\/g, "/")).href);
-const py = await loadPyodide({ indexURL: P("dist", "pyodide") + path.sep, stdLibURL: P("dist", "pyodide", "python_stdlib.wasm") });
+const { loadPyodide } = await import(new URL("file:///" + P("node_modules", "pyodide", "pyodide.mjs").replace(/\\/g, "/")).href);
+const py = await loadPyodide({ indexURL: P("node_modules", "pyodide") + path.sep });
 const SITE = py.runPython("import site; site.getsitepackages()[0]");
-for (const f of WHEELS) py.unpackArchive(new Uint8Array(fs.readFileSync(P("dist", "pyodide", "pkg", f))), "wheel", { extractDir: SITE });
+for (const f of WHEELS) py.unpackArchive(new Uint8Array(fs.readFileSync(P("vendor", f.replace(/\.wasm$/, ".whl")))), "wheel", { extractDir: SITE });
 py.runPython("import importlib; importlib.invalidate_caches(); import pydantic");
 py.runPython(PY_RUNNER);
 const pyRun = py.globals.get("run");
 const runPy = (code, tests = "", mock = false) => JSON.parse(pyRun(code, tests, mock ? PY_MOCK : ""));
+// testwrite: the learner's tests are main.py; the code under test is loaded first, as setup
+const runTestwrite = (impl, testCode, mock = false) => JSON.parse(pyRun(testCode, PY_DISCOVER, (mock ? PY_MOCK + "\n" : "") + impl));
 
 function runTs(code, tests = "") {
   const { diagnostics, js } = CCTS.compile(ts, libs, code, tests);
   const job = CCTS.buildJob(TS_RUNTIME, js);
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve({ timeout: true, diagnostics, tests: [] }), 8000);
-    const ctx = { setTimeout, __POST: (m) => { clearTimeout(timer); resolve({ ...m, diagnostics, js }); } };
+    const ctx = { setTimeout, clearTimeout, __POST: (m) => { clearTimeout(timer); resolve({ ...m, diagnostics, js }); } };
     vm.createContext(ctx);
     vm.runInContext(ZOD, ctx);
     try { vm.runInContext(job, ctx); }
@@ -130,6 +142,7 @@ function realNode(js) {
   fs.writeFileSync(f, js);
   try { return execFileSync(process.execPath, [f], { encoding: "utf8", timeout: 8000 }).replace(/\n$/, ""); }
   catch (e) { return "ERROR: " + (e.stderr || e.message).split("\n").slice(0, 6).join("\n"); }
+  finally { fs.rmSync(f, { force: true }); }
 }
 
 // ---------------------------------------------------------------- validate
@@ -143,11 +156,12 @@ async function run(lang, code, tests, mock) { return lang === "py" ? runPy(code,
 
 const ids = new Set();
 for (const day of DAYS) {
-  const validate = onlyDay === null || Number(day.id) === onlyDay;
+  const validate = onlyDays === null || onlyDays.has(Number(day.id));
   for (const c of day.concepts) {
     if (!validate || !c.code) continue;
     const r = await run(c.lang, c.code, "", c.mock);
     checked++;
+    if (SHOW) console.log(`--- ${c.id} ${c.title}\n${r.stdout || ""}${r.error || ""}${(r.diagnostics || []).map((d) => `L${d.line} ${d.message}`).join("\n")}`);
     if (c.error_demo === "yes") { if (!r.error && !(r.diagnostics || []).length) bad(c.id, "error demo did not error"); }
     else if (r.error || (r.diagnostics || []).length) bad(c.id, "concept example fails: " + summary(r));
   }
@@ -168,6 +182,7 @@ for (const day of DAYS) {
       if (r.error || (r.diagnostics || []).length) { bad(it.id, "predict code errors: " + summary(r)); continue; }
       it.expected = r.stdout.replace(/\s+$/, "");
       if (!it.expected) bad(it.id, "predict prints nothing");
+      if (SHOW) console.log(`--- ${it.id} ${it.title}\n${it.expected}`);
       if (it.lang === "ts") {
         const real = realNode(r.js);
         const norm = (x) => x.split("\n").map((l) => l.replace(/\s+$/, "")).join("\n");
@@ -176,6 +191,21 @@ for (const day of DAYS) {
       continue;
     }
     if (t === "local") { if (!it.verify) bad(it.id, "local task needs verify"); continue; }
+    if (t === "testwrite") {
+      if (it.lang !== "py") { bad(it.id, "testwrite is Python only"); continue; }
+      if (!it.impl || !it.mutants.length || !it.solution || it.starter === undefined) { bad(it.id, "testwrite needs impl, mutants, solution (reference tests) and starter"); continue; }
+      const onImpl = runTestwrite(it.impl, it.solution, it.mock);
+      if (!allPass(onImpl)) bad(it.id, "reference tests fail on the correct impl: " + summary(onImpl));
+      it.mutants.forEach((m, i) => {
+        if (!m.note) bad(it.id, `mutant ${i + 1} has no clue after =====`);
+        const r = runTestwrite(m.code, it.solution, it.mock);
+        if (r.error) bad(it.id, `mutant ${i + 1} does not even load: ${r.error.split("\n").pop()}`);
+        else if (allPass(r)) bad(it.id, `reference tests miss mutant ${i + 1} (${m.note})`);
+      });
+      const st = runTestwrite(it.impl, it.starter, it.mock);
+      if (allPass(st) && it.mutants.every((m) => !allPass(runTestwrite(m.code, it.starter, it.mock)))) bad(it.id, "STARTER tests already catch every mutant");
+      continue;
+    }
     if (t === "order" && !it.tests) continue;
     if (!it.tests) { bad(it.id, "missing tests"); continue; }
     const sol = await run(it.lang, it.solution, it.tests, it.mock);
@@ -194,18 +224,29 @@ for (const day of DAYS) {
   }
 }
 
-// ---------------------------------------------------------------- emit
+// ---------------------------------------------------------------- report + emit
+const counts = DAYS.map((d) => `D${d.id}:${d.items.length}+${d.concepts.length}c`).join(" ");
+console.log(`checked ${checked} | ${counts} | items ${DAYS.reduce((n, d) => n + d.items.length, 0)}`);
+if (problems.length) { console.log(`\n${problems.length} PROBLEM(S):\n- ` + problems.join("\n- ")); process.exitCode = 1; }
+else console.log(EMIT ? "all exercises valid" : `day ${[...onlyDays].join(",")} valid (validation only, dist/ not written)`);
+if (!EMIT) process.exit();
+
+fs.rmSync(DIST, { recursive: true, force: true });
+fs.mkdirSync(P("dist", "pyodide", "pkg"), { recursive: true });
+// The artifact host serves no .zip/.whl, so archives ship under a binary-safe .wasm name:
+// the stdlib is loaded via stdLibURL, the Pydantic wheels are unpacked into site-packages.
+for (const f of ["pyodide.mjs", "pyodide.asm.mjs", "pyodide.asm.wasm", "pyodide-lock.json"])
+  fs.copyFileSync(P("node_modules", "pyodide", f), P("dist", "pyodide", f));
+fs.copyFileSync(P("node_modules", "pyodide", "python_stdlib.zip"), P("dist", "pyodide", "python_stdlib.wasm"));
+for (const f of WHEELS) fs.copyFileSync(P("vendor", f.replace(/\.wasm$/, ".whl")), P("dist", "pyodide", "pkg", f));
+fs.writeFileSync(P("dist", "zod.iife.js"), ZOD);
 const course = { builtAt: new Date().toISOString(), days: DAYS };
 fs.writeFileSync(P("dist", "course.js"), "window.CC_COURSE = " + JSON.stringify(course) + ";\n");
 fs.writeFileSync(P("dist", "harness.js"), [
-  "window.CC_HARNESS = " + JSON.stringify({ PY_RUNNER, PY_MOCK, TS_RUNTIME, WHEELS }) + ";",
+  "window.CC_HARNESS = " + JSON.stringify({ PY_RUNNER, PY_MOCK, PY_DISCOVER, TS_RUNTIME, WHEELS }) + ";",
   TS_COMPILE,
 ].join("\n"));
 fs.writeFileSync(P("dist", "ts-libs.json"), JSON.stringify(libs));
 const CM_CSS = fs.readFileSync(P("node_modules", "codemirror", "lib", "codemirror.css"), "utf8");
 fs.writeFileSync(P("dist", "index.html"), fs.readFileSync(P("src", "index.html"), "utf8").replace("/*CODEMIRROR_CSS*/", () => CM_CSS));
-
-const counts = DAYS.map((d) => `D${d.id}:${d.items.length}+${d.concepts.length}c`).join(" ");
-console.log(`checked ${checked} | ${counts} | items ${DAYS.reduce((n, d) => n + d.items.length, 0)}`);
-if (problems.length) { console.log(`\n${problems.length} PROBLEM(S):\n- ` + problems.join("\n- ")); process.exitCode = 1; }
-else console.log("all exercises valid");
+console.log("dist/ written");

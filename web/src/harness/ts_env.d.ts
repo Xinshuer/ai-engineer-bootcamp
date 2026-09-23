@@ -38,4 +38,5 @@ declare const MOCK: {
   reset(seed?: number): void;
   seed(n: number): void;
   failNext(status: number, times?: number): void;
+  embed(text: string): number[];
 };

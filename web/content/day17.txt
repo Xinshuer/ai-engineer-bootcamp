@@ -1,0 +1,1661 @@
+@@ day 17
+title: Agent 循环：工具注册、参数校验、上限、审批、幂等
+lang: ts
+hours: 5 小时
+--- goal
+手写一个「能上线的形状」的 Agent 循环：用 Zod 定义工具并生成 JSON Schema，参数不合法时把错误回送给模型，有步数和 token 上限并说明为什么停，每一步都留下轨迹，危险的工具要人批准，有副作用的工具重试也只执行一次。最后你会看到，Mastra 的 `createTool` / `Agent` 和 Clause Check 的 `tools.py`、`review.py` 用的是同一套零件。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片并改动运行
+- 练习区全部通过（包括本机任务：看真实项目的工具轨迹）
+- 闭卷挑战 3 题
+- 打开 `clausecheck/tools.py` 的 `execute` 和 `review.py` 的 `model_review`，指出今天写的每个零件对应哪几行
+
+@@ concept
+title: Agent = 循环 + 上限
+--- body
+第 7 天的 `miniAgent` 已经是一个 Agent：请求模型 → 模型要调工具就执行 → 把结果放回 messages → 再请求……直到模型给出文字回答。今天把它改造成能上线的样子。
+
+上线前最先要想的不是「怎么让它更聪明」，而是**「怎么让它停下来」**：模型可能一直调工具（死循环），而每一步都花钱。所以上限是设计的一部分，停下来时还要说明原因：
+
+```ts
+type StopReason = "answer" | "max_steps" | "budget";
+```
+
+Clause Check 的 `review.py` 里 `while trace.steps < settings.max_steps` 就是这个上限（`config.py` 默认 6 步）。本页的模拟服务器有个开关：用户消息里带 `[loop]`，模型就会一直调工具，专门用来测上限。
+--- code
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+
+async function run(question: string, maxSteps: number): Promise<string> {
+  const messages: any[] = [{ role: "user", content: question }];
+  for (let step = 1; step <= maxSteps; step++) {
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const choice = (await res.json()).choices[0];
+    console.log(`  step ${step}: ${choice.finish_reason}`);
+    if (choice.finish_reason !== "tool_calls") {
+      return `answer: ${choice.message.content}`;
+    }
+    const call = choice.message.tool_calls[0];
+    messages.push(choice.message);
+    messages.push({ role: "tool", tool_call_id: call.id, content: `rule for ${JSON.parse(call.function.arguments).topic}` });
+  }
+  return "stopped: max_steps";
+}
+
+async function main() {
+  console.log(await run("Is unlimited liability acceptable?", 3));
+  console.log(await run("Is unlimited liability acceptable? [loop]", 3));
+}
+main();
+
+@@ concept
+title: 工具注册表：一个 schema，两种用途
+--- body
+一个工具 = 名字 + 说明 + 参数 schema + 执行函数。schema 同时做两件事：
+
+1. `z.toJSONSchema(schema)` 生成给模型看的 `parameters`
+2. 模型传回参数时，用 `schema.safeParse(...)` 在代码里校验
+
+一份定义，模型看到的和代码检查的永远一致。`tools.py` 的 `tool_specs()` 用 Pydantic 的 `model_json_schema()` 做的是同一件事。
+
+工具按名字放进 `Map<string, Tool>`（第 16 天），查找用 `.get(name)`。`run` 的参数写成 `any`，因为每个工具的参数形状都不同；这里用 any 是安全的，因为进 `run` 之前一定先过了 `safeParse`。
+
+小说明：本页的 Zod 类型声明是简化版，没有 `z.ZodType`，所以题目里写好了 `type AnySchema = ReturnType<typeof z.any>`，意思就是「任何一个 Zod schema」。真实项目里直接写 `z.ZodType`。
+--- code
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+
+const lookupPlaybook: Tool = {
+  name: "lookup_playbook",
+  description: "Return the customer's rule for one topic. Call this before deciding any verdict.",
+  schema: z.object({ topic: z.enum(["liability_cap", "payment", "termination"]).describe("Topic of the clause") }),
+  run: (args) => `rule for ${args.topic}`,
+};
+const registry = new Map<string, Tool>([[lookupPlaybook.name, lookupPlaybook]]);
+
+console.log(JSON.stringify(z.toJSONSchema(lookupPlaybook.schema), null, 2));
+console.log(registry.has("lookup_playbook"), registry.get("delete_all"));
+
+@@ concept
+title: 参数校验：错误是写给模型看的
+--- body
+模型给的 `arguments` 是一段 **JSON 文字**，它可能：格式坏了、字段不对、工具名根本不存在。这三种情况都**不要 throw 让整个循环崩掉**，而是把错误写成工具结果回给模型，它下一步通常会自己改正：
+
+```ts
+messages.push({ role: "tool", tool_call_id: call.id, content: "INVALID_ARGS: topic: Invalid option ..." });
+```
+
+这正是 `tools.py` 里 `execute` 的做法：`UNKNOWN_TOOL`、`INVALID_ARGS` 作为内容返回，外加一个 `is_error` 标记，注释写的是「Never raises for model mistakes」。
+
+经典错误：`JSON.parse` 没包 try/catch。模型写坏一次参数，整份合同的审查就崩了。
+--- code
+import { z } from "zod";
+
+const TopicArgs = z.object({ topic: z.enum(["liability_cap", "payment"]) });
+
+function check(argText: string): string {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(argText);
+  } catch {
+    return "INVALID_JSON: arguments are not valid JSON";
+  }
+  const r = TopicArgs.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}`;
+  }
+  return `OK: ${r.data.topic}`;
+}
+
+console.log(check('{"topic": "payment"}'));
+console.log(check('{"topic": '));
+console.log(check('{"topic": "gdpr"}'));
+
+@@ concept
+title: 上限和停止原因
+--- body
+两种上限一起用：
+
+- **步数**：最多请求模型几次（`maxSteps`）
+- **预算**：把每次回答里的 `usage.total_tokens` 加起来，超过 `maxTokens` 就停。messages 越来越长，所以每一步都比上一步贵（运行下面的例子看数字）
+
+停下来时返回的不只是一段文字，而是一个说明「为什么停」的对象：
+
+```ts
+type RunResult = { reason: "answer" | "max_steps" | "budget"; answer: string | null; steps: number };
+```
+
+调用方看 `reason` 决定怎么办：`answer` 正常使用；`max_steps` / `budget` 就像 `review.py` 那样退回「flag，需要人看」，而不是假装审查完成了。
+--- code
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+
+async function main() {
+  const messages: any[] = [{ role: "user", content: "Is unlimited liability acceptable? [loop]" }];
+  let used = 0;
+  for (let step = 1; step <= 4; step++) {
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const data = await res.json();
+    used += data.usage.total_tokens;
+    console.log(`step ${step}: +${data.usage.total_tokens} tokens, total ${used}`);
+    const call = data.choices[0].message.tool_calls[0];
+    messages.push(data.choices[0].message);
+    messages.push({ role: "tool", tool_call_id: call.id, content: "rule for liability_cap: cap at 12 months of fees" });
+  }
+}
+main();
+
+@@ concept
+title: 轨迹：每一步都记下来
+--- body
+律师问「8.1 为什么被 flag？」，你要能打开记录看到：模型调了哪些工具、传了什么参数、成功没有、拿到了什么。这就是**轨迹**（trace），Langfuse 这类工具展示的就是它。
+
+每调一次工具记一条：
+
+```ts
+type TraceEntry = { step: number; tool: string; args: string; ok: boolean; result: string };
+```
+
+`args` 记模型给的**原始文字**（坏 JSON 也要记下来，排错时最需要它）。Clause Check 的 `ReviewTrace` 记了 `steps`、token 数、`stop_reason`，还有 `tool_calls` 标签列表，比如 `lookup_playbook:liability_cap`、`get_clause:12`、`propose_redline:INVALID_ARGS`。
+
+排错顺序还是第 7 天那句：先看模型拿到了什么（轨迹），再怀疑模型的推理。
+--- code
+type TraceEntry = { step: number; tool: string; args: string; ok: boolean; result: string };
+
+const trace: TraceEntry[] = [];
+function record(step: number, tool: string, args: string, ok: boolean, result: string): void {
+  trace.push({ step, tool, args, ok, result: result.slice(0, 40) });
+}
+
+record(1, "lookup_playbook", '{"topic":"liability_cap"}', true, "Cap at 12 months of fees; never accept unlimited liability.");
+record(2, "get_clause", '{"clause_id":"12"}', true, "The limitations in Section 8 shall not apply to Customer.");
+record(3, "propose_redline", '{"clause_id":', false, "INVALID_JSON: arguments are not valid JSON");
+
+for (const e of trace) {
+  console.log(`${e.step} ${e.ok ? "ok " : "ERR"} ${e.tool.padEnd(16)} ${e.args}`);
+}
+const errors = trace.filter((e) => !e.ok).length;
+console.log(`${trace.length} tool calls, ${errors} error(s)`);
+
+@@ concept
+title: 人在回路：危险的工具要人批准
+--- body
+查 playbook、读条款是**只读**的，调错了也没关系。发邮件、改合同、付款这类有后果的工具，要先问人：
+
+- 工具上标记 `needsApproval: true`
+- 循环执行它之前，调用一个**注入进来的** `approve(request)` 函数；真实应用里它会弹出按钮等人点，测试里传一个假的
+- 被拒绝时不执行，把 `DENIED: ...` 作为工具结果告诉模型，让它换个做法
+- **批准永远不能来自模型**：不能给工具加一个 `approved` 参数让模型自己填
+
+Clause Check 的做法一样：`propose_redline` 只「记录一个提议」，真正把修改写进导出文件之前，`graph.py` 的 `approve` 节点会停下来等人决定（明天手写这个「暂停再继续」）。
+--- code
+type Call = { tool: string; args: Record<string, string> };
+const NEEDS_APPROVAL = new Set(["send_redline_email"]);
+
+async function execute(call: Call, approve: (c: Call) => Promise<boolean>): Promise<string> {
+  if (NEEDS_APPROVAL.has(call.tool)) {
+    const yes = await approve(call);
+    if (!yes) {
+      return `DENIED: the user rejected ${call.tool}`;
+    }
+  }
+  return `ran ${call.tool} for ${call.args.clause_id}`;
+}
+
+async function main() {
+  const alwaysNo = async (c: Call) => {
+    console.log(`  (asking a human about ${c.tool})`);
+    return false;
+  };
+  const alwaysYes = async (_c: Call) => true;
+  console.log(await execute({ tool: "lookup_playbook", args: { clause_id: "8.1" } }, alwaysNo));
+  console.log(await execute({ tool: "send_redline_email", args: { clause_id: "8.1" } }, alwaysNo));
+  console.log(await execute({ tool: "send_redline_email", args: { clause_id: "8.1" } }, alwaysYes));
+}
+main();
+
+@@ concept
+title: 幂等：重试不能发两封邮件
+--- body
+同一个工具调用可能被执行不止一次：模型重复调用、429 之后整步重试、程序崩了从检查点恢复（明天）。只读工具无所谓，**发邮件就会发两封**。
+
+解决办法叫**幂等**：给每个动作一个固定的 key（比如 `` `${clauseId}:${action}` ``），做成功后把 key 记进一个 `Set`；下次看到同一个 key 就直接返回「已经做过了」，不再真的做。
+
+两个要点：
+
+- **做成功之后**再记 key。发送失败时不记，重试才发得出去
+- 真实系统里这个 Set 要放进数据库，否则程序一重启就忘了。Stripe 这类支付接口支持 `Idempotency-Key` 请求头，是同一个思路
+--- code
+class Outbox {
+  #done = new Set<string>();
+  sent: string[] = [];
+
+  send(clauseId: string, action: string): string {
+    const key = `${clauseId}:${action}`;
+    if (this.#done.has(key)) {
+      return `ALREADY_DONE: ${key}`;
+    }
+    this.sent.push(key);
+    this.#done.add(key);
+    return `SENT: ${key}`;
+  }
+}
+
+const outbox = new Outbox();
+console.log(outbox.send("8.1", "redline_email"));
+console.log(outbox.send("8.1", "redline_email"));
+console.log(outbox.send("8.1", "reminder"));
+console.log(outbox.sent);
+
+@@ concept
+title: 对照框架：Mastra 和 LangGraph
+--- body
+今天手写的零件，框架里都有现成的。Mastra 的写法大致如下（示意，具体签名以 mastra.ai 官方文档为准）：
+
+```ts
+import { createTool } from "@mastra/core/tools";
+import { Agent } from "@mastra/core/agent";
+
+const lookupPlaybook = createTool({
+  id: "lookup_playbook",
+  description: "Return the customer's rule for one topic. Call before deciding.",
+  inputSchema: z.object({ topic: z.enum(TOPICS) }),
+  execute: async (...) => { ... },
+});
+const reviewer = new Agent({ name: "reviewer", instructions: "...", model: ..., tools: { lookupPlaybook } });
+```
+
+- `inputSchema` 就是你的 `schema`：框架替你生成 JSON Schema、替你校验参数
+- `execute` 就是你的 `run`；`Agent` 里的循环就是你的 `runAgent`，步数上限在调用时的选项里设置
+- LangGraph（Python）：`ToolNode` 负责执行模型要的工具，`recursion_limit` 限制总步数，人工审批用 `interrupt()`（明天）
+
+面试时可以这样说：「我手写过这个循环，所以知道框架替我做了哪些事，出了问题知道去哪儿找。」
+--- code
+const parts = [
+  { mine: "Tool.schema (Zod)", mastra: "createTool inputSchema", project: "tools.py ARG_MODELS" },
+  { mine: "Tool.run", mastra: "createTool execute", project: "ReviewContext handlers" },
+  { mine: "dispatch()", mastra: "inside Agent", project: "ReviewContext.execute" },
+  { mine: "runAgent() + maxSteps", mastra: "Agent + step limit", project: "model_review, max_steps" },
+  { mine: "trace", mastra: "tracing / observability", project: "ReviewTrace + Langfuse" },
+];
+for (const p of parts) {
+  console.log(`${p.mine.padEnd(22)} ${p.mastra.padEnd(24)} ${p.project}`);
+}
+
+@@ item d17-01
+type: predict
+title: 复习：可辨识联合
+level: 1
+--- prompt
+复习第 15 天。Agent 的每一步可以用一个可辨识联合来描述。写出输出。
+--- code
+type Step =
+  | { kind: "tool"; name: string; ok: boolean }
+  | { kind: "answer"; text: string }
+  | { kind: "stopped"; reason: "max_steps" | "budget" };
+
+function describe(s: Step): string {
+  switch (s.kind) {
+    case "tool":
+      return s.ok ? `called ${s.name}` : `${s.name} failed`;
+    case "answer":
+      return `answer (${s.text.length} chars)`;
+    case "stopped":
+      return `stopped: ${s.reason}`;
+  }
+}
+
+const steps: Step[] = [
+  { kind: "tool", name: "lookup_playbook", ok: true },
+  { kind: "tool", name: "get_clause", ok: false },
+  { kind: "answer", text: "Flag it." },
+];
+for (const s of steps) {
+  console.log(describe(s));
+}
+console.log(describe({ kind: "stopped", reason: "budget" }));
+--- explain
+`switch (s.kind)` 进了哪个 case，TypeScript 就知道 `s` 是哪一种，所以 `case "tool"` 里能用 `s.name`，`case "answer"` 里能用 `s.text`。今天的停止原因 `"answer" | "max_steps" | "budget"` 也是字面量联合，调用方用 switch 分别处理。
+
+@@ item d17-02
+type: code
+title: 复习：参数必须是对象
+level: 1
+--- prompt
+复习第 16 天的 `Result`。工具参数必须是一个 JSON **对象**。写 `parseJsonObject(text)`：
+
+- 解析失败：`{ ok: false, error: "INVALID_JSON" }`
+- 解析出来不是对象（数组、`null`、字符串、数字）：`{ ok: false, error: "NOT_AN_OBJECT" }`
+- 否则：`{ ok: true, value: 解析结果 }`
+
+例：`parseJsonObject('["payment"]')` → `{ ok: false, error: "NOT_AN_OBJECT" }`。`review.py` 里也有这一步检查：「arguments were not a JSON object」。
+--- starter
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseJsonObject(text: string): Result<object> {
+  return { ok: false, error: "" };
+}
+--- solution
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseJsonObject(text: string): Result<object> {
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "INVALID_JSON" };
+  }
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    return { ok: false, error: "NOT_AN_OBJECT" };
+  }
+  return { ok: true, value: data };
+}
+--- tests
+expect("合法对象", () => parseJsonObject('{"topic": "payment"}'), { ok: true, value: { topic: "payment" } });
+expect("坏 JSON", () => parseJsonObject('{"topic": '), { ok: false, error: "INVALID_JSON" });
+expect("数组不算", () => parseJsonObject('["payment"]'), { ok: false, error: "NOT_AN_OBJECT" });
+expect("null 不算", () => parseJsonObject("null"), { ok: false, error: "NOT_AN_OBJECT" });
+expect("字符串不算", () => parseJsonObject('"payment"'), { ok: false, error: "NOT_AN_OBJECT" });
+--- hints
+- 先 try/catch 包住 `JSON.parse`，结果存进 `let data: unknown`。
+- `typeof null` 也是 `"object"`，数组的 typeof 也是 `"object"`，所以要额外判断 `data === null` 和 `Array.isArray(data)`。
+
+@@ item d17-03
+type: code
+title: 从 Zod 生成工具定义
+level: 2
+--- prompt
+写 `toolSpec(tool)`，返回发给 API 的工具对象：
+
+```ts
+{ type: "function", function: { name, description, parameters } }
+```
+
+`parameters` 用 `z.toJSONSchema(tool.schema)` 生成，再删掉其中的 `$schema` 键（它只说明 JSON Schema 的版本，模型用不上；`tools.py` 的 `tool_specs()` 也会删掉多余的 `title`）。删除一个键：`delete obj.key`。
+--- starter
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolSpec = { type: "function"; function: { name: string; description: string; parameters: Record<string, any> } };
+
+function toolSpec(tool: Tool): ToolSpec {
+  return { type: "function", function: { name: tool.name, description: "", parameters: {} } };
+}
+--- solution
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolSpec = { type: "function"; function: { name: string; description: string; parameters: Record<string, any> } };
+
+function toolSpec(tool: Tool): ToolSpec {
+  const parameters = z.toJSONSchema(tool.schema);
+  delete parameters.$schema;
+  return { type: "function", function: { name: tool.name, description: tool.description, parameters } };
+}
+--- tests
+const GET_CLAUSE: Tool = {
+  name: "get_clause",
+  description: "Fetch another clause of the same contract by its number, e.g. '12' or '9.1'.",
+  schema: z.object({ clause_id: z.string().describe("Clause number as printed, e.g. '12'") }),
+  run: (args) => `text of ${args.clause_id}`,
+};
+expect("外层结构", () => toolSpec(GET_CLAUSE).type, "function");
+expect("description 原样带上", () => toolSpec(GET_CLAUSE).function.description, GET_CLAUSE.description);
+expect("parameters 来自 schema", () => toolSpec(GET_CLAUSE).function.parameters, {
+  type: "object",
+  properties: { clause_id: { type: "string", description: "Clause number as printed, e.g. '12'" } },
+  required: ["clause_id"],
+  additionalProperties: false,
+});
+expect("没有 $schema", () => "$schema" in toolSpec(GET_CLAUSE).function.parameters, false);
+--- hints
+- `const parameters = z.toJSONSchema(tool.schema);` 得到一个普通对象。
+- `delete parameters.$schema;` 之后再放进返回的对象里。
+
+@@ item d17-04
+type: choice
+title: 限制写在哪里
+level: 1
+--- prompt
+`lookup_playbook` 的参数 `topic` 只能是 playbook 里的 11 个主题之一。这个限制放在哪里最好？
+--- options
+- 只写在 description 里：「topic must be one of liability_cap, payment, …」
+- 写成 `z.enum([...])`：它会变成 JSON Schema 里的 `enum` 给模型看，`safeParse` 还会在代码里真的拦住不合法的值
+- 不用限制，工具内部查不到就返回空字符串
+- 写在 system prompt 里，让模型记住
+answer: 2
+--- explain
+description 和 prompt 是给模型的「建议」，模型可能不听；schema 是「规则」：它同时生成 `enum` 给模型看，又在代码里执行。`tools.py` 里就是这样：`LookupPlaybookArgs` 的 `topic: Topic` 是一个 11 个值的 `Literal`，生成的 schema 里就是 `enum`。description 该写的是「什么时候用、什么时候不用、调用后会发生什么」（第 12 天 `mark_for_review` 的教训）。返回空字符串最糟：模型以为 playbook 对这个主题没有要求。
+
+@@ item d17-05
+type: fill
+title: 填空：注册表
+level: 1
+--- prompt
+填空，完成 `buildRegistry`（名字重复就 throw）和 `findTool`（找不到时返回一段列出可用工具的错误文字，模型看到就知道该用哪个名字）。
+--- template
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string };
+
+function buildRegistry(tools: Tool[]): Map<string, Tool> {
+  const registry = new [[Map]]<string, Tool>();
+  for (const t of tools) {
+    if (registry.[[has]](t.name)) {
+      throw new Error(`duplicate tool: ${t.name}`);
+    }
+    registry.[[set]](t.name, t);
+  }
+  return registry;
+}
+
+function findTool(registry: Map<string, Tool>, name: string): Tool | string {
+  return registry.[[get]](name) ?? `UNKNOWN_TOOL: ${name}. Available: ${[...registry.keys()].join(", ")}`;
+}
+--- tests
+const mk = (name: string): Tool => ({ name, description: name, schema: z.object({}), run: () => name });
+const REG = buildRegistry([mk("lookup_playbook"), mk("get_clause")]);
+expect("两个工具", () => REG.size, 2);
+expect("找得到", () => {
+  const t = findTool(REG, "get_clause");
+  return typeof t === "string" ? t : t.name;
+}, "get_clause");
+expect("找不到", () => findTool(REG, "delete_all"), "UNKNOWN_TOOL: delete_all. Available: lookup_playbook, get_clause");
+expectThrows("名字重复", () => buildRegistry([mk("get_clause"), mk("get_clause")]));
+--- hints
+- Map 的四个常用方法：`has`、`get`、`set`、`size`（最后一个是属性）。
+- `registry.get(name)` 找不到时是 `undefined`，所以后面的 `??` 会接上错误文字。
+
+@@ item d17-06
+type: predict
+title: 模型看到的参数说明
+level: 2
+--- prompt
+写出输出。注意 `.optional()` 的字段在不在 `required` 里，`.describe(...)` 变成了什么。
+--- code
+import { z } from "zod";
+
+const Args = z.object({
+  topic: z.enum(["payment", "liability_cap"]).describe("Topic of the clause"),
+  clause_id: z.string().optional(),
+});
+const schema = z.toJSONSchema(Args);
+console.log(schema.type);
+console.log(JSON.stringify(schema.required));
+console.log(JSON.stringify(schema.properties.topic));
+console.log(Object.keys(schema.properties).length);
+--- explain
+可选字段不会出现在 `required` 里；`.describe()` 变成 `description`，这是模型看到的「这个参数是什么」，写清楚它和写清楚工具的 description 一样重要。`z.enum` 变成 `enum` 列表，模型就知道只能从这几个里选。
+
+@@ item d17-07
+type: code
+title: 解析并校验参数
+level: 2
+--- prompt
+写 `parseArgs(tool, text)`，返回 `Result<any>`：
+
+- `text` 不是合法 JSON：`{ ok: false, error: "INVALID_JSON: arguments are not valid JSON" }`
+- `tool.schema.safeParse` 失败：取第一个 issue，`{ ok: false, error: "INVALID_ARGS: " + 路径 + ": " + message }`，路径用 `issue.path.join(".")`
+- 成功：`{ ok: true, value: r.data }`
+
+注意返回 `r.data` 而不是原始对象：Zod 会补上默认值（下面 `max_chars` 默认 1500，和 `tools.py` 里的 `MAX_CLAUSE_CHARS` 一样）。
+--- starter
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseArgs(tool: Tool, text: string): Result<any> {
+  return { ok: true, value: JSON.parse(text) };
+}
+--- solution
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseArgs(tool: Tool, text: string): Result<any> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, error: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, value: r.data };
+}
+--- tests
+const GET_CLAUSE: Tool = {
+  name: "get_clause",
+  description: "Fetch another clause by its number.",
+  schema: z.object({ clause_id: z.string(), max_chars: z.number().default(1500) }),
+  run: (args) => `text of ${args.clause_id}`,
+};
+const head = (r: Result<any>) => (r.ok ? "ok" : r.error.split(":").slice(0, 2).join(":"));
+expect("合法，并补上默认值", () => parseArgs(GET_CLAUSE, '{"clause_id": "12"}'), { ok: true, value: { clause_id: "12", max_chars: 1500 } });
+expect("坏 JSON", () => parseArgs(GET_CLAUSE, '{"clause_id": '), { ok: false, error: "INVALID_JSON: arguments are not valid JSON" });
+expect("缺字段", () => head(parseArgs(GET_CLAUSE, "{}")), "INVALID_ARGS: clause_id");
+expect("类型不对", () => head(parseArgs(GET_CLAUSE, '{"clause_id": "12", "max_chars": "long"}')), "INVALID_ARGS: max_chars");
+--- hints
+- 两步：先 try/catch `JSON.parse`，再 `tool.schema.safeParse(raw)`。
+- 失败时 `const issue = r.error.issues[0];`，路径是数组，用 `issue.path.join(".")` 变成文字。
+
+@@ item d17-08
+type: code
+title: 分发一次工具调用
+level: 2
+--- prompt
+写 `dispatch(registry, call)`（async），返回 `ToolResult`：
+
+- 工具名不在注册表里：`{ ok: false, content: "UNKNOWN_TOOL: 名字" }`
+- `parseArgs` 失败：`{ ok: false, content: 它的 error }`
+- 成功：`{ ok: true, content: await tool.run(参数) }`（`run` 可能是 async 的，所以要 await）
+
+参数不合法时**绝不能**执行工具。`parseArgs` 已经写好（上一题）。
+--- starter
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseArgs(tool: Tool, text: string): Result<any> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, error: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, value: r.data };
+}
+
+async function dispatch(registry: Map<string, Tool>, call: ToolCall): Promise<ToolResult> {
+  return { ok: false, content: "" };
+}
+--- solution
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseArgs(tool: Tool, text: string): Result<any> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, error: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, value: r.data };
+}
+
+async function dispatch(registry: Map<string, Tool>, call: ToolCall): Promise<ToolResult> {
+  const tool = registry.get(call.function.name);
+  if (!tool) {
+    return { ok: false, content: `UNKNOWN_TOOL: ${call.function.name}` };
+  }
+  const args = parseArgs(tool, call.function.arguments);
+  if (!args.ok) {
+    return { ok: false, content: args.error };
+  }
+  return { ok: true, content: await tool.run(args.value) };
+}
+--- tests
+let runs = 0;
+const LOOKUP: Tool = {
+  name: "lookup_playbook",
+  description: "Return the customer's rule for one topic.",
+  schema: z.object({ topic: z.enum(["liability_cap", "payment"]) }),
+  run: async (args) => {
+    runs += 1;
+    return `rule for ${args.topic}`;
+  },
+};
+const REG = new Map<string, Tool>([[LOOKUP.name, LOOKUP]]);
+const call = (name: string, args: string): ToolCall => ({ id: "call_1", function: { name, arguments: args } });
+expectAsync("成功（run 是 async 的）", () => dispatch(REG, call("lookup_playbook", '{"topic": "payment"}')), { ok: true, content: "rule for payment" });
+expectAsync("不存在的工具", () => dispatch(REG, call("delete_all", "{}")), { ok: false, content: "UNKNOWN_TOOL: delete_all" });
+expectAsync("坏 JSON", () => dispatch(REG, call("lookup_playbook", '{"topic": ')), { ok: false, content: "INVALID_JSON: arguments are not valid JSON" });
+expectAsync("参数不合法：不执行工具", async () => {
+  runs = 0;
+  const r = await dispatch(REG, call("lookup_playbook", '{"topic": "gdpr"}'));
+  return [r.ok, r.content.startsWith("INVALID_ARGS: topic"), runs];
+}, [false, true, 0]);
+--- hints
+- `const tool = registry.get(call.function.name);` 找不到时是 `undefined`，用 `if (!tool)` 提前返回。
+- `const args = parseArgs(...)`；`if (!args.ok)` 返回错误，之后 TypeScript 就知道 `args.value` 存在。
+
+@@ item d17-09
+type: code
+title: 有上限的 Agent 循环
+level: 3
+--- prompt
+写 `runAgent(question, registry, maxSteps = 4)`，返回 `RunResult`：
+
+1. `messages` 从一条 user 消息开始；每一步 POST 一次，请求体带 `model: "deepseek-chat"`、`messages`、`tools`（注册表里每个工具的 `toolSpec`）
+2. `finish_reason` 不是 `"tool_calls"`：返回 `{ reason: "answer", answer: 回答文字, steps: 已请求次数 }`
+3. 否则：先把模型那条消息 push 进 `messages`，再对 `tool_calls` 里的**每一个**调用 `dispatch`，各 push 一条 `{ role: "tool", tool_call_id, content }`
+4. 请求满 `maxSteps` 次还没有回答：返回 `{ reason: "max_steps", answer: null, steps: maxSteps }`
+
+`toolSpec`、`dispatch` 已经写好。测试会用 `[bad-args]`（模型给坏参数）和 `[loop]`（模型停不下来）。
+--- starter
+import { z } from "zod";
+
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOPICS = ["liability_cap", "auto_renewal", "data_processing", "payment", "confidentiality", "termination", "other"] as const;
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+type RunResult = { reason: "answer" | "max_steps"; answer: string | null; steps: number };
+
+const LOOKUP: Tool = {
+  name: "lookup_playbook",
+  description: "Return the customer's rule for one topic. Call this before deciding any verdict.",
+  schema: z.object({ topic: z.enum(TOPICS) }),
+  run: (args) => `rule for ${args.topic}: cap at 12 months of fees`,
+};
+const REGISTRY = new Map<string, Tool>([[LOOKUP.name, LOOKUP]]);
+
+function toolSpec(tool: Tool) {
+  const parameters = z.toJSONSchema(tool.schema);
+  delete parameters.$schema;
+  return { type: "function", function: { name: tool.name, description: tool.description, parameters } };
+}
+
+async function dispatch(registry: Map<string, Tool>, call: ToolCall): Promise<ToolResult> {
+  const tool = registry.get(call.function.name);
+  if (!tool) return { ok: false, content: `UNKNOWN_TOOL: ${call.function.name}` };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(call.function.arguments);
+  } catch {
+    return { ok: false, content: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, content: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, content: await tool.run(r.data) };
+}
+
+async function runAgent(question: string, registry: Map<string, Tool>, maxSteps = 4): Promise<RunResult> {
+  const messages: any[] = [{ role: "user", content: question }];
+  const tools = [...registry.values()].map(toolSpec);
+  return { reason: "max_steps", answer: null, steps: 0 };
+}
+--- solution
+import { z } from "zod";
+
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOPICS = ["liability_cap", "auto_renewal", "data_processing", "payment", "confidentiality", "termination", "other"] as const;
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+type RunResult = { reason: "answer" | "max_steps"; answer: string | null; steps: number };
+
+const LOOKUP: Tool = {
+  name: "lookup_playbook",
+  description: "Return the customer's rule for one topic. Call this before deciding any verdict.",
+  schema: z.object({ topic: z.enum(TOPICS) }),
+  run: (args) => `rule for ${args.topic}: cap at 12 months of fees`,
+};
+const REGISTRY = new Map<string, Tool>([[LOOKUP.name, LOOKUP]]);
+
+function toolSpec(tool: Tool) {
+  const parameters = z.toJSONSchema(tool.schema);
+  delete parameters.$schema;
+  return { type: "function", function: { name: tool.name, description: tool.description, parameters } };
+}
+
+async function dispatch(registry: Map<string, Tool>, call: ToolCall): Promise<ToolResult> {
+  const tool = registry.get(call.function.name);
+  if (!tool) return { ok: false, content: `UNKNOWN_TOOL: ${call.function.name}` };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(call.function.arguments);
+  } catch {
+    return { ok: false, content: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, content: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, content: await tool.run(r.data) };
+}
+
+async function runAgent(question: string, registry: Map<string, Tool>, maxSteps = 4): Promise<RunResult> {
+  const messages: any[] = [{ role: "user", content: question }];
+  const tools = [...registry.values()].map(toolSpec);
+  for (let step = 1; step <= maxSteps; step++) {
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({ model: "deepseek-chat", messages, tools }),
+    });
+    const choice = (await res.json()).choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return { reason: "answer", answer: choice.message.content, steps: step };
+    }
+    messages.push(choice.message);
+    for (const call of choice.message.tool_calls) {
+      const result = await dispatch(registry, call);
+      messages.push({ role: "tool", tool_call_id: call.id, content: result.content });
+    }
+  }
+  return { reason: "max_steps", answer: null, steps: maxSteps };
+}
+--- tests
+expectAsync("正常：调一次工具，第 2 步回答", async () => {
+  MOCK.reset();
+  const r = await runAgent("Is unlimited liability acceptable?", REGISTRY);
+  return [r, MOCK.calls.length];
+}, [{ reason: "answer", answer: "Based on the playbook: rule for liability_cap: cap at 12 months of fees", steps: 2 }, 2]);
+expectAsync("请求里带着工具定义", async () => {
+  MOCK.reset();
+  await runAgent("Is unlimited liability acceptable?", REGISTRY);
+  return MOCK.calls[0].body.tools[0].function.name;
+}, "lookup_playbook");
+expectAsync("[bad-args]：错误回给模型，循环不崩", async () => {
+  MOCK.reset();
+  const r = await runAgent("Is unlimited liability acceptable? [bad-args]", REGISTRY);
+  const toolMsg = MOCK.calls[1].body.messages[2];
+  return [r.reason, toolMsg.role, toolMsg.content.slice(0, 12)];
+}, ["answer", "tool", "INVALID_JSON"]);
+expectAsync("[loop]：请求 3 次后停下", async () => {
+  MOCK.reset();
+  const r = await runAgent("Is unlimited liability acceptable? [loop]", REGISTRY, 3);
+  return [r, MOCK.calls.length];
+}, [{ reason: "max_steps", answer: null, steps: 3 }, 3]);
+--- hints
+- 骨架：`for (let step = 1; step <= maxSteps; step++) { 请求; 是回答就 return; 否则 push 模型消息 + 每个工具结果 }`，循环外 return max_steps。
+- `const choice = (await res.json()).choices[0];`，工具调用在 `choice.message.tool_calls`，它是数组，用 `for (const call of ...)`。
+- 每个工具结果：`messages.push({ role: "tool", tool_call_id: call.id, content: (await dispatch(registry, call)).content });`
+
+@@ item d17-10
+type: fix
+title: 修 bug：少了一条消息
+level: 2
+--- prompt
+这个循环在本页能拿到回答，但换成真实的 DeepSeek / OpenAI 接口会返回 400：每条 `tool` 消息前面，必须有那条带 `tool_calls` 的 assistant 消息（模型要知道「我刚才调了什么」）。模拟服务器没那么严格，所以测试会直接检查第二次请求的 messages。运行测试，看角色顺序，修好它。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+
+async function agent(question: string, maxSteps = 3): Promise<string> {
+  const messages: any[] = [{ role: "user", content: question }];
+  for (let step = 0; step < maxSteps; step++) {
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const choice = (await res.json()).choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return choice.message.content;
+    }
+    for (const call of choice.message.tool_calls) {
+      const topic = JSON.parse(call.function.arguments).topic;
+      messages.push({ role: "tool", tool_call_id: call.id, content: `rule for ${topic}` });
+    }
+  }
+  return "STOPPED";
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+
+async function agent(question: string, maxSteps = 3): Promise<string> {
+  const messages: any[] = [{ role: "user", content: question }];
+  for (let step = 0; step < maxSteps; step++) {
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const choice = (await res.json()).choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return choice.message.content;
+    }
+    messages.push(choice.message);
+    for (const call of choice.message.tool_calls) {
+      const topic = JSON.parse(call.function.arguments).topic;
+      messages.push({ role: "tool", tool_call_id: call.id, content: `rule for ${topic}` });
+    }
+  }
+  return "STOPPED";
+}
+--- tests
+expectAsync("还能拿到回答", () => agent("Is unlimited liability acceptable?"), "Based on the playbook: rule for liability_cap");
+expectAsync("第二次请求的角色顺序", async () => {
+  MOCK.reset();
+  await agent("Is unlimited liability acceptable?");
+  return MOCK.calls[1].body.messages.map((m: any) => m.role);
+}, ["user", "assistant", "tool"]);
+expectAsync("assistant 消息里带着 tool_calls", async () => {
+  MOCK.reset();
+  await agent("Is unlimited liability acceptable?");
+  return MOCK.calls[1].body.messages[1].tool_calls[0].id;
+}, "call_1");
+--- hints
+- 第二次请求里只有 `["user", "tool"]`：模型自己那条消息没放回去。
+- 在执行工具之前加一行 `messages.push(choice.message);`（整条原样放回，里面有 `tool_calls`）。
+
+@@ item d17-11
+type: fix
+title: 修 bug：多请求了一次
+level: 2
+--- prompt
+上线后发现：设置 `maxSteps = 3` 的条款，账单上每条都有 4 次请求。用 `[loop]` 让模型停不下来，运行测试，找到多出来的那一次并修好。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+
+async function agent(question: string, maxSteps: number): Promise<{ reason: string; steps: number }> {
+  const messages: any[] = [{ role: "user", content: question }];
+  let steps = 0;
+  while (steps <= maxSteps) {
+    steps += 1;
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const choice = (await res.json()).choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return { reason: "answer", steps };
+    }
+    messages.push(choice.message);
+    for (const call of choice.message.tool_calls) {
+      messages.push({ role: "tool", tool_call_id: call.id, content: "rule for liability_cap" });
+    }
+  }
+  return { reason: "max_steps", steps };
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+
+async function agent(question: string, maxSteps: number): Promise<{ reason: string; steps: number }> {
+  const messages: any[] = [{ role: "user", content: question }];
+  let steps = 0;
+  while (steps < maxSteps) {
+    steps += 1;
+    const res = await fetch(API_URL, { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }) });
+    const choice = (await res.json()).choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return { reason: "answer", steps };
+    }
+    messages.push(choice.message);
+    for (const call of choice.message.tool_calls) {
+      messages.push({ role: "tool", tool_call_id: call.id, content: "rule for liability_cap" });
+    }
+  }
+  return { reason: "max_steps", steps };
+}
+--- tests
+expectAsync("maxSteps = 3 只请求 3 次", async () => {
+  MOCK.reset();
+  const r = await agent("Is unlimited liability acceptable? [loop]", 3);
+  return [r, MOCK.calls.length];
+}, [{ reason: "max_steps", steps: 3 }, 3]);
+expectAsync("maxSteps = 1 只请求 1 次", async () => {
+  MOCK.reset();
+  await agent("Is unlimited liability acceptable? [loop]", 1);
+  return MOCK.calls.length;
+}, 1);
+expectAsync("正常回答不受影响", () => agent("Is unlimited liability acceptable?", 3), { reason: "answer", steps: 2 });
+--- hints
+- 在脑子里走一遍 `maxSteps = 1`：`steps` 从 0 开始，循环条件第一次、第二次各是什么？
+- 「最多 N 次」：从 0 开始数就用 `<`，从 1 开始数才用 `<=`。
+
+@@ item d17-12
+type: order
+title: 排代码：循环的主体
+level: 2
+--- prompt
+排出 `agentLoop`。`callModel(messages)`（发请求并返回解析后的回答）和 `dispatch(call)`（执行一个工具，返回文字）已经写好。有两行干扰项。
+--- lines
+async function agentLoop(question: string, maxSteps: number): Promise<string> {
+  const messages: any[] = [{ role: "user", content: question }];
+  for (let step = 0; step < maxSteps; step++) {
+    const data = await callModel(messages);
+    const message = data.choices[0].message;
+    if (data.choices[0].finish_reason !== "tool_calls") return message.content;
+    messages.push(message);
+    for (const call of message.tool_calls) {
+      messages.push({ role: "tool", tool_call_id: call.id, content: await dispatch(call) });
+    }
+  }
+  return "STOPPED: max_steps";
+}
+--- distractors
+  for (let step = 0; step <= maxSteps; step++) {
+    const data = callModel(messages);
+--- tests
+async function callModel(messages: any[]): Promise<any> {
+  const tools = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` }, body: JSON.stringify({ model: "deepseek-chat", messages, tools }) });
+  return res.json();
+}
+async function dispatch(call: any): Promise<string> {
+  return `rule for ${JSON.parse(call.function.arguments).topic}`;
+}
+expectAsync("回答", () => agentLoop("Is unlimited liability acceptable?", 3), "Based on the playbook: rule for liability_cap");
+expectAsync("[loop] 只请求 2 次", async () => {
+  MOCK.reset();
+  const r = await agentLoop("Is unlimited liability acceptable? [loop]", 2);
+  return [r, MOCK.calls.length];
+}, ["STOPPED: max_steps", 2]);
+expectAsync("消息顺序", async () => {
+  MOCK.reset();
+  await agentLoop("Is unlimited liability acceptable?", 3);
+  return MOCK.calls[1].body.messages.map((m: any) => m.role);
+}, ["user", "assistant", "tool"]);
+--- hints
+- 顺序：准备 messages → 循环 → 请求 → 取出消息 → 是回答就 return → 放回模型消息 → 逐个执行工具。
+- 一个干扰项会多请求一次，另一个少了 await。
+
+@@ item d17-13
+type: translate
+title: 翻译：轨迹摘要
+level: 2
+--- prompt
+把下面的 Python 翻译成 TypeScript 的 `summarizeTrace(trace)`。它把轨迹变成 Clause Check 报告里 `tools` 那一列的标签（简化版）：成功的调用是 `工具名:clause_id`（没有就用 topic，都没有就只写工具名），失败的是 `工具名:INVALID_ARGS`。
+
+提示：Python 的 `a or b` 在 TypeScript 里是 `a || b`。
+--- source
+def summarize_trace(trace):
+    labels = []
+    errors = 0
+    for e in trace:
+        if e["ok"]:
+            key = e["args"].get("clause_id") or e["args"].get("topic")
+            labels.append(f"{e['tool']}:{key}" if key else e["tool"])
+        else:
+            labels.append(f"{e['tool']}:INVALID_ARGS")
+            errors += 1
+    return {"calls": len(trace), "errors": errors, "tool_calls": labels}
+--- starter
+type TraceEntry = { tool: string; args: Record<string, string>; ok: boolean };
+type TraceSummary = { calls: number; errors: number; tool_calls: string[] };
+
+function summarizeTrace(trace: TraceEntry[]): TraceSummary {
+  return { calls: 0, errors: 0, tool_calls: [] };
+}
+--- solution
+type TraceEntry = { tool: string; args: Record<string, string>; ok: boolean };
+type TraceSummary = { calls: number; errors: number; tool_calls: string[] };
+
+function summarizeTrace(trace: TraceEntry[]): TraceSummary {
+  const labels: string[] = [];
+  let errors = 0;
+  for (const e of trace) {
+    if (e.ok) {
+      const key = e.args.clause_id || e.args.topic;
+      labels.push(key ? `${e.tool}:${key}` : e.tool);
+    } else {
+      labels.push(`${e.tool}:INVALID_ARGS`);
+      errors += 1;
+    }
+  }
+  return { calls: trace.length, errors, tool_calls: labels };
+}
+--- tests
+const TRACE: TraceEntry[] = [
+  { tool: "lookup_playbook", args: { topic: "liability_cap" }, ok: true },
+  { tool: "get_clause", args: { clause_id: "12" }, ok: true },
+  { tool: "propose_redline", args: {}, ok: false },
+  { tool: "mark_for_review", args: {}, ok: true },
+];
+expect("四次调用", () => summarizeTrace(TRACE), {
+  calls: 4,
+  errors: 1,
+  tool_calls: ["lookup_playbook:liability_cap", "get_clause:12", "propose_redline:INVALID_ARGS", "mark_for_review"],
+});
+expect("空轨迹", () => summarizeTrace([]), { calls: 0, errors: 0, tool_calls: [] });
+expect("clause_id 优先于 topic", () => summarizeTrace([{ tool: "get_clause", args: { clause_id: "8.1", topic: "payment" }, ok: true }]).tool_calls, ["get_clause:8.1"]);
+--- hints
+- `for (const e of trace)`；`e["ok"]` → `e.ok`，`e["args"].get("clause_id")` → `e.args.clause_id`（不存在时是 `undefined`）。
+- 条件表达式：`key ? \`${e.tool}:${key}\` : e.tool`。
+
+@@ item d17-14
+type: local
+title: 本机任务：看真实项目的工具轨迹
+level: 2
+--- prompt
+在真实项目里看一次轨迹。在 PowerShell 里运行（mock 模式不调模型、不花钱）：
+
+```
+cd "G:\Contract Clause Reviewer"
+python -m clausecheck review data/sample_contract.txt --mode mock
+```
+
+表格最后一列 `tools` 就是每条的 `trace.tool_calls`，和上一题的标签是一个格式。找到调用了 `get_clause` 的行，然后回答自己：
+
+- 8.1 为什么要去读第 12 条？（打开 `data/sample_contract.txt` 看 8.1 的第一句）
+- 第 12 条调了几次 `get_clause`？如果真实模型每一步只调一个工具，`config.py` 里默认的 `max_steps = 6` 够它做完这些调用吗？
+
+把终端输出粘贴到下面。
+placeholder: 粘贴终端输出（要包含 tools 那一列）
+verify: lookup_playbook:\w+[\s\S]*get_clause:\d
+--- hints
+- 看到 `No module named clausecheck`：确认你在项目根目录 `G:\Contract Clause Reviewer` 里运行。
+- 报告会写到 `data/sample_contract.report.json`（`.gitignore` 已经忽略它），可以在 VS Code 里打开看完整的 `trace`。
+
+@@ item d17-15
+type: code
+title: 预算上限 + 轨迹
+level: 3
+--- prompt
+在上一版循环上加两样东西。写 `runAgent(question, registry, limits)`，返回 `RunResult`：
+
+- **token 预算**：每次拿到回答后，把 `usage.total_tokens` 加进 `tokens`。是文字回答就返回 `reason: "answer"`（已经付过钱了）；要调工具时，如果 `tokens >= limits.maxTokens`，**不执行工具**，返回 `reason: "budget"`
+- **轨迹**：每执行一个工具，往 `trace` 里 push `{ step, tool: 工具名, args: 原始 arguments 文字, ok, result: dispatch 的 content }`
+- 请求满 `limits.maxSteps` 次：`reason: "max_steps"`
+
+三种返回都带上 `steps`（已请求次数）、`tokens`、`trace`，`answer` 只有回答时才有文字，其余为 `null`。`callModel` 和 `dispatch` 已经写好。
+--- starter
+import { z } from "zod";
+
+const TOPICS = ["liability_cap", "auto_renewal", "data_processing", "payment", "confidentiality", "termination", "other"] as const;
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+type TraceEntry = { step: number; tool: string; args: string; ok: boolean; result: string };
+type Limits = { maxSteps: number; maxTokens: number };
+type RunResult = { reason: "answer" | "max_steps" | "budget"; answer: string | null; steps: number; tokens: number; trace: TraceEntry[] };
+
+const LOOKUP: Tool = {
+  name: "lookup_playbook",
+  description: "Return the customer's rule for one topic. Call this before deciding any verdict.",
+  schema: z.object({ topic: z.enum(TOPICS) }),
+  run: (args) => `rule for ${args.topic}: cap at 12 months of fees`,
+};
+const REGISTRY = new Map<string, Tool>([[LOOKUP.name, LOOKUP]]);
+
+async function callModel(messages: any[], registry: Map<string, Tool>): Promise<any> {
+  const tools = [...registry.values()].map((t) => {
+    const parameters = z.toJSONSchema(t.schema);
+    delete parameters.$schema;
+    return { type: "function", function: { name: t.name, description: t.description, parameters } };
+  });
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-chat", messages, tools }),
+  });
+  return res.json();
+}
+
+async function dispatch(registry: Map<string, Tool>, call: ToolCall): Promise<ToolResult> {
+  const tool = registry.get(call.function.name);
+  if (!tool) return { ok: false, content: `UNKNOWN_TOOL: ${call.function.name}` };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(call.function.arguments);
+  } catch {
+    return { ok: false, content: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, content: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, content: await tool.run(r.data) };
+}
+
+async function runAgent(question: string, registry: Map<string, Tool>, limits: Limits): Promise<RunResult> {
+  const messages: any[] = [{ role: "user", content: question }];
+  const trace: TraceEntry[] = [];
+  let tokens = 0;
+  return { reason: "max_steps", answer: null, steps: 0, tokens, trace };
+}
+--- solution
+import { z } from "zod";
+
+const TOPICS = ["liability_cap", "auto_renewal", "data_processing", "payment", "confidentiality", "termination", "other"] as const;
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+type TraceEntry = { step: number; tool: string; args: string; ok: boolean; result: string };
+type Limits = { maxSteps: number; maxTokens: number };
+type RunResult = { reason: "answer" | "max_steps" | "budget"; answer: string | null; steps: number; tokens: number; trace: TraceEntry[] };
+
+const LOOKUP: Tool = {
+  name: "lookup_playbook",
+  description: "Return the customer's rule for one topic. Call this before deciding any verdict.",
+  schema: z.object({ topic: z.enum(TOPICS) }),
+  run: (args) => `rule for ${args.topic}: cap at 12 months of fees`,
+};
+const REGISTRY = new Map<string, Tool>([[LOOKUP.name, LOOKUP]]);
+
+async function callModel(messages: any[], registry: Map<string, Tool>): Promise<any> {
+  const tools = [...registry.values()].map((t) => {
+    const parameters = z.toJSONSchema(t.schema);
+    delete parameters.$schema;
+    return { type: "function", function: { name: t.name, description: t.description, parameters } };
+  });
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: "deepseek-chat", messages, tools }),
+  });
+  return res.json();
+}
+
+async function dispatch(registry: Map<string, Tool>, call: ToolCall): Promise<ToolResult> {
+  const tool = registry.get(call.function.name);
+  if (!tool) return { ok: false, content: `UNKNOWN_TOOL: ${call.function.name}` };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(call.function.arguments);
+  } catch {
+    return { ok: false, content: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, content: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, content: await tool.run(r.data) };
+}
+
+async function runAgent(question: string, registry: Map<string, Tool>, limits: Limits): Promise<RunResult> {
+  const messages: any[] = [{ role: "user", content: question }];
+  const trace: TraceEntry[] = [];
+  let tokens = 0;
+  for (let step = 1; step <= limits.maxSteps; step++) {
+    const data = await callModel(messages, registry);
+    tokens += data.usage.total_tokens;
+    const choice = data.choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return { reason: "answer", answer: choice.message.content, steps: step, tokens, trace };
+    }
+    if (tokens >= limits.maxTokens) {
+      return { reason: "budget", answer: null, steps: step, tokens, trace };
+    }
+    messages.push(choice.message);
+    for (const call of choice.message.tool_calls) {
+      const r = await dispatch(registry, call);
+      trace.push({ step, tool: call.function.name, args: call.function.arguments, ok: r.ok, result: r.content });
+      messages.push({ role: "tool", tool_call_id: call.id, content: r.content });
+    }
+  }
+  return { reason: "max_steps", answer: null, steps: limits.maxSteps, tokens, trace };
+}
+--- tests
+const BIG: Limits = { maxSteps: 5, maxTokens: 100000 };
+expectAsync("正常回答，轨迹一条", async () => {
+  MOCK.reset();
+  const r = await runAgent("Is unlimited liability acceptable?", REGISTRY, BIG);
+  return [r.reason, r.steps, r.trace];
+}, ["answer", 2, [{ step: 1, tool: "lookup_playbook", args: '{"topic":"liability_cap"}', ok: true, result: "rule for liability_cap: cap at 12 months of fees" }]]);
+expectAsync("坏参数也记进轨迹", async () => {
+  MOCK.reset();
+  const r = await runAgent("Is unlimited liability acceptable? [bad-args]", REGISTRY, BIG);
+  return [r.trace[0].ok, r.trace[0].args, r.trace[0].result.slice(0, 12)];
+}, [false, '{"topic": ', "INVALID_JSON"]);
+expectAsync("[loop] + 步数上限", async () => {
+  MOCK.reset();
+  const r = await runAgent("Is unlimited liability acceptable? [loop]", REGISTRY, { maxSteps: 3, maxTokens: 100000 });
+  return [r.reason, r.steps, r.trace.length, r.tokens];
+}, ["max_steps", 3, 3, 105]);
+expectAsync("[loop] + 预算上限：第 3 步超预算，不再执行工具", async () => {
+  MOCK.reset();
+  const r = await runAgent("Is unlimited liability acceptable? [loop]", REGISTRY, { maxSteps: 10, maxTokens: 100 });
+  return [r.reason, r.steps, r.trace.length, r.tokens, MOCK.calls.length];
+}, ["budget", 3, 2, 105, 3]);
+--- hints
+- 在上一版循环里，拿到 `data` 后第一件事：`tokens += data.usage.total_tokens;`。
+- 先判断「是不是回答」，再判断「预算够不够」，两个都过了才执行工具。
+- 轨迹在执行工具的那个 for 里记：`trace.push({ step, tool: call.function.name, args: call.function.arguments, ok: r.ok, result: r.content });`
+
+@@ item d17-16
+type: code
+title: 审批关卡
+level: 3
+--- prompt
+写 `gatedDispatch(registry, call, approve)`：和 `dispatch` 一样，但多一道关：
+
+1. 工具不存在 / 参数不合法：和以前一样返回错误，**不问人**（坏的调用不值得打扰人）
+2. 工具有 `needsApproval: true`：先 `await approve({ tool: 工具名, args: 校验后的参数 })`
+3. 被拒绝：返回 `{ ok: false, content: "DENIED: the user rejected 工具名" }`，**不执行**工具
+4. 其他情况执行工具，返回 `{ ok: true, content }`
+
+`approve` 是注入进来的函数：真实应用里它等人点按钮，测试里传假的。
+--- starter
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string>; needsApproval?: boolean };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+type ApprovalRequest = { tool: string; args: any };
+type Approve = (req: ApprovalRequest) => Promise<boolean>;
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseArgs(tool: Tool, text: string): Result<any> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, error: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, value: r.data };
+}
+
+async function gatedDispatch(registry: Map<string, Tool>, call: ToolCall, approve: Approve): Promise<ToolResult> {
+  const tool = registry.get(call.function.name);
+  if (!tool) {
+    return { ok: false, content: `UNKNOWN_TOOL: ${call.function.name}` };
+  }
+  const args = parseArgs(tool, call.function.arguments);
+  if (!args.ok) {
+    return { ok: false, content: args.error };
+  }
+  return { ok: true, content: await tool.run(args.value) };
+}
+--- solution
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string>; needsApproval?: boolean };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+type ApprovalRequest = { tool: string; args: any };
+type Approve = (req: ApprovalRequest) => Promise<boolean>;
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseArgs(tool: Tool, text: string): Result<any> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "INVALID_JSON: arguments are not valid JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, error: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  return { ok: true, value: r.data };
+}
+
+async function gatedDispatch(registry: Map<string, Tool>, call: ToolCall, approve: Approve): Promise<ToolResult> {
+  const tool = registry.get(call.function.name);
+  if (!tool) {
+    return { ok: false, content: `UNKNOWN_TOOL: ${call.function.name}` };
+  }
+  const args = parseArgs(tool, call.function.arguments);
+  if (!args.ok) {
+    return { ok: false, content: args.error };
+  }
+  if (tool.needsApproval) {
+    const yes = await approve({ tool: tool.name, args: args.value });
+    if (!yes) {
+      return { ok: false, content: `DENIED: the user rejected ${tool.name}` };
+    }
+  }
+  return { ok: true, content: await tool.run(args.value) };
+}
+--- tests
+let sends = 0;
+let asked: ApprovalRequest[] = [];
+const SEND: Tool = {
+  name: "send_redline_email",
+  description: "Email the proposed redline for one clause to the counterparty. Needs human approval.",
+  schema: z.object({ clause_id: z.string() }),
+  run: (args) => {
+    sends += 1;
+    return `email sent for ${args.clause_id}`;
+  },
+  needsApproval: true,
+};
+const LOOKUP: Tool = { name: "lookup_playbook", description: "Read-only.", schema: z.object({ topic: z.string() }), run: (args) => `rule for ${args.topic}` };
+const REG = new Map<string, Tool>([[SEND.name, SEND], [LOOKUP.name, LOOKUP]]);
+const yes: Approve = async (req) => { asked.push(req); return true; };
+const no: Approve = async (req) => { asked.push(req); return false; };
+const call = (name: string, args: string): ToolCall => ({ id: "call_1", function: { name, arguments: args } });
+const reset = () => { sends = 0; asked = []; };
+expectAsync("批准后执行，approve 拿到校验后的参数", async () => {
+  reset();
+  const r = await gatedDispatch(REG, call("send_redline_email", '{"clause_id": "8.1"}'), yes);
+  return [r, asked, sends];
+}, [{ ok: true, content: "email sent for 8.1" }, [{ tool: "send_redline_email", args: { clause_id: "8.1" } }], 1]);
+expectAsync("拒绝：不执行", async () => {
+  reset();
+  const r = await gatedDispatch(REG, call("send_redline_email", '{"clause_id": "8.1"}'), no);
+  return [r, sends];
+}, [{ ok: false, content: "DENIED: the user rejected send_redline_email" }, 0]);
+expectAsync("只读工具不问人", async () => {
+  reset();
+  const r = await gatedDispatch(REG, call("lookup_playbook", '{"topic": "payment"}'), no);
+  return [r.content, asked.length];
+}, ["rule for payment", 0]);
+expectAsync("坏参数不打扰人", async () => {
+  reset();
+  const r = await gatedDispatch(REG, call("send_redline_email", "{}"), yes);
+  return [r.ok, asked.length, sends];
+}, [false, 0, 0]);
+--- hints
+- 审批这一步放在「参数校验通过」之后、`tool.run` 之前。
+- `if (tool.needsApproval) { const yes = await approve({ tool: tool.name, args: args.value }); if (!yes) return ...; }`
+
+@@ item d17-17
+type: choice
+title: 谁来批准
+level: 2
+--- prompt
+同事想省事：给 `send_redline_email` 的 schema 加了一个参数 `approved: z.boolean()`，description 里写「只有用户明确同意时才传 true」，代码里 `if (args.approved) send()`。问题在哪？
+--- options
+- 没问题，模型会遵守 description
+- 批准变成了模型自己说了算：合同文字里的一句提示注入，或者模型一次误判，就能让它传 `true`。批准必须来自模型之外的人（注入的 `approve` 函数），不能来自模型的输出
+- 应该用 `z.string()` 而不是 `z.boolean()`
+- description 写得不够严厉，加上 "IMPORTANT" 就行
+answer: 2
+--- explain
+模型的输出（包括工具参数）都可能被合同里的文字影响（第 12 天的提示注入）。能触发真实后果的决定，要由代码去问人，而且人的回答不经过模型。这也是 `graph.py` 文档里那句话：「The approved decision is executed by code - the model does not get to re-decide」。
+
+@@ item d17-18
+type: code
+title: 只发一次的发件箱
+level: 2
+--- prompt
+写 `Outbox` 类，让发送变成幂等的：
+
+- 构造时传入 `mailer: (key: string) => void`（真正发邮件的函数，可能 throw）
+- `send(clauseId, action)`：key 是 `` `${clauseId}:${action}` ``
+  - 这个 key 已经成功发过：返回 `"ALREADY_DONE: " + key`，不调用 mailer
+  - 否则调用 `mailer(key)`；成功后记下 key，返回 `"SENT: " + key`
+  - `mailer` throw 时**不要记下 key**，让错误继续往外抛（调用方稍后重试时还能发出去）
+
+用 `#done = new Set<string>()` 记录（第 16 天的私有字段）。
+--- starter
+class Outbox {
+  #done = new Set<string>();
+  #mailer: (key: string) => void;
+
+  constructor(mailer: (key: string) => void) {
+    this.#mailer = mailer;
+  }
+
+  send(clauseId: string, action: string): string {
+    return "";
+  }
+}
+--- solution
+class Outbox {
+  #done = new Set<string>();
+  #mailer: (key: string) => void;
+
+  constructor(mailer: (key: string) => void) {
+    this.#mailer = mailer;
+  }
+
+  send(clauseId: string, action: string): string {
+    const key = `${clauseId}:${action}`;
+    if (this.#done.has(key)) {
+      return `ALREADY_DONE: ${key}`;
+    }
+    this.#mailer(key);
+    this.#done.add(key);
+    return `SENT: ${key}`;
+  }
+}
+--- tests
+const mailed: string[] = [];
+const box = new Outbox((key) => { mailed.push(key); });
+expect("第一次发送", () => box.send("8.1", "redline_email"), "SENT: 8.1:redline_email");
+expect("重复调用不再发送", () => [box.send("8.1", "redline_email"), mailed.length], ["ALREADY_DONE: 8.1:redline_email", 1]);
+expect("不同动作是不同的 key", () => [box.send("8.1", "reminder"), mailed], ["SENT: 8.1:reminder", ["8.1:redline_email", "8.1:reminder"]]);
+let failures = 1;
+const flaky = new Outbox(() => {
+  if (failures > 0) {
+    failures -= 1;
+    throw new Error("SMTP timeout");
+  }
+});
+expectThrows("发送失败：错误抛出去", () => flaky.send("12", "redline_email"));
+expect("失败后重试能发出去", () => flaky.send("12", "redline_email"), "SENT: 12:redline_email");
+--- hints
+- 先算 key，再 `if (this.#done.has(key)) return ...`。
+- 顺序很重要：先 `this.#mailer(key)`，它没 throw 才会走到下一行 `this.#done.add(key)`。不用写 try/catch，错误会自己抛出去。
+
+@@ item d17-19
+type: choice
+title: 对照 Mastra
+level: 2
+--- prompt
+Mastra 里定义工具和 Agent 的写法（示意）：
+
+```ts
+const lookupPlaybook = createTool({ id: "lookup_playbook", description: "...", inputSchema: z.object({ topic: z.enum(TOPICS) }), execute: async (...) => { ... } });
+const reviewer = new Agent({ name: "reviewer", instructions: "...", model: ..., tools: { lookupPlaybook } });
+```
+
+下面哪一个对应关系是**错的**？
+--- options
+- `inputSchema` 对应你的 `Tool.schema`：用来生成 JSON Schema，也用来校验模型给的参数
+- `execute` 对应你的 `Tool.run`
+- `new Agent({ tools })` 加上一次调用，对应你的注册表 + `runAgent` 循环
+- `description` 只是给开发者看的注释，不会发给模型
+answer: 4
+--- explain
+`description` 会和参数 schema 一起发给模型，它是模型决定「要不要调、什么时候调」的主要依据，本质上是 prompt 的一部分（第 12 天：`mark_for_review` 的 description 写错，模型就过度 flag）。其余三个对应关系都对：框架帮你写好了 `toolSpec`、`dispatch` 和循环，但零件是一样的。
+
+@@ item d17-e1
+type: scratch
+title: 闭卷：工具分发
+exam: yes
+level: 3
+--- prompt
+写 `dispatch(registry, call)`（async）。先原样定义这些类型：
+
+```ts
+import { z } from "zod";
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+```
+
+`registry` 是 `Map<string, Tool>`。返回：
+
+- 工具不存在：`{ ok: false, content: "UNKNOWN_TOOL: 名字" }`
+- `arguments` 不是合法 JSON：`{ ok: false, content: "INVALID_JSON" }`
+- schema 校验失败（取第一个 issue）：`{ ok: false, content: "INVALID_ARGS: " + issue.path.join(".") + ": " + issue.message }`
+- `run` throw 了：`{ ok: false, content: "TOOL_ERROR: " + 错误的 message }`
+- 成功：`{ ok: true, content: run 的返回值 }`（传给 `run` 的是 safeParse 之后的数据）
+--- solution
+import { z } from "zod";
+
+type AnySchema = ReturnType<typeof z.any>;
+type Tool = { name: string; description: string; schema: AnySchema; run: (args: any) => string | Promise<string> };
+type ToolCall = { id: string; function: { name: string; arguments: string } };
+type ToolResult = { ok: boolean; content: string };
+
+async function dispatch(registry: Map<string, Tool>, call: ToolCall): Promise<ToolResult> {
+  const tool = registry.get(call.function.name);
+  if (!tool) {
+    return { ok: false, content: `UNKNOWN_TOOL: ${call.function.name}` };
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(call.function.arguments);
+  } catch {
+    return { ok: false, content: "INVALID_JSON" };
+  }
+  const r = tool.schema.safeParse(raw);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    return { ok: false, content: `INVALID_ARGS: ${issue.path.join(".")}: ${issue.message}` };
+  }
+  try {
+    return { ok: true, content: await tool.run(r.data) };
+  } catch (e) {
+    return { ok: false, content: `TOOL_ERROR: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+--- tests
+const GET_CLAUSE: Tool = {
+  name: "get_clause",
+  description: "Fetch another clause by its number.",
+  schema: z.object({ clause_id: z.string(), max_chars: z.number().default(20) }),
+  run: async (args) => {
+    if (args.clause_id === "99") throw new Error("NOT_FOUND 99");
+    return `text of ${args.clause_id}, max ${args.max_chars}`;
+  },
+};
+const REG = new Map<string, Tool>([[GET_CLAUSE.name, GET_CLAUSE]]);
+const call = (name: string, args: string): ToolCall => ({ id: "call_1", function: { name, arguments: args } });
+expectAsync("成功（带默认值）", () => dispatch(REG, call("get_clause", '{"clause_id": "12"}')), { ok: true, content: "text of 12, max 20" });
+expectAsync("未知工具和坏 JSON", async () => [
+  (await dispatch(REG, call("send_email", "{}"))).content,
+  (await dispatch(REG, call("get_clause", "{oops"))).content,
+], ["UNKNOWN_TOOL: send_email", "INVALID_JSON"]);
+expectAsync("参数不合法", async () => (await dispatch(REG, call("get_clause", "{}"))).content.split(":").slice(0, 2).join(":"), "INVALID_ARGS: clause_id");
+expectAsync("工具自己出错", () => dispatch(REG, call("get_clause", '{"clause_id": "99"}')), { ok: false, content: "TOOL_ERROR: NOT_FOUND 99" });
+
+@@ item d17-e2
+type: scratch
+title: 闭卷：有上限的循环
+exam: yes
+level: 3
+--- prompt
+写 `agent(question: string, maxSteps: number)`，返回 `Promise<{ reason: "answer" | "max_steps"; answer: string | null; steps: number }>`。
+
+- 每一步 POST 到 `https://api.deepseek.com/v1/chat/completions`，请求头 `Authorization: Bearer ${process.env.DEEPSEEK_API_KEY}`，请求体 `{ model: "deepseek-chat", messages, tools: TOOLS }`，`TOOLS` 如下（原样复制）：
+
+```ts
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+```
+
+- `finish_reason` 不是 `"tool_calls"`：返回 `{ reason: "answer", answer: 回答文字, steps: 已请求次数 }`
+- 否则把模型消息放回 `messages`，对每个工具调用放一条 tool 消息：参数能解析就是 `` `rule for ${topic}` ``，解析失败就是 `"INVALID_JSON"`
+- 请求满 `maxSteps` 次：`{ reason: "max_steps", answer: null, steps: maxSteps }`
+--- solution
+const TOOLS = [{ type: "function", function: { name: "lookup_playbook", description: "Return the customer's rule for a topic", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } } }];
+
+function runTool(argText: string): string {
+  try {
+    return `rule for ${JSON.parse(argText).topic}`;
+  } catch {
+    return "INVALID_JSON";
+  }
+}
+
+async function agent(question: string, maxSteps: number): Promise<{ reason: "answer" | "max_steps"; answer: string | null; steps: number }> {
+  const messages: any[] = [{ role: "user", content: question }];
+  for (let step = 1; step <= maxSteps; step++) {
+    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({ model: "deepseek-chat", messages, tools: TOOLS }),
+    });
+    const choice = (await res.json()).choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      return { reason: "answer", answer: choice.message.content, steps: step };
+    }
+    messages.push(choice.message);
+    for (const call of choice.message.tool_calls) {
+      messages.push({ role: "tool", tool_call_id: call.id, content: runTool(call.function.arguments) });
+    }
+  }
+  return { reason: "max_steps", answer: null, steps: maxSteps };
+}
+--- tests
+expectAsync("正常回答", () => agent("Is unlimited liability acceptable?", 4), { reason: "answer", answer: "Based on the playbook: rule for liability_cap", steps: 2 });
+expectAsync("坏参数也不崩", () => agent("Is unlimited liability acceptable? [bad-args]", 4), { reason: "answer", answer: "Based on the playbook: INVALID_JSON", steps: 2 });
+expectAsync("[loop] 停在上限", async () => {
+  MOCK.reset();
+  const r = await agent("Is unlimited liability acceptable? [loop]", 3);
+  return [r, MOCK.calls.length];
+}, [{ reason: "max_steps", answer: null, steps: 3 }, 3]);
+
+@@ item d17-e3
+type: scratch
+title: 闭卷：审批 + 幂等
+exam: yes
+level: 3
+--- prompt
+写 `ActionRunner` 类：
+
+- 构造函数 `constructor(approve: (key: string) => boolean, perform: (key: string) => void)`
+- 方法 `run(clauseId: string, action: string): "DONE" | "DUPLICATE" | "DENIED"`，key 是 `` `${clauseId}:${action}` ``：
+  1. 这个 key 已经做过：返回 `"DUPLICATE"`，**不再问人**，也不执行
+  2. 否则问 `approve(key)`；拒绝就返回 `"DENIED"`（不记录，以后还可以再问）
+  3. 批准就调用 `perform(key)`，记下 key，返回 `"DONE"`
+--- solution
+class ActionRunner {
+  #done = new Set<string>();
+  #approve: (key: string) => boolean;
+  #perform: (key: string) => void;
+
+  constructor(approve: (key: string) => boolean, perform: (key: string) => void) {
+    this.#approve = approve;
+    this.#perform = perform;
+  }
+
+  run(clauseId: string, action: string): "DONE" | "DUPLICATE" | "DENIED" {
+    const key = `${clauseId}:${action}`;
+    if (this.#done.has(key)) {
+      return "DUPLICATE";
+    }
+    if (!this.#approve(key)) {
+      return "DENIED";
+    }
+    this.#perform(key);
+    this.#done.add(key);
+    return "DONE";
+  }
+}
+--- tests
+const asked: string[] = [];
+const performed: string[] = [];
+let allow = false;
+const runner = new ActionRunner(
+  (key) => { asked.push(key); return allow; },
+  (key) => { performed.push(key); },
+);
+expect("先被拒绝", () => runner.run("8.1", "send_redline"), "DENIED");
+expect("再次询问后批准", () => { allow = true; return runner.run("8.1", "send_redline"); }, "DONE");
+expect("重复：不问人、不执行", () => [runner.run("8.1", "send_redline"), asked.length, performed], ["DUPLICATE", 2, ["8.1:send_redline"]]);
+expect("另一条条款", () => [runner.run("12", "send_redline"), performed.length], ["DONE", 2]);

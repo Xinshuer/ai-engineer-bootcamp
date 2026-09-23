@@ -1,0 +1,1207 @@
+@@ day 15
+title: TS 进阶类型：interface、联合、泛型、守卫
+lang: ts
+hours: 4–5 小时
+--- goal
+学会用类型把数据「说清楚」：interface、可选和只读字段、联合类型和收窄、可辨识联合 + 穷尽检查、泛型、工具类型、`unknown` 和类型守卫、`as const`。Mastra、Zod 和各家 SDK 的类型都是这样写的。今天之后你能读懂它们，也能给 Clause Check 的数据（判定、条款、模型回复）写出同样精确的类型。
+--- checklist
+- 先清空复习区
+- 读完 8 张知识卡片，每张都故意改出一个类型错误，读懂报错再改回来
+- 练习区全部通过（类型检查也必须干净）
+- 本机任务：用 `tsc` 在自己电脑上抓住一个漏掉的 case
+- 闭卷挑战 3 题
+
+@@ concept
+title: interface 和 type
+--- body
+第 5 天你用 `type` 给对象起过名字。`interface` 是另一种写法，描述对象形状时两者几乎一样：
+
+```ts
+interface Clause { id: string; text: string }
+type Verdict = "accept" | "flag" | "redline";
+```
+
+区别只要记两条：
+
+- **联合类型只能用 `type`** 写
+- `interface` 可以 `extends` 另一个 interface，在它的基础上加字段
+
+TypeScript 只看**形状**：一个对象只要字段对得上，就符合这个类型，不管它是怎么来的。一个项目选一种风格保持一致就好。本课的约定：对象用 `interface`，联合用 `type`。
+--- code
+type Verdict = "accept" | "flag" | "redline";
+
+interface Clause {
+  id: string;
+  text: string;
+}
+interface ReviewedClause extends Clause {
+  verdict: Verdict;
+}
+
+const c: ReviewedClause = { id: "8.1", text: "Liability is unlimited.", verdict: "redline" };
+const plain: Clause = c; // 多一个 verdict 字段也可以：形状对得上就行
+console.log(c.id, c.verdict);
+console.log(plain.text);
+
+@@ concept
+title: 可选、只读、可选链
+--- body
+- `heading?: string`：这个字段可以没有，读出来的类型是 `string | undefined`
+- `readonly id: string`：创建后不能再改（整个对象只读可以写 `Readonly<Clause>`）
+- `c.source?.page`：**可选链**。`?.` 左边是 `null` / `undefined` 时，整个表达式直接得到 `undefined`，而不是报错
+- 配合第 5 天的 `??` 给默认值：`c.source?.page ?? "?"`
+
+经典错误：直接写 `c.heading.toUpperCase()`，TypeScript 报 `TS18048: 'c.heading' is possibly 'undefined'`。这不是 TypeScript 找麻烦：模型输出、JSON 文件里的字段真的会缺。数组的 `find` 也一样，找不到时返回 `undefined`。
+--- code
+interface Clause {
+  readonly id: string;
+  heading?: string;
+  source?: { file: string; page?: number };
+}
+
+const a: Clause = { id: "8.1", heading: "Cap on Liability", source: { file: "msa.pdf", page: 3 } };
+const b: Clause = { id: "12" };
+
+for (const c of [a, b]) {
+  const heading = c.heading ?? "(no heading)";
+  console.log(c.id, heading, c.source?.page ?? "?", c.source?.file.toUpperCase());
+}
+// a.id = "9.9"; // 去掉注释试试：Cannot assign to 'id' because it is a read-only property
+
+@@ concept
+title: 联合类型和收窄
+--- body
+`string | null` 表示「可能是字符串，也可能是 null」。用之前先**检查**，TypeScript 会跟着你的 if 判断，把类型「收窄」：
+
+- `x === null`、`x === undefined`
+- `typeof x === "string"`（还有 `"number"`、`"boolean"`、`"object"`）
+- `Array.isArray(x)`
+- `"verdict" in obj`：对象里有没有这个键
+
+if 里面，TypeScript 知道 x 具体是什么；出了 if，又回到联合类型。在本机 VS Code 里把鼠标放到变量上，能看到每一行它的类型。
+
+经典坑：`typeof null` 和 `typeof []` 的结果都是 `"object"`（JavaScript 的历史包袱）。所以判断数组用 `Array.isArray`，判断对象时要同时排除 `null`。
+--- code
+function show(x: string | number | string[] | null): string {
+  if (x === null) {
+    return "nothing";
+  }
+  if (typeof x === "string") {
+    return `text: ${x.toUpperCase()}`;
+  }
+  if (Array.isArray(x)) {
+    return `list of ${x.length}`;
+  }
+  return `number: ${x.toFixed(1)}`; // 走到这里，x 只可能是 number
+}
+console.log(show("flag"));
+console.log(show(["8.1", "12"]));
+console.log(show(0.5));
+console.log(show(null));
+console.log(typeof null, typeof ["8.1"]);
+
+@@ concept
+title: 可辨识联合和穷尽检查
+--- body
+模型的一次回复可能是「最终回答」「要调工具」或「出错」，每种情况带的字段不同。Clause Check 的 `review.py` 里，`Step` 用一个字符串字段 `stop` 区分它们（`"end"`、`"tool_use"`、`"error"` …）。
+
+TypeScript 把这写成**可辨识联合**：每种情况都有同一个字段（常叫 `kind`、`type`、`stop`），值是不同的字面量。`switch (s.stop)` 的每个 case 里，TypeScript 知道 s 是哪一种，只有 `"tool_use"` 分支能读 `s.tool`。
+
+**穷尽检查**：在 `default` 里写
+
+```ts
+const unreachable: never = s;
+```
+
+`never` 是「不可能有值」的类型。所有情况都处理了，走到 default 的 s 就是 never，不报错；以后有人加了第四种却忘了处理，这一行立刻报类型错误，bug 在运行前就被抓住。
+--- code
+type Step =
+  | { stop: "end"; text: string }
+  | { stop: "tool_use"; tool: string; args: string }
+  | { stop: "error"; error: string };
+
+function nextAction(s: Step): string {
+  switch (s.stop) {
+    case "end":
+      return `answer: ${s.text}`;
+    case "tool_use":
+      return `run ${s.tool}(${s.args})`;
+    case "error":
+      return `give up: ${s.error}`;
+    default: {
+      const unreachable: never = s;
+      return unreachable;
+    }
+  }
+}
+
+const steps: Step[] = [
+  { stop: "tool_use", tool: "lookup_playbook", args: '{"topic": "payment"}' },
+  { stop: "end", text: "flag: payment term unclear" },
+  { stop: "error", error: "http 429" },
+];
+for (const s of steps) {
+  console.log(nextAction(s));
+}
+
+@@ concept
+title: 泛型：类型的参数
+--- body
+写一个「取第一个元素」的函数：给 `string[]` 用时要返回 string，给 `Clause[]` 用时要返回 Clause。写成 `any` 就把类型丢了。**泛型**就是「类型的参数」：
+
+```ts
+function first<T>(xs: T[]): T | undefined {
+  return xs[0];
+}
+```
+
+`<T>` 读作「对某个类型 T」。调用时一般不用写 `first<string>(...)`，TypeScript 会从参数推断出 T。你其实早就用过泛型：`Promise<string>`、`Record<string, number>`、`Array<string>`，尖括号里的就是类型参数。type 也可以带参数：`type ApiResult<T> = { ok: true; data: T } | { ok: false; error: string }`。
+
+经典错误：在函数里写 `const x: T = "8.1"`。T 由调用方决定，函数自己不能假设它是 string。
+--- code
+function first<T>(xs: T[]): T | undefined {
+  return xs[0];
+}
+
+function countBy<T>(xs: T[], key: (x: T) => string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const x of xs) {
+    const k = key(x);
+    counts[k] = (counts[k] ?? 0) + 1;
+  }
+  return counts;
+}
+
+interface Review {
+  id: string;
+  verdict: string;
+}
+const reviews: Review[] = [
+  { id: "3.1", verdict: "accept" },
+  { id: "8.1", verdict: "flag" },
+  { id: "10.1", verdict: "flag" },
+];
+const none: string[] = [];
+console.log(first(reviews)?.id, first(none) ?? "empty");
+console.log(countBy(reviews, (r) => r.verdict));
+console.log(countBy(["low", "high", "low"], (r) => r));
+
+@@ concept
+title: 工具类型：从一个类型派生另一个
+--- body
+不用重写一遍，就能从已有类型「派生」出新类型：
+
+- `Partial<Review>`：所有字段变成可选，适合「补丁」（只改几个字段）
+- `Pick<Review, "id" | "verdict">`：只留这几个字段
+- `Omit<Review, "cost_usd">`：去掉这几个字段
+- `Record<K, V>`：第 5 天就用过
+- `ReturnType<typeof fn>`：取函数的返回类型（读别人代码时会见到）
+
+最重要的一点：**这些都只是类型，运行时不存在**。`Omit` 不会帮你删字段；想真的去掉，要用代码生成一个新对象。常用写法是**解构剩余**：
+
+```ts
+const { cost_usd, ...rest } = review; // rest = 除 cost_usd 外的所有字段
+```
+--- code
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  cost_usd: number;
+}
+type ReviewPatch = Partial<Review>;
+type PublicReview = Omit<Review, "cost_usd">;
+
+const r: Review = { id: "8.1", verdict: "flag", risk: "high", cost_usd: 0.0021 };
+const patch: ReviewPatch = { verdict: "redline" };
+const updated: Review = { ...r, ...patch };
+console.log(updated.verdict, r.verdict);
+
+const { cost_usd, ...rest } = r;
+const pub: PublicReview = rest;
+console.log(Object.keys(pub), cost_usd);
+
+@@ concept
+title: unknown 和类型守卫
+--- body
+`JSON.parse` 返回 `any`：从这里开始 TypeScript 不再检查，字段名拼错也不报错，要到运行时才出事。模型输出、HTTP 响应、文件内容都是**外部数据**，应该当成 `unknown`：「不知道是什么，用之前必须先检查」。
+
+把检查写成**类型守卫**函数，返回类型写成 `x is Verdict`：
+
+```ts
+function isVerdict(x: unknown): x is Verdict { ... }
+```
+
+`if (isVerdict(data))` 之后，if 里面的 data 就是 Verdict。
+
+两个经典错误：
+
+- `data as Verdict` 只是**告诉**编译器「相信我」，运行时什么也不检查
+- 守卫里漏查了一个字段，编译器也发现不了：守卫是你自己的承诺。字段一多，就用第 6 天的 Zod：一份 schema 同时负责检查和类型，不会漏
+--- code
+const VERDICTS = ["accept", "flag", "redline"];
+interface Verdict {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+}
+
+function isVerdict(x: unknown): x is Verdict {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "clause_id" in x &&
+    typeof x.clause_id === "string" &&
+    "verdict" in x &&
+    typeof x.verdict === "string" &&
+    VERDICTS.includes(x.verdict)
+  );
+}
+
+const inputs = ['{"clause_id": "8.1", "verdict": "flag"}', '{"clause_id": "8.1", "verdict": "maybe"}', "null"];
+for (const raw of inputs) {
+  const data: unknown = JSON.parse(raw);
+  if (isVerdict(data)) {
+    console.log("ok:", data.clause_id, data.verdict);
+  } else {
+    console.log("rejected:", raw);
+  }
+}
+
+@@ concept
+title: as const：一份列表，两种用途
+--- body
+同一份列表常常要用两次：运行时要一个数组（遍历、检查），编译时要一个联合类型。分开写两遍，迟早会不一致。`as const` 让一份定义同时给出两样：
+
+```ts
+const RISKS = ["low", "medium", "high"] as const;
+type Risk = (typeof RISKS)[number]; // "low" | "medium" | "high"
+```
+
+- `as const`：数组变成只读，元素的类型是具体的字面量，而不是 string
+- `typeof RISKS`：取这个**值**的类型；`[number]`：「用数字下标取到的元素」的类型
+
+经典坑：x 是 `string` 时，`RISKS.includes(x)` 会报错（TypeScript 认为 RISKS 里只可能是那三个词）。查任意字符串要写成 `(RISKS as readonly string[]).includes(x)`。Zod 的 `z.enum(RISKS)` 也可以直接用这份列表。
+--- code
+const RISKS = ["low", "medium", "high"] as const;
+type Risk = (typeof RISKS)[number];
+
+function isRisk(x: string): x is Risk {
+  return (RISKS as readonly string[]).includes(x);
+}
+
+function rank(r: Risk): number {
+  return RISKS.indexOf(r);
+}
+
+for (const raw of ["high", "urgent", "low"]) {
+  if (isRisk(raw)) {
+    console.log(raw, "rank", rank(raw));
+  } else {
+    console.log(raw, "is not a risk level");
+  }
+}
+console.log(RISKS.length, RISKS[2]);
+
+@@ item d15-01
+type: code
+title: 复习：async 调用 + 计数
+level: 2
+--- prompt
+复习第 5、6 天。写 `countTopics(texts)`：对每段文字**按顺序** await 一次 `askJson(text)`（已写好），取回答里的 `topic` 字段计数，返回 `{ 主题: 次数 }`。空数组返回 `{}`。
+--- starter
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function askJson(text: string): Promise<any> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }),
+  });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function countTopics(texts: string[]): Promise<Record<string, number>> {
+  return {};
+}
+--- solution
+const API_URL = "https://api.deepseek.com/v1/chat/completions";
+const HEADERS = { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` };
+
+async function askJson(text: string): Promise<any> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: text }], response_format: { type: "json_object" } }),
+  });
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function countTopics(texts: string[]): Promise<Record<string, number>> {
+  const counts: Record<string, number> = {};
+  for (const text of texts) {
+    const answer = await askJson(text);
+    counts[answer.topic] = (counts[answer.topic] ?? 0) + 1;
+  }
+  return counts;
+}
+--- tests
+const TEXTS = [
+  "Review clause 4.2: renews for twenty-four months",
+  "Review clause 8.1: liability is unlimited",
+  "Review clause 3.1: fees are due within thirty days",
+  "Review clause 8.2: Subject to Section 12, the cap applies",
+];
+expectAsync("计数", () => countTopics(TEXTS), { auto_renewal: 1, liability_cap: 2, other: 1 });
+expectAsync("空数组", () => countTopics([]), {});
+expectAsync("每段调用一次", async () => { MOCK.reset(); await countTopics(TEXTS); return MOCK.calls.length; }, 4);
+--- hints
+- `for (const text of texts) { const answer = await askJson(text); ... }`
+- 计数还是第 5 天的写法：`counts[k] = (counts[k] ?? 0) + 1;`，这里 k 是 `answer.topic`。
+
+@@ item d15-02
+type: choice
+title: 只能用 type 写的
+level: 1
+--- prompt
+下面哪一个**只能**用 `type` 写，不能用 `interface` 写？
+--- options
+- 对象形状 `{ id: string; text: string }`
+- 联合类型 `"accept" | "flag" | "redline"`
+- 带可选字段的对象 `{ id: string; heading?: string }`
+- 在另一个对象类型的基础上加一个字段
+answer: 2
+--- explain
+`interface` 只能描述对象（可以用 `extends` 在别的 interface 上加字段）；联合类型、字面量类型只能用 `type`。其余三种两者都能写。读 Mastra、OpenAI SDK 的类型定义时两种都会看到，把它们当成同一回事来读就行。
+
+@@ item d15-03
+type: fix
+title: 可能是 undefined
+level: 2
+--- prompt
+运行一下，类型检查报了三处 `possibly 'undefined'`。修好它们，规则：
+
+- 找不到这个编号，返回 `"(missing)"`
+- 条款没有 `heading` 时，用 `"(no heading)"`
+
+例：`headingOf(CLAUSES, "8.1")` → `"8.1 CAP ON LIABILITY"`，`headingOf(CLAUSES, "12")` → `"12 (no heading)"`。
+--- starter
+interface Clause {
+  id: string;
+  heading?: string;
+}
+
+function headingOf(clauses: Clause[], id: string): string {
+  const clause = clauses.find((c) => c.id === id);
+  return `${clause.id} ${clause.heading.toUpperCase()}`;
+}
+--- solution
+interface Clause {
+  id: string;
+  heading?: string;
+}
+
+function headingOf(clauses: Clause[], id: string): string {
+  const clause = clauses.find((c) => c.id === id);
+  if (clause === undefined) {
+    return "(missing)";
+  }
+  return `${clause.id} ${clause.heading?.toUpperCase() ?? "(no heading)"}`;
+}
+--- tests
+const CLAUSES: Clause[] = [{ id: "8.1", heading: "Cap on Liability" }, { id: "12" }];
+expect("有标题", () => headingOf(CLAUSES, "8.1"), "8.1 CAP ON LIABILITY");
+expect("没有标题", () => headingOf(CLAUSES, "12"), "12 (no heading)");
+expect("找不到", () => headingOf(CLAUSES, "99"), "(missing)");
+--- hints
+- `find` 可能找不到。先写 `if (clause === undefined) { return ...; }`，这一行之后 TypeScript 就知道 clause 一定存在。
+- `heading` 是可选的：`clause.heading?.toUpperCase()` 在没有标题时得到 undefined，再用 `??` 给默认值。
+
+@@ item d15-04
+type: predict
+title: 收窄的结果
+level: 2
+--- prompt
+写出输出。最后一行是 JavaScript 的两个老坑，想想为什么要用 `Array.isArray` 和 `=== null`。
+--- code
+function kindOf(x: string | number | string[] | null | undefined): string {
+  if (x === null || x === undefined) {
+    return "empty";
+  }
+  if (typeof x === "number") {
+    return x > 0.5 ? "high score" : "low score";
+  }
+  if (Array.isArray(x)) {
+    return `${x.length} ids`;
+  }
+  return x.trim() === "" ? "blank" : `text ${x}`;
+}
+console.log(kindOf(0.8), kindOf(0));
+console.log(kindOf(["8.1"]), kindOf([]));
+console.log(kindOf("  "), kindOf("flag"));
+console.log(kindOf(null), kindOf(undefined));
+console.log(typeof null, typeof [], Array.isArray([]));
+--- explain
+每个 if 都排除掉一种可能，走到最后一行时 x 只剩 `string`，所以能直接调用 `x.trim()`。`typeof` 对 `null` 和数组都返回 `"object"`，所以判断数组要用 `Array.isArray`，判断「是个对象」时要加上 `x !== null`。
+
+@@ item d15-05
+type: code
+title: 统一 rule_ids
+level: 2
+--- prompt
+模型有时把 `rule_ids` 写成数组，有时写成逗号分隔的字符串，有时干脆给 `null`。写 `normalizeIds(input)`，统一返回字符串数组：每项去掉首尾空格，去掉空项。
+
+- `["PB-01", " PB-03 "]` → `["PB-01", "PB-03"]`
+- `"PB-01, PB-03"` → `["PB-01", "PB-03"]`
+- `null`、`""` → `[]`
+--- starter
+function normalizeIds(input: string | string[] | null): string[] {
+  return [];
+}
+--- solution
+function normalizeIds(input: string | string[] | null): string[] {
+  if (input === null) {
+    return [];
+  }
+  const parts = typeof input === "string" ? input.split(",") : input;
+  return parts.map((s) => s.trim()).filter((s) => s !== "");
+}
+--- tests
+expect("数组", () => normalizeIds(["PB-01", " PB-03 "]), ["PB-01", "PB-03"]);
+expect("逗号字符串", () => normalizeIds("PB-01, PB-03"), ["PB-01", "PB-03"]);
+expect("null", () => normalizeIds(null), []);
+expect("空字符串和多余逗号", () => [normalizeIds(""), normalizeIds("PB-01,,")], [[], ["PB-01"]]);
+--- hints
+- 先处理 `null`，然后用 `typeof input === "string"` 区分字符串和数组。
+- 字符串先 `split(",")` 变成数组，之后两种情况就一样了：`.map((s) => s.trim()).filter((s) => s !== "")`。
+
+@@ item d15-06
+type: code
+title: 描述一个决定
+level: 2
+--- prompt
+写 `describe(d)`：
+
+- `{ kind: "accept" }` → `"accept"`
+- `{ kind: "flag", reason: "unclear fee" }` → `"flag: unclear fee"`
+- `{ kind: "redline", replacement: "Cap at 12 months." }` → `"redline -> Cap at 12 months."`
+
+用 `switch (d.kind)`，并在 `default` 里加上穷尽检查（下一题你会看到它的用处）。
+--- starter
+type Decision =
+  | { kind: "accept" }
+  | { kind: "flag"; reason: string }
+  | { kind: "redline"; replacement: string };
+
+function describe(d: Decision): string {
+  switch (d.kind) {
+    case "accept":
+      return "accept";
+  }
+  return "";
+}
+--- solution
+type Decision =
+  | { kind: "accept" }
+  | { kind: "flag"; reason: string }
+  | { kind: "redline"; replacement: string };
+
+function describe(d: Decision): string {
+  switch (d.kind) {
+    case "accept":
+      return "accept";
+    case "flag":
+      return `flag: ${d.reason}`;
+    case "redline":
+      return `redline -> ${d.replacement}`;
+    default: {
+      const unreachable: never = d;
+      return unreachable;
+    }
+  }
+}
+--- tests
+expect("accept", () => describe({ kind: "accept" }), "accept");
+expect("flag", () => describe({ kind: "flag", reason: "unclear fee" }), "flag: unclear fee");
+expect("redline", () => describe({ kind: "redline", replacement: "Cap at 12 months." }), "redline -> Cap at 12 months.");
+--- hints
+- 在 `case "flag":` 分支里 TypeScript 知道 d 有 `reason`；在 `case "redline":` 分支里有 `replacement`。
+- 穷尽检查照抄知识卡片：`default: { const unreachable: never = d; return unreachable; }`
+
+@@ item d15-07
+type: fix
+title: 漏掉的 case
+level: 2
+--- prompt
+团队给 `Decision` 加了第四种情况 `{ kind: "escalate"; to: string }`（交给某个人处理），却忘了改 `describe`。运行一下：类型检查立刻在 `default` 那一行报错。读懂报错，补上这个 case，返回 `"escalate to legal"` 这样的文字。**不要**删掉穷尽检查那一行，它刚刚帮你抓住了一个 bug。
+--- starter
+type Decision =
+  | { kind: "accept" }
+  | { kind: "flag"; reason: string }
+  | { kind: "redline"; replacement: string }
+  | { kind: "escalate"; to: string };
+
+function describe(d: Decision): string {
+  switch (d.kind) {
+    case "accept":
+      return "accept";
+    case "flag":
+      return `flag: ${d.reason}`;
+    case "redline":
+      return `redline -> ${d.replacement}`;
+    default: {
+      const unreachable: never = d;
+      return unreachable;
+    }
+  }
+}
+--- solution
+type Decision =
+  | { kind: "accept" }
+  | { kind: "flag"; reason: string }
+  | { kind: "redline"; replacement: string }
+  | { kind: "escalate"; to: string };
+
+function describe(d: Decision): string {
+  switch (d.kind) {
+    case "accept":
+      return "accept";
+    case "flag":
+      return `flag: ${d.reason}`;
+    case "redline":
+      return `redline -> ${d.replacement}`;
+    case "escalate":
+      return `escalate to ${d.to}`;
+    default: {
+      const unreachable: never = d;
+      return unreachable;
+    }
+  }
+}
+--- tests
+expect("escalate", () => describe({ kind: "escalate", to: "legal" }), "escalate to legal");
+expect("flag 还是对的", () => describe({ kind: "flag", reason: "late fee" }), "flag: late fee");
+--- hints
+- 报错的意思是：`{ kind: "escalate"; to: string }` 这种情况走到了 default，而那里只允许 never。
+- 在 default 前面加一个 `case "escalate":`，返回 `` `escalate to ${d.to}` ``。
+
+@@ item d15-08
+type: code
+title: 泛型 first 和 last
+level: 1
+--- prompt
+写两个泛型函数：`first(xs)` 返回第一个元素，`last(xs)` 返回最后一个；空数组都返回 `undefined`。返回类型是 `T | undefined`。例：`last(["3.1", "8.1"])` → `"8.1"`。
+--- starter
+function first<T>(xs: T[]): T | undefined {
+  return undefined;
+}
+
+function last<T>(xs: T[]): T | undefined {
+  return undefined;
+}
+--- solution
+function first<T>(xs: T[]): T | undefined {
+  return xs[0];
+}
+
+function last<T>(xs: T[]): T | undefined {
+  return xs[xs.length - 1];
+}
+--- tests
+expect("first", () => first(["3.1", "8.1", "12"]), "3.1");
+expect("last", () => last(["3.1", "8.1", "12"]), "12");
+expect("空数组", () => [first([]), last([])], [undefined, undefined]);
+expect("类型跟着走", () => { const c: { id: string } | undefined = last([{ id: "8.1" }]); return c?.id; }, "8.1");
+--- hints
+- 数组越界时 JavaScript 返回 `undefined`，不会报错，所以空数组不用特别处理。
+- 最后一个的下标是 `xs.length - 1`。ES2022 还有 `xs.at(-1)`，结果一样。
+
+@@ item d15-09
+type: code
+title: 泛型 groupBy
+level: 2
+--- prompt
+写 `groupBy(xs, key)`：`key` 是一个函数，算出每个元素属于哪一组。返回 `Record<string, T[]>`，组内保持原顺序。例：`groupBy(reviews, (r) => r.verdict)` → `{ flag: [...], accept: [...] }`。
+
+同一个函数还能按风险、按章节号分组：泛型 + 函数参数，写一次到处用。
+--- starter
+function groupBy<T>(xs: T[], key: (x: T) => string): Record<string, T[]> {
+  const groups: Record<string, T[]> = {};
+  return groups;
+}
+--- solution
+function groupBy<T>(xs: T[], key: (x: T) => string): Record<string, T[]> {
+  const groups: Record<string, T[]> = {};
+  for (const x of xs) {
+    const k = key(x);
+    if (groups[k] === undefined) {
+      groups[k] = [];
+    }
+    groups[k].push(x);
+  }
+  return groups;
+}
+--- tests
+const REVIEWS = [
+  { id: "3.1", verdict: "accept" },
+  { id: "8.1", verdict: "flag" },
+  { id: "8.2", verdict: "accept" },
+  { id: "10.1", verdict: "flag" },
+];
+const ids = (g: Record<string, { id: string }[]>) => Object.fromEntries(Object.entries(g).map(([k, v]) => [k, v.map((r) => r.id)]));
+expect("按判定", () => ids(groupBy(REVIEWS, (r) => r.verdict)), { accept: ["3.1", "8.2"], flag: ["8.1", "10.1"] });
+expect("按章节号", () => ids(groupBy(REVIEWS, (r) => r.id.split(".")[0])), { "3": ["3.1"], "8": ["8.1", "8.2"], "10": ["10.1"] });
+expect("字符串也行", () => groupBy(["low", "high", "low"], (s) => s), { low: ["low", "low"], high: ["high"] });
+expect("空", () => groupBy([], (x: string) => x), {});
+--- hints
+- 对每个元素先算出组名 `const k = key(x);`。
+- 这一组还不存在时先放一个空数组，再 `push`。和第 5 天的 `groupByTopic` 一样，只是「组名」变成了调用 `key(x)`。
+
+@@ item d15-10
+type: order
+title: 排代码：泛型 indexBy
+level: 2
+--- prompt
+排出 `indexBy`：把数组变成「名字 → 元素」的查找表，名字由 `key(x)` 算出；同名时后面的覆盖前面的。有两行干扰项。
+--- lines
+function indexBy<T>(xs: T[], key: (x: T) => string): Record<string, T> {
+  const out: Record<string, T> = {};
+  for (const x of xs) {
+    out[key(x)] = x;
+  }
+  return out;
+}
+--- distractors
+function indexBy(xs: T[], key: (x: T) => string): Record<string, T> {
+  for (const x in xs) {
+--- tests
+const CLAUSES = [
+  { id: "3.1", heading: "Invoicing" },
+  { id: "8.1", heading: "Cap on Liability" },
+];
+expect("按 id 查", () => indexBy(CLAUSES, (c) => c.id)["8.1"].heading, "Cap on Liability");
+expect("同名后面覆盖前面", () => indexBy(["flag", "fine", "accept"], (s) => s[0]), { f: "fine", a: "accept" });
+expect("空", () => indexBy([], (x: string) => x), {});
+--- hints
+- 没有 `<T>` 的那一行里，T 从哪来？TypeScript 会说 `Cannot find name 'T'`。
+- 遍历数组的**值**用 `of`；`in` 拿到的是下标字符串。
+
+@@ item d15-11
+type: code
+title: Partial 补丁
+level: 2
+--- prompt
+律师在界面上只改了一两个字段。写泛型 `applyPatch(obj, patch)`：返回一个**新对象**，`patch` 里有的字段覆盖原值，其它不变，**不要修改** `obj`。`patch` 的类型要写成 `Partial<T>`（starter 里写错了）。例：`applyPatch(review, { verdict: "redline" })`。
+--- starter
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  note?: string;
+}
+
+function applyPatch<T>(obj: T, patch: T): T {
+  return obj;
+}
+--- solution
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  note?: string;
+}
+
+function applyPatch<T>(obj: T, patch: Partial<T>): T {
+  return { ...obj, ...patch };
+}
+--- tests
+const R: Review = { id: "8.1", verdict: "flag", risk: "high" };
+expect("改一个字段", () => applyPatch(R, { verdict: "redline" }), { id: "8.1", verdict: "redline", risk: "high" });
+expect("加上可选字段", () => applyPatch(R, { note: "cap too low" }).note, "cap too low");
+expect("原对象没被改", () => { applyPatch(R, { risk: "low" }); return R.risk; }, "high");
+expect("空补丁也返回新对象", () => { const out = applyPatch(R, {}); return [out === R, out.verdict]; }, [false, "flag"]);
+expect("别的类型也能用", () => applyPatch({ a: 1, b: 2 }, { b: 3 }), { a: 1, b: 3 });
+--- hints
+- 先把参数类型改成 `patch: Partial<T>`，测试里的类型错误就消失了。
+- 展开运算符 `{ ...obj, ...patch }` 生成新对象，后面的字段覆盖前面的。
+
+@@ item d15-12
+type: predict
+title: Omit 在运行时
+level: 2
+--- prompt
+写出输出。想一想：`Omit` 在运行时还存在吗？
+--- code
+interface Review {
+  id: string;
+  verdict: string;
+  cost_usd: number;
+}
+type PublicReview = Omit<Review, "cost_usd">;
+
+const full: Review = { id: "8.1", verdict: "flag", cost_usd: 0.002 };
+const shown: PublicReview = full;
+console.log(Object.keys(shown).join(", "));
+console.log(JSON.stringify(shown));
+const { cost_usd, ...rest } = full;
+console.log(Object.keys(rest).join(", "), cost_usd);
+--- explain
+类型在编译后会被全部擦掉：`shown` 和 `full` 是同一个对象，所以 JSON 里 `cost_usd` 还在。如果这是 API 的响应，内部成本就发给了客户。要真的去掉字段，必须用代码（比如解构剩余）生成一个新对象。
+
+@@ item d15-13
+type: code
+title: 对外的审查结果
+level: 2
+--- prompt
+API 返回给前端的审查结果不能带内部字段。写两个函数，都返回**新对象**，不修改原对象：
+
+- `toPublic(r)`：去掉 `cost_usd` 和 `raw_response`，其余字段都保留（类型 `PublicReview` 已经用 `Omit` 定义好）
+- `toSummary(r)`：只留 `id` 和 `verdict`（类型用 `Pick` 定义好）
+
+starter 能通过类型检查，但测试会失败：想想上一题。
+--- starter
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  cost_usd: number;
+  raw_response: string;
+}
+type PublicReview = Omit<Review, "cost_usd" | "raw_response">;
+type ReviewSummary = Pick<Review, "id" | "verdict">;
+
+function toPublic(r: Review): PublicReview {
+  return r;
+}
+
+function toSummary(r: Review): ReviewSummary {
+  return r;
+}
+--- solution
+interface Review {
+  id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk: "low" | "medium" | "high";
+  cost_usd: number;
+  raw_response: string;
+}
+type PublicReview = Omit<Review, "cost_usd" | "raw_response">;
+type ReviewSummary = Pick<Review, "id" | "verdict">;
+
+function toPublic(r: Review): PublicReview {
+  const { cost_usd, raw_response, ...rest } = r;
+  return rest;
+}
+
+function toSummary(r: Review): ReviewSummary {
+  return { id: r.id, verdict: r.verdict };
+}
+--- tests
+const FULL: Review = { id: "8.1", verdict: "flag", risk: "high", cost_usd: 0.0021, raw_response: '{"verdict": "flag"}' };
+expect("toPublic 去掉内部字段", () => toPublic(FULL), { id: "8.1", verdict: "flag", risk: "high" });
+expect("toSummary 只留两个字段", () => toSummary(FULL), { id: "8.1", verdict: "flag" });
+expect("JSON 里没有成本", () => JSON.stringify(toPublic(FULL)).includes("cost_usd"), false);
+expect("原对象没被改", () => FULL.cost_usd, 0.0021);
+--- hints
+- `return r` 返回的还是原来那个带着所有字段的对象，类型只是「看不见」多余的字段。
+- `toPublic`：`const { cost_usd, raw_response, ...rest } = r;` 然后返回 `rest`。`toSummary`：直接写一个新对象 `{ id: r.id, verdict: r.verdict }`。
+
+@@ item d15-14
+type: choice
+title: any 和 unknown
+level: 2
+--- prompt
+`const data = JSON.parse(raw);` 之后写了 `data.verdcit.toUpperCase()`（verdict 拼错了）。下面哪句话是对的？
+--- options
+- TypeScript 会报错，因为 `verdcit` 拼错了
+- 不会报类型错误：`JSON.parse` 返回 `any`，TypeScript 不检查 any；要到运行时才报 `Cannot read properties of undefined`
+- 类型检查和运行都不会出错
+- 把 `data` 标成 `unknown` 也一样不会报类型错误
+answer: 2
+--- explain
+`any` 等于关掉检查。`unknown` 正好相反：在你用 `typeof`、`in` 或类型守卫检查之前，什么都不让做（`data.verdict` 直接报错）。所以外部数据（模型输出、HTTP 响应）一律先当成 `unknown`，检查过再用。这也是 Zod 的 `safeParse` 参数类型是 unknown 的原因。
+
+@@ item d15-15
+type: code
+title: 守卫 + 过滤坏数据
+level: 3
+--- prompt
+模型一次返回了一个 JSON 数组，但其中有的元素不合格。不用 Zod，手写：
+
+- `isVerdict(x: unknown): x is Verdict`：x 是对象（不是 null），`clause_id` 是字符串，`verdict` 是 `accept` / `flag` / `redline` 之一
+- `parseVerdicts(raw: string): Verdict[]`：解析 `raw`，只保留合格的元素；`raw` 不是合法 JSON，或者解析出来不是数组，都返回 `[]`
+--- starter
+const VERDICTS = ["accept", "flag", "redline"];
+interface Verdict {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+}
+
+function isVerdict(x: unknown): x is Verdict {
+  return false;
+}
+
+function parseVerdicts(raw: string): Verdict[] {
+  return [];
+}
+--- solution
+const VERDICTS = ["accept", "flag", "redline"];
+interface Verdict {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+}
+
+function isVerdict(x: unknown): x is Verdict {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "clause_id" in x &&
+    typeof x.clause_id === "string" &&
+    "verdict" in x &&
+    typeof x.verdict === "string" &&
+    VERDICTS.includes(x.verdict)
+  );
+}
+
+function parseVerdicts(raw: string): Verdict[] {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(data)) {
+    return [];
+  }
+  return data.filter(isVerdict);
+}
+--- tests
+expect("合格", () => isVerdict({ clause_id: "8.1", verdict: "flag" }), true);
+expect("null 和字符串", () => [isVerdict(null), isVerdict("flag")], [false, false]);
+expect("判定不在三个值里", () => isVerdict({ clause_id: "8.1", verdict: "maybe" }), false);
+expect("clause_id 不是字符串", () => isVerdict({ clause_id: 8.1, verdict: "flag" }), false);
+const RAW = '[{"clause_id": "3.1", "verdict": "accept"}, {"clause_id": "8.1", "verdict": "HIGH"}, null, {"clause_id": "10.1", "verdict": "redline"}]';
+expect("只留合格的", () => parseVerdicts(RAW).map((v) => v.clause_id), ["3.1", "10.1"]);
+expect("坏 JSON 和不是数组", () => [parseVerdicts("Sure! ["), parseVerdicts('{"clause_id": "8.1", "verdict": "flag"}')], [[], []]);
+--- hints
+- 守卫照着知识卡片写：`typeof x === "object" && x !== null && "clause_id" in x && typeof x.clause_id === "string" && ...`。
+- `JSON.parse` 放进 try/catch；再用 `Array.isArray(data)` 检查是不是数组。
+- 守卫函数可以直接交给 filter：`data.filter(isVerdict)`，结果的类型就是 `Verdict[]`。
+
+@@ item d15-16
+type: code
+title: as const：最高风险
+level: 2
+--- prompt
+`RISKS` 已经给好。先把 `type Risk` 改成**从 RISKS 推导**出来的联合类型，然后写：
+
+- `isRisk(x: string): x is Risk`
+- `maxRisk(values: string[]): Risk`：忽略不是风险等级的值，返回其中最高的等级（low < medium < high）；一个合法值都没有时返回 `"low"`
+
+例：`maxRisk(["low", "HIGH", "medium", "urgent"])` → `"medium"`（`"HIGH"` 大小写不对，不算）。
+--- starter
+const RISKS = ["low", "medium", "high"] as const;
+type Risk = string; // 改成从 RISKS 推导出来的联合类型
+
+function isRisk(x: string): x is Risk {
+  return false;
+}
+
+function maxRisk(values: string[]): Risk {
+  return "low";
+}
+--- solution
+const RISKS = ["low", "medium", "high"] as const;
+type Risk = (typeof RISKS)[number];
+
+function isRisk(x: string): x is Risk {
+  return (RISKS as readonly string[]).includes(x);
+}
+
+function maxRisk(values: string[]): Risk {
+  let best: Risk = "low";
+  for (const v of values) {
+    if (isRisk(v) && RISKS.indexOf(v) > RISKS.indexOf(best)) {
+      best = v;
+    }
+  }
+  return best;
+}
+--- tests
+expect("例子", () => maxRisk(["low", "HIGH", "medium", "urgent"]), "medium");
+expect("有 high", () => maxRisk(["high", "low"]), "high");
+expect("一个合法值都没有", () => maxRisk(["urgent", ""]), "low");
+expect("isRisk", () => [isRisk("medium"), isRisk("urgent")], [true, false]);
+expect("Risk 是三个字面量的联合", () => { const r: "low" | "medium" | "high" = maxRisk(["high"]); return r; }, "high");
+--- hints
+- `type Risk = (typeof RISKS)[number];`
+- 检查任意字符串：`(RISKS as readonly string[]).includes(x)`。
+- 等级高低就是在 RISKS 里的下标：`RISKS.indexOf(v) > RISKS.indexOf(best)` 时更新 best。
+
+@@ item d15-17
+type: fill
+title: 填空：一份列表两种用途
+level: 1
+--- prompt
+补全代码：`VERDICTS` 既是运行时的数组，又推导出 `Verdict` 类型；`isVerdict` 是一个类型守卫。
+--- template
+const VERDICTS = ["accept", "flag", "redline"] [[as const]];
+type Verdict = ([[typeof]] VERDICTS)[number];
+
+function isVerdict(x: string): x [[is]] Verdict {
+  return (VERDICTS as readonly string[]).includes(x);
+}
+
+function toVerdict(x: string): Verdict {
+  const v = x.trim().toLowerCase();
+  return isVerdict(v) ? v : "flag";
+}
+--- tests
+expect("清洗后合法", () => toVerdict(" REDLINE "), "redline");
+expect("不认识的当 flag", () => toVerdict("maybe"), "flag");
+expect("类型是联合", () => { const v: "accept" | "flag" | "redline" = toVerdict("accept"); return v; }, "accept");
+--- hints
+- 让数组元素保持字面量类型的两个词是什么？
+- 「取一个值的类型」用哪个关键字？守卫函数的返回类型写成 `x ___ Verdict`。
+
+@@ item d15-18
+type: translate
+title: 翻译：dataclass→TS
+level: 2
+--- prompt
+把 Python 的 dataclass 和函数翻译成 TypeScript 的 `interface Review` 和 `headline(r)`。
+
+interface 里不能写默认值：Python 里有默认值的字段（包括默认 `None` 的），在 TypeScript 里写成**可选**字段（`?`），在函数里用 `??` 补上默认值。例：`headline({ clause_id: "8.1", verdict: "flag" })` → `"8.1 flag/low: no note"`。
+--- source
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class Review:
+    clause_id: str
+    verdict: Literal["accept", "flag", "redline"]
+    risk: Literal["low", "medium", "high"] = "low"
+    note: str | None = None
+
+def headline(r: Review) -> str:
+    note = r.note if r.note is not None else "no note"
+    return f"{r.clause_id} {r.verdict}/{r.risk}: {note}"
+--- starter
+interface Review {
+  clause_id: string;
+}
+
+function headline(r: Review): string {
+  return "";
+}
+--- solution
+interface Review {
+  clause_id: string;
+  verdict: "accept" | "flag" | "redline";
+  risk?: "low" | "medium" | "high";
+  note?: string;
+}
+
+function headline(r: Review): string {
+  return `${r.clause_id} ${r.verdict}/${r.risk ?? "low"}: ${r.note ?? "no note"}`;
+}
+--- tests
+const minimal: Review = { clause_id: "8.1", verdict: "flag" };
+expect("只给必填字段", () => headline(minimal), "8.1 flag/low: no note");
+expect("全部字段", () => headline({ clause_id: "10.1", verdict: "redline", risk: "high", note: "data leaves the EU" }), "10.1 redline/high: data leaves the EU");
+--- hints
+- `Literal[...]` 对应 TypeScript 的字面量联合 `"accept" | "flag" | "redline"`。
+- `risk: ... = "low"` → `risk?: "low" | "medium" | "high"`，用的时候写 `r.risk ?? "low"`。
+
+@@ item d15-19
+type: local
+title: 本机：tsc 类型检查
+level: 2
+--- prompt
+本页每次运行都会帮你做类型检查。在自己电脑上，这一步要自己跑 `tsc`（TypeScript 编译器）。
+
+1. 在 `G:\Contract Clause Reviewer\learn` 下新建 `decision.ts`，**不看页面**手写：`Decision` 可辨识联合（accept / flag / redline 三种）、带 `never` 穷尽检查的 `describe(d)`，最后一行 `console.log(describe({ kind: "flag", reason: "unclear fee" }));`
+2. 在项目根目录运行一次，确认能打印：
+
+```
+cd "G:\Contract Clause Reviewer"
+npx tsx learn/decision.ts
+```
+
+3. **删掉** `case "redline"` 那个分支，再运行一次 `npx tsx learn/decision.ts`：它还是能正常打印！因为 tsx 只负责运行，**不做类型检查**
+4. 运行类型检查（第一次会询问是否下载 TypeScript，输入 y）：
+
+```
+npx -p typescript tsc --noEmit --strict learn/decision.ts
+```
+
+5. 把第 4 步的输出粘贴到下面，应该看到 `TS2322` 和 `not assignable to type 'never'`。最后把 case 加回来，再跑一次 tsc：没有任何输出，就是通过了。
+placeholder: 粘贴 tsc 的输出
+verify: not assignable to type 'never'
+--- hints
+- tsc 什么都没输出：说明类型检查通过了。确认你真的删掉了一个 case，并且 default 里有 `const unreachable: never = d;`。
+- 真实项目里一般在 `package.json` 里配一个 `"typecheck": "tsc --noEmit"` 脚本，提交代码前跑一遍。
+
+@@ item d15-e1
+type: scratch
+title: 闭卷：事件汇总
+exam: yes
+level: 3
+--- prompt
+Agent 运行时会产生一串事件。定义可辨识联合 `ReviewEvent`（用字段 `type` 区分）：
+
+- `{ type: "tool_call"; tool: string }`
+- `{ type: "verdict"; clause_id: string; verdict: "accept" | "flag" | "redline" }`
+- `{ type: "error"; message: string }`
+
+写 `summarize(events: ReviewEvent[])`，返回 `{ toolCalls: 工具调用次数, verdicts: { 判定: 次数 }, errors: [所有 message，保持顺序] }`。用 switch，并加上 `never` 穷尽检查。
+--- solution
+type ReviewEvent =
+  | { type: "tool_call"; tool: string }
+  | { type: "verdict"; clause_id: string; verdict: "accept" | "flag" | "redline" }
+  | { type: "error"; message: string };
+
+interface Summary {
+  toolCalls: number;
+  verdicts: Record<string, number>;
+  errors: string[];
+}
+
+function summarize(events: ReviewEvent[]): Summary {
+  const out: Summary = { toolCalls: 0, verdicts: {}, errors: [] };
+  for (const e of events) {
+    switch (e.type) {
+      case "tool_call":
+        out.toolCalls += 1;
+        break;
+      case "verdict":
+        out.verdicts[e.verdict] = (out.verdicts[e.verdict] ?? 0) + 1;
+        break;
+      case "error":
+        out.errors.push(e.message);
+        break;
+      default: {
+        const unreachable: never = e;
+        throw new Error(`unknown event: ${JSON.stringify(unreachable)}`);
+      }
+    }
+  }
+  return out;
+}
+--- tests
+const EVENTS: ReviewEvent[] = [
+  { type: "tool_call", tool: "lookup_playbook" },
+  { type: "verdict", clause_id: "8.1", verdict: "redline" },
+  { type: "error", message: "http 429" },
+  { type: "tool_call", tool: "get_clause" },
+  { type: "verdict", clause_id: "3.1", verdict: "accept" },
+  { type: "verdict", clause_id: "10.1", verdict: "redline" },
+  { type: "error", message: "bad json" },
+];
+expect("混合事件", () => summarize(EVENTS), { toolCalls: 2, verdicts: { redline: 2, accept: 1 }, errors: ["http 429", "bad json"] });
+expect("空", () => summarize([]), { toolCalls: 0, verdicts: {}, errors: [] });
+
+@@ item d15-e2
+type: scratch
+title: 闭卷：泛型 topBy
+exam: yes
+level: 3
+--- prompt
+写泛型函数 `topBy<T>(xs: T[], score: (x: T) => number, k: number): T[]`：按 `score` 从高到低返回前 `k` 个元素。
+
+- 分数相同时保持原顺序
+- **不修改** `xs`
+- `k` 大于长度时返回全部；`k <= 0` 时返回 `[]`
+--- solution
+function topBy<T>(xs: T[], score: (x: T) => number, k: number): T[] {
+  if (k <= 0) {
+    return [];
+  }
+  return [...xs].sort((a, b) => score(b) - score(a)).slice(0, k);
+}
+--- tests
+const RISK_SCORE: Record<string, number> = { low: 1, medium: 2, high: 3 };
+const CLAUSES = [
+  { id: "3.1", risk: "low" },
+  { id: "8.1", risk: "high" },
+  { id: "4.2", risk: "medium" },
+  { id: "10.1", risk: "high" },
+];
+expect("前 3 个，同分保持原顺序", () => topBy(CLAUSES, (c) => RISK_SCORE[c.risk], 3).map((c) => c.id), ["8.1", "10.1", "4.2"]);
+expect("原数组没被改", () => { topBy(CLAUSES, (c) => RISK_SCORE[c.risk], 2); return CLAUSES.map((c) => c.id); }, ["3.1", "8.1", "4.2", "10.1"]);
+expect("字符串按长度", () => topBy(["a", "abc", "ab"], (s) => s.length, 10), ["abc", "ab", "a"]);
+expect("k 为 0 或负数", () => [topBy([1, 2, 3], (n) => n, 0), topBy([1, 2, 3], (n) => n, -1)], [[], []]);
+
+@@ item d15-e3
+type: scratch
+title: 闭卷：守卫加载规则
+exam: yes
+level: 3
+--- prompt
+从 JSON 文字里加载 playbook 规则，不用 Zod，手写检查：
+
+- `interface Rule { id: string; topic: string; severity: "low" | "medium" | "high"; keywords?: string[] }`
+- `isRule(x: unknown): x is Rule`：`id`、`topic` 是字符串，`severity` 是三档之一；`keywords` 可以没有，有的话必须是字符串数组
+- `loadRules(raw: string): { rules: Rule[]; rejected: number }`：`raw` 应该是 `{"rules": [...]}` 这样的 JSON。合格的规则放进 `rules`（保持顺序），不合格的数量记在 `rejected`。`raw` 不是合法 JSON，或者没有 `rules` 数组时，返回 `{ rules: [], rejected: 0 }`
+--- solution
+const SEVERITIES = ["low", "medium", "high"];
+
+interface Rule {
+  id: string;
+  topic: string;
+  severity: "low" | "medium" | "high";
+  keywords?: string[];
+}
+
+function isRule(x: unknown): x is Rule {
+  if (typeof x !== "object" || x === null) {
+    return false;
+  }
+  if (!("id" in x) || typeof x.id !== "string") {
+    return false;
+  }
+  if (!("topic" in x) || typeof x.topic !== "string") {
+    return false;
+  }
+  if (!("severity" in x) || typeof x.severity !== "string" || !SEVERITIES.includes(x.severity)) {
+    return false;
+  }
+  if ("keywords" in x) {
+    const kw = x.keywords;
+    if (!Array.isArray(kw) || !kw.every((k) => typeof k === "string")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function loadRules(raw: string): { rules: Rule[]; rejected: number } {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { rules: [], rejected: 0 };
+  }
+  if (typeof data !== "object" || data === null || !("rules" in data) || !Array.isArray(data.rules)) {
+    return { rules: [], rejected: 0 };
+  }
+  const items: unknown[] = data.rules;
+  const rules = items.filter(isRule);
+  return { rules, rejected: items.length - rules.length };
+}
+--- tests
+const RAW = JSON.stringify({
+  rules: [
+    { id: "PB-01", topic: "liability_cap", severity: "high", keywords: ["liability", "cap"] },
+    { id: "PB-02", topic: "auto_renewal", severity: "urgent" },
+    { id: "PB-03", topic: "payment", severity: "medium", keywords: "fee" },
+    { id: "PB-04", topic: "data_processing", severity: "high" },
+    null,
+  ],
+});
+expect("合格的留下", () => loadRules(RAW).rules.map((r) => r.id), ["PB-01", "PB-04"]);
+expect("不合格的计数", () => loadRules(RAW).rejected, 3);
+expect("isRule 单独检查", () => [isRule({ id: "PB-05", topic: "x", severity: "low" }), isRule({ id: "PB-05", topic: "x", severity: "low", keywords: [1] })], [true, false]);
+expect("坏 JSON 和没有 rules", () => [loadRules("{oops"), loadRules('{"items": []}')], [{ rules: [], rejected: 0 }, { rules: [], rejected: 0 }]);

@@ -4,12 +4,12 @@ lang: py
 langs: Python + TypeScript
 hours: 5–6 小时
 --- goal
-不靠提示，用两种语言各写一遍 Clause Check 的核心流水线：拆条款 → 逐条调模型 → 校验 → 汇总；再在真实项目里做一次「加规则 → 加用例 → 跑测试」的完整改动。最后是 6 题 72 分钟的毕业闭卷。
+不靠提示，用两种语言各写一遍 Clause Check 的核心流水线：拆条款 → 逐条调模型 → 校验 → 汇总；再在真实项目里做一次「加规则 → 加用例 → 跑测试」的完整改动。最后是 6 题 72 分钟的第 1 周周考。
 --- checklist
 - 复习区清零
 - 综合题全部通过（Python 和 TypeScript 各三题）
 - 两个本机任务：改真实项目并跑测试；用 DeepSeek 跑一次评测
-- 毕业闭卷：6 题至少过 4 题
+- 第 1 周周考：6 题至少过 4 题
 - 准备面试口述：用 2 分钟讲清楚你写过的每一段代码在 Clause Check 里对应哪个文件
 
 @@ concept
@@ -467,7 +467,7 @@ level: 3
 
 ```
 cd "G:\Contract Clause Reviewer"
-$env:CLAUSECHECK_MODE="mock"; python -m pytest -q
+$env:CLAUSECHECK_MODE="mock"; python -m pytest
 python evals/run_evals.py --mode mock --runs 1
 ```
 
@@ -504,7 +504,7 @@ verify: high-risk recall
 
 @@ item d7-e1
 type: scratch
-title: 毕业闭卷 1：解析并计数（Python）
+title: 周考 1：解析并计数（Python）
 exam: yes
 level: 3
 --- prompt
@@ -539,7 +539,7 @@ expect("空", lambda: parse_and_count([]), {"valid": 0, "invalid": 0, "counts": 
 
 @@ item d7-e2
 type: scratch
-title: 毕业闭卷 2：Pydantic 批量加载（Python）
+title: 周考 2：Pydantic 批量加载（Python）
 exam: yes
 level: 3
 --- prompt
@@ -575,7 +575,7 @@ expect("坏 JSON", lambda: load_clauses("[{"), [])
 
 @@ item d7-e3
 type: scratch
-title: 毕业闭卷 3：带重试的批量判定（Python）
+title: 周考 3：带重试的批量判定（Python）
 exam: yes
 level: 3
 mock: yes
@@ -619,7 +619,7 @@ expect_raises("三次都 429", _give_up, RuntimeError)
 
 @@ item d7-e4
 type: scratch
-title: 毕业闭卷 4：解析并计数（TypeScript）
+title: 周考 4：解析并计数（TypeScript）
 exam: yes
 level: 3
 lang: ts
@@ -654,7 +654,7 @@ expect("空", () => parseAndCount([]), { valid: 0, invalid: 0, counts: {} });
 
 @@ item d7-e5
 type: scratch
-title: 毕业闭卷 5：Zod 批量加载（TypeScript）
+title: 周考 5：Zod 批量加载（TypeScript）
 exam: yes
 level: 3
 lang: ts
@@ -689,7 +689,7 @@ expect("坏 JSON", () => loadClauses("[{"), []);
 
 @@ item d7-e6
 type: scratch
-title: 毕业闭卷 6：带重试的批量判定（TypeScript）
+title: 周考 6：带重试的批量判定（TypeScript）
 exam: yes
 level: 3
 lang: ts
