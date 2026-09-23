@@ -23,7 +23,7 @@ Clause Check 的 `evals/cases.json` 里每条用例有 `id`、`kind`、`clause` 
 - `kind`：`must_flag`（有风险，必须拦下）、`must_accept`（普通样板条款，必须放过）、`trap`（交叉引用陷阱）、`injection`（提示注入）
 - `expect` 写**允许的答案集合** `verdict_in`，不是唯一答案：flag 和 redline 都算「拦下了」
 - 正确答案来自**人的判断**，不是模型说的
-- 线上每出一个错，先把它变成一条用例（`learn/04_failure_to_dataset.md`）
+- 线上每出一个错，先把它变成一条用例（训练营 `lessons/04_failure_to_dataset.md`）
 
 `harness.py` 的 `check()` 返回**失败原因的列表**，空列表就是通过。好处是失败时知道为什么失败。
 --- code
@@ -257,7 +257,7 @@ print("cache hit ratio:", round(hit / (hit + miss), 2))
 @@ concept
 title: A/B 对比：一次只改一个东西
 --- body
-改了 prompt，怎么知道变好了？**同一批用例、同样的 N**，两个版本各跑一遍，逐条并排比。三条规矩（`learn/05_prompt_ab.md`）：
+改了 prompt，怎么知道变好了？**同一批用例、同样的 N**，两个版本各跑一遍，逐条并排比。三条规矩（训练营 `lessons/05_prompt_ab.md`）：
 
 - **一次只改一个东西**，否则不知道是谁起的作用
 - 先看高风险召回有没有掉，再看误报有没有少
@@ -1223,7 +1223,7 @@ python evals/run_evals.py --mode deepseek --runs 3 --prompt v2 --out evals/resul
 
 `--out` 让两次结果分开保存（`evals/results*.json` 不会进 git）。
 
-3. 把两遍 DeepSeek 的通过率表粘贴到下面（至少要有两行 `high-risk recall`），然后对照 `learn/05_prompt_ab.md` 回答自己三个问题：高风险召回掉了吗？must_accept 用例的误报变少了吗？有没有哪条用例变差？
+3. 把两遍 DeepSeek 的通过率表粘贴到下面（至少要有两行 `high-risk recall`），然后对照训练营文件夹里的 `lessons/05_prompt_ab.md` 回答自己三个问题：高风险召回掉了吗？must_accept 用例的误报变少了吗？有没有哪条用例变差？
 placeholder: 粘贴两张 DeepSeek 通过率表
 verify: high-risk recall[\s\S]*high-risk recall
 --- hints

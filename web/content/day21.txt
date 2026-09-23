@@ -516,7 +516,7 @@ cards: 两分钟讲项目; 面试里诚实说自己的水平
 --- context
 面试开头几乎一定会让你「介绍一下你的项目」。事先写好、讲熟，开场两分钟就能让面试官看到你真懂这个项目，后面的追问也会顺着你讲的内容来。
 --- prompt
-1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\my_pitch.md`
+1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\work\my_pitch.md`
 2. 用**英文**写你的两分钟讲述，分五段：Problem / Design / A hard bug / How I measure / Next。参考「两分钟讲项目」卡片，但要用你自己的话，只写你能解释的东西
 3. 必须提到：playbook、evals、recall、一个你修过的 bug（样板条款误报 → `PB-00`，或者今天修的排序 bug），以及至少一个真实的数字（从 README 的评测表、或你自己跑出来的结果里找）
 4. 对着计时器大声讲三遍，超过两分半就删

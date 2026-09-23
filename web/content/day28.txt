@@ -1388,7 +1388,7 @@ cards: 面试怎么讲这个架构; 架构：从上传到看板
 --- context
 面试里几乎一定会被问「你怎么把它部署到云上」。这一题把这周搭起来的整套架构写成两分钟的英文讲稿，再练到能对着计时器讲出来。
 --- prompt
-1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\cloud_pitch.md`
+1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\work\cloud_pitch.md`
 2. 用**英文**写「Clause Check 上云」的两分钟讲述，分五段：Goal / Flow / Failures / Cost / Security & trade-offs。参考「面试怎么讲这个架构」卡片，用你自己的话
 3. 必须提到：Pub/Sub（或 SQS）、at-least-once、idempotency key、BigQuery、EU 区域（europe-north1 或 eu-north-1），以及一个你自己算出来的数字（比如 P6 的每月成本）
 4. 最后一句诚实地说：这是用模拟的 SDK 搭的，还没有部署到真账号

@@ -3000,11 +3000,11 @@ cards: 测试策略：三层，两个运行环境
 python -m pip install langchain langgraph langchain-deepseek langchain-openai langchain-text-splitters langgraph-checkpoint-sqlite numpy
 ```
 
-2. 打开 P8（「P8 给界面推送进度」），在做对的代码上点「复制为本机文件」，在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\d35-14.py`，粘贴保存
+2. 打开 P8（「P8 给界面推送进度」），在做对的代码上点「复制为本机文件」，在 VS Code 里新建 `G:\Contract Clause Reviewer\work\d35-14.py`，粘贴保存
 3. 在终端运行：
 
 ```
-cd "G:\Contract Clause Reviewer\learn"
+cd "G:\Contract Clause Reviewer\work"
 python d35-14.py
 ```
 

@@ -22,7 +22,7 @@ fetch-vendor.mjs               下载页面要带的 Python 包（vendor/ 不进
 构建：
 
 ```bash
-cd learn/web
+cd web
 npm install
 node fetch-vendor.mjs            # 下载 Pydantic、LangChain/LangGraph 等 wheel 到 vendor/（版本写在脚本里）
 node build.mjs                   # 全部验证，并生成 dist/

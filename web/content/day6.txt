@@ -853,14 +853,14 @@ cards: fetch：TypeScript 里的 requests.post; async / await：等网络的时�
 --- prompt
 **不看这个页面**，手写一次 TypeScript 的真实调用。
 
-1. 在 `G:\Contract Clause Reviewer\learn` 下新建 `my_first_call.ts`
+1. 在 `G:\Contract Clause Reviewer\work` 下新建 `my_first_call.ts`
 2. 第一行写 `process.loadEnvFile();`（Node 自带，读取当前目录的 `.env`）
 3. 手写一个 async 的 `main()`：fetch DeepSeek（模型 `deepseek-flash`），打印回答和 `total_tokens`，最后调用 `main()`
 4. 在项目根目录运行（这样 `.env` 能被找到）：
 
 ```
 cd "G:\Contract Clause Reviewer"
-npx tsx learn/my_first_call.ts
+npx tsx work/my_first_call.ts
 ```
 
 5. 把输出粘贴到下面

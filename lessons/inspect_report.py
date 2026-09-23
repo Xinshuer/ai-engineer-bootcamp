@@ -1,6 +1,7 @@
-"""Lesson 02: list the clauses in a report that deserve a second look.
+r"""Lesson 02: list the clauses in a report that deserve a second look.
 
-    python learn/inspect_report.py data/sample_contract.local.v2.report.json
+    cd <the Clause Check project folder>
+    python "G:\Clause Check 编程营\lessons\inspect_report.py" data/sample_contract.local.v2.report.json
 """
 from __future__ import annotations
 
@@ -9,7 +10,11 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# run from the Clause Check project folder: the project is found from the current folder
+ROOT = Path.cwd()
+if not (ROOT / "clausecheck").is_dir():
+    sys.exit('Run this from the Clause Check project folder, e.g. cd "G:\\Contract Clause Reviewer"')
+sys.path.insert(0, str(ROOT))
 
 SAYS_FINE = re.compile(r"\b(standard|boilerplate|acceptable|consistent with|aligns with|satisf(y|ies|ying)|no never.accept)\b", re.I)
 

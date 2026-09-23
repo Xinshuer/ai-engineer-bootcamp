@@ -9,7 +9,7 @@ hours: 5 小时
 - 读完 8 张知识卡片并改动运行，特意制造一个类型错误看看报什么
 - 练习区全部通过（类型检查也必须干净）
 - 闭卷挑战 3 题
-- 本机：在 `learn` 下新建 `hello.ts`，写 3 行，运行 `npx tsx learn/hello.ts`
+- 本机：在项目的 `work` 文件夹下新建 `hello.ts`，写 3 行，运行 `npx tsx work/hello.ts`
 
 @@ concept
 title: 从 Python 到 TypeScript

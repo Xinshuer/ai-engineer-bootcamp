@@ -1210,7 +1210,7 @@ COPY . .
 CMD exec uvicorn clausecheck.api:app --host 0.0.0.0 --port ${PORT:-8080}
 ```
 
-再新建 `.dockerignore`（`learn` 里有网站的 node_modules，很大）：
+再新建 `.dockerignore`（`.env` 里有密钥，`work` 里是你自己的练习文件，都不该进镜像）：
 
 ```
 .env
@@ -1219,8 +1219,6 @@ __pycache__
 .pytest_cache
 *.report.json
 work
-learn
-node_modules
 ```
 
 然后在 PowerShell 里运行（第一次要下载基础镜像和依赖，可能要好几分钟）：

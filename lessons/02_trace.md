@@ -15,11 +15,11 @@
 
 ## 跑
 
-`learn/inspect_report.py` 把一份报告里"值得看一眼"的条款挑出来：
+`lessons/inspect_report.py` 把一份报告里"值得看一眼"的条款挑出来：
 
 ```bash
 python -m clausecheck review data/sample_contract.txt --mode mock --out data/map.report.json
-python learn/inspect_report.py data/map.report.json
+python "G:\Clause Check 编程营\lessons\inspect_report.py" data/map.report.json
 ```
 
 它检查这几个信号：判定不是 accept 但理由里写着 "standard / acceptable / consistent with"（模型改口了）；调了 `mark_for_review`（模型要人看）；redline 但 anchor 没定位到；步数到了上限（可能在兜圈）；有 error。
@@ -29,7 +29,7 @@ mock 模式下会列出 4 条，全是规则自己判的 redline / flag，被"�
 真正有意思的是拿模型跑出来的报告看。项目里保留了一份本地 Qwen 用 v2 prompt 跑的：
 
 ```bash
-python learn/inspect_report.py data/sample_contract.local.v2.report.json
+python "G:\Clause Check 编程营\lessons\inspect_report.py" data/sample_contract.local.v2.report.json
 ```
 
 会列出 11 条，读完理由后能分成三组：

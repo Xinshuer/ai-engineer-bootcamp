@@ -148,7 +148,7 @@ mock: yes
 
 模型决定「调不调、调哪个」，**只能看 description**。好的描述写清三件事：什么时候用、调用后会发生什么、什么时候**不要**用。
 
-项目里的真实教训：`mark_for_review` 的描述曾经写着 "use it when out of the playbook's scope"，模型就把没有规则的普通样板条款一条条交给了人。只改 system prompt 反而更差；改了工具描述、再给 playbook 加上 PB-00 才修好（`learn/04_failure_to_dataset.md`）。
+项目里的真实教训：`mark_for_review` 的描述曾经写着 "use it when out of the playbook's scope"，模型就把没有规则的普通样板条款一条条交给了人。只改 system prompt 反而更差；改了工具描述、再给 playbook 加上 PB-00 才修好（训练营 `lessons/04_failure_to_dataset.md`）。
 --- code
 import json
 import os
@@ -213,7 +213,7 @@ mock: yes
 --- body
 DeepSeek（还有 Anthropic、OpenAI）会缓存请求的**前缀**：这次请求**开头**和之前某次一模一样的部分算「命中」，命中的输入便宜很多。`deepseek-flash` 高峰时段的输入价格：没命中 0.30、命中缓存 0.006 美元每百万 token，差 50 倍；非高峰时段两个都减半，差距不变。以官方价格页为准（2026-09）。项目 `config.py` 的 `PRICES` 里记的也是这个价（2026-09），DeepSeek 调价以后要跟着改。
 
-所以顺序很重要：**不变的放前面，变的放最后**：系统指令 → 工具定义 → playbook / few-shot 例子 → 当前条款。一个时间戳、一个请求编号放在 system 开头，缓存就永远不命中，而且不报任何错（`learn/06_cache_cost.md` 的实验）。
+所以顺序很重要：**不变的放前面，变的放最后**：系统指令 → 工具定义 → playbook / few-shot 例子 → 当前条款。一个时间戳、一个请求编号放在 system 开头，缓存就永远不命中，而且不报任何错（训练营 `lessons/06_cache_cost.md` 的实验）。
 
 怎么看：回答里的 `usage["prompt_cache_hit_tokens"]`。本页的模拟服务器按 64 个字符一块比较前缀，和真服务器一样「只认开头」。
 --- code

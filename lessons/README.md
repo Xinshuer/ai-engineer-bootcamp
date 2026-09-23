@@ -3,6 +3,8 @@
 给第一次做 LLM 应用的人。每课只讲一件事，一条命令能跑完，10–20 分钟一课。
 先在 `mock` 模式（不调模型、免费、秒出）找感觉，标了 🔑 的课再用 DeepSeek。
 
+课文里的命令都在 Clause Check 项目文件夹里运行（项目：<https://github.com/Xinshuer/Contract-Clause-Reviewer>）。几个小脚本放在这个 repo 的 `lessons/` 里，运行时写它的完整路径，例如 `python "G:\Clause Check 编程营\lessons\inspect_report.py" data/map.report.json`。
+
 ```bash
 cd "G:\Contract Clause Reviewer"
 cp .env.example .env         # 填 DEEPSEEK_API_KEY=sk-...

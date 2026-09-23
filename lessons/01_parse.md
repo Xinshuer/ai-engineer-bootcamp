@@ -6,7 +6,7 @@
 
 ```bash
 python -m clausecheck clauses data/sample_contract.txt      # 先看正常切分：29 条 + 15 个章节标题
-python learn/sim_page_break.py                              # 再看分页后的两种处理
+python "G:\Clause Check 编程营\lessons\sim_page_break.py"                          # 再看分页后的两种处理
 ```
 
 第二条命令把示例合同"打印"成 5 页，每页底部加一行页脚，并且故意让一页在 `8.1 Cap on Liability` 标题之后断开。然后用两种方式处理：
@@ -24,7 +24,7 @@ python learn/sim_page_break.py                              # 再看分页后的
 
 ## 动手
 
-在 `learn/sim_page_break.py` 里把 `BREAK_AFTER` 改成 `"4.2 Automatic Renewal"`，再跑。这次消失的是哪条？
+在训练营的 `lessons/sim_page_break.py` 里把 `BREAK_AFTER` 改成 `"4.2 Automatic Renewal"`，再跑。这次消失的是哪条？
 
 ## 面试一句话
 

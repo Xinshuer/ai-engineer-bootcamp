@@ -154,7 +154,7 @@ title: 本机的样子：包、入口和 README
 网页里一题一个文件。放到本机时，把它拆成一个**包**（一个文件夹，里面有 `__init__.py`）：
 
 ```
-learn/minicheck/
+work/minicheck/
   __init__.py     空文件，表示「这是一个包」
   __main__.py     from .cli import main  和  raise SystemExit(main())
   models.py  split.py  review.py  pipeline.py  cli.py
@@ -170,7 +170,7 @@ learn/minicheck/
 steps = [
     ("安装依赖", "python -m pip install requests pydantic python-dotenv"),
     ("放密钥", "在仓库根目录的 .env 里写 DEEPSEEK_API_KEY=sk-...（.env 不进 git）"),
-    ("运行", "cd learn  然后  python -m minicheck ..\\data\\sample_contract.txt --out ..\\data\\mini.report.json"),
+    ("运行", "cd work  然后  python -m minicheck ..\\data\\sample_contract.txt --out ..\\data\\mini.report.json"),
     ("只导出高风险", "python -m minicheck ..\\data\\sample_contract.txt --only-risk high"),
 ]
 lines = ["# minicheck", "", "逐条审查合同条款，输出 JSON 报告。", "", "## 怎么运行"]
@@ -1581,14 +1581,14 @@ cards: 本机的样子：包、入口和 README; 项目怎么拆：五个文件�
 --- prompt
 把今天的 mini 工具搬到你的电脑上，用真的 DeepSeek 跑一遍示例合同，再和真实项目的结果对比。
 
-1. 新建文件夹 `G:\Contract Clause Reviewer\learn\minicheck\`，照「本机的样子」卡片建好文件：`__init__.py`（空）、`__main__.py`、`models.py`、`split.py`、`review.py`、`pipeline.py`、`cli.py`
+1. 新建文件夹 `G:\Contract Clause Reviewer\work\minicheck\`，照「本机的样子」卡片建好文件：`__init__.py`（空）、`__main__.py`、`models.py`、`split.py`、`review.py`、`pipeline.py`、`cli.py`
 2. 把第 15 题里每一段 `# ===== xxx.py =====` 下面的代码放进对应的文件（最好照着理解重打一遍），`main` 用你自己写的版本
 3. 每个文件顶部补上它自己用到的 `import`。包内互相导入要加点，比如 `cli.py` 里写 `from .pipeline import review_contract, write_report` 和 `from .review import review_clause`
 4. `review.py` 顶部再加三行，读仓库根目录的 `.env`（只有本机需要，网页里的模拟服务器不用）：`from pathlib import Path`、`from dotenv import load_dotenv`、`load_dotenv(Path(__file__).resolve().parents[2] / ".env")`
 5. 在终端运行你的工具，再运行真实项目（两个报告都写在 `data/` 里，`.gitignore` 已经忽略了 `*.report.json`）：
 
 ```
-cd "G:\Contract Clause Reviewer\learn"
+cd "G:\Contract Clause Reviewer\work"
 python -m minicheck ..\data\sample_contract.txt --out ..\data\mini.report.json
 cd "G:\Contract Clause Reviewer"
 python -m clausecheck review data/sample_contract.txt --mode deepseek --out data/ds.report.json
@@ -1602,7 +1602,7 @@ python -m clausecheck review data/sample_contract.txt --mode deepseek --out data
 placeholder: 粘贴两行 counts=…（你的 minicheck 一行，真实项目一行）
 verify: counts=\{[\s\S]*counts=\{
 --- hints
-- `ModuleNotFoundError: No module named 'minicheck'`：确认你是在 `learn` 文件夹里运行的（第一个 `cd`），而且 `minicheck` 文件夹里有 `__init__.py`。
+- `ModuleNotFoundError: No module named 'minicheck'`：确认你是在 `work` 文件夹里运行的（第一个 `cd`），而且 `minicheck` 文件夹里有 `__init__.py`。
 - `ImportError: attempted relative import with no known parent package`：不要直接 `python cli.py`，要用 `python -m minicheck`。
 - 401：`.env` 里的 key 不对，或者 `load_dotenv` 那一行的路径不对。在那一行下面 `print(Path(__file__).resolve().parents[2])` 看看是不是仓库根目录。
 - 真实项目输出的最后有 `errors on clauses: [...]`：打开 `data/ds.report.json`，看那几条 `rationale` 里的错误。有 `The supported API model names are ...`：模型名不对，看看 `.env` 里是不是写了别的 `CLAUSECHECK_DEEPSEEK_MODEL`。

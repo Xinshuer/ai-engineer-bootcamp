@@ -1016,13 +1016,13 @@ cards: 用 requests 发请求; Chat API 的请求和回答长什么样
 在自己电脑上，**不看这个页面**，手写一次真实的调用。
 
 1. 确认 `G:\Contract Clause Reviewer\.env` 里有 `DEEPSEEK_API_KEY=sk-...`（这个文件不会进 git）
-2. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\my_first_call.py`
+2. 在 VS Code 里新建 `G:\Contract Clause Reviewer\work\my_first_call.py`
 3. 从空白手写：读 `.env`（`from dotenv import load_dotenv` 然后 `load_dotenv()`）、组请求（模型 `deepseek-flash`）、调 `https://api.deepseek.com/v1/chat/completions`、打印回答和 `total_tokens`
 4. 在终端运行：
 
 ```
 cd "G:\Contract Clause Reviewer"
-python learn/my_first_call.py
+python work/my_first_call.py
 ```
 
 5. 把终端的完整输出粘贴到下面

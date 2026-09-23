@@ -1091,19 +1091,19 @@ cards: 可辨识联合和穷尽检查; d5:从 Python 到 TypeScript
 --- prompt
 本页每次运行都会帮你做类型检查。在自己电脑上，这一步要自己跑 `tsc`（TypeScript 编译器）。
 
-1. 在 `G:\Contract Clause Reviewer\learn` 下新建 `decision.ts`，**不看页面**手写：`Decision` 可辨识联合（accept / flag / redline 三种）、带 `never` 穷尽检查的 `describe(d)`，最后一行 `console.log(describe({ kind: "flag", reason: "unclear fee" }));`
+1. 在 `G:\Contract Clause Reviewer\work` 下新建 `decision.ts`，**不看页面**手写：`Decision` 可辨识联合（accept / flag / redline 三种）、带 `never` 穷尽检查的 `describe(d)`，最后一行 `console.log(describe({ kind: "flag", reason: "unclear fee" }));`
 2. 在项目根目录运行一次，确认能打印：
 
 ```
 cd "G:\Contract Clause Reviewer"
-npx tsx learn/decision.ts
+npx tsx work/decision.ts
 ```
 
-3. **删掉** `case "redline"` 那个分支，再运行一次 `npx tsx learn/decision.ts`：它还是能正常打印！因为 tsx 只负责运行，**不做类型检查**
+3. **删掉** `case "redline"` 那个分支，再运行一次 `npx tsx work/decision.ts`：它还是能正常打印！因为 tsx 只负责运行，**不做类型检查**
 4. 运行类型检查（第一次会询问是否下载 TypeScript，输入 y）：
 
 ```
-npx -p typescript tsc --noEmit --strict learn/decision.ts
+npx -p typescript tsc --noEmit --strict work/decision.ts
 ```
 
 5. 把第 4 步的输出粘贴到下面，应该看到 `TS2322` 和 `not assignable to type 'never'`。最后把 case 加回来，再跑一次 tsc：没有任何输出，就是通过了。

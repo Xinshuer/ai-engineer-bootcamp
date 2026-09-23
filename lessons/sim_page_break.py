@@ -1,13 +1,18 @@
-"""Lesson 01: simulate a paginated PDF and compare page-by-page splitting with join-then-split.
+r"""Lesson 01: simulate a paginated PDF and compare page-by-page splitting with join-then-split.
 
-    python learn/sim_page_break.py
+    cd <the Clause Check project folder>
+    python "G:\Clause Check 编程营\lessons\sim_page_break.py"
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# run from the Clause Check project folder: the project is found from the current folder
+ROOT = Path.cwd()
+if not (ROOT / "clausecheck").is_dir():
+    sys.exit('Run this from the Clause Check project folder, e.g. cd "G:\\Contract Clause Reviewer"')
+sys.path.insert(0, str(ROOT))
 
 from clausecheck.parse import _normalise, _strip_repeated_lines  # noqa: E402
 from clausecheck.split import split_clauses  # noqa: E402
@@ -15,7 +20,7 @@ from clausecheck.split import split_clauses  # noqa: E402
 BREAK_AFTER = "8.1 Cap on Liability"  # the page break lands right after this heading line
 PAGES = 5
 
-text = (Path(__file__).resolve().parent.parent / "data" / "sample_contract.txt").read_text(encoding="utf-8")
+text = (ROOT / "data" / "sample_contract.txt").read_text(encoding="utf-8")
 lines = text.splitlines()
 
 # --- "print" the contract: 5 pages, one forced break after the target heading --------

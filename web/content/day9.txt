@@ -1076,13 +1076,13 @@ cards: 测试函数和 pytest; 怎么想测试用例
 --- prompt
 在自己电脑上，亲手看一次测试从绿变红、再变绿。
 
-1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\learn\test_my_first.py`
+1. 在 VS Code 里新建 `G:\Contract Clause Reviewer\work\test_my_first.py`
 2. **不看页面**，从空白手写 `truncate(text, n)`（规则和上一题一样）和至少 3 个 `test_` 函数：短文本不变、长度刚好等于 n、超长时截断后长度正好是 n
 3. 在终端运行：
 
 ```
 cd "G:\Contract Clause Reviewer"
-python -m pytest learn/test_my_first.py
+python -m pytest work/test_my_first.py
 ```
 
 应该看到 `3 passed`（项目的 `pyproject.toml` 里已经配好了 `-q`）。

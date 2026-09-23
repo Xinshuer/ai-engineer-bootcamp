@@ -1436,7 +1436,7 @@ cards: 模块：一个文件一件事; 依赖注入：把外部世界传进来
 --- prompt
 本页每题只有一个文件。今天在自己电脑上真的拆一次模块，并用真的 DeepSeek 跑通。
 
-1. 在 `G:\Contract Clause Reviewer\learn` 下新建文件夹 `ts16`，放三个文件：
+1. 在 `G:\Contract Clause Reviewer\work` 下新建文件夹 `ts16`，放三个文件：
    - `types.ts`：`export type Result<T> = ...`
    - `client.ts`：第一行 `import type { Result } from "./types";`，然后 `export class DeepSeekClient`（照 d16-15 写，不看答案；默认用全局 `fetch`；模型 `deepseek-flash`，思考模式关掉）
    - `main.ts`：开头 `import { DeepSeekClient } from "./client";`，然后 `process.loadEnvFile();`（读取当前目录的 `.env`）。再写一个 async 的 `main()`：创建客户端（密钥 `process.env.DEEPSEEK_API_KEY ?? ""`），审查一条条款，`console.log` 结果；最后一行调用 `main();`（和第 6 天一样，不要在最外层直接写 await）
@@ -1445,7 +1445,7 @@ cards: 模块：一个文件一件事; 依赖注入：把外部世界传进来
 
 ```
 cd "G:\Contract Clause Reviewer"
-npx tsx learn/ts16/main.ts
+npx tsx work/ts16/main.ts
 ```
 
 4. 把输出粘贴到下面，应该看到 `ok: true` 和一个判定。

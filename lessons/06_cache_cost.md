@@ -5,7 +5,7 @@ DeepSeek 和 Anthropic 都按**前缀**缓存 prompt：前面每个字节都一�
 ## 跑
 
 ```bash
-python learn/cache_experiment.py
+python "G:\Clause Check 编程营\lessons\cache_experiment.py"
 ```
 
 脚本用 DeepSeek 审同一条条款 3 次，打印每次的 `cache_read`（命中 token）和 `input`（未命中 token）；然后在 system prompt **最前面**加一个时间戳，再审 3 次。

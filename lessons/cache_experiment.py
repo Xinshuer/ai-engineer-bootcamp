@@ -1,6 +1,7 @@
-"""Lesson 06: watch the prompt cache hit, then break it with a timestamp.
+r"""Lesson 06: watch the prompt cache hit, then break it with a timestamp.
 
-    python learn/cache_experiment.py            # needs DEEPSEEK_API_KEY in .env
+    cd <the Clause Check project folder>
+    python "G:\Clause Check 编程营\lessons\cache_experiment.py"            # needs DEEPSEEK_API_KEY in .env
 """
 from __future__ import annotations
 
@@ -8,7 +9,11 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# run from the Clause Check project folder: the project is found from the current folder
+ROOT = Path.cwd()
+if not (ROOT / "clausecheck").is_dir():
+    sys.exit('Run this from the Clause Check project folder, e.g. cd "G:\\Contract Clause Reviewer"')
+sys.path.insert(0, str(ROOT))
 
 from clausecheck.config import Settings  # noqa: E402
 from clausecheck.review import OpenAICompatBackend, _user_message  # noqa: E402
