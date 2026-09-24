@@ -1887,7 +1887,7 @@ function renderReview(main) {
   const items = ALL_ITEMS.filter((it) => STATE.items[it.id]?.review);
   main.append(h("section", { class: "panel" },
     h("h2", {}, tr("复习区", "Review")),
-    h("div", { class: "md", html: md(tr("这里是需要**独立重做一次**的题：看过答案的、用了 2 个以上提示的、提交很多次才过的、闭卷没做出来的。\n\n点开题目 →「从空白重做」→ 不看答案写对，它就会离开这里。每天开始新内容之前，先把这里清空。", "These exercises need **one more solve on your own**: ones where you saw the answer, used more than 2 hints, needed many tries, or missed in a closed-book exam.\n\nOpen the exercise → Redo from blank → get it right without the answer, and it leaves this list. Empty this list before you start anything new each day.")) })));
+    h("div", { class: "md", html: md(tr("这里是需要**独立重做一次**的题：看过答案的、用了 2 个以上提示的、提交很多次才过的、闭卷没做出来的。\n\n点开题目（答题区会自动清空）→ 不看答案写对，它就会离开这里。每天开始新内容之前，先把这里清空。", "These exercises need **one more solve on your own**: ones where you saw the answer, used more than 2 hints, needed many tries, or missed in a closed-book exam.\n\nOpen the exercise (its answer is cleared for you) → get it right without the answer, and it leaves this list. Empty this list before you start anything new each day.")) })));
   if (!items.length) { main.append(h("div", { class: "panel" }, h("p", { class: "emptyNote" }, tr("复习区是空的。保持住：做完一题后，隔一天再从空白写一遍，最能检验是不是真会了。", "Review is empty. Keep it that way: rewriting an exercise from blank a day later is the best test of whether you really know it.")))); return; }
   renderPractice(main, null, items, "review");
 }
