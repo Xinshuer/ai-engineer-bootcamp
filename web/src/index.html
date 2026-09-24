@@ -429,7 +429,7 @@ function merge(other) {
     mine.a = Math.max(mine.a || 0, r.a || 0);
     mine.h = Math.max(mine.h || 0, r.h || 0);
     mine.sol = mine.sol || !!r.sol;
-    if (newer) { mine.review = !!r.review; if (r.code !== undefined) mine.code = r.code; if (r.fills) mine.fills = r.fills; if (r.order) mine.order = r.order; mine.u = r.u; }
+    if (newer) { mine.review = !!r.review; if (r.redo) mine.redo = true; else delete mine.redo; if (r.code !== undefined) mine.code = r.code; if (r.fills) mine.fills = r.fills; if (r.order) mine.order = r.order; mine.u = r.u; }
     if (r.t && (!mine.t || r.t < mine.t)) mine.t = r.t;
     mine.sec = Math.max(mine.sec || 0, r.sec || 0);
   }
@@ -1085,7 +1085,7 @@ function canSeeSolution(item, r) {
   return { ok: false, why: tr(`再认真试 ${SOLUTION_AFTER_TRIES - r.a} 次（或独立思考 10 分钟）后可以看答案`, `The answer unlocks after ${SOLUTION_AFTER_TRIES - r.a} more real ${SOLUTION_AFTER_TRIES - r.a === 1 ? "try" : "tries"} (or 10 minutes of thinking on your own)`) };
 }
 function isExamLive(item) { return !!(STATE.exam && STATE.exam.active && item.exam && Number(STATE.exam.day) === item.day); }
-const SESSION = { opened: {}, results: {}, hintsShown: {}, solShown: {}, choice: {}, redo: {} };
+const SESSION = { opened: {}, results: {}, hintsShown: {}, solShown: {}, choice: {}, redo: {}, reviewNow: {} };
 
 function markAttempt(item, passed, meta = {}) {
   const r = rec(item.id);
@@ -1098,8 +1098,8 @@ function markAttempt(item, passed, meta = {}) {
     // review rules: a solve that needed the answer, many hints or many tries goes to review;
     // a clean re-solve from review clears it.
     const sawNow = SESSION.solShown[item.id];
-    if (r.review && !sawNow && SESSION.redo[item.id]) r.review = false;
-    else if (firstTime && (r.sol || r.h >= 2 || r.a >= 5 || meta.wrongChoices >= 2)) r.review = true;
+    if (r.review && !sawNow && SESSION.redo[item.id]) { r.review = false; delete r.redo; }
+    else if (firstTime && (r.sol || r.h >= 2 || r.a >= 5 || meta.wrongChoices >= 2)) { r.review = true; SESSION.reviewNow[item.id] = true; }
   } else if (r.s === "new") r.s = "tried";
   save();
   renderRail(); renderMeter();
@@ -1257,6 +1257,18 @@ function renderItem(work, item, ctx) {
   const r = rec(item.id);
   SESSION.opened[item.id] ||= Date.now();
   const exam = isExamLive(item);
+  // a review item starts from blank (the old answer is what sent it to review); r.redo remembers that the
+  // blank redo has begun, so a half-written redo survives a reload. An item that went to review in this
+  // session keeps what is on screen until the next session.
+  if (!exam && status(item.id) === "review" && !SESSION.reviewNow[item.id]) {
+    if (!r.redo) {
+      r.redo = true; delete r.code; delete r.fills; delete r.order; r.u = Date.now();
+      delete SESSION.choice[item.id]; delete SESSION.results[item.id];
+      SESSION.hintsShown[item.id] = 0; SESSION.solShown[item.id] = false;
+      save();
+    }
+    SESSION.redo[item.id] = true;
+  }
   const st = status(item.id);
   const stLabel = { solved: tr("已通过", "Solved"), review: tr("需要重做", "Redo"), tried: tr("尝试中", "In progress"), new: "" }[st];
   work.append(h("div", { class: "workHead" },
@@ -1266,7 +1278,7 @@ function renderItem(work, item, ctx) {
     stLabel ? h("span", { class: "status " + st }, stLabel) : "",
     r.a ? h("span", { class: "note" }, tr(`已提交 ${r.a} 次`, `${r.a} ${r.a === 1 ? "try" : "tries"}`)) : "",
     h("h2", {}, item.title)));
-  if (st === "review") work.append(h("div", { class: "hintBox" }, tr("这道题之前看过答案或用了较多提示，现在进了复习区。点「从空白重做」，不看答案独立写对一次，它就会离开复习区。", "You looked at the answer or used several hints here, so this exercise is in Review. Click Redo from blank and get it right once on your own, without the answer, and it leaves Review.")));
+  if (st === "review") work.append(h("div", { class: "hintBox" }, tr("这道题之前看过答案或用了较多提示，现在进了复习区。答题区已经清空：不看答案、独立做对一次，它就会离开复习区。", "You looked at the answer or used several hints here, so this exercise is in Review. Your old answer has been cleared: get it right once on your own, without the answer, and it leaves Review.")));
   if (item.context) {
     const bg = h("div", { class: "context" }, h("p", { class: "panelLabel" }, tr("背景", "Background")), h("div", { class: "md", html: md(item.context) }));
     highlightIn(bg, item.lang);
@@ -1340,6 +1352,7 @@ function helpers(work, item, { exam, solution, onRedo }) {
     const sb = h("button", { class: "btn", disabled: !gate.ok, onclick: () => {
       SESSION.solShown[item.id] = true;
       if (r.s !== "solved") { r.sol = true; r.review = true; }
+      if (r.review) { r.redo = false; SESSION.reviewNow[item.id] = true; }   // a peek spoils this redo: blank again next session
       r.u = Date.now(); save(); renderRail(); renderMeter();
       solArea.replaceChildren(h("div", { class: "solution" },
         h("p", { class: "panelLabel" }, tr("参考答案", "Reference solution")),
@@ -1861,7 +1874,7 @@ function finishExam(reason) {
   const score = items.filter((it) => SESSION.results[it.id] && isPass(SESSION.results[it.id])).length;
   const prev = STATE.exams[day] || {};
   STATE.exams[day] = { best: Math.max(prev.best || 0, score), last: score, at: Date.now(), tries: (prev.tries || 0) + 1, minutes: Math.round((Date.now() - STATE.exam.startedAt) / 60000) };
-  for (const it of items) if (!(SESSION.results[it.id] && isPass(SESSION.results[it.id]))) { const r = rec(it.id); r.review = true; r.u = Date.now(); }
+  for (const it of items) if (!(SESSION.results[it.id] && isPass(SESSION.results[it.id]))) { const r = rec(it.id); r.review = true; r.redo = false; r.u = Date.now(); SESSION.reviewNow[it.id] = true; }
   STATE.exam = null;
   clearTimeout(examTick);
   save();
